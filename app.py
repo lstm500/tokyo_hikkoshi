@@ -1,10 +1,13 @@
-"""住まいコンパス — Streamlit版 v02
+"""住まいコンパス — Streamlit版 v04（Supabase保存）
 実行: streamlit run app.py
 依存: streamlit>=1.50,<2 / folium>=0.18,<1 / streamlit-folium>=0.24,<1 / requests>=2.32,<3
 実物件の家賃メッシュ表示。通勤は概算。公開情報取得はサイトの仕様・接続状況に依存。
 """
 from __future__ import annotations
 import csv
+import os
+import base64
+import hashlib
 import heapq
 import io
 import math
@@ -1657,7 +1660,7 @@ SNAPSHOT_INFO = {'layout': '2LDK',
  'fetched_at': '2026-10-05T12:02:34+00:00'}
 MD_CODES = {'1LDK': '15', '2LDK': '25', '3LDK': '35', '4LDK': '45-'}
 DEFAULT_URL = 'https://www.homes.co.jp/chintai/tokyo/ikebukuro_00488-st/list/'
-HEADERS = {'User-Agent': 'SumaiCompass/2.0 (personal rental map)'}
+HEADERS = {'User-Agent': 'SumaiCompass/4.0 (personal rental map)'}
 _HTTP = threading.local()
 
 def http_session():
@@ -1911,8 +1914,8 @@ def mesh(properties, origin, cell=100, radius=1500, interpolate=True, reach=400,
     return cells
 
 
-def validate_records(raw):
-    if len(raw) > 5_000_000:
+def validate_records(raw, maximum=2000):
+    if len(raw) > max(5_000_000, maximum*2500):
         raise ValueError('CSVは5MB以内にしてください。')
     reader = csv.DictReader(io.StringIO(raw.decode('utf-8-sig')))
     required = {'name', 'lat', 'lng', 'layout', 'rent', 'fees', 'area'}
@@ -1920,8 +1923,8 @@ def validate_records(raw):
         raise ValueError('name, lat, lng, layout, rent, fees, area列が必要です。金額は円、座標は掲載位置を指定します。')
     records = []
     for n, row in enumerate(reader, 2):
-        if n > 2001:
-            raise ValueError('CSVは2,000件以内にしてください。')
+        if n > maximum+1:
+            raise ValueError(f'CSVは{maximum:,}件以内にしてください。')
         try:
             p = {key: row.get(key, '') for key in REAL_FIELDS}
             for key in ('lat', 'lng', 'area'):
@@ -1976,7 +1979,7 @@ def fetch_facilities_at(lat, lng, category):
 
 
 def make_map(origin, cells, records, facilities):
-    m = folium.Map(location=[origin['lat'], origin['lng']], zoom_start=15, tiles='OpenStreetMap', control_scale=True)
+    m = folium.Map(location=[origin['lat'], origin['lng']], zoom_start=st.session_state.get('zoom03', 15), tiles='OpenStreetMap', control_scale=True)
     for c in cells:
         estimated = c['kind'] == '近隣からの推定'
         tip = (f'{c["price"]/10000:.1f}万円/月 · {c["kind"]}<br>'
@@ -1996,11 +1999,307 @@ def make_map(origin, cells, records, facilities):
                             fill=True, fill_color=color_for(p['rent']+p['fees']), fill_opacity=1,
                             tooltip=f'{escape(p["name"])} · {(p["rent"]+p["fees"])/10000:g}万',
                             popup=folium.Popup(detail, max_width=300)).add_to(m)
-    folium.Marker([origin['lat'], origin['lng']], tooltip='表示中心：'+origin['name'], icon=folium.Icon(color='darkblue', icon='info-sign')).add_to(m)
+
     for f in facilities:
         folium.CircleMarker([f['lat'], f['lng']], radius=6, fill=True, fill_color='#173a5e', fill_opacity=1,
                             color='white', weight=1, tooltip=escape(f['name'])).add_to(m)
     return m
+
+def normalize_bounds(raw):
+    try:
+        if isinstance(raw, dict):
+            a, b = raw['_southWest'], raw['_northEast']
+            values = [float(a['lat']), float(a['lng']), float(b['lat']), float(b['lng'])]
+        else:
+            values = list(map(float, raw))
+        south, west, north, east = values
+        if not all(math.isfinite(x) for x in values) or not (-85 <= south < north <= 85 and -180 <= west < east <= 180):
+            return None
+        return values
+    except (TypeError, KeyError, ValueError):
+        return None
+
+
+def inside(p, bounds):
+    return bool(bounds and bounds[0] <= p['lat'] <= bounds[2] and bounds[1] <= p['lng'] <= bounds[3])
+
+
+def cell_intersects(c, b):
+    sw, ne = c['bounds']
+    return sw[0] <= b[2] and ne[0] >= b[0] and sw[1] <= b[3] and ne[1] >= b[1]
+
+
+def bounds_radius(b, origin):
+    return max(distance(origin, dict(lat=lat,lng=lng))*1000 for lat in (b[0],b[2]) for lng in (b[1],b[3]))
+
+
+class StorageError(Exception):
+    """Safe, actionable messages; never expose provider response bodies or credentials."""
+
+
+def secret_value(name, default=''):
+    value = os.environ.get(name)
+    if value is None:
+        try:
+            value = st.secrets.get(name, default)
+        except (FileNotFoundError, st.errors.StreamlitSecretNotFoundError):
+            value = default
+    return str(value or '').strip()
+
+
+def supabase_settings():
+    url = secret_value('SUPABASE_URL').rstrip('/')
+    key = secret_value('SUPABASE_SECRET_KEY') or secret_value('SUPABASE_SERVICE_ROLE_KEY')
+    namespace = secret_value('SUPABASE_NAMESPACE', 'sumai-compass')
+    if not url or not key:
+        raise StorageError('StreamlitのSecretsにSUPABASE_URLとSUPABASE_SECRET_KEYを設定してください。')
+    try:
+        parsed = urlparse(url)
+        valid_url = (parsed.scheme == 'https' and parsed.hostname and parsed.hostname.endswith('.supabase.co')
+                     and not parsed.username and not parsed.password and parsed.port in (None,443)
+                     and parsed.path in ('','/') and not parsed.query and not parsed.fragment)
+    except ValueError:
+        valid_url = False
+    if not valid_url:
+        raise StorageError('SUPABASE_URLには https://プロジェクトID.supabase.co 形式のProject URLを設定してください。')
+    if not re.fullmatch(r'[a-zA-Z0-9_-]{1,80}', namespace):
+        raise StorageError('SUPABASE_NAMESPACEは英数字・ハイフン・アンダースコアで80文字以内にしてください。')
+    headers = {'apikey':key, 'Content-Type':'application/json', 'Accept':'application/json'}
+    if key.startswith('sb_secret_'):
+        pass  # New secret keys use apikey, not Authorization: Bearer.
+    else:
+        try:
+            encoded = key.split('.')[1]
+            payload = json.loads(base64.urlsafe_b64decode(encoded + '='*(-len(encoded)%4)))
+            if len(key.split('.')) != 3 or payload.get('role') != 'service_role':
+                raise ValueError()
+        except (ValueError, IndexError, UnicodeError, TypeError, AttributeError):
+            raise StorageError('Secret key（sb_secret_…）または旧service_roleキーを使用してください。anon/publishableキーでは保存できません。') from None
+        headers['Authorization'] = 'Bearer '+key
+    return url, headers, namespace
+
+
+def supabase_request(method, route, *, params=None, payload=None):
+    url, headers, _ = supabase_settings()
+    allowed = ('sumai_properties','sumai_fetch_queries','sumai_metadata','rpc/sumai_save_properties')
+    if route not in allowed:
+        raise StorageError('保存先の指定が不正です。')
+    try:
+        # Use a separate one-shot connection: do not share the HOME'S scraping session or headers.
+        response = requests.request(method, url+'/rest/v1/'+route, headers=headers,
+                                    params=params, json=payload, timeout=(10,45), allow_redirects=False)
+    except requests.RequestException:
+        raise StorageError('Supabaseに接続できませんでした。Projectの稼働状態・接続設定を確認して再試行してください。') from None
+    if not 200 <= response.status_code < 300:
+        if response.status_code in (401,403):
+            message = 'Supabaseのキーまたはアクセス権が不正です。Secret keyとセットアップSQLを確認してください。'
+        elif response.status_code == 404:
+            message = 'Supabaseのテーブルまたは保存用関数がありません。supabase_setup_ver.04.sqlをSQL Editorで実行してください。'
+        else:
+            message = f'Supabaseの読み込み・保存に失敗しました（HTTP {response.status_code}）。保存済みデータは削除していません。'
+        raise StorageError(message)
+    try:
+        return response.json()
+    except ValueError:
+        raise StorageError('Supabaseの応答を読み取れませんでした。') from None
+
+
+def load_store():
+    _, _, namespace = supabase_settings()
+    records, offset = [], 0
+    # PostgREST caps one response; read every page with a deterministic primary-key order.
+    while True:
+        rows = supabase_request('GET','sumai_properties',params={
+            'namespace':'eq.'+namespace, 'select':'identity,payload', 'order':'identity.asc', 'limit':500, 'offset':offset})
+        if not isinstance(rows,list) or any(not isinstance(r,dict) or not isinstance(r.get('payload'),dict) for r in rows):
+            raise StorageError('Supabaseの物件データ形式が不正です。')
+        if not rows:
+            break
+        records.extend(row['payload'] for row in rows)
+        offset += len(rows)  # Continue even if the server's configured cap is less than 500.
+    meta = supabase_request('GET','sumai_metadata',params={
+        'namespace':'eq.'+namespace,'select':'payload','identity':'eq.last_fetch','limit':1})
+    if not isinstance(meta,list) or (meta and (not isinstance(meta[0],dict) or not isinstance(meta[0].get('payload'),dict))):
+        raise StorageError('Supabaseの取得履歴の形式が不正です。')
+    try:
+        valid = validate_records(export_records(records),maximum=max(2000,len(records))) if records else []
+    except (ValueError, KeyError, TypeError, csv.Error):
+        raise StorageError('保存済み物件の座標・家賃・間取りを確認できません。Supabaseのデータを確認してください。') from None
+    return deduplicate(valid), meta[0]['payload'] if meta else {}
+
+
+def query_key(bounds, layout, limit):
+    # Hash avoids escaping JSON punctuation inside a PostgREST text filter.
+    value = json.dumps([list(map(lambda x: round(x,5), bounds)),layout,limit],ensure_ascii=False)
+    return hashlib.sha256(value.encode()).hexdigest()
+
+
+def cached_query(bounds, layout, limit):
+    _, _, namespace = supabase_settings()
+    rows = supabase_request('GET','sumai_fetch_queries',params={
+        'namespace':'eq.'+namespace,'identity':'eq.'+query_key(bounds,layout,limit),'select':'payload','limit':1})
+    if not isinstance(rows,list) or (rows and (not isinstance(rows[0],dict) or not isinstance(rows[0].get('payload'),dict))):
+        raise StorageError('Supabaseの範囲キャッシュの形式が不正です。')
+    return rows[0]['payload'] if rows else None
+
+
+def save_store(records, info, bounds=None, layout=None, limit=None):
+    _, _, namespace = supabase_settings()
+    try:
+        records = validate_records(export_records(records),maximum=5000)
+    except (ValueError, KeyError, TypeError, csv.Error) as error:
+        raise StorageError('保存する物件データの形式を確認してください。') from None
+    if not records:
+        raise StorageError('保存する物件がありません。')
+    now = datetime.now(timezone.utc).isoformat(timespec='seconds')
+    unique = {}
+    for p in records:
+        stamp = p.get('fetched_at') or now
+        try:
+            parsed = datetime.fromisoformat(stamp.replace('Z','+00:00'))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            p['fetched_at'] = parsed.astimezone(timezone.utc).isoformat(timespec='seconds')
+        except (ValueError, TypeError, AttributeError):
+            raise StorageError('物件の取得日時を確認してください。') from None
+        identity = p.get('url') or str(p['id'])
+        if identity not in unique or unique[identity]['fetched_at'] <= p['fetched_at']:
+            unique[identity] = p
+    result = supabase_request('POST','rpc/sumai_save_properties',payload={
+        'p_namespace':namespace,'p_records':list(unique.values()),'p_info':info,
+        'p_query_key':query_key(bounds,layout,limit) if bounds is not None else None})
+    if not isinstance(result,dict) or result.get('ok') is not True:
+        raise StorageError('Supabaseへの保存完了を確認できませんでした。再読み込みして確認してください。')
+    try:
+        return load_store()[0]
+    except StorageError:
+        raise StorageError('Supabaseへの保存は完了しましたが、再読み込みに失敗しました。再接続して確認してください。') from None
+
+
+def show_storage_setup():
+    st.info('保存・読み込み先はSupabaseです。接続設定が完了すると地図を表示します。')
+    st.markdown('1. SupabaseのSQL Editorで **supabase_setup_ver.04.sql** を実行。\n'
+                '2. Streamlitの **Settings → Secrets** に下の接続情報を登録。\n'
+                '3. アプリを再起動、または下のボタンで再接続。')
+    st.code('SUPABASE_URL = "https://プロジェクトID.supabase.co"\n'
+            'SUPABASE_SECRET_KEY = "sb_secret_から始まるSecret key"\n'
+            'SUPABASE_NAMESPACE = "sumai-compass"',language='toml')
+    st.caption('キーはStreamlitのサーバーからのみ使用します。GitHubやチャットには貼り付けないでください。旧service_roleキーはSUPABASE_SERVICE_ROLE_KEYでも指定できます。')
+    if st.button('Supabaseに再接続',key='reconnect04'):
+        st.rerun()
+
+
+MAP_TILE_URL = 'https://www.homes.co.jp/_ajax/map/realestate_article/tile/'
+MAP_INFO_URL = 'https://www.homes.co.jp/_ajax/map/realestate_article/info_view/'
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def map_robots_allowed():
+    response = http_session().get('https://www.homes.co.jp/robots.txt',headers=HEADERS,timeout=(20,20))
+    response.raise_for_status()
+    rp = urllib.robotparser.RobotFileParser()
+    rp.parse(response.text.splitlines())
+    return all(rp.can_fetch('SumaiCompass', u) for u in (MAP_TILE_URL, MAP_INFO_URL, DEFAULT_URL))
+
+
+def tile_xy(lat, lng, zoom=15):
+    n = 2**zoom
+    return int((lng/360+.5)*n), int((1-math.asinh(math.tan(math.radians(lat)))/math.pi)/2*n)
+
+
+def map_request(url, data):
+    if url not in (MAP_TILE_URL, MAP_INFO_URL):
+        raise ValueError('取得先が不正です。')
+    r = http_session().post(url,data=data,headers=HEADERS,timeout=(20,20),allow_redirects=False)
+    if 300 <= r.status_code < 400:
+        raise ValueError('取得元が別ページへ移動しました。')
+    r.raise_for_status()
+    if len(r.content) > 4_000_000:
+        raise ValueError('応答が大きすぎます。')
+    r.encoding = 'utf-8'
+    return r
+
+
+def map_condition(layout):
+    return {'cond[mbg][3001]':'3001','cond[mbg][3002]':'3002','cond[mbg][3003]':'3003',
+            'cond[monthmoneyroom]':'0','cond[monthmoneyroomh]':'0','cond[housearea]':'0',
+            'cond[houseareah]':'0','cond[walkminutesh]':'0','cond[houseageh]':'0',
+            'cond[newdate]':'0','cond[freeword]':'','cond[fwtype]':'1','cond[exfreeword]':'',
+            f'cond[madori][{MD_CODES[layout]}]':MD_CODES[layout]}
+
+
+def collect_viewport(bounds, layout, limit=120, progress=None):
+    bounds = normalize_bounds(bounds)
+    if not bounds:
+        raise ValueError('地図の表示範囲を確認できません。')
+    center = dict(lat=(bounds[0]+bounds[2])/2,lng=(bounds[1]+bounds[3])/2)
+    if bounds_radius(bounds,center) > 6000:
+        raise ValueError('地図を拡大してください。')
+    if not (34.8 <= bounds[0] < bounds[2] <= 36.5 and 138.5 <= bounds[1] < bounds[3] <= 140.9):
+        raise ValueError('首都圏の範囲で取得してください。')
+    if not map_robots_allowed():
+        raise ValueError('現在、取得元が自動取得を許可していません。')
+    zoom = 15
+    xmin,ymin = tile_xy(bounds[2],bounds[1],zoom)
+    xmax,ymax = tile_xy(bounds[0],bounds[3],zoom)
+    tiles = [(x,y) for x in range(xmin,xmax+1) for y in range(ymin,ymax+1)]
+    if len(tiles) > 160:
+        raise ValueError('検索区画が多すぎます。地図を拡大してください。')
+    warnings, candidates = [], {}
+    for offset in range(0,len(tiles),6):
+        data = map_condition(layout)
+        data['zoom'] = zoom
+        for i,(x,y) in enumerate(tiles[offset:offset+6]):
+            data[f'tiles[{i}][x]'], data[f'tiles[{i}][y]'] = x,y
+        try:
+            payload = map_request(MAP_TILE_URL,data).json()
+            for group in payload.values():
+                for row in group.get('row_set',[]):
+                    if inside(dict(lat=float(row['lat']),lng=float(row['lon'])),bounds):
+                        key = row.get('tykey')
+                        if key and re.fullmatch(r'[a-zA-Z0-9]+',str(key)):
+                            candidates[key] = row
+        except (requests.RequestException, ValueError, KeyError, TypeError, AttributeError) as error:
+            warnings.append(f'検索区画の一部を取得できませんでした（{type(error).__name__}）。')
+    # Rotate geographically ordered buildings so that the limit is shared across the viewport.
+    keys = sorted(candidates, key=lambda k:(float(candidates[k]['lon']),float(candidates[k]['lat'])))
+    if len(keys) > limit:
+        keys = [keys[min(len(keys)-1,int(i*len(keys)/limit))] for i in range(limit)]
+        warnings.append('候補建物が取得上限を超えたため、範囲内から分散して選択しました。')
+    links = []
+    for start in range(0,len(keys),8):
+        data = map_condition(layout)
+        data['cond[tykey]'] = ','.join(keys[start:start+8])
+        try:
+            links.extend(room_links(map_request(MAP_INFO_URL,data).text))
+        except (requests.RequestException, ValueError) as error:
+            warnings.append(f'候補一覧の一部を取得できませんでした（{type(error).__name__}）。')
+    links = list(dict.fromkeys(links))
+    # Spread detail-page budget across buildings rather than only the first building.
+    if len(links) > limit:
+        links = [links[min(len(links)-1,int(i*len(links)/limit))] for i in range(limit)]
+    records, failed = [], 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        jobs = [pool.submit(fetch_listing,u) for u in links]
+        for n,job in enumerate(concurrent.futures.as_completed(jobs),1):
+            try:
+                p = job.result()
+                if p and p['layout'] == layout and inside(p,bounds):
+                    records.append(p)
+                else:
+                    failed += 1
+            except (requests.RequestException, ValueError, KeyError, TypeError):
+                failed += 1
+            if progress:
+                progress(n,len(links),len(records))
+    if failed:
+        warnings.append(f'{failed}ページは範囲・間取り・位置・費用を確認できず除外しました。')
+    records = deduplicate(records)
+    return records, dict(layout=layout,bounds=bounds,requested=len(links),received=len(records),
+                         candidate_buildings=len(candidates), warnings=warnings,
+                         source_url='https://www.homes.co.jp/chintai/map/',
+                         fetched_at=datetime.now(timezone.utc).isoformat(timespec='seconds'))
+
 
 def main():
     st.set_page_config(page_title='住まいコンパス', page_icon='🏠', layout='wide', initial_sidebar_state='collapsed')
@@ -2015,8 +2314,17 @@ def main():
     st.caption('掲載物件の総額家賃を、街の中で比較')
     state = st.session_state
     if 'records02' not in state:
-        state.records02 = list(SNAPSHOT)
-        state.info02 = dict(SNAPSHOT_INFO)
+        try:
+            records, info = load_store()
+            if not records:
+                # First connection only: persist the existing, dated real Ikebukuro snapshot.
+                records = save_store(list(SNAPSHOT), dict(SNAPSHOT_INFO))
+                _, info = load_store()
+            state.records02, state.info02 = records, info
+        except StorageError as error:
+            st.error(str(error))
+            show_storage_setup()
+            st.stop()
         state.facilities02 = []
         state.facility_origin02 = None
     if 'flash02' in state:
@@ -2032,44 +2340,75 @@ def main():
         reach = c2.slider('推定に使う建物の範囲（m）', 200, 700, 400, 50, key='reach02')
         budget = st.number_input('物件一覧・ピンの月額上限（万円）', 1.0, 1000.0, 50.0, 1.0, key='budget02')
         st.caption('家賃の高低を比較できるよう、面の色分けは予算で絞る前の全取得物件を使います。推定は3建物以上ある範囲だけです。')
-        source_url = st.text_input('LIFULL HOME’Sの駅・地域の賃貸一覧URL', value=DEFAULT_URL, key='source02')
-        st.caption('初期取得先は池袋駅です。別の地域では、その地域の物件一覧URLと地図の中心駅を変更してください。')
         limit = st.selectbox('取得上限（物件ページ数）', [60, 120, 180, 240], index=1, key='limit02')
-        st.caption('最大3一覧ページ。少数の取得では、街全体の相場を代表しない場合があります。物件ページは同時2件、1時間キャッシュします。')
-        if st.button('この間取りの物件を取得・更新', key='fetch02'):
-            if not safe_source_url(source_url):
-                st.error('https://www.homes.co.jp/chintai/ で始まる物件一覧URLを指定してください。')
-            else:
-                progress = st.progress(0.0, text='物件一覧を取得しています…')
-                def update(n, total, ok):
-                    progress.progress(n/max(1,total), text=f'{n}/{total}ページを確認 · {ok}物件を取得')
-                try:
-                    records, info = collect(source_url, layout, limit, progress=update)
-                    if records:
-                        # Preserve other layouts from the same source; replace this layout atomically.
-                        old = [p for p in state.records02 if p['layout'] != layout] if state.info02.get('source_url') == source_url else []
-                        state.records02 = deduplicate(old+records)
-                        state.info02 = info
-                        state.flash02 = f'{len(records)}物件の掲載座標・家賃・管理費等を取得しました。'
-                        st.rerun()
-                    else:
-                        st.error('座標・間取り・費用を確認できる物件がありません。前回の取得データを保持しています。')
-                        for warning in info['warnings']:
-                            st.warning(warning)
-                except (requests.RequestException, ValueError) as error:
-                    st.error(f'取得できませんでした（{type(error).__name__}）。前回データを保持しています。CSVの読み込みも利用できます。')
-                finally:
-                    progress.empty()
+        st.caption('取得はボタンを押したときだけ行います。間取り・表示範囲で検索し、掲載座標を確認した物件を保存します。')
     origin = BY_NAME[station_name]
+    if state.get('map_station03') != station_name:
+        state.map_station03 = station_name
+        state.bounds03 = None
+        state.view_center03 = [origin['lat'], origin['lng']]
+        state.zoom03 = 15
+    bounds = state.get('bounds03')
+    view = dict(lat=state.view_center03[0], lng=state.view_center03[1], name=station_name)
+    render_radius = bounds_radius(bounds, view) if bounds else radius
     all_layout = [p for p in state.records02 if p['layout'] == layout]
-    nearby = [p for p in all_layout if distance(p, origin)*1000 <= radius]
+    nearby = [p for p in all_layout if inside(p, bounds)] if bounds else [p for p in all_layout if distance(p, origin)*1000 <= radius]
+    support = [p for p in all_layout if distance(p, view)*1000 <= render_radius+reach]
     displayed = [p for p in nearby if p['rent']+p['fees'] <= budget*10000]
-    cells = mesh(nearby, origin, cell, radius, interpolate, reach)
+    cells = mesh(support, view, cell, render_radius, interpolate, reach) if render_radius <= 6000 else []
+    if bounds:
+        cells = [c for c in cells if cell_intersects(c, bounds)]
     if state.facility_origin02 != station_name:
         state.facilities02 = []
         state.facility_origin02 = station_name
-    st_folium(make_map(origin, cells, displayed, state.facilities02), height=560, use_container_width=True,
-              key=f'mesh02_{station_name}_{layout}_{cell}_{radius}_{interpolate}_{reach}', returned_objects=[])
+    def remember_view():
+        data = state.get(f'map03_{station_name}', {})
+        if isinstance(data, dict):
+            valid = normalize_bounds(data.get('bounds'))
+            if valid:
+                state.bounds03 = valid
+                state.view_center03 = [(valid[0]+valid[2])/2, (valid[1]+valid[3])/2]
+                zoom = data.get('zoom')
+                if isinstance(zoom, (int, float)) and 1 <= zoom <= 20:
+                    state.zoom03 = int(zoom)
+    st_folium(make_map(view, cells, displayed, state.facilities02), height=560, use_container_width=True,
+              key=f'map03_{station_name}', returned_objects=['bounds', 'zoom'],
+              center=tuple(state.view_center03), zoom=state.zoom03, on_change=remember_view)
+    st.caption('地図を移動・拡大してから取得ボタンを押してください。表示中の長方形が取得・一覧の対象です。')
+    refresh = st.checkbox('保存済み範囲も再取得する（通常は保存データを利用）', key='refresh03')
+    if st.button('表示範囲の家賃帯一覧を取得・保存', type='primary', disabled=bounds is None, key='fetch03'):
+        if bounds_radius(bounds, view) > 6000:
+            st.warning('取得対象が広すぎます。対角線が約12km以内になるまで拡大してください。')
+        else:
+            progress = st.progress(0.0, text='表示範囲の物件を検索しています…')
+            try:
+                cached = cached_query(bounds, layout, limit) if not refresh else None
+                if cached:
+                    state.records02, state.info02 = load_store()
+                    state.flash02 = 'この範囲の保存データを読み込みました。最新情報は再取得を選んでください。'
+                    st.rerun()
+                if refresh:
+                    fetch_listing.clear()
+                records, info = collect_viewport(bounds, layout, limit,
+                    progress=lambda n,total,ok: progress.progress(n/max(1,total), text=f'{n}/{total}ページを確認 · {ok}物件'))
+                if records:
+                    state.records02 = save_store(records, info, bounds, layout, limit)
+                    state.info02 = info
+                    state.flash02 = f'表示範囲内の{len(records)}物件を取得・保存しました。次回は自動で読み込みます。'
+                    st.rerun()
+                else:
+                    st.warning('表示範囲内の物件を確認できませんでした。保存済みデータは保持しています。')
+                    for warning in info.get('warnings', []):
+                        st.caption(warning)
+            except (requests.RequestException, StorageError, OSError, ValueError, KeyError, TypeError) as error:
+                st.error(str(error) if isinstance(error, StorageError) else f'取得できませんでした（{type(error).__name__}）。保存済みデータは保持しています。')
+            finally:
+                progress.empty()
+    if render_radius > 6000:
+        st.caption('広域表示ではピン・一覧のみ表示します。拡大すると100m単位の色分けと取得が利用できます。')
+    if bounds is None:
+        st.caption('地図の表示範囲を読み込み中です。地図を少し動かすと取得ボタンが有効になります。')
+    st.caption(f'Supabaseから読み込み済み：{len(state.records02)}物件。取得後は自動保存し、次回起動時もSupabaseから読み込みます。')
     labels = ['15万円以下', '15〜20万円', '20〜22.5万円', '22.5〜25万円', '25〜27.5万円', '27.5〜30万円', '30〜35万円', '35万円超']
     st.markdown('<div style="display:flex;flex-wrap:wrap;gap:10px;margin:6px 0">'+''.join(
         f'<span style="font-size:13px;color:#173a5e"><i style="display:inline-block;width:13px;height:13px;background:{color};margin-right:4px"></i>{label}</span>'
@@ -2081,6 +2420,13 @@ def main():
     c2.metric('掲載建物の位置数', f'{len({(round(p["lat"],5),round(p["lng"],5)) for p in nearby})}箇所')
     c3.metric('色分けメッシュ', f'{len(cells)}区画')
     st.caption(f'直接集計 {observed_count}区画 / 近隣推定 {len(cells)-observed_count}区画。募集住戸は同じ位置・間取り・階・面積・金額の重複を除いています。')
+    with st.expander('表示範囲の家賃帯一覧', expanded=True):
+        counts = [0]*len(COLORS)
+        for p in nearby:
+            counts[sum((p['rent']+p['fees'])/10000 > cut for cut in BANDS)] += 1
+        st.dataframe([{'家賃帯（管理費等込み）':label, '募集住戸数':count}
+                      for label,count in zip(labels,counts)], hide_index=True, width='stretch')
+        st.caption('選択した間取り・表示範囲の保存済み募集物件を集計。予算上限で絞る前の件数です。')
     info = state.info02
     if info:
         stamp = info.get('fetched_at', '')
@@ -2093,7 +2439,7 @@ def main():
         for warning in info.get('warnings', []):
             st.caption(warning)
     if not nearby:
-        st.info('この地域・間取りの取得データがありません。「地域・色分け・物件取得の設定」で取得するか、座標付きCSVを読み込んでください。架空の家賃で塗り分けは行いません。')
+        st.info('この地域・間取りの取得データがありません。地図下のボタンで表示範囲の物件を取得するか、座標付きCSVを読み込んでください。架空の家賃で塗り分けは行いません。')
     elif len({(round(p['lat'],5),round(p['lng'],5)) for p in nearby}) < 3:
         st.info('建物の位置数が少ないため、近隣メッシュの推定範囲が限られます。')
     st.caption('掲載位置には誤差がある場合があります。建物ごとの募集総額中央値を集計・推定するため、築年数や面積の違いも色に影響します。各物件の募集ページで現在の条件を確認してください。')
@@ -2139,24 +2485,33 @@ def main():
                 st.error('施設を取得できませんでした。Google マップで確認してください。')
         st.link_button('Google マップで周辺施設を確認','https://www.google.com/maps/search/?'+urlencode({'api':1,'query':station_name+' '+category}))
         st.caption('OpenStreetMap登録施設を使用。登録漏れ・閉店・位置誤差がある場合があります。')
-    with st.expander('物件データをCSVで保存・読み込み'):
-        st.caption('取得データはこのセッションで保持します。保存しておく場合はCSVをダウンロードしてください。v01の駅単位CSVには物件位置がないため使用できません。')
+    with st.expander('Supabase保存・CSVバックアップ・読み込み'):
+        st.caption('物件・取得範囲・間取り・取得日時をSupabaseに保存します。再デプロイ後も同じSupabaseから読み込みます。v03で取得したCSVは、ここからSupabaseへ追加保存できます。v01の駅単位CSVには物件位置がないため使用できません。')
+        if st.button('Supabaseの保存データを再読み込み',key='reload04'):
+            try:
+                records, info = load_store()
+                state.records02, state.info02 = records, info
+                state.flash02 = f'Supabaseから{len(records)}物件を読み込みました。'
+                st.rerun()
+            except StorageError as error:
+                st.error(str(error))
         st.download_button('取得した物件データを保存',export_records(state.records02),'sumai_geo_properties.csv','text/csv')
         upload = st.file_uploader('座標付き物件CSV',type=['csv'])
-        if st.button('CSVで現在の物件データを置き換え',disabled=upload is None):
+        if st.button('CSVの物件データを追加・保存',disabled=upload is None):
             try:
                 imported = validate_records(upload.getvalue())
-                state.records02 = imported
-                state.info02 = dict(source_url='CSV',fetched_at=datetime.now(timezone.utc).isoformat(timespec='seconds'),warnings=[])
+                info = dict(source_url='CSV',fetched_at=datetime.now(timezone.utc).isoformat(timespec='seconds'),warnings=[])
+                loaded = save_store(imported, info)
+                state.records02, state.info02 = loaded, info
                 state.flash02 = f'{len(imported)}物件を読み込みました。'
                 st.rerun()
-            except (ValueError,UnicodeError,csv.Error) as error:
+            except (ValueError,UnicodeError,csv.Error,StorageError,OSError) as error:
                 st.error(str(error))
     with st.expander('集計・推定・データ取得の方法'):
         st.write('家賃は実際の募集額＋管理費等。敷金・礼金・駐車場・その他の月額サービス料は含みません。管理費等が確認できない物件、掲載座標がない物件は除外します。')
         st.write('直接集計：各建物位置の募集住戸総額の中央値を求め、そのメッシュ内の建物中央値をさらに集計します。掲載位置が同一の建物は同じ位置群として扱います。')
         st.write('近隣推定：メッシュ中心から指定距離内に3建物位置以上ある場合だけ、距離の逆二乗で加重平均します。これは近隣の募集額を使った推定であり、その場所に実在する募集中の物件価格ではありません。駅の一つの家賃を全域に広げる計算ではありません。')
-        st.write('募集状況は取得日時の公開ページ情報。取得一覧の順番・件数上限で偏りがあり、地域全体の相場推計ではありません。自動取得は公開ページの構造・接続状況で停止することがあります。認証やアクセス制限の回避は行いません。')
+        st.write('募集状況は取得日時の公開ページ情報。取得できる候補・件数上限で偏りがあり、地域全体の相場推計ではありません。自動取得は公開ページの構造・接続状況で停止することがあります。認証やアクセス制限の回避は行いません。')
         st.write('背景地図：© OpenStreetMap contributors。初期データは池袋駅の2LDKの取得結果。間取りや地域を変更した場合は、新しいデータの取得が必要です。')
 
 
