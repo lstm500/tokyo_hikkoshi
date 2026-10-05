@@ -1,7 +1,7 @@
-"""住まいコンパス — Streamlit版 v01
+"""住まいコンパス — Streamlit版 v02
 実行: streamlit run app.py
 依存: streamlit>=1.50,<2 / folium>=0.18,<1 / streamlit-folium>=0.24,<1 / requests>=2.32,<3
-家賃サンプル・通勤概算の試作版。物件データはセッション内＋CSVバックアップ。
+実物件の家賃メッシュ表示。通勤は概算。公開情報取得はサイトの仕様・接続状況に依存。
 """
 from __future__ import annotations
 import csv
@@ -9,55 +9,64 @@ import heapq
 import io
 import math
 import uuid
+import json
+import re
+import statistics
+import time
+import concurrent.futures
+import threading
+import urllib.robotparser
+from datetime import datetime, timezone
+from bs4 import BeautifulSoup
 from html import escape
-from urllib.parse import urlencode, urlparse
+from urllib.parse import urlencode, urlparse, urljoin, parse_qsl, urlunparse
 
 import folium
 import requests
 import streamlit as st
 from streamlit_folium import st_folium
 
-STATIONS = [{'name': '東京', 'lat': 35.6812, 'lng': 139.7671, 'region': '東京', 'base': 16},
- {'name': '品川', 'lat': 35.6285, 'lng': 139.7388, 'region': '東京', 'base': 17},
- {'name': '大崎', 'lat': 35.6197, 'lng': 139.7286, 'region': '東京', 'base': 16},
- {'name': '五反田', 'lat': 35.6264, 'lng': 139.7235, 'region': '東京', 'base': 16},
- {'name': '目黒', 'lat': 35.6339, 'lng': 139.7158, 'region': '東京', 'base': 18},
- {'name': '恵比寿', 'lat': 35.6467, 'lng': 139.7101, 'region': '東京', 'base': 20},
- {'name': '渋谷', 'lat': 35.658, 'lng': 139.7016, 'region': '東京', 'base': 20},
- {'name': '新宿', 'lat': 35.6909, 'lng': 139.7003, 'region': '東京', 'base': 17},
- {'name': '池袋', 'lat': 35.7295, 'lng': 139.7109, 'region': '東京', 'base': 14},
- {'name': '上野', 'lat': 35.7138, 'lng': 139.777, 'region': '東京', 'base': 14},
- {'name': '秋葉原', 'lat': 35.6984, 'lng': 139.7731, 'region': '東京', 'base': 15},
- {'name': '赤羽', 'lat': 35.778, 'lng': 139.7209, 'region': '東京', 'base': 11},
- {'name': '川口', 'lat': 35.8019, 'lng': 139.7175, 'region': '埼玉', 'base': 9},
- {'name': '浦和', 'lat': 35.8585, 'lng': 139.6571, 'region': '埼玉', 'base': 10},
- {'name': '大宮', 'lat': 35.9063, 'lng': 139.6238, 'region': '埼玉', 'base': 9},
- {'name': '大井町', 'lat': 35.6063, 'lng': 139.7346, 'region': '東京', 'base': 14},
- {'name': '蒲田', 'lat': 35.5625, 'lng': 139.716, 'region': '東京', 'base': 11},
- {'name': '川崎', 'lat': 35.5313, 'lng': 139.697, 'region': '神奈川', 'base': 11},
- {'name': '横浜', 'lat': 35.4662, 'lng': 139.622, 'region': '神奈川', 'base': 12},
- {'name': '武蔵小杉', 'lat': 35.575, 'lng': 139.6595, 'region': '神奈川', 'base': 13},
- {'name': '日吉', 'lat': 35.553, 'lng': 139.6468, 'region': '神奈川', 'base': 11},
- {'name': '自由が丘', 'lat': 35.6074, 'lng': 139.6685, 'region': '東京', 'base': 16},
- {'name': '中目黒', 'lat': 35.6443, 'lng': 139.699, 'region': '東京', 'base': 19},
- {'name': '中野', 'lat': 35.7058, 'lng': 139.6658, 'region': '東京', 'base': 13},
- {'name': '荻窪', 'lat': 35.7045, 'lng': 139.6201, 'region': '東京', 'base': 12},
- {'name': '吉祥寺', 'lat': 35.7032, 'lng': 139.5797, 'region': '東京', 'base': 14},
- {'name': '三鷹', 'lat': 35.7027, 'lng': 139.5603, 'region': '東京', 'base': 12},
- {'name': '国分寺', 'lat': 35.7001, 'lng': 139.4808, 'region': '東京', 'base': 10},
- {'name': '立川', 'lat': 35.6982, 'lng': 139.4137, 'region': '東京', 'base': 10},
- {'name': '錦糸町', 'lat': 35.696, 'lng': 139.814, 'region': '東京', 'base': 12},
- {'name': '新小岩', 'lat': 35.7169, 'lng': 139.8586, 'region': '東京', 'base': 10},
- {'name': '市川', 'lat': 35.7289, 'lng': 139.9084, 'region': '千葉', 'base': 10},
- {'name': '船橋', 'lat': 35.7017, 'lng': 139.985, 'region': '千葉', 'base': 9},
- {'name': '津田沼', 'lat': 35.6907, 'lng': 140.0207, 'region': '千葉', 'base': 9},
- {'name': '千葉', 'lat': 35.6134, 'lng': 140.1133, 'region': '千葉', 'base': 8},
- {'name': '北千住', 'lat': 35.7494, 'lng': 139.805, 'region': '東京', 'base': 11},
- {'name': '松戸', 'lat': 35.7847, 'lng': 139.9007, 'region': '千葉', 'base': 8},
- {'name': '柏', 'lat': 35.8622, 'lng': 139.9711, 'region': '千葉', 'base': 8},
- {'name': '二子玉川', 'lat': 35.6117, 'lng': 139.6267, 'region': '東京', 'base': 16},
- {'name': '溝の口', 'lat': 35.5998, 'lng': 139.6115, 'region': '神奈川', 'base': 11},
- {'name': '南浦和', 'lat': 35.8476, 'lng': 139.669, 'region': '埼玉', 'base': 9}]
+STATIONS = [{'name': '東京', 'lat': 35.6812, 'lng': 139.7671, 'region': '東京'},
+ {'name': '品川', 'lat': 35.6285, 'lng': 139.7388, 'region': '東京'},
+ {'name': '大崎', 'lat': 35.6197, 'lng': 139.7286, 'region': '東京'},
+ {'name': '五反田', 'lat': 35.6264, 'lng': 139.7235, 'region': '東京'},
+ {'name': '目黒', 'lat': 35.6339, 'lng': 139.7158, 'region': '東京'},
+ {'name': '恵比寿', 'lat': 35.6467, 'lng': 139.7101, 'region': '東京'},
+ {'name': '渋谷', 'lat': 35.658, 'lng': 139.7016, 'region': '東京'},
+ {'name': '新宿', 'lat': 35.6909, 'lng': 139.7003, 'region': '東京'},
+ {'name': '池袋', 'lat': 35.7295, 'lng': 139.7109, 'region': '東京'},
+ {'name': '上野', 'lat': 35.7138, 'lng': 139.777, 'region': '東京'},
+ {'name': '秋葉原', 'lat': 35.6984, 'lng': 139.7731, 'region': '東京'},
+ {'name': '赤羽', 'lat': 35.778, 'lng': 139.7209, 'region': '東京'},
+ {'name': '川口', 'lat': 35.8019, 'lng': 139.7175, 'region': '埼玉'},
+ {'name': '浦和', 'lat': 35.8585, 'lng': 139.6571, 'region': '埼玉'},
+ {'name': '大宮', 'lat': 35.9063, 'lng': 139.6238, 'region': '埼玉'},
+ {'name': '大井町', 'lat': 35.6063, 'lng': 139.7346, 'region': '東京'},
+ {'name': '蒲田', 'lat': 35.5625, 'lng': 139.716, 'region': '東京'},
+ {'name': '川崎', 'lat': 35.5313, 'lng': 139.697, 'region': '神奈川'},
+ {'name': '横浜', 'lat': 35.4662, 'lng': 139.622, 'region': '神奈川'},
+ {'name': '武蔵小杉', 'lat': 35.575, 'lng': 139.6595, 'region': '神奈川'},
+ {'name': '日吉', 'lat': 35.553, 'lng': 139.6468, 'region': '神奈川'},
+ {'name': '自由が丘', 'lat': 35.6074, 'lng': 139.6685, 'region': '東京'},
+ {'name': '中目黒', 'lat': 35.6443, 'lng': 139.699, 'region': '東京'},
+ {'name': '中野', 'lat': 35.7058, 'lng': 139.6658, 'region': '東京'},
+ {'name': '荻窪', 'lat': 35.7045, 'lng': 139.6201, 'region': '東京'},
+ {'name': '吉祥寺', 'lat': 35.7032, 'lng': 139.5797, 'region': '東京'},
+ {'name': '三鷹', 'lat': 35.7027, 'lng': 139.5603, 'region': '東京'},
+ {'name': '国分寺', 'lat': 35.7001, 'lng': 139.4808, 'region': '東京'},
+ {'name': '立川', 'lat': 35.6982, 'lng': 139.4137, 'region': '東京'},
+ {'name': '錦糸町', 'lat': 35.696, 'lng': 139.814, 'region': '東京'},
+ {'name': '新小岩', 'lat': 35.7169, 'lng': 139.8586, 'region': '東京'},
+ {'name': '市川', 'lat': 35.7289, 'lng': 139.9084, 'region': '千葉'},
+ {'name': '船橋', 'lat': 35.7017, 'lng': 139.985, 'region': '千葉'},
+ {'name': '津田沼', 'lat': 35.6907, 'lng': 140.0207, 'region': '千葉'},
+ {'name': '千葉', 'lat': 35.6134, 'lng': 140.1133, 'region': '千葉'},
+ {'name': '北千住', 'lat': 35.7494, 'lng': 139.805, 'region': '東京'},
+ {'name': '松戸', 'lat': 35.7847, 'lng': 139.9007, 'region': '千葉'},
+ {'name': '柏', 'lat': 35.8622, 'lng': 139.9711, 'region': '千葉'},
+ {'name': '二子玉川', 'lat': 35.6117, 'lng': 139.6267, 'region': '東京'},
+ {'name': '溝の口', 'lat': 35.5998, 'lng': 139.6115, 'region': '神奈川'},
+ {'name': '南浦和', 'lat': 35.8476, 'lng': 139.669, 'region': '埼玉'}]
 LINES = [{'name': '山手線',
   'seq': ['東京', '品川', '大崎', '五反田', '目黒', '恵比寿', '渋谷', '新宿', '池袋', '上野', '秋葉原', '東京'],
   'rate': 136,
@@ -156,320 +165,2000 @@ def route(origin, destination):
     raise ValueError('登録路線で到達できません。')
 
 
-def rent_band(station, layout, properties):
-    added = [p for p in properties if p['station'] == station['name'] and p['layout'] == layout]
-    if added:
-        amounts = [p['rent']+p['management']+p['common'] for p in added]
-        return min(amounts)/10000, max(amounts)/10000, added
-    factor = {'1LDK': 1, '2LDK': 1.45, '3LDK': 1.85, '4LDK': 2.35}[layout]
-    return round(station['base']*factor*.8, 1), round(station['base']*factor*1.2, 1), []
+SNAPSHOT = [{'id': 'ed2f2657ad567ec6eef5294b1dc707bd3db4f4b0',
+  'name': '間取り',
+  'address': '東京都豊島区東池袋3丁目',
+  'lat': 35.731997902093,
+  'lng': 139.7176908125,
+  'layout': '2LDK',
+  'rent': 303000,
+  'fees': 15000,
+  'area': 48.86,
+  'floor': '11階',
+  'url': 'https://www.homes.co.jp/chintai/room/ed2f2657ad567ec6eef5294b1dc707bd3db4f4b0/',
+  'fetched_at': '2026-10-05T12:01:37+00:00',
+  'modified': '2026-10-02',
+  'source': "LIFULL HOME'S"},
+ {'id': 'cf6ffd6b47d7aeb1f775761626a1c81b01a03a74',
+  'name': '間取り',
+  'address': '東京都豊島区南池袋1丁目15-22',
+  'lat': 35.725097889978,
+  'lng': 139.70893961185,
+  'layout': '2LDK',
+  'rent': 314000,
+  'fees': 12000,
+  'area': 47.55,
+  'floor': '5階',
+  'url': 'https://www.homes.co.jp/chintai/room/cf6ffd6b47d7aeb1f775761626a1c81b01a03a74/',
+  'fetched_at': '2026-10-05T12:01:37+00:00',
+  'modified': '2026-10-03',
+  'source': "LIFULL HOME'S"},
+ {'id': '3af182f6ce9c8047f773abe1b1367ebbd1f0be90',
+  'name': '間取り',
+  'address': '東京都豊島区上池袋2丁目',
+  'lat': 35.734975073851,
+  'lng': 139.71796066979,
+  'layout': '2LDK',
+  'rent': 200000,
+  'fees': 15000,
+  'area': 55.78,
+  'floor': '2階',
+  'url': 'https://www.homes.co.jp/chintai/room/3af182f6ce9c8047f773abe1b1367ebbd1f0be90/',
+  'fetched_at': '2026-10-05T12:01:38+00:00',
+  'modified': '2026-10-05',
+  'source': "LIFULL HOME'S"},
+ {'id': '8d4d970320957a705f14615a9176ac00cb710651',
+  'name': '間取り',
+  'address': '東京都豊島区上池袋２丁目14-13',
+  'lat': 35.734973685126,
+  'lng': 139.7179609476,
+  'layout': '2LDK',
+  'rent': 200000,
+  'fees': 20000,
+  'area': 55.78,
+  'floor': '2階',
+  'url': 'https://www.homes.co.jp/chintai/room/8d4d970320957a705f14615a9176ac00cb710651/',
+  'fetched_at': '2026-10-05T12:01:38+00:00',
+  'modified': '2026-10-05',
+  'source': "LIFULL HOME'S"},
+ {'id': '79fc3f8ca5cd9b430a1cbd873f1212bdcdf65eb5',
+  'name': '間取り',
+  'address': '東京都豊島区上池袋２丁目14-13',
+  'lat': 35.734973685126,
+  'lng': 139.7179609476,
+  'layout': '2LDK',
+  'rent': 200000,
+  'fees': 15000,
+  'area': 55.78,
+  'floor': '2階',
+  'url': 'https://www.homes.co.jp/chintai/room/79fc3f8ca5cd9b430a1cbd873f1212bdcdf65eb5/',
+  'fetched_at': '2026-10-05T12:01:38+00:00',
+  'modified': '2026-10-05',
+  'source': "LIFULL HOME'S"},
+ {'id': '9bf5d45a8fa5a32d02f7b550232baa2f3e2a20a0',
+  'name': '間取り',
+  'address': '東京都豊島区上池袋2丁目14-13',
+  'lat': 35.734975073851,
+  'lng': 139.71796066979,
+  'layout': '2LDK',
+  'rent': 200000,
+  'fees': 20000,
+  'area': 55.78,
+  'floor': '2階',
+  'url': 'https://www.homes.co.jp/chintai/room/9bf5d45a8fa5a32d02f7b550232baa2f3e2a20a0/',
+  'fetched_at': '2026-10-05T12:01:38+00:00',
+  'modified': '2026-10-05',
+  'source': "LIFULL HOME'S"},
+ {'id': 'afca076cc1e90b13286ff9acf1e861d384178ea1',
+  'name': '間取り',
+  'address': '東京都豊島区南池袋２丁目7',
+  'lat': 35.724895309222,
+  'lng': 139.71545489936,
+  'layout': '2LDK',
+  'rent': 320000,
+  'fees': 30000,
+  'area': 72.16,
+  'floor': '8階',
+  'url': 'https://www.homes.co.jp/chintai/room/afca076cc1e90b13286ff9acf1e861d384178ea1/',
+  'fetched_at': '2026-10-05T12:01:39+00:00',
+  'modified': '2026-10-05',
+  'source': "LIFULL HOME'S"},
+ {'id': '3ef9af441308ac0487b6fae49c62b4c2cc5b5064',
+  'name': '間取り',
+  'address': '東京都豊島区南池袋2丁目',
+  'lat': 35.724906973928,
+  'lng': 139.71543073428,
+  'layout': '2LDK',
+  'rent': 320000,
+  'fees': 30000,
+  'area': 72.16,
+  'floor': '8階',
+  'url': 'https://www.homes.co.jp/chintai/room/3ef9af441308ac0487b6fae49c62b4c2cc5b5064/',
+  'fetched_at': '2026-10-05T12:01:40+00:00',
+  'modified': '2026-10-01',
+  'source': "LIFULL HOME'S"},
+ {'id': '1ee9c245b549499f153553935b7a3f0cdc061be1',
+  'name': '間取り',
+  'address': '東京都豊島区南池袋２丁目',
+  'lat': 35.724778374751,
+  'lng': 139.71533519202,
+  'layout': '2LDK',
+  'rent': 320000,
+  'fees': 30000,
+  'area': 72.16,
+  'floor': '3階',
+  'url': 'https://www.homes.co.jp/chintai/room/1ee9c245b549499f153553935b7a3f0cdc061be1/',
+  'fetched_at': '2026-10-05T12:01:40+00:00',
+  'modified': '2026-10-05',
+  'source': "LIFULL HOME'S"},
+ {'id': '20db92ed5ab10c08526443eb5217fd10bfdee3ab',
+  'name': '間取り',
+  'address': '東京都豊島区南池袋２丁目',
+  'lat': 35.72451736607,
+  'lng': 139.71806608144,
+  'layout': '2LDK',
+  'rent': 612000,
+  'fees': 50000,
+  'area': 70.44,
+  'floor': '41階',
+  'url': 'https://www.homes.co.jp/chintai/room/20db92ed5ab10c08526443eb5217fd10bfdee3ab/',
+  'fetched_at': '2026-10-05T12:01:41+00:00',
+  'modified': '2026-10-05',
+  'source': "LIFULL HOME'S"},
+ {'id': '120604cd5d435e33b84d3cea9469397381fe2f2b',
+  'name': '間取り',
+  'address': '東京都豊島区南池袋２丁目',
+  'lat': 35.72451736607,
+  'lng': 139.71806608144,
+  'layout': '2LDK',
+  'rent': 410000,
+  'fees': 40000,
+  'area': 55.44,
+  'floor': '41階',
+  'url': 'https://www.homes.co.jp/chintai/room/120604cd5d435e33b84d3cea9469397381fe2f2b/',
+  'fetched_at': '2026-10-05T12:01:41+00:00',
+  'modified': '2026-10-05',
+  'source': "LIFULL HOME'S"},
+ {'id': '1d242f41b0e3b9e543cb61b352804b8b44adf43f',
+  'name': '間取図',
+  'address': '東京都豊島区南池袋２丁目1-2',
+  'lat': 35.724299885395,
+  'lng': 139.71787249553,
+  'layout': '2LDK',
+  'rent': 410000,
+  'fees': 40000,
+  'area': 55.44,
+  'floor': '41階',
+  'url': 'https://www.homes.co.jp/chintai/room/1d242f41b0e3b9e543cb61b352804b8b44adf43f/',
+  'fetched_at': '2026-10-05T12:01:41+00:00',
+  'modified': '2026-10-05',
+  'source': "LIFULL HOME'S"},
+ {'id': '74455ab55cddfbf3af90b4aea54ed86882979030',
+  'name': '間取り',
+  'address': '東京都豊島区南池袋２丁目',
+  'lat': 35.72451736607,
+  'lng': 139.71806608144,
+  'layout': '2LDK',
+  'rent': 662000,
+  'fees': 50000,
+  'area': 70.44,
+  'floor': '40階',
+  'url': 'https://www.homes.co.jp/chintai/room/74455ab55cddfbf3af90b4aea54ed86882979030/',
+  'fetched_at': '2026-10-05T12:01:42+00:00',
+  'modified': '2026-10-05',
+  'source': "LIFULL HOME'S"},
+ {'id': '0a2cc97856e96b5db8c8e4aebd4674e15eb08d44',
+  'name': '間取図',
+  'address': '東京都北区滝野川６丁目21-7',
+  'lat': 35.745039419723,
+  'lng': 139.72551823321,
+  'layout': '2LDK',
+  'rent': 350000,
+  'fees': 15000,
+  'area': 64.68,
+  'floor': '6階',
+  'url': 'https://www.homes.co.jp/chintai/room/0a2cc97856e96b5db8c8e4aebd4674e15eb08d44/',
+  'fetched_at': '2026-10-05T12:01:43+00:00',
+  'modified': '2026-10-05',
+  'source': "LIFULL HOME'S"},
+ {'id': '63d4c2bb92ba3181f6bc5ee561b2d55570cacf06',
+  'name': '間取図',
+  'address': '東京都北区滝野川６丁目21-7',
+  'lat': 35.745039419723,
+  'lng': 139.72551823321,
+  'layout': '2LDK',
+  'rent': 385000,
+  'fees': 15000,
+  'area': 70.92,
+  'floor': '14階',
+  'url': 'https://www.homes.co.jp/chintai/room/63d4c2bb92ba3181f6bc5ee561b2d55570cacf06/',
+  'fetched_at': '2026-10-05T12:01:44+00:00',
+  'modified': '2026-10-05',
+  'source': "LIFULL HOME'S"},
+ {'id': '92f984df0ef3928dd4aa61a18c4c6a7dc0609de9',
+  'name': '間取り',
+  'address': '東京都文京区音羽1丁目',
+  'lat': 35.716697133088,
+  'lng': 139.72834663304,
+  'layout': '2LDK',
+  'rent': 184000,
+  'fees': 15000,
+  'area': 53.33,
+  'floor': '7階',
+  'url': 'https://www.homes.co.jp/chintai/room/92f984df0ef3928dd4aa61a18c4c6a7dc0609de9/',
+  'fetched_at': '2026-10-05T12:01:45+00:00',
+  'modified': '2026-10-03',
+  'source': "LIFULL HOME'S"},
+ {'id': 'b52405c0f51ebd271471b7cb81641eff4cef8e31',
+  'name': '間取り',
+  'address': '東京都豊島区上池袋１丁目',
+  'lat': 35.737608202349,
+  'lng': 139.72139499404,
+  'layout': '2LDK',
+  'rent': 245000,
+  'fees': 15000,
+  'area': 62.87,
+  'floor': '8階',
+  'url': 'https://www.homes.co.jp/chintai/room/b52405c0f51ebd271471b7cb81641eff4cef8e31/',
+  'fetched_at': '2026-10-05T12:01:45+00:00',
+  'modified': '2026-10-05',
+  'source': "LIFULL HOME'S"},
+ {'id': '2f8b0c1f9646348944f9852e469c1e8a850a8a59',
+  'name': '間取り',
+  'address': '東京都豊島区南池袋１丁目15-22',
+  'lat': 35.725096778999,
+  'lng': 139.70893988965,
+  'layout': '2LDK',
+  'rent': 265000,
+  'fees': 12000,
+  'area': 48.56,
+  'floor': '3階',
+  'url': 'https://www.homes.co.jp/chintai/room/2f8b0c1f9646348944f9852e469c1e8a850a8a59/',
+  'fetched_at': '2026-10-05T12:01:45+00:00',
+  'modified': '2026-10-05',
+  'source': "LIFULL HOME'S"},
+ {'id': '518c470b3d7f81c223c0bf7bee88594023f28674',
+  'name': '間取り',
+  'address': '東京都豊島区南池袋1丁目15-22',
+  'lat': 35.725097889978,
+  'lng': 139.70893961185,
+  'layout': '2LDK',
+  'rent': 272000,
+  'fees': 12000,
+  'area': 48.56,
+  'floor': '7階',
+  'url': 'https://www.homes.co.jp/chintai/room/518c470b3d7f81c223c0bf7bee88594023f28674/',
+  'fetched_at': '2026-10-05T12:01:46+00:00',
+  'modified': '2026-10-05',
+  'source': "LIFULL HOME'S"},
+ {'id': 'ca9b4a813f8d0cdacdabb2cd6b87897e924f6b0b',
+  'name': '間取り',
+  'address': '東京都豊島区南池袋１丁目15-22',
+  'lat': 35.725096778999,
+  'lng': 139.70893988965,
+  'layout': '2LDK',
+  'rent': 269000,
+  'fees': 12000,
+  'area': 48.56,
+  'floor': '6階',
+  'url': 'https://www.homes.co.jp/chintai/room/ca9b4a813f8d0cdacdabb2cd6b87897e924f6b0b/',
+  'fetched_at': '2026-10-05T12:01:46+00:00',
+  'modified': '2026-10-05',
+  'source': "LIFULL HOME'S"},
+ {'id': '943cb5ce7c3c36ee26c1e84f867e98cebb48b652',
+  'name': '間取り',
+  'address': '東京都豊島区南池袋1丁目',
+  'lat': 35.725097889978,
+  'lng': 139.70893961185,
+  'layout': '2LDK',
+  'rent': 265000,
+  'fees': 12000,
+  'area': 48.56,
+  'floor': '4階',
+  'url': 'https://www.homes.co.jp/chintai/room/943cb5ce7c3c36ee26c1e84f867e98cebb48b652/',
+  'fetched_at': '2026-10-05T12:01:47+00:00',
+  'modified': '2026-10-02',
+  'source': "LIFULL HOME'S"},
+ {'id': '4a714180174c1318412f85ee48ca260c6eef6b02',
+  'name': '間取り',
+  'address': '東京都豊島区南池袋1丁目',
+  'lat': 35.725097889978,
+  'lng': 139.70893961185,
+  'layout': '2LDK',
+  'rent': 263000,
+  'fees': 12000,
+  'area': 48.56,
+  'floor': '2階',
+  'url': 'https://www.homes.co.jp/chintai/room/4a714180174c1318412f85ee48ca260c6eef6b02/',
+  'fetched_at': '2026-10-05T12:01:49+00:00',
+  'modified': '2026-10-02',
+  'source': "LIFULL HOME'S"},
+ {'id': 'c0bc0dee17531e5f98f2efd2cae2765d37f6a3ab',
+  'name': '間取り',
+  'address': '東京都豊島区南池袋１丁目',
+  'lat': 35.725096778999,
+  'lng': 139.70893988965,
+  'layout': '2LDK',
+  'rent': 258000,
+  'fees': 12000,
+  'area': 48.56,
+  'floor': '1階',
+  'url': 'https://www.homes.co.jp/chintai/room/c0bc0dee17531e5f98f2efd2cae2765d37f6a3ab/',
+  'fetched_at': '2026-10-05T12:01:50+00:00',
+  'modified': '2026-10-05',
+  'source': "LIFULL HOME'S"},
+ {'id': '2432c65ee8e0e5f206a5bd734ce956e584299f3f',
+  'name': '間取り',
+  'address': '東京都豊島区南池袋１丁目15-22',
+  'lat': 35.725077061672,
+  'lng': 139.70903988194,
+  'layout': '2LDK',
+  'rent': 258000,
+  'fees': 12000,
+  'area': 48.56,
+  'floor': '1階',
+  'url': 'https://www.homes.co.jp/chintai/room/2432c65ee8e0e5f206a5bd734ce956e584299f3f/',
+  'fetched_at': '2026-10-05T12:01:52+00:00',
+  'modified': '2026-10-05',
+  'source': "LIFULL HOME'S"},
+ {'id': 'f86e14e29b39ee76041cc49e28f48ced497cba02',
+  'name': '間取り',
+  'address': '東京都豊島区西池袋３丁目21-13',
+  'lat': 35.729726482917,
+  'lng': 139.70698709179,
+  'layout': '2LDK',
+  'rent': 590000,
+  'fees': 20000,
+  'area': 91.82,
+  'floor': '32階',
+  'url': 'https://www.homes.co.jp/chintai/room/f86e14e29b39ee76041cc49e28f48ced497cba02/',
+  'fetched_at': '2026-10-05T12:01:52+00:00',
+  'modified': '2026-10-05',
+  'source': "LIFULL HOME'S"},
+ {'id': '81a7b2b1e4d930a9e1192f4f33a1ea76db857a35',
+  'name': '間取り',
+  'address': '東京都豊島区西池袋3丁目21-13',
+  'lat': 35.729606219092,
+  'lng': 139.70700209535,
+  'layout': '2LDK',
+  'rent': 490000,
+  'fees': 20000,
+  'area': 91.82,
+  'floor': '32階',
+  'url': 'https://www.homes.co.jp/chintai/room/81a7b2b1e4d930a9e1192f4f33a1ea76db857a35/',
+  'fetched_at': '2026-10-05T12:01:53+00:00',
+  'modified': '2026-10-05',
+  'source': "LIFULL HOME'S"},
+ {'id': 'b1c3bf574ed569e2a804895ad9b0c15fa698a8c0',
+  'name': '間取り',
+  'address': '東京都豊島区西池袋3丁目21-13',
+  'lat': 35.729727871642,
+  'lng': 139.70698681398,
+  'layout': '2LDK',
+  'rent': 490000,
+  'fees': 20000,
+  'area': 91.82,
+  'floor': '32階',
+  'url': 'https://www.homes.co.jp/chintai/room/b1c3bf574ed569e2a804895ad9b0c15fa698a8c0/',
+  'fetched_at': '2026-10-05T12:01:54+00:00',
+  'modified': '2026-10-04',
+  'source': "LIFULL HOME'S"},
+ {'id': '452e3c94b9bfaa850d193a3683d8e57260e4d1c2',
+  'name': '間取り',
+  'address': '東京都豊島区西池袋３丁目',
+  'lat': 35.729716762429,
+  'lng': 139.70701097903,
+  'layout': '2LDK',
+  'rent': 450000,
+  'fees': 20000,
+  'area': 81.87,
+  'floor': '30階',
+  'url': 'https://www.homes.co.jp/chintai/room/452e3c94b9bfaa850d193a3683d8e57260e4d1c2/',
+  'fetched_at': '2026-10-05T12:01:54+00:00',
+  'modified': '2026-10-05',
+  'source': "LIFULL HOME'S"},
+ {'id': 'ff84c2b89b676509a2e8789ad173773282e9f329',
+  'name': '間取り',
+  'address': '東京都豊島区西池袋３丁目21-13',
+  'lat': 35.729574001361,
+  'lng': 139.70703431612,
+  'layout': '2LDK',
+  'rent': 450000,
+  'fees': 20000,
+  'area': 81.9,
+  'floor': '30階',
+  'url': 'https://www.homes.co.jp/chintai/room/ff84c2b89b676509a2e8789ad173773282e9f329/',
+  'fetched_at': '2026-10-05T12:01:55+00:00',
+  'modified': '2026-10-05',
+  'source': "LIFULL HOME'S"},
+ {'id': '1014754633452e627b000d3dd4afa0349a7e3770',
+  'name': '間取図',
+  'address': '東京都豊島区西池袋３丁目21-13',
+  'lat': 35.72957650108,
+  'lng': 139.70703431602,
+  'layout': '2LDK',
+  'rent': 450000,
+  'fees': 20000,
+  'area': 81.87,
+  'floor': '30階',
+  'url': 'https://www.homes.co.jp/chintai/room/1014754633452e627b000d3dd4afa0349a7e3770/',
+  'fetched_at': '2026-10-05T12:01:55+00:00',
+  'modified': '2026-10-04',
+  'source': "LIFULL HOME'S"},
+ {'id': 'cc6ae2bdaecff98aa1eceb41776c047bbe1449e5',
+  'name': '間取り',
+  'address': '東京都豊島区西池袋3丁目21-13',
+  'lat': 35.729727871642,
+  'lng': 139.70698681398,
+  'layout': '2LDK',
+  'rent': 337000,
+  'fees': 20000,
+  'area': 66.69,
+  'floor': '6階',
+  'url': 'https://www.homes.co.jp/chintai/room/cc6ae2bdaecff98aa1eceb41776c047bbe1449e5/',
+  'fetched_at': '2026-10-05T12:01:55+00:00',
+  'modified': '2026-09-29',
+  'source': "LIFULL HOME'S"},
+ {'id': 'c9fcaf38dbb4bbbf72f71b5cd05b60a0c900b8a5',
+  'name': '間取り',
+  'address': '東京都豊島区西池袋３丁目21-13',
+  'lat': 35.729447076506,
+  'lng': 139.70723208219,
+  'layout': '2LDK',
+  'rent': 450000,
+  'fees': 20000,
+  'area': 81.87,
+  'floor': '30階',
+  'url': 'https://www.homes.co.jp/chintai/room/c9fcaf38dbb4bbbf72f71b5cd05b60a0c900b8a5/',
+  'fetched_at': '2026-10-05T12:01:57+00:00',
+  'modified': '2026-10-05',
+  'source': "LIFULL HOME'S"},
+ {'id': '50c4fd3347cb2b46c3582e6e86f953be0db88e96',
+  'name': 'ウエストパークタワー池袋 3207',
+  'address': '東京都豊島区西池袋３丁目21-13',
+  'lat': 35.729447076506,
+  'lng': 139.70723208219,
+  'layout': '2LDK',
+  'rent': 490000,
+  'fees': 20000,
+  'area': 91.82,
+  'floor': '32階',
+  'url': 'https://www.homes.co.jp/chintai/room/50c4fd3347cb2b46c3582e6e86f953be0db88e96/',
+  'fetched_at': '2026-10-05T12:01:57+00:00',
+  'modified': '2026-10-05',
+  'source': "LIFULL HOME'S"},
+ {'id': '4282c80d10aca7d97c1f48792fea440302a58ec3',
+  'name': 'ウエストパークタワー池袋',
+  'address': '東京都豊島区西池袋３丁目21-13',
+  'lat': 35.729447076506,
+  'lng': 139.70723208219,
+  'layout': '2LDK',
+  'rent': 337000,
+  'fees': 20000,
+  'area': 66.69,
+  'floor': '6階',
+  'url': 'https://www.homes.co.jp/chintai/room/4282c80d10aca7d97c1f48792fea440302a58ec3/',
+  'fetched_at': '2026-10-05T12:01:58+00:00',
+  'modified': '2026-10-05',
+  'source': "LIFULL HOME'S"},
+ {'id': '287968dd587f833d1f92dbb771fab31807bfae1a',
+  'name': '間取り',
+  'address': '東京都新宿区西早稲田2丁目',
+  'lat': 35.710900076679,
+  'lng': 139.71012258187,
+  'layout': '2LDK',
+  'rent': 260000,
+  'fees': 10000,
+  'area': 61.71,
+  'floor': '12階',
+  'url': 'https://www.homes.co.jp/chintai/room/287968dd587f833d1f92dbb771fab31807bfae1a/',
+  'fetched_at': '2026-10-05T12:02:00+00:00',
+  'modified': '2026-10-01',
+  'source': "LIFULL HOME'S"},
+ {'id': '349e1e0b5a284ad779db2cbe04419e8cd1fd4360',
+  'name': '間取り',
+  'address': '東京都豊島区東池袋3丁目13-3',
+  'lat': 35.73185097621,
+  'lng': 139.71776581203,
+  'layout': '2LDK',
+  'rent': 246000,
+  'fees': 12000,
+  'area': 42.17,
+  'floor': '3階',
+  'url': 'https://www.homes.co.jp/chintai/room/349e1e0b5a284ad779db2cbe04419e8cd1fd4360/',
+  'fetched_at': '2026-10-05T12:02:00+00:00',
+  'modified': '2026-10-02',
+  'source': "LIFULL HOME'S"},
+ {'id': '715d7f293e73fdc0ac37e3079e2db97ced3800ba',
+  'name': '間取図',
+  'address': '東京都豊島区東池袋３丁目13-3',
+  'lat': 35.731865703332,
+  'lng': 139.71801106836,
+  'layout': '2LDK',
+  'rent': 355000,
+  'fees': 15000,
+  'area': 54.51,
+  'floor': '10階',
+  'url': 'https://www.homes.co.jp/chintai/room/715d7f293e73fdc0ac37e3079e2db97ced3800ba/',
+  'fetched_at': '2026-10-05T12:02:00+00:00',
+  'modified': '2026-10-05',
+  'source': "LIFULL HOME'S"},
+ {'id': '4a1199bd1f80652988bc1dad0d8a235bde294737',
+  'name': '間取図',
+  'address': '東京都豊島区東池袋３丁目13-3',
+  'lat': 35.731865703332,
+  'lng': 139.71801106836,
+  'layout': '2LDK',
+  'rent': 248000,
+  'fees': 12000,
+  'area': 42.05,
+  'floor': '6階',
+  'url': 'https://www.homes.co.jp/chintai/room/4a1199bd1f80652988bc1dad0d8a235bde294737/',
+  'fetched_at': '2026-10-05T12:02:00+00:00',
+  'modified': '2026-10-03',
+  'source': "LIFULL HOME'S"},
+ {'id': 'c6f070438eb5cbbb95bbb18f373d5837b6d1db00',
+  'name': '間取図',
+  'address': '東京都豊島区東池袋３丁目13-3',
+  'lat': 35.731849032371,
+  'lng': 139.71778025533,
+  'layout': '2LDK',
+  'rent': 248000,
+  'fees': 12000,
+  'area': 42.05,
+  'floor': '6階',
+  'url': 'https://www.homes.co.jp/chintai/room/c6f070438eb5cbbb95bbb18f373d5837b6d1db00/',
+  'fetched_at': '2026-10-05T12:02:01+00:00',
+  'modified': '2026-10-05',
+  'source': "LIFULL HOME'S"},
+ {'id': '8b82dba4a4ddec5576d3da26e864b74fa77843f9',
+  'name': '間取図',
+  'address': '東京都豊島区東池袋３丁目13-3',
+  'lat': 35.731865703332,
+  'lng': 139.71801106836,
+  'layout': '2LDK',
+  'rent': 246000,
+  'fees': 12000,
+  'area': 42.17,
+  'floor': '3階',
+  'url': 'https://www.homes.co.jp/chintai/room/8b82dba4a4ddec5576d3da26e864b74fa77843f9/',
+  'fetched_at': '2026-10-05T12:02:01+00:00',
+  'modified': '2026-10-03',
+  'source': "LIFULL HOME'S"},
+ {'id': '279c0334caf0fb231fbaae9d5f067aa3d01a24f6',
+  'name': '間取り',
+  'address': '東京都豊島区東池袋3丁目',
+  'lat': 35.731997902093,
+  'lng': 139.7176908125,
+  'layout': '2LDK',
+  'rent': 310000,
+  'fees': 15000,
+  'area': 48.86,
+  'floor': '12階',
+  'url': 'https://www.homes.co.jp/chintai/room/279c0334caf0fb231fbaae9d5f067aa3d01a24f6/',
+  'fetched_at': '2026-10-05T12:02:01+00:00',
+  'modified': '2026-10-02',
+  'source': "LIFULL HOME'S"},
+ {'id': '95e63c546532d07193a00ceac66e6e25257af16c',
+  'name': '間取り',
+  'address': '東京都豊島区東池袋３丁目13-5',
+  'lat': 35.731996235964,
+  'lng': 139.71770386701,
+  'layout': '2LDK',
+  'rent': 312000,
+  'fees': 15000,
+  'area': 48.86,
+  'floor': '12階',
+  'url': 'https://www.homes.co.jp/chintai/room/95e63c546532d07193a00ceac66e6e25257af16c/',
+  'fetched_at': '2026-10-05T12:02:02+00:00',
+  'modified': '2026-10-05',
+  'source': "LIFULL HOME'S"},
+ {'id': '58493f3a7fd0998ef84c1a6443d8981e597280cc',
+  'name': '間取図',
+  'address': '東京都豊島区東池袋３丁目13-5',
+  'lat': 35.731995958254,
+  'lng': 139.71770525579,
+  'layout': '2LDK',
+  'rent': 310000,
+  'fees': 15000,
+  'area': 48.86,
+  'floor': '12階',
+  'url': 'https://www.homes.co.jp/chintai/room/58493f3a7fd0998ef84c1a6443d8981e597280cc/',
+  'fetched_at': '2026-10-05T12:02:02+00:00',
+  'modified': '2026-10-04',
+  'source': "LIFULL HOME'S"},
+ {'id': '07a56931f8b21cc3d0f3cf5c231c4aa2f9bbef33',
+  'name': '間取り',
+  'address': '東京都豊島区東池袋３丁目13-5',
+  'lat': 35.731996235964,
+  'lng': 139.71770386701,
+  'layout': '2LDK',
+  'rent': 343000,
+  'fees': 15000,
+  'area': 53.41,
+  'floor': '11階',
+  'url': 'https://www.homes.co.jp/chintai/room/07a56931f8b21cc3d0f3cf5c231c4aa2f9bbef33/',
+  'fetched_at': '2026-10-05T12:02:02+00:00',
+  'modified': '2026-10-05',
+  'source': "LIFULL HOME'S"},
+ {'id': '31a6e9fc71ca7c154430097a2aeff488a9766b4b',
+  'name': '間取図',
+  'address': '東京都豊島区東池袋３丁目13-5',
+  'lat': 35.731995958254,
+  'lng': 139.71770525579,
+  'layout': '2LDK',
+  'rent': 337000,
+  'fees': 15000,
+  'area': 53.41,
+  'floor': '11階',
+  'url': 'https://www.homes.co.jp/chintai/room/31a6e9fc71ca7c154430097a2aeff488a9766b4b/',
+  'fetched_at': '2026-10-05T12:02:03+00:00',
+  'modified': '2026-10-04',
+  'source': "LIFULL HOME'S"},
+ {'id': '05401a21e61a4a831bb0ac415b1053e433eef0d6',
+  'name': '間取り',
+  'address': '東京都豊島区東池袋3丁目',
+  'lat': 35.731997902093,
+  'lng': 139.7176908125,
+  'layout': '2LDK',
+  'rent': 337000,
+  'fees': 15000,
+  'area': 53.41,
+  'floor': '11階',
+  'url': 'https://www.homes.co.jp/chintai/room/05401a21e61a4a831bb0ac415b1053e433eef0d6/',
+  'fetched_at': '2026-10-05T12:02:03+00:00',
+  'modified': '2026-10-02',
+  'source': "LIFULL HOME'S"},
+ {'id': 'b8ce21338f610fd55f35a771286dd0e8a4435f99',
+  'name': '間取り',
+  'address': '東京都豊島区東池袋3丁目',
+  'lat': 35.731997902093,
+  'lng': 139.7176908125,
+  'layout': '2LDK',
+  'rent': 307000,
+  'fees': 15000,
+  'area': 48.86,
+  'floor': '11階',
+  'url': 'https://www.homes.co.jp/chintai/room/b8ce21338f610fd55f35a771286dd0e8a4435f99/',
+  'fetched_at': '2026-10-05T12:02:04+00:00',
+  'modified': '2026-10-03',
+  'source': "LIFULL HOME'S"},
+ {'id': '00ecfac724c390d6cc863dbe1677a4a63f1062fb',
+  'name': '間取り',
+  'address': '東京都豊島区東池袋３丁目13-5',
+  'lat': 35.731996235964,
+  'lng': 139.71770386701,
+  'layout': '2LDK',
+  'rent': 307000,
+  'fees': 15000,
+  'area': 48.86,
+  'floor': '11階',
+  'url': 'https://www.homes.co.jp/chintai/room/00ecfac724c390d6cc863dbe1677a4a63f1062fb/',
+  'fetched_at': '2026-10-05T12:02:04+00:00',
+  'modified': '2026-10-05',
+  'source': "LIFULL HOME'S"},
+ {'id': 'be49b41bfe4eec944a7e4af587a4660f10504b7a',
+  'name': '間取図',
+  'address': '東京都豊島区東池袋３丁目13-5',
+  'lat': 35.731995958254,
+  'lng': 139.71770525579,
+  'layout': '2LDK',
+  'rent': 303000,
+  'fees': 15000,
+  'area': 48.86,
+  'floor': '11階',
+  'url': 'https://www.homes.co.jp/chintai/room/be49b41bfe4eec944a7e4af587a4660f10504b7a/',
+  'fetched_at': '2026-10-05T12:02:05+00:00',
+  'modified': '2026-10-04',
+  'source': "LIFULL HOME'S"},
+ {'id': 'b1b25b43ee8d605e0aae76951493275143238589',
+  'name': '間取図',
+  'address': '東京都豊島区東池袋３丁目13-5',
+  'lat': 35.731995958254,
+  'lng': 139.71770525579,
+  'layout': '2LDK',
+  'rent': 331000,
+  'fees': 15000,
+  'area': 53.41,
+  'floor': '9階',
+  'url': 'https://www.homes.co.jp/chintai/room/b1b25b43ee8d605e0aae76951493275143238589/',
+  'fetched_at': '2026-10-05T12:02:05+00:00',
+  'modified': '2026-10-04',
+  'source': "LIFULL HOME'S"},
+ {'id': 'b6eb663196a52613600e3e21d4542bd8e0004010',
+  'name': '間取り',
+  'address': '東京都豊島区東池袋3丁目',
+  'lat': 35.731997902093,
+  'lng': 139.7176908125,
+  'layout': '2LDK',
+  'rent': 331000,
+  'fees': 15000,
+  'area': 53.41,
+  'floor': '9階',
+  'url': 'https://www.homes.co.jp/chintai/room/b6eb663196a52613600e3e21d4542bd8e0004010/',
+  'fetched_at': '2026-10-05T12:02:05+00:00',
+  'modified': '2026-10-02',
+  'source': "LIFULL HOME'S"},
+ {'id': 'b1a7e45f060b38c011a2fb99228c8fb5b666fb62',
+  'name': '間取り',
+  'address': '東京都豊島区東池袋３丁目13-5',
+  'lat': 35.731996235964,
+  'lng': 139.71770386701,
+  'layout': '2LDK',
+  'rent': 302000,
+  'fees': 15000,
+  'area': 48.86,
+  'floor': '9階',
+  'url': 'https://www.homes.co.jp/chintai/room/b1a7e45f060b38c011a2fb99228c8fb5b666fb62/',
+  'fetched_at': '2026-10-05T12:02:06+00:00',
+  'modified': '2026-10-05',
+  'source': "LIFULL HOME'S"},
+ {'id': '6b04eb76616cbe6bdfbc5f8f493f849931996810',
+  'name': '間取図',
+  'address': '東京都豊島区東池袋３丁目13-5',
+  'lat': 35.731995958254,
+  'lng': 139.71770525579,
+  'layout': '2LDK',
+  'rent': 300000,
+  'fees': 15000,
+  'area': 48.86,
+  'floor': '9階',
+  'url': 'https://www.homes.co.jp/chintai/room/6b04eb76616cbe6bdfbc5f8f493f849931996810/',
+  'fetched_at': '2026-10-05T12:02:06+00:00',
+  'modified': '2026-10-04',
+  'source': "LIFULL HOME'S"},
+ {'id': 'ed7844182ee3e7fe1925ebc63250298ae36756e3',
+  'name': '間取り',
+  'address': '東京都豊島区東池袋3丁目',
+  'lat': 35.731997902093,
+  'lng': 139.7176908125,
+  'layout': '2LDK',
+  'rent': 300000,
+  'fees': 15000,
+  'area': 48.86,
+  'floor': '9階',
+  'url': 'https://www.homes.co.jp/chintai/room/ed7844182ee3e7fe1925ebc63250298ae36756e3/',
+  'fetched_at': '2026-10-05T12:02:07+00:00',
+  'modified': '2026-10-02',
+  'source': "LIFULL HOME'S"},
+ {'id': '5aee3d21c518591d5fc8a393ec3f276f3c6dd1d0',
+  'name': '間取り',
+  'address': '東京都豊島区南大塚1丁目',
+  'lat': 35.725716311859,
+  'lng': 139.73562870685,
+  'layout': '2LDK',
+  'rent': 243000,
+  'fees': 12000,
+  'area': 53.25,
+  'floor': '5階',
+  'url': 'https://www.homes.co.jp/chintai/room/5aee3d21c518591d5fc8a393ec3f276f3c6dd1d0/',
+  'fetched_at': '2026-10-05T12:02:09+00:00',
+  'modified': '2026-10-02',
+  'source': "LIFULL HOME'S"},
+ {'id': 'de684a3d69ca2a0bb5c468a635b0cd9204860cb9',
+  'name': '間取り',
+  'address': '東京都板橋区大山町',
+  'lat': 35.748550825908,
+  'lng': 139.69942281127,
+  'layout': '2LDK',
+  'rent': 240000,
+  'fees': 30000,
+  'area': 53.85,
+  'floor': '5階',
+  'url': 'https://www.homes.co.jp/chintai/room/de684a3d69ca2a0bb5c468a635b0cd9204860cb9/',
+  'fetched_at': '2026-10-05T12:02:09+00:00',
+  'modified': '2026-09-29',
+  'source': "LIFULL HOME'S"},
+ {'id': '63ef30f10299196e10685ebf3e51a7271c28efad',
+  'name': '間取り',
+  'address': '東京都板橋区板橋4丁目',
+  'lat': 35.748781959183,
+  'lng': 139.72199282677,
+  'layout': '2LDK',
+  'rent': 215000,
+  'fees': 10000,
+  'area': 54.99,
+  'floor': '10階',
+  'url': 'https://www.homes.co.jp/chintai/room/63ef30f10299196e10685ebf3e51a7271c28efad/',
+  'fetched_at': '2026-10-05T12:02:11+00:00',
+  'modified': '2026-10-02',
+  'source': "LIFULL HOME'S"},
+ {'id': '21a555102c817ad9ecedfd535dd23f46a6a3ae99',
+  'name': '間取り',
+  'address': '東京都板橋区板橋4丁目',
+  'lat': 35.748781959183,
+  'lng': 139.72199282677,
+  'layout': '2LDK',
+  'rent': 219000,
+  'fees': 10000,
+  'area': 54.99,
+  'floor': '10階',
+  'url': 'https://www.homes.co.jp/chintai/room/21a555102c817ad9ecedfd535dd23f46a6a3ae99/',
+  'fetched_at': '2026-10-05T12:02:11+00:00',
+  'modified': '2026-10-04',
+  'source': "LIFULL HOME'S"},
+ {'id': '680fb7dfa36929768c16ebf379604cd8d7964c52',
+  'name': '間取り',
+  'address': '東京都板橋区板橋４丁目1-1',
+  'lat': 35.748672532749,
+  'lng': 139.72220503535,
+  'layout': '2LDK',
+  'rent': 219000,
+  'fees': 10000,
+  'area': 54.99,
+  'floor': '10階',
+  'url': 'https://www.homes.co.jp/chintai/room/680fb7dfa36929768c16ebf379604cd8d7964c52/',
+  'fetched_at': '2026-10-05T12:02:11+00:00',
+  'modified': '2026-10-05',
+  'source': "LIFULL HOME'S"},
+ {'id': '038ca715e3c67c1df6fd54f4c2a51f90067f5ab1',
+  'name': '間取り',
+  'address': '東京都豊島区雑司が谷３丁目15-25',
+  'lat': 35.720925171137,
+  'lng': 139.71433959825,
+  'layout': '2LDK',
+  'rent': 299000,
+  'fees': 25000,
+  'area': 50.31,
+  'floor': '4階',
+  'url': 'https://www.homes.co.jp/chintai/room/038ca715e3c67c1df6fd54f4c2a51f90067f5ab1/',
+  'fetched_at': '2026-10-05T12:02:12+00:00',
+  'modified': '2026-10-05',
+  'source': "LIFULL HOME'S"},
+ {'id': 'ed3ba1a26af61bfe59587031aa2faa9a9e176be2',
+  'name': '間取り',
+  'address': '東京都豊島区雑司が谷3丁目',
+  'lat': 35.721560096315,
+  'lng': 139.71421652763,
+  'layout': '2LDK',
+  'rent': 299000,
+  'fees': 20000,
+  'area': 50.31,
+  'floor': '4階',
+  'url': 'https://www.homes.co.jp/chintai/room/ed3ba1a26af61bfe59587031aa2faa9a9e176be2/',
+  'fetched_at': '2026-10-05T12:02:13+00:00',
+  'modified': '2026-10-04',
+  'source': "LIFULL HOME'S"},
+ {'id': 'ffe5d1429e9279f7d760b269e5bac2b2877a1b7f',
+  'name': '間取り',
+  'address': '東京都豊島区雑司が谷３丁目15-25',
+  'lat': 35.720925171137,
+  'lng': 139.71433959825,
+  'layout': '2LDK',
+  'rent': 285000,
+  'fees': 20000,
+  'area': 50.31,
+  'floor': '1階',
+  'url': 'https://www.homes.co.jp/chintai/room/ffe5d1429e9279f7d760b269e5bac2b2877a1b7f/',
+  'fetched_at': '2026-10-05T12:02:13+00:00',
+  'modified': '2026-10-05',
+  'source': "LIFULL HOME'S"},
+ {'id': 'e71d0f2987d950e17a648aebda482487dbe5ff7a',
+  'name': '間取り',
+  'address': '東京都豊島区雑司が谷3丁目15-25',
+  'lat': 35.721560096315,
+  'lng': 139.71421652763,
+  'layout': '2LDK',
+  'rent': 285000,
+  'fees': 20000,
+  'area': 50.31,
+  'floor': '1階',
+  'url': 'https://www.homes.co.jp/chintai/room/e71d0f2987d950e17a648aebda482487dbe5ff7a/',
+  'fetched_at': '2026-10-05T12:02:13+00:00',
+  'modified': '2026-10-03',
+  'source': "LIFULL HOME'S"},
+ {'id': '75e56ecbd443fb513619e742cd2efb6822a0251f',
+  'name': '間取り',
+  'address': '東京都文京区大塚5丁目',
+  'lat': 35.720069172626,
+  'lng': 139.72533258699,
+  'layout': '2LDK',
+  'rent': 236000,
+  'fees': 25000,
+  'area': 51.05,
+  'floor': '3階',
+  'url': 'https://www.homes.co.jp/chintai/room/75e56ecbd443fb513619e742cd2efb6822a0251f/',
+  'fetched_at': '2026-10-05T12:02:14+00:00',
+  'modified': '2026-10-03',
+  'source': "LIFULL HOME'S"},
+ {'id': '3350e7e8c38a2d7b1a37f8b532b8830eb02aeed9',
+  'name': '間取り',
+  'address': '東京都文京区大塚5丁目',
+  'lat': 35.720069172626,
+  'lng': 139.72533258699,
+  'layout': '2LDK',
+  'rent': 259000,
+  'fees': 25000,
+  'area': 59.31,
+  'floor': '7階',
+  'url': 'https://www.homes.co.jp/chintai/room/3350e7e8c38a2d7b1a37f8b532b8830eb02aeed9/',
+  'fetched_at': '2026-10-05T12:02:14+00:00',
+  'modified': '2026-10-04',
+  'source': "LIFULL HOME'S"},
+ {'id': '4c09ca28474241345b1b90cff40fc88a63c7ffe9',
+  'name': '間取図',
+  'address': '東京都文京区大塚５丁目40-17',
+  'lat': 35.720200546574,
+  'lng': 139.72532730438,
+  'layout': '2LDK',
+  'rent': 236000,
+  'fees': 25000,
+  'area': 51.05,
+  'floor': '3階',
+  'url': 'https://www.homes.co.jp/chintai/room/4c09ca28474241345b1b90cff40fc88a63c7ffe9/',
+  'fetched_at': '2026-10-05T12:02:14+00:00',
+  'modified': '2026-09-30',
+  'source': "LIFULL HOME'S"},
+ {'id': '0bd7fc57066fa98e83afb55dd9200458c692b6fb',
+  'name': '間取り',
+  'address': '東京都新宿区中落合2丁目',
+  'lat': 35.722245836969,
+  'lng': 139.69285470538,
+  'layout': '2LDK',
+  'rent': 158000,
+  'fees': 12000,
+  'area': 52.21,
+  'floor': '1階',
+  'url': 'https://www.homes.co.jp/chintai/room/0bd7fc57066fa98e83afb55dd9200458c692b6fb/',
+  'fetched_at': '2026-10-05T12:02:15+00:00',
+  'modified': '2026-09-30',
+  'source': "LIFULL HOME'S"},
+ {'id': '9f9b446470617120541299e82371d60a100c9452',
+  'name': '間取り',
+  'address': '東京都新宿区中落合２丁目27-18',
+  'lat': 35.722284166251,
+  'lng': 139.69286470299,
+  'layout': '2LDK',
+  'rent': 158000,
+  'fees': 12000,
+  'area': 52.21,
+  'floor': '1階',
+  'url': 'https://www.homes.co.jp/chintai/room/9f9b446470617120541299e82371d60a100c9452/',
+  'fetched_at': '2026-10-05T12:02:15+00:00',
+  'modified': '2026-10-05',
+  'source': "LIFULL HOME'S"},
+ {'id': '1f32a61112ae68c905749bf20cd17b37d73a7b5c',
+  'name': '間取り',
+  'address': '東京都新宿区中落合3丁目',
+  'lat': 35.721072844778,
+  'lng': 139.69027969372,
+  'layout': '2LDK',
+  'rent': 298000,
+  'fees': 8000,
+  'area': 88.81,
+  'floor': '6階',
+  'url': 'https://www.homes.co.jp/chintai/room/1f32a61112ae68c905749bf20cd17b37d73a7b5c/',
+  'fetched_at': '2026-10-05T12:02:16+00:00',
+  'modified': '2026-09-30',
+  'source': "LIFULL HOME'S"},
+ {'id': '36889372e4683f32c0ddc9f529778c6bffa9d566',
+  'name': '間取り',
+  'address': '東京都豊島区目白2丁目',
+  'lat': 35.720224930732,
+  'lng': 139.71278670287,
+  'layout': '2LDK',
+  'rent': 350000,
+  'fees': 10000,
+  'area': 75.63,
+  'floor': '4階',
+  'url': 'https://www.homes.co.jp/chintai/room/36889372e4683f32c0ddc9f529778c6bffa9d566/',
+  'fetched_at': '2026-10-05T12:02:17+00:00',
+  'modified': '2026-10-05',
+  'source': "LIFULL HOME'S"},
+ {'id': '74a1a19b25a4f10080971f6ed800ece1d489e552',
+  'name': '間取り',
+  'address': '東京都豊島区南大塚2丁目',
+  'lat': 35.728079009771,
+  'lng': 139.73220973577,
+  'layout': '2LDK',
+  'rent': 220000,
+  'fees': 18000,
+  'area': 41.31,
+  'floor': '6階',
+  'url': 'https://www.homes.co.jp/chintai/room/74a1a19b25a4f10080971f6ed800ece1d489e552/',
+  'fetched_at': '2026-10-05T12:02:18+00:00',
+  'modified': '2026-10-01',
+  'source': "LIFULL HOME'S"},
+ {'id': 'db863147c90cb14a9b306a404c11c7fcd63c1b8c',
+  'name': '間取り',
+  'address': '東京都北区滝野川6丁目',
+  'lat': 35.748027046051,
+  'lng': 139.72205979592,
+  'layout': '2LDK',
+  'rent': 230000,
+  'fees': 20000,
+  'area': 60.65,
+  'floor': '11階',
+  'url': 'https://www.homes.co.jp/chintai/room/db863147c90cb14a9b306a404c11c7fcd63c1b8c/',
+  'fetched_at': '2026-10-05T12:02:18+00:00',
+  'modified': '2026-10-01',
+  'source': "LIFULL HOME'S"},
+ {'id': 'b5559897d9dfc9131a0675884626dd49492cdea7',
+  'name': '★間取り★',
+  'address': '東京都北区滝野川６丁目44-12',
+  'lat': 35.746074023853,
+  'lng': 139.72546208522,
+  'layout': '2LDK',
+  'rent': 239000,
+  'fees': 15000,
+  'area': 55.21,
+  'floor': '12階',
+  'url': 'https://www.homes.co.jp/chintai/room/b5559897d9dfc9131a0675884626dd49492cdea7/',
+  'fetched_at': '2026-10-05T12:02:19+00:00',
+  'modified': '2026-10-05',
+  'source': "LIFULL HOME'S"},
+ {'id': '5f8c012cadc8eb871452f4a5f8a935235677df24',
+  'name': '間取り',
+  'address': '東京都北区滝野川6丁目',
+  'lat': 35.746268989187,
+  'lng': 139.72498767327,
+  'layout': '2LDK',
+  'rent': 238000,
+  'fees': 15000,
+  'area': 55.23,
+  'floor': '12階',
+  'url': 'https://www.homes.co.jp/chintai/room/5f8c012cadc8eb871452f4a5f8a935235677df24/',
+  'fetched_at': '2026-10-05T12:02:19+00:00',
+  'modified': '2026-10-01',
+  'source': "LIFULL HOME'S"},
+ {'id': '8dcdc3f2970e4cb62217460ce4299ec34cb41406',
+  'name': '間取り',
+  'address': '東京都北区滝野川６丁目44-12',
+  'lat': 35.746234272148,
+  'lng': 139.72503517063,
+  'layout': '2LDK',
+  'rent': 236000,
+  'fees': 15000,
+  'area': 55.21,
+  'floor': '8階',
+  'url': 'https://www.homes.co.jp/chintai/room/8dcdc3f2970e4cb62217460ce4299ec34cb41406/',
+  'fetched_at': '2026-10-05T12:02:19+00:00',
+  'modified': '2026-10-05',
+  'source': "LIFULL HOME'S"},
+ {'id': 'b8529a3b39e5652288058d2068f76f244ff900dd',
+  'name': '間取り',
+  'address': '東京都北区滝野川６丁目44-12',
+  'lat': 35.746218996508,
+  'lng': 139.72505072548,
+  'layout': '2LDK',
+  'rent': 233000,
+  'fees': 15000,
+  'area': 55.21,
+  'floor': '5階',
+  'url': 'https://www.homes.co.jp/chintai/room/b8529a3b39e5652288058d2068f76f244ff900dd/',
+  'fetched_at': '2026-10-05T12:02:20+00:00',
+  'modified': '2026-10-05',
+  'source': "LIFULL HOME'S"},
+ {'id': '63e23f5b850ea3969c67ee5cf50c756a6607f378',
+  'name': '間取図',
+  'address': '東京都北区滝野川６丁目',
+  'lat': 35.746267045333,
+  'lng': 139.72500156106,
+  'layout': '2LDK',
+  'rent': 232000,
+  'fees': 15000,
+  'area': 55.21,
+  'floor': '5階',
+  'url': 'https://www.homes.co.jp/chintai/room/63e23f5b850ea3969c67ee5cf50c756a6607f378/',
+  'fetched_at': '2026-10-05T12:02:20+00:00',
+  'modified': '2026-10-05',
+  'source': "LIFULL HOME'S"},
+ {'id': '431d7f01b48e8065f1098ea6dd5e93de383f0387',
+  'name': '間取り',
+  'address': '東京都豊島区東池袋3丁目22-21',
+  'lat': 35.730828959031,
+  'lng': 139.72112667849,
+  'layout': '2LDK',
+  'rent': 312000,
+  'fees': 14000,
+  'area': 68.93,
+  'floor': '12階',
+  'url': 'https://www.homes.co.jp/chintai/room/431d7f01b48e8065f1098ea6dd5e93de383f0387/',
+  'fetched_at': '2026-10-05T12:02:21+00:00',
+  'modified': '2026-10-05',
+  'source': "LIFULL HOME'S"},
+ {'id': '69e3a12755df1307d88714afb3690b90dd9c59e6',
+  'name': '間取り',
+  'address': '東京都豊島区長崎1丁目',
+  'lat': 35.728752711635,
+  'lng': 139.69689076731,
+  'layout': '2LDK',
+  'rent': 240000,
+  'fees': 10000,
+  'area': 55.58,
+  'floor': '4階',
+  'url': 'https://www.homes.co.jp/chintai/room/69e3a12755df1307d88714afb3690b90dd9c59e6/',
+  'fetched_at': '2026-10-05T12:02:21+00:00',
+  'modified': '2026-10-01',
+  'source': "LIFULL HOME'S"},
+ {'id': 'f2988fee0b5c956e1deaebc2a85da48cf76952c1',
+  'name': '間取り',
+  'address': '東京都板橋区氷川町47-9',
+  'lat': 35.751197642797,
+  'lng': 139.7058077172,
+  'layout': '2LDK',
+  'rent': 150000,
+  'fees': 10000,
+  'area': 48.42,
+  'floor': '5階',
+  'url': 'https://www.homes.co.jp/chintai/room/f2988fee0b5c956e1deaebc2a85da48cf76952c1/',
+  'fetched_at': '2026-10-05T12:02:22+00:00',
+  'modified': '2026-10-05',
+  'source': "LIFULL HOME'S"},
+ {'id': 'b7514d5c146450cc8788e07a59b0abfc225eb49e',
+  'name': '間取り',
+  'address': '東京都文京区大塚5丁目',
+  'lat': 35.720094169223,
+  'lng': 139.72531064341,
+  'layout': '2LDK',
+  'rent': 255000,
+  'fees': 25000,
+  'area': 59.57,
+  'floor': '3階',
+  'url': 'https://www.homes.co.jp/chintai/room/b7514d5c146450cc8788e07a59b0abfc225eb49e/',
+  'fetched_at': '2026-10-05T12:02:23+00:00',
+  'modified': '2026-10-05',
+  'source': "LIFULL HOME'S"},
+ {'id': '5a4827819b63d7391789737c7c6d8679265454f9',
+  'name': '間取り',
+  'address': '東京都豊島区上池袋2丁目15-17',
+  'lat': 35.73572195187,
+  'lng': 139.71862363892,
+  'layout': '2LDK',
+  'rent': 290000,
+  'fees': 15000,
+  'area': 69.57,
+  'floor': '6階',
+  'url': 'https://www.homes.co.jp/chintai/room/5a4827819b63d7391789737c7c6d8679265454f9/',
+  'fetched_at': '2026-10-05T12:02:23+00:00',
+  'modified': '2026-10-01',
+  'source': "LIFULL HOME'S"},
+ {'id': '3b7da3793723877c49dd1f5458d37a586ea1f083',
+  'name': '間取り',
+  'address': '東京都北区滝野川７丁目48-2',
+  'lat': 35.741272883742,
+  'lng': 139.72492121338,
+  'layout': '2LDK',
+  'rent': 249000,
+  'fees': 12000,
+  'area': 55.76,
+  'floor': '15階',
+  'url': 'https://www.homes.co.jp/chintai/room/3b7da3793723877c49dd1f5458d37a586ea1f083/',
+  'fetched_at': '2026-10-05T12:02:24+00:00',
+  'modified': '2026-10-05',
+  'source': "LIFULL HOME'S"},
+ {'id': 'ac093b64721f80570db1610b1a3ff356db14504b',
+  'name': '間取り',
+  'address': '東京都北区滝野川7丁目48-2',
+  'lat': 35.741207889632,
+  'lng': 139.72486760944,
+  'layout': '2LDK',
+  'rent': 247000,
+  'fees': 12000,
+  'area': 55.86,
+  'floor': '12階',
+  'url': 'https://www.homes.co.jp/chintai/room/ac093b64721f80570db1610b1a3ff356db14504b/',
+  'fetched_at': '2026-10-05T12:02:24+00:00',
+  'modified': '2026-09-29',
+  'source': "LIFULL HOME'S"},
+ {'id': 'dd7c146e36956356781fdf5069543d1ba6846f2b',
+  'name': '間取図',
+  'address': '東京都北区滝野川７丁目48-2',
+  'lat': 35.741299823479,
+  'lng': 139.72485871761,
+  'layout': '2LDK',
+  'rent': 249000,
+  'fees': 12000,
+  'area': 55.76,
+  'floor': '13階',
+  'url': 'https://www.homes.co.jp/chintai/room/dd7c146e36956356781fdf5069543d1ba6846f2b/',
+  'fetched_at': '2026-10-05T12:02:25+00:00',
+  'modified': '2026-10-03',
+  'source': "LIFULL HOME'S"},
+ {'id': 'aeac2fe866e20475832132416af3b8594a64dce2',
+  'name': '間取り',
+  'address': '東京都北区滝野川7丁目',
+  'lat': 35.741207889632,
+  'lng': 139.72486760944,
+  'layout': '2LDK',
+  'rent': 249000,
+  'fees': 12000,
+  'area': 55.76,
+  'floor': '13階',
+  'url': 'https://www.homes.co.jp/chintai/room/aeac2fe866e20475832132416af3b8594a64dce2/',
+  'fetched_at': '2026-10-05T12:02:25+00:00',
+  'modified': '2026-10-05',
+  'source': "LIFULL HOME'S"},
+ {'id': 'fea8079485d43be37d81fb344538705149326361',
+  'name': '間取図',
+  'address': '東京都北区滝野川７丁目48-2',
+  'lat': 35.741299823479,
+  'lng': 139.72485871761,
+  'layout': '2LDK',
+  'rent': 247000,
+  'fees': 12000,
+  'area': 55.76,
+  'floor': '11階',
+  'url': 'https://www.homes.co.jp/chintai/room/fea8079485d43be37d81fb344538705149326361/',
+  'fetched_at': '2026-10-05T12:02:26+00:00',
+  'modified': '2026-10-03',
+  'source': "LIFULL HOME'S"},
+ {'id': '7a8ce3bacdcd3b893fc4dfb8209b490a3ce2aec1',
+  'name': '間取図',
+  'address': '東京都北区滝野川７丁目48-2',
+  'lat': 35.741206501286,
+  'lng': 139.72488205272,
+  'layout': '2LDK',
+  'rent': 247000,
+  'fees': 12000,
+  'area': 55.76,
+  'floor': '11階',
+  'url': 'https://www.homes.co.jp/chintai/room/7a8ce3bacdcd3b893fc4dfb8209b490a3ce2aec1/',
+  'fetched_at': '2026-10-05T12:02:26+00:00',
+  'modified': '2026-10-02',
+  'source': "LIFULL HOME'S"},
+ {'id': '87810cc818bf023b126d0cb588572b2f309e8beb',
+  'name': '間取り',
+  'address': '東京都北区滝野川７丁目48-2',
+  'lat': 35.741206500922,
+  'lng': 139.72486844276,
+  'layout': '2LDK',
+  'rent': 245000,
+  'fees': 12000,
+  'area': 56.33,
+  'floor': '10階',
+  'url': 'https://www.homes.co.jp/chintai/room/87810cc818bf023b126d0cb588572b2f309e8beb/',
+  'fetched_at': '2026-10-05T12:02:26+00:00',
+  'modified': '2026-10-05',
+  'source': "LIFULL HOME'S"},
+ {'id': '90a26a50ebc8e143ef9b36850f863568f5380514',
+  'name': '間取り',
+  'address': '東京都北区滝野川7丁目',
+  'lat': 35.743227027324,
+  'lng': 139.72190666884,
+  'layout': '2LDK',
+  'rent': 245000,
+  'fees': 12000,
+  'area': 55.86,
+  'floor': '10階',
+  'url': 'https://www.homes.co.jp/chintai/room/90a26a50ebc8e143ef9b36850f863568f5380514/',
+  'fetched_at': '2026-10-05T12:02:27+00:00',
+  'modified': '2026-10-05',
+  'source': "LIFULL HOME'S"},
+ {'id': 'dda2b2e05900d2672b6cf6b98bc1683c94d702ec',
+  'name': '間取り',
+  'address': '東京都豊島区東池袋3丁目23-22',
+  'lat': 35.730365152488,
+  'lng': 139.72225160151,
+  'layout': '2LDK',
+  'rent': 325000,
+  'fees': 25000,
+  'area': 64.3,
+  'floor': '29階',
+  'url': 'https://www.homes.co.jp/chintai/room/dda2b2e05900d2672b6cf6b98bc1683c94d702ec/',
+  'fetched_at': '2026-10-05T12:02:27+00:00',
+  'modified': '2026-09-29',
+  'source': "LIFULL HOME'S"},
+ {'id': '0c22e5e4bcde2178d82c24d41a89da318ad20edf',
+  'name': '間取り',
+  'address': '東京都豊島区東池袋３丁目',
+  'lat': 35.73027016787,
+  'lng': 139.72242659045,
+  'layout': '2LDK',
+  'rent': 325000,
+  'fees': 25000,
+  'area': 64.3,
+  'floor': '29階',
+  'url': 'https://www.homes.co.jp/chintai/room/0c22e5e4bcde2178d82c24d41a89da318ad20edf/',
+  'fetched_at': '2026-10-05T12:02:28+00:00',
+  'modified': '2026-10-05',
+  'source': "LIFULL HOME'S"},
+ {'id': '0a4c9a0aa3a55301f162f04a751f54a6cb1b0380',
+  'name': '間取り',
+  'address': '東京都新宿区高田馬場2丁目',
+  'lat': 35.711714146162,
+  'lng': 139.70991756659,
+  'layout': '2LDK',
+  'rent': 240500,
+  'fees': 10500,
+  'area': 59.39,
+  'floor': '4階',
+  'url': 'https://www.homes.co.jp/chintai/room/0a4c9a0aa3a55301f162f04a751f54a6cb1b0380/',
+  'fetched_at': '2026-10-05T12:02:28+00:00',
+  'modified': '2026-10-03',
+  'source': "LIFULL HOME'S"},
+ {'id': 'cf8db61c49c9ca9a0152ad7cbcaed4669bd7ed5a',
+  'name': '間取り',
+  'address': '東京都新宿区高田馬場２丁目1-1',
+  'lat': 35.711712201951,
+  'lng': 139.70991812218,
+  'layout': '2LDK',
+  'rent': 275500,
+  'fees': 10500,
+  'area': 56.46,
+  'floor': '19階',
+  'url': 'https://www.homes.co.jp/chintai/room/cf8db61c49c9ca9a0152ad7cbcaed4669bd7ed5a/',
+  'fetched_at': '2026-10-05T12:02:28+00:00',
+  'modified': '2026-10-05',
+  'source': "LIFULL HOME'S"},
+ {'id': '126b9b8b4fcb3126d7b3fcf3ca76cfd6a8cba4c4',
+  'name': '当社は仲介手数料無料！\u3000リノベーション2LDK\u3000NURO光無料\u3000WEB申込受付中♪',
+  'address': '東京都新宿区高田馬場２丁目',
+  'lat': 35.711748583995,
+  'lng': 139.70981535167,
+  'layout': '2LDK',
+  'rent': 254500,
+  'fees': 10500,
+  'area': 56.46,
+  'floor': '19階',
+  'url': 'https://www.homes.co.jp/chintai/room/126b9b8b4fcb3126d7b3fcf3ca76cfd6a8cba4c4/',
+  'fetched_at': '2026-10-05T12:02:28+00:00',
+  'modified': '2026-10-05',
+  'source': "LIFULL HOME'S"},
+ {'id': 'be80ab3766bbb15369afa65ff3bc00f61ebdb1f6',
+  'name': '間取り',
+  'address': '東京都新宿区高田馬場2丁目',
+  'lat': 35.711714146162,
+  'lng': 139.70991756659,
+  'layout': '2LDK',
+  'rent': 254500,
+  'fees': 10500,
+  'area': 56.46,
+  'floor': '19階',
+  'url': 'https://www.homes.co.jp/chintai/room/be80ab3766bbb15369afa65ff3bc00f61ebdb1f6/',
+  'fetched_at': '2026-10-05T12:02:29+00:00',
+  'modified': '2026-09-30',
+  'source': "LIFULL HOME'S"},
+ {'id': 'fc8662a1f1caf7dfb5aa0287750cc66b6c05868f',
+  'name': '間取図',
+  'address': '東京都新宿区高田馬場２丁目1-1',
+  'lat': 35.711982725466,
+  'lng': 139.70985950518,
+  'layout': '2LDK',
+  'rent': 271500,
+  'fees': 10500,
+  'area': 56.46,
+  'floor': '15階',
+  'url': 'https://www.homes.co.jp/chintai/room/fc8662a1f1caf7dfb5aa0287750cc66b6c05868f/',
+  'fetched_at': '2026-10-05T12:02:29+00:00',
+  'modified': '2026-10-04',
+  'source': "LIFULL HOME'S"},
+ {'id': 'b42ed5fed749ed1027ca86ed9a16d73516582ef1',
+  'name': '間取図',
+  'address': '東京都新宿区高田馬場２丁目1-1',
+  'lat': 35.711712202315,
+  'lng': 139.70993173213,
+  'layout': '2LDK',
+  'rent': 271500,
+  'fees': 10500,
+  'area': 56.46,
+  'floor': '15階',
+  'url': 'https://www.homes.co.jp/chintai/room/b42ed5fed749ed1027ca86ed9a16d73516582ef1/',
+  'fetched_at': '2026-10-05T12:02:30+00:00',
+  'modified': '2026-10-03',
+  'source': "LIFULL HOME'S"},
+ {'id': 'c34bab469b6726c48e899904df97b1bccdb1f61c',
+  'name': '間取り',
+  'address': '東京都新宿区高田馬場２丁目1-1',
+  'lat': 35.712030499925,
+  'lng': 139.70993671892,
+  'layout': '2LDK',
+  'rent': 265500,
+  'fees': 10500,
+  'area': 56.46,
+  'floor': '13階',
+  'url': 'https://www.homes.co.jp/chintai/room/c34bab469b6726c48e899904df97b1bccdb1f61c/',
+  'fetched_at': '2026-10-05T12:02:30+00:00',
+  'modified': '2026-10-05',
+  'source': "LIFULL HOME'S"},
+ {'id': 'fff01047e83ff67dc70b32986aa5355a588e9b78',
+  'name': '間取り',
+  'address': '東京都新宿区高田馬場2丁目',
+  'lat': 35.711714146162,
+  'lng': 139.70991756659,
+  'layout': '2LDK',
+  'rent': 265500,
+  'fees': 10500,
+  'area': 56.46,
+  'floor': '13階',
+  'url': 'https://www.homes.co.jp/chintai/room/fff01047e83ff67dc70b32986aa5355a588e9b78/',
+  'fetched_at': '2026-10-05T12:02:31+00:00',
+  'modified': '2026-10-04',
+  'source': "LIFULL HOME'S"},
+ {'id': '5cf4f65f2db8ad626fe0237c44146e89e3209fce',
+  'name': '間取図',
+  'address': '東京都新宿区高田馬場２丁目1-1',
+  'lat': 35.711712202315,
+  'lng': 139.70993173213,
+  'layout': '2LDK',
+  'rent': 249500,
+  'fees': 10500,
+  'area': 56.46,
+  'floor': '13階',
+  'url': 'https://www.homes.co.jp/chintai/room/5cf4f65f2db8ad626fe0237c44146e89e3209fce/',
+  'fetched_at': '2026-10-05T12:02:31+00:00',
+  'modified': '2026-10-01',
+  'source': "LIFULL HOME'S"},
+ {'id': 'b3ad5578dd94b349038979739c0a49ee1f19131e',
+  'name': '間取図',
+  'address': '東京都新宿区高田馬場２丁目1-1',
+  'lat': 35.711982725466,
+  'lng': 139.70985950518,
+  'layout': '2LDK',
+  'rent': 249500,
+  'fees': 10500,
+  'area': 56.46,
+  'floor': '13階',
+  'url': 'https://www.homes.co.jp/chintai/room/b3ad5578dd94b349038979739c0a49ee1f19131e/',
+  'fetched_at': '2026-10-05T12:02:31+00:00',
+  'modified': '2026-10-04',
+  'source': "LIFULL HOME'S"},
+ {'id': '8d50deedeba7838b78858fb108ad4b19fa641c8f',
+  'name': '間取り',
+  'address': '東京都新宿区高田馬場2丁目',
+  'lat': 35.711714146162,
+  'lng': 139.70991756659,
+  'layout': '2LDK',
+  'rent': 254500,
+  'fees': 10500,
+  'area': 60.15,
+  'floor': '8階',
+  'url': 'https://www.homes.co.jp/chintai/room/8d50deedeba7838b78858fb108ad4b19fa641c8f/',
+  'fetched_at': '2026-10-05T12:02:32+00:00',
+  'modified': '2026-10-02',
+  'source': "LIFULL HOME'S"},
+ {'id': '99051c9763bd065fa536cc15de3408807857af02',
+  'name': '間取り',
+  'address': '東京都新宿区高田馬場2丁目',
+  'lat': 35.711714146162,
+  'lng': 139.70991756659,
+  'layout': '2LDK',
+  'rent': 254500,
+  'fees': 10500,
+  'area': 60.15,
+  'floor': '7階',
+  'url': 'https://www.homes.co.jp/chintai/room/99051c9763bd065fa536cc15de3408807857af02/',
+  'fetched_at': '2026-10-05T12:02:33+00:00',
+  'modified': '2026-10-03',
+  'source': "LIFULL HOME'S"},
+ {'id': '4cca4077fb2ad52541edc78b0ef968e0ffadb425',
+  'name': '間取図',
+  'address': '東京都新宿区高田馬場２丁目1-1',
+  'lat': 35.711712202315,
+  'lng': 139.70993173213,
+  'layout': '2LDK',
+  'rent': 244500,
+  'fees': 10500,
+  'area': 60.15,
+  'floor': '8階',
+  'url': 'https://www.homes.co.jp/chintai/room/4cca4077fb2ad52541edc78b0ef968e0ffadb425/',
+  'fetched_at': '2026-10-05T12:02:33+00:00',
+  'modified': '2026-10-02',
+  'source': "LIFULL HOME'S"},
+ {'id': '5367f730f3d176a4c3bebefeba98980298cea98a',
+  'name': '間取図',
+  'address': '東京都新宿区高田馬場２丁目1-1',
+  'lat': 35.711712202315,
+  'lng': 139.70993173213,
+  'layout': '2LDK',
+  'rent': 256500,
+  'fees': 10500,
+  'area': 59.39,
+  'floor': '4階',
+  'url': 'https://www.homes.co.jp/chintai/room/5367f730f3d176a4c3bebefeba98980298cea98a/',
+  'fetched_at': '2026-10-05T12:02:33+00:00',
+  'modified': '2026-10-01',
+  'source': "LIFULL HOME'S"}]
+SNAPSHOT_INFO = {'layout': '2LDK',
+ 'requested': 150,
+ 'received': 106,
+ 'warnings': ['16ページは位置・金額・間取りを確認できず除外しました。'],
+ 'source_url': 'https://www.homes.co.jp/chintai/tokyo/ikebukuro_00488-st/list/',
+ 'fetched_at': '2026-10-05T12:02:34+00:00'}
+MD_CODES = {'1LDK': '15', '2LDK': '25', '3LDK': '35', '4LDK': '45-'}
+DEFAULT_URL = 'https://www.homes.co.jp/chintai/tokyo/ikebukuro_00488-st/list/'
+HEADERS = {'User-Agent': 'SumaiCompass/2.0 (personal rental map)'}
+_HTTP = threading.local()
+
+def http_session():
+    if not hasattr(_HTTP, 'session'):
+        _HTTP.session = requests.Session()
+    return _HTTP.session
+
+REAL_FIELDS = ['id', 'name', 'address', 'lat', 'lng', 'layout', 'rent', 'fees', 'area', 'floor', 'url', 'fetched_at', 'modified', 'source']
+COLORS = ['#2166ac', '#1d8fa7', '#48aa96', '#87b85c', '#d2be42', '#e9a248', '#df7245', '#c94049']
+BANDS = [15, 20, 22.5, 25, 27.5, 30, 35]
 
 
-def calculate(station, layout, properties, destination, home_walk, work_walk):
-    r = route(station['name'], destination)
-    low, high, added = rent_band(station, layout, properties)
-    return dict(station, route=r, low=low, high=high, properties=added,
-                door=math.ceil(r['time']+home_walk+work_walk+(3 if r['legs'] else 0)),
-                distance=r['km']+(home_walk+work_walk)*.08)
+def safe_source_url(url):
+    try:
+        p = urlparse(url)
+        return (p.scheme == 'https' and p.hostname == 'www.homes.co.jp' and not p.username
+                and not p.password and p.port in (None, 443) and p.path.startswith('/chintai/'))
+    except (ValueError, TypeError):
+        return False
 
 
-def safe_url(value):
-    parsed = urlparse(str(value))
-    return parsed.scheme in ('https', 'http') and bool(parsed.netloc)
+def fetch_html(url):
+    if not safe_source_url(url):
+        raise ValueError('LIFULL HOME’Sの賃貸ページURLを指定してください。')
+    response = http_session().get(url, headers=HEADERS, timeout=(20, 20))
+    response.raise_for_status()
+    if not safe_source_url(response.url):
+        raise ValueError('物件ページ以外に移動しました。')
+    if len(response.content) > 4_000_000:
+        raise ValueError('ページが大きすぎます。')
+    response.encoding = 'utf-8'
+    return response.text
 
 
-def parse_properties(raw):
-    """Validate the whole file before mutation. Import is all-or-nothing."""
-    if len(raw) > 2_000_000:
-        raise ValueError('CSVは2MB以内にしてください。')
-    reader = csv.DictReader(io.StringIO(raw.decode('utf-8-sig')))
-    if not reader.fieldnames or not set(CSV_FIELDS)-{'id', 'url'} <= set(reader.fieldnames):
-        raise ValueError('このアプリで書き出したCSVを選択してください。')
-    result = []
-    seen = set()
-    for number, row in enumerate(reader, 2):
-        if len(result) >= 1000:
-            raise ValueError('物件は1,000件以内にしてください。')
-        if row.get('station') not in BY_NAME or row.get('layout') not in LAYOUTS:
-            raise ValueError(f'{number}行目：駅または間取りが不正です。')
-        name = row.get('name', '').strip()
-        if name.startswith("'") and name[1:].startswith(('=', '+', '-', '@', '\t', '\r')):
-            name = name[1:]
-        if not name or len(name) > 60:
-            raise ValueError(f'{number}行目：物件名は1〜60文字で指定してください。')
-        money = {}
-        for field in ('rent', 'management', 'common'):
+@st.cache_data(ttl=3600, show_spinner=False)
+def check_robots():
+    response = http_session().get('https://www.homes.co.jp/robots.txt', headers=HEADERS, timeout=(20, 20))
+    response.raise_for_status()
+    rp = urllib.robotparser.RobotFileParser()
+    rp.parse(response.text.splitlines())
+    return rp.can_fetch('SumaiCompass', DEFAULT_URL) and rp.can_fetch('SumaiCompass', 'https://www.homes.co.jp/chintai/room/test/')
+
+
+def search_url(base, layout, page):
+    p = urlparse(base)
+    if not safe_source_url(base) or not p.path.endswith('/list/'):
+        raise ValueError('駅や地域の「物件一覧」ページのURLを指定してください。')
+    args = [(k, v) for k, v in parse_qsl(p.query) if not k.startswith('cond[madori]') and k != 'page']
+    args += [(f'cond[madori][{MD_CODES[layout]}]', MD_CODES[layout]), ('page', str(page))]
+    return urlunparse(p._replace(query=urlencode(args), fragment=''))
+
+
+def room_links(html):
+    soup = BeautifulSoup(html, 'html.parser')
+    links = []
+    for a in soup.select('a[href]'):
+        url = urljoin('https://www.homes.co.jp', a['href']).split('?')[0]
+        if safe_source_url(url) and re.fullmatch(r'/chintai/(room/[a-zA-Z0-9]+|b-[0-9]+)/', urlparse(url).path) and url not in links:
+            links.append(url)
+    # Room URLs and agency URLs can represent the same unit; canonical URL is used later.
+    return links
+
+
+def money(value):
+    if isinstance(value, (float, int)) and math.isfinite(value) and value >= 0:
+        return int(value)
+    text = str(value).replace(',', '').replace(' ', '').strip()
+    if text in ('無', 'なし', '-', '0', '0円'):
+        return 0
+    match = re.fullmatch(r'(\d+(?:\.\d+)?)\s*(万円|円)?(?:/月)?', text)
+    if not match:
+        raise ValueError('家賃または管理費等が読み取れません。')
+    return round(float(match[1])*(10000 if match[2] == '万円' else 1))
+
+
+def json_nodes(value):
+    if isinstance(value, list):
+        for item in value:
+            yield from json_nodes(item)
+    elif isinstance(value, dict):
+        yield value
+        if '@graph' in value:
+            yield from json_nodes(value['@graph'])
+
+
+def parse_listing(html, url, fetched_at):
+    soup = BeautifulSoup(html, 'html.parser')
+    for script in soup.find_all('script', type='application/ld+json'):
+        try:
+            parsed = json.loads(script.string or script.get_text())
+        except (TypeError, ValueError):
+            continue
+        for data in json_nodes(parsed):
+            if data.get('@type') != 'RealEstateListing':
+                continue
+            offer, entity = data.get('offers', {}), data.get('mainEntity', {})
+            if not isinstance(offer, dict) or not isinstance(entity, dict):
+                continue
+            if offer.get('availability') not in (None, 'https://schema.org/InStock', 'http://schema.org/InStock'):
+                continue
+            if offer.get('priceCurrency') != 'JPY':
+                continue
+            geo = entity.get('geo', {})
             try:
-                value = int(row.get(field, ''))
-            except (ValueError, TypeError):
-                raise ValueError(f'{number}行目：金額は整数で入力してください。') from None
-            if value < (1 if field == 'rent' else 0) or value > 10_000_000:
-                raise ValueError(f'{number}行目：金額が入力範囲外です。')
-            money[field] = value
-        url = row.get('url', '').strip()
-        if url and not safe_url(url):
-            raise ValueError(f'{number}行目：URLはhttpまたはhttpsで指定してください。')
-        ident = row.get('id', '').strip() or str(uuid.uuid4())
-        if ident.startswith("'") and ident[1:].startswith(('=', '+', '-', '@', '\t', '\r')):
-            ident = ident[1:]
-        if len(ident) > 100 or ident in seen:
-            raise ValueError(f'{number}行目：物件IDが重複または不正です。')
-        seen.add(ident)
-        result.append(dict(id=ident, name=name, station=row['station'], layout=row['layout'], url=url, **money))
+                lat, lng = float(geo['latitude']), float(geo['longitude'])
+                rent = money(offer['price'])
+                size = float(entity.get('floorSize', {}).get('value', 0))
+            except (KeyError, ValueError, TypeError):
+                continue
+            if not (34 <= lat <= 37 and 138 <= lng <= 141 and 0 < rent <= 10_000_000 and math.isfinite(size) and size > 0):
+                continue
+            attrs = {a.get('name'): a.get('value') for a in entity.get('additionalProperty', []) if isinstance(a, dict)}
+            layout = str(attrs.get('間取り', '')).strip()
+            if layout not in LAYOUTS:
+                continue
+            costs = {a.get('name'): a.get('value') for a in offer.get('additionalProperty', []) if isinstance(a, dict)}
+            if '管理費等' not in costs:
+                continue  # Unknown fees are not silently treated as zero.
+            try:
+                fees = money(costs['管理費等'])
+                if fees > 10_000_000:
+                    continue
+            except ValueError:
+                continue
+            address = entity.get('address', {})
+            if not isinstance(address, dict):
+                continue
+            addr = ''.join(str(address.get(k, '')) for k in ('addressRegion', 'addressLocality', 'streetAddress'))
+            image = entity.get('image', [])
+            caption = image[0].get('caption') if isinstance(image, list) and image and isinstance(image[0], dict) else None
+            canonical = data.get('url', url)
+            if not safe_source_url(canonical):
+                canonical = url
+            return dict(id=canonical.rstrip('/').split('/')[-1], name=caption or entity.get('name', '物件'),
+                        address=addr, lat=lat, lng=lng, layout=layout, rent=rent, fees=fees,
+                        area=size, floor=str(entity.get('floorLevel', '')), url=canonical,
+                        fetched_at=fetched_at, modified=str(data.get('dateModified', '')), source="LIFULL HOME'S")
+    return None
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_listing(url):
+    return parse_listing(fetch_html(url), url, datetime.now(timezone.utc).isoformat(timespec='seconds'))
+
+
+def unit_key(p):
+    # Multiple agencies listing the same room are counted once when observable fields match.
+    return (round(p['lat'], 5), round(p['lng'], 5), p['layout'], p['floor'], round(p['area'], 1), p['rent'], p['fees'])
+
+
+def deduplicate(properties):
+    result, seen = [], set()
+    for p in properties:
+        key = unit_key(p)
+        if key not in seen:
+            seen.add(key)
+            result.append(p)
     return result
 
 
-def export_properties(properties):
-    output = io.StringIO()
-    writer = csv.DictWriter(output, fieldnames=CSV_FIELDS)
-    writer.writeheader()
+def collect(base, layout, limit=120, pages=3, progress=None):
+    if not check_robots():
+        raise ValueError('現在、取得元が自動取得を許可していません。CSV読み込みを利用してください。')
+    links, warnings, seen_links = [], [], set()
+    for page in range(1, pages+1):
+        try:
+            found = room_links(fetch_html(search_url(base, layout, page)))
+        except (requests.RequestException, ValueError) as error:
+            warnings.append(f'一覧{page}ページ目を取得できませんでした（{type(error).__name__}）。')
+            break
+        fresh = [u for u in found if u not in seen_links]
+        if not fresh:
+            break
+        seen_links.update(fresh)
+        links.extend(fresh)
+        if len(links) >= limit:
+            break
+    links = links[:limit]
+    records, failed = [], 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        futures = {pool.submit(fetch_listing, url): url for url in links}
+        for number, future in enumerate(concurrent.futures.as_completed(futures), 1):
+            try:
+                p = future.result()
+                if p and p['layout'] == layout:
+                    records.append(p)
+                else:
+                    failed += 1
+            except (requests.RequestException, ValueError, KeyError, TypeError):
+                failed += 1
+            if progress:
+                progress(number, len(links), len(records))
+    records = deduplicate(records)
+    if failed:
+        warnings.append(f'{failed}ページは位置・金額・間取りを確認できず除外しました。')
+    return records, dict(layout=layout, requested=len(links), received=len(records), warnings=warnings,
+                         source_url=base, fetched_at=datetime.now(timezone.utc).isoformat(timespec='seconds'))
+
+
+def project(lat, lng, origin):
+    return ((lng-origin['lng'])*111320*math.cos(math.radians(origin['lat'])), (lat-origin['lat'])*111320)
+
+
+def unproject(x, y, origin):
+    return [origin['lat']+y/111320, origin['lng']+x/(111320*math.cos(math.radians(origin['lat'])))]
+
+
+def color_for(yen):
+    amount = yen/10000
+    return COLORS[sum(amount > cut for cut in BANDS)]
+
+
+def mesh(properties, origin, cell=100, radius=1500, interpolate=True, reach=400, minimum=3):
+    buildings = {}
     for p in properties:
-        row = dict(p)
-        # Avoid spreadsheet formula execution. Imports reverse this protective prefix.
-        for field in ('name', 'url', 'id'):
-            value = str(row.get(field, ''))
-            if value.startswith(('=', '+', '-', '@', '\t', '\r')):
-                row[field] = "'"+value
-        writer.writerow({key: row.get(key, '') for key in CSV_FIELDS})
+        x, y = project(p['lat'], p['lng'], origin)
+        if math.hypot(x, y) > radius:
+            continue
+        key = (round(p['lat'], 5), round(p['lng'], 5))
+        buildings.setdefault(key, []).append(p)
+    observed = {}
+    points = []
+    for ps in buildings.values():
+        x, y = project(ps[0]['lat'], ps[0]['lng'], origin)
+        point = dict(x=x, y=y, price=statistics.median(p['rent']+p['fees'] for p in ps), count=len(ps))
+        points.append(point)
+        observed.setdefault((math.floor(x/cell), math.floor(y/cell)), []).append(point)
+    cells = []
+    extent = math.ceil(radius/cell)
+    for ix in range(-extent, extent):
+        for iy in range(-extent, extent):
+            cx, cy = (ix+.5)*cell, (iy+.5)*cell
+            if math.hypot(cx, cy) > radius:
+                continue
+            own = observed.get((ix, iy), [])
+            if own:
+                price = statistics.median(p['price'] for p in own)
+                kind, support, farthest = '掲載物件の集計', own, 0
+            elif interpolate:
+                support = [p for p in points if math.hypot(p['x']-cx, p['y']-cy) <= reach]
+                if len(support) < minimum:
+                    continue
+                weighted = [(p['price'], 1/max(50, math.hypot(p['x']-cx, p['y']-cy))**2) for p in support]
+                price = sum(value*w for value, w in weighted)/sum(w for _, w in weighted)
+                kind = '近隣からの推定'
+                farthest = round(max(math.hypot(p['x']-cx, p['y']-cy) for p in support))
+            else:
+                continue
+            cells.append(dict(bounds=[unproject(ix*cell, iy*cell, origin), unproject((ix+1)*cell, (iy+1)*cell, origin)],
+                              price=price, kind=kind, buildings=len(support), rooms=sum(p['count'] for p in support), farthest=farthest))
+    return cells
+
+
+def validate_records(raw):
+    if len(raw) > 5_000_000:
+        raise ValueError('CSVは5MB以内にしてください。')
+    reader = csv.DictReader(io.StringIO(raw.decode('utf-8-sig')))
+    required = {'name', 'lat', 'lng', 'layout', 'rent', 'fees', 'area'}
+    if not reader.fieldnames or not required <= set(reader.fieldnames):
+        raise ValueError('name, lat, lng, layout, rent, fees, area列が必要です。金額は円、座標は掲載位置を指定します。')
+    records = []
+    for n, row in enumerate(reader, 2):
+        if n > 2001:
+            raise ValueError('CSVは2,000件以内にしてください。')
+        try:
+            p = {key: row.get(key, '') for key in REAL_FIELDS}
+            for key in ('lat', 'lng', 'area'):
+                p[key] = float(row[key])
+            for key in ('rent', 'fees'):
+                p[key] = int(row[key])
+            if not (34 <= p['lat'] <= 37 and 138 <= p['lng'] <= 141 and math.isfinite(p['area']) and p['area'] > 0
+                    and 0 < p['rent'] <= 10_000_000 and 0 <= p['fees'] <= 10_000_000 and p['layout'] in LAYOUTS):
+                raise ValueError()
+            for field in ('name', 'id', 'address', 'floor'):
+                p[field] = str(p[field])[:200]
+                if p[field].startswith("'") and p[field][1:].startswith(('=', '+', '-', '@')):
+                    p[field] = p[field][1:]
+            p['name'] = p['name'].strip()
+            if not p['name']:
+                raise ValueError()
+            if p['url'] and (urlparse(p['url']).scheme not in ('http', 'https') or not urlparse(p['url']).netloc):
+                raise ValueError()
+            p['id'] = p['id'] or str(uuid.uuid4())
+            p['source'] = p['source'] or 'CSV入力'
+            records.append(p)
+        except (ValueError, TypeError, KeyError):
+            raise ValueError(f'{n}行目の金額・位置・間取りを確認してください。') from None
+    return deduplicate(records)
+
+
+def export_records(records):
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=REAL_FIELDS)
+    writer.writeheader()
+    for p in records:
+        row = {k: p.get(k, '') for k in REAL_FIELDS}
+        for k, value in row.items():
+            if isinstance(value, str) and value.startswith(('=', '+', '-', '@', '\t', '\r')):
+                row[k] = "'"+value
+        writer.writerow(row)
     return output.getvalue().encode('utf-8-sig')
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
-def fetch_facilities(station_name, category):
-    s = BY_NAME[station_name]
-    query = (f'[out:json][timeout:15];nwr{FACILITY_FILTERS[category]}'
-             f'(around:1000,{s["lat"]},{s["lng"]});out center tags;')
-    response = requests.post('https://overpass-api.de/api/interpreter', data={'data': query},
-                             timeout=(5, 20), headers={'User-Agent': 'SumaiCompass/1.0'})
-    response.raise_for_status()
-    data = response.json()
+def fetch_facilities_at(lat, lng, category):
+    query = f'[out:json][timeout:15];nwr{FACILITY_FILTERS[category]}(around:1000,{lat},{lng});out center tags;'
+    r = requests.post('https://overpass-api.de/api/interpreter', data={'data': query}, timeout=(5, 20))
+    r.raise_for_status()
     facilities = []
-    for element in data.get('elements', []):
-        center = element.get('center', {})
-        lat, lng = element.get('lat', center.get('lat')), element.get('lon', center.get('lon'))
-        if not isinstance(lat, (int, float)) or not isinstance(lng, (int, float)):
-            continue
-        if not (-90 <= lat <= 90 and -180 <= lng <= 180):
-            continue
-        tags = element.get('tags', {})
-        facility = dict(name=tags.get('name') or tags.get('brand') or '名称未登録', lat=lat, lng=lng)
-        facility['meters'] = round(distance(s, facility)*1000)
-        facilities.append(facility)
-    return sorted(facilities, key=lambda f: f['meters'])[:60]
+    for e in r.json().get('elements', []):
+        loc = e.get('center', {})
+        x, y = e.get('lat', loc.get('lat')), e.get('lon', loc.get('lon'))
+        if isinstance(x, (int, float)) and isinstance(y, (int, float)):
+            facilities.append(dict(lat=x, lng=y, name=e.get('tags', {}).get('name', '名称未登録')))
+    return facilities[:100]
 
 
-def build_map(rows, selected, destination, facilities, focus):
-    center = [BY_NAME[selected]['lat'], BY_NAME[selected]['lng']] if selected else [35.69, 139.73]
-    m = folium.Map(location=center, zoom_start=12 if focus else 10, control_scale=True, tiles='OpenStreetMap')
-    for row in rows:
-        name = row['name']
-        color = '#173a5e' if name == selected else ('#ad5a25' if row['properties'] else '#196f9b')
-        source = '入力物件' if row['properties'] else '架空サンプル'
-        html = (f'<div style="background:white;border:2px solid {color};border-radius:9px;'
-                'padding:6px 8px;white-space:nowrap;box-shadow:0 2px 8px #0002;text-align:center;'
-                f'color:{color};font: bold 13px sans-serif">{row["low"]:g}〜{row["high"]:g}万'
-                f'<br><span style="font-size:11px;font-weight:normal">{escape(name)} · {source}</span></div>')
-        folium.Marker([row['lat'], row['lng']], tooltip=name,
-                      icon=folium.DivIcon(html=html, icon_size=(150, 48), icon_anchor=(75, 24)),
-                      popup=folium.Popup(f'{escape(name)} · {source}<br>約{row["door"]}分 / 乗り換え{row["route"]["transfers"]}回', max_width=240)).add_to(m)
-    if selected:
-        r = route(selected, destination)
-        if len(r['path']) > 1:
-            folium.PolyLine([[BY_NAME[n]['lat'], BY_NAME[n]['lng']] for n in r['path']],
-                            color='#196f9b', weight=4, dash_array='7,5', tooltip='概算経路・駅を結ぶ参考線').add_to(m)
+def make_map(origin, cells, records, facilities):
+    m = folium.Map(location=[origin['lat'], origin['lng']], zoom_start=15, tiles='OpenStreetMap', control_scale=True)
+    for c in cells:
+        estimated = c['kind'] == '近隣からの推定'
+        tip = (f'{c["price"]/10000:.1f}万円/月 · {c["kind"]}<br>'
+               f'根拠：{c["buildings"]}建物 / {c["rooms"]}募集住戸'
+               +(f'<br>最遠の参照建物：{c["farthest"]}m' if estimated else ''))
+        folium.Rectangle(c['bounds'], color=color_for(c['price']), weight=.5, fill=True,
+                         fill_color=color_for(c['price']), fill_opacity=.36 if estimated else .65,
+                         dash_array='3,3' if estimated else None, tooltip=tip).add_to(m)
+    for p in records:
+        url = p['url']
+        safe = urlparse(url).scheme in ('http', 'https') and bool(urlparse(url).netloc)
+        detail = (f'<b>{escape(p["name"])}</b><br>{escape(p["layout"])} / {p["area"]:g}㎡ / {escape(p["floor"])}<br>'
+                  f'総額 {(p["rent"]+p["fees"])/10000:g}万円（月額）<br>'
+                  f'家賃 {p["rent"]:,}円 ＋ 管理費等 {p["fees"]:,}円<br>{escape(p["address"])}<br>'
+                  +(f'<a href="{escape(url, quote=True)}" target="_blank" rel="noopener">募集ページを確認</a>' if safe else 'CSV入力'))
+        folium.CircleMarker([p['lat'], p['lng']], radius=5, color='white', weight=1,
+                            fill=True, fill_color=color_for(p['rent']+p['fees']), fill_opacity=1,
+                            tooltip=f'{escape(p["name"])} · {(p["rent"]+p["fees"])/10000:g}万',
+                            popup=folium.Popup(detail, max_width=300)).add_to(m)
+    folium.Marker([origin['lat'], origin['lng']], tooltip='表示中心：'+origin['name'], icon=folium.Icon(color='darkblue', icon='info-sign')).add_to(m)
     for f in facilities:
-        folium.CircleMarker([f['lat'], f['lng']], radius=7, color='white', weight=2,
-                            fill=True, fill_color='#ad5a25', fill_opacity=1,
-                            tooltip=f['name'], popup=escape(f['name'])).add_to(m)
-    if rows and not focus:
-        m.fit_bounds([[r['lat'], r['lng']] for r in rows], padding=(40, 40), max_zoom=12)
+        folium.CircleMarker([f['lat'], f['lng']], radius=6, fill=True, fill_color='#173a5e', fill_opacity=1,
+                            color='white', weight=1, tooltip=escape(f['name'])).add_to(m)
     return m
-
 
 def main():
     st.set_page_config(page_title='住まいコンパス', page_icon='🏠', layout='wide', initial_sidebar_state='collapsed')
     st.markdown('''<style>
-    .stApp {background:#fff;color:#173a5e;color-scheme:light}
-    h1,h2,h3,p,label {color:#173a5e}
-    .block-container {padding-top:1.2rem;padding-bottom:2rem}
-    [data-testid="stSidebar"] {background:#f1f5f9}
-    [data-testid="stMetric"] {background:#f1f5f9;border-radius:10px;padding:10px}
-    @media(max-width:760px){.block-container{padding-left:.8rem;padding-right:.8rem}h1{font-size:1.6rem}}
+    .stApp{background:white;color:#173a5e;color-scheme:light}
+    .block-container{padding-top:1rem;padding-bottom:2rem}
+    h1,h2,h3,p,label{color:#173a5e}
+    [data-testid="stMetric"]{background:#f1f5f9;padding:8px;border-radius:10px}
+    @media(max-width:760px){.block-container{padding-left:.7rem;padding-right:.7rem}h1{font-size:1.5rem}}
     </style>''', unsafe_allow_html=True)
     st.title('住まいコンパス')
-    st.caption('東京・神奈川・埼玉・千葉｜主要41駅')
+    st.caption('掲載物件の総額家賃を、街の中で比較')
     state = st.session_state
-    if 'flash' in state:
-        st.success(state.pop('flash'))
-    if 'properties' not in state:
-        state.properties = []
-    if 'selected' not in state:
-        state.selected = '武蔵小杉'
-    if 'facilities' not in state:
-        state.facilities = []
-        state.facility_key = None
-    with st.expander('検索・通勤条件', expanded=True):
-        layout = st.radio('間取り', LAYOUTS, index=1, horizontal=True, key='layout')
+    if 'records02' not in state:
+        state.records02 = list(SNAPSHOT)
+        state.info02 = dict(SNAPSHOT_INFO)
+        state.facilities02 = []
+        state.facility_origin02 = None
+    if 'flash02' in state:
+        st.success(state.pop('flash02'))
+    layout = st.radio('間取り', LAYOUTS, index=1, horizontal=True, key='layout02')
+    with st.expander('地域・色分け・物件取得の設定', expanded=False):
+        station_name = st.selectbox('地図の中心駅', list(BY_NAME), index=list(BY_NAME).index('池袋'), key='center02')
         c1, c2 = st.columns(2)
-        budget = c1.number_input('月額上限（万円・管理費・共益費込み）', 1.0, 3000.0, 30.0, 1.0, key='budget')
-        region = c2.selectbox('エリア', ['首都圏全体', '東京', '神奈川', '埼玉', '千葉'], key='region')
-        destination = st.selectbox('勤務先の最寄り駅', list(BY_NAME), key='destination')
+        cell = c1.selectbox('メッシュの大きさ', [100, 200, 300], format_func=lambda x: f'{x}m', key='cell02')
+        radius = c2.selectbox('駅からの表示範囲', [1000, 1500, 2000, 3000], index=1, format_func=lambda x: f'{x/1000:g}km', key='radius02')
         c1, c2 = st.columns(2)
-        home_walk = c1.number_input('自宅 → 駅（徒歩・分）', 0, 60, 10, key='home_walk')
-        work_walk = c2.number_input('駅 → 勤務先（徒歩・分）', 0, 60, 8, key='work_walk')
-        c1, c2 = st.columns(2)
-        max_time = c1.selectbox('通勤時間上限', ['指定なし', 30, 45, 60, 90], key='max_time')
-        max_transfers = c2.selectbox('乗り換え上限', ['指定なし', 0, 1, 2], key='max_transfers')
-        order = st.selectbox('並び順', ['家賃が低い順', '通勤が短い順', '乗り換えが少ない順'], key='order')
-        only_real = st.checkbox('入力した物件があるエリアだけ表示', key='only_real')
-    st.warning('初期家賃帯は架空のサンプルです。市場相場・募集中の物件ではありません。通勤時間と距離は概算です。')
-    rows = [calculate(s, layout, state.properties, destination, home_walk, work_walk) for s in STATIONS]
-    rows = [r for r in rows if (region == '首都圏全体' or r['region'] == region)
-            and r['low'] <= budget and (max_time == '指定なし' or r['door'] <= max_time)
-            and (max_transfers == '指定なし' or r['route']['transfers'] <= max_transfers)
-            and (not only_real or r['properties'])]
-    rows.sort(key=lambda r: (r['door'], r['low']) if order == '通勤が短い順' else
-              (r['route']['transfers'], r['door']) if order == '乗り換えが少ない順' else (r['low'], r['door']))
-    if rows:
-        names = [r['name'] for r in rows]
-        if state.selected not in names:
-            state.selected = names[0]
-        selected = st.selectbox('地図に表示する候補の詳細', names, key='selected')
-    else:
-        selected = None
-        st.info('条件に合う候補がありません。予算や通勤条件を変更してください。')
-    c1, c2 = st.columns(2)
-    category = c1.selectbox('周辺施設の種類', list(FACILITY_FILTERS), key='category')
-    focus = c2.checkbox('選択した駅に地図を合わせる', value=False, key='focus')
-    facility_key = (selected, category)
-    if state.facility_key != facility_key:
-        state.facilities = []
-        state.facility_key = facility_key
-    if st.button('選択駅から1kmの施設を取得', disabled=selected is None):
-        try:
-            with st.spinner('周辺施設を取得しています…'):
-                state.facilities = fetch_facilities(selected, category)
-            if not state.facilities:
-                st.info('この範囲の登録施設がありません。未登録の施設もあります。')
-        except (requests.RequestException, ValueError, KeyError, TypeError):
-            state.facilities = []
-            st.error('施設を取得できませんでした。再取得するか、下のGoogle マップで確認してください。')
-    m = build_map(rows, selected, destination, state.facilities, focus)
-    map_data = st_folium(m, height=480, use_container_width=True, key=f'candidate_map_{selected}_{layout}_{category}_{focus}',
-                         returned_objects=['last_object_clicked_tooltip'])
-    clicked = (map_data or {}).get('last_object_clicked_tooltip')
-    if clicked and rows and clicked in names and clicked != state.selected:
-        # Update the selector before its next creation, using a pending value.
-        state.pending_selection = clicked
-        st.rerun()
-    st.caption(f'{len(rows)}候補エリア｜青：架空サンプル / 茶：入力物件（選択駅は濃紺）｜家賃帯の下限が予算内のエリアを表示')
-    if selected:
-        row = next(r for r in rows if r['name'] == selected)
-        st.subheader(f'{selected} · {layout} · {row["low"]:g}〜{row["high"]:g}万円 / 月')
-        st.caption('入力物件の月額総額範囲' if row['properties'] else '架空サンプル・相場ではありません')
-        c1, c2 = st.columns(2)
-        c1.metric('ドアツードア（概算）', f'約{row["door"]}分')
-        c2.metric('移動距離（概算）', f'{row["distance"]:.1f}km')
-        c1, c2 = st.columns(2)
-        r = row['route']
-        c1.metric('乗り換え', f'{r["transfers"]}回')
-        c2.metric('乗車時間（概算）', f'約{math.ceil(r["time"]-r["transfers"]*5)}分')
-        groups = []
-        for a, b, line in r['legs']:
-            if groups and groups[-1][2] == line:
-                groups[-1][1] = b
+        interpolate = c1.checkbox('近隣データから未掲載メッシュも推定', value=True, key='interpolate02')
+        reach = c2.slider('推定に使う建物の範囲（m）', 200, 700, 400, 50, key='reach02')
+        budget = st.number_input('物件一覧・ピンの月額上限（万円）', 1.0, 1000.0, 50.0, 1.0, key='budget02')
+        st.caption('家賃の高低を比較できるよう、面の色分けは予算で絞る前の全取得物件を使います。推定は3建物以上ある範囲だけです。')
+        source_url = st.text_input('LIFULL HOME’Sの駅・地域の賃貸一覧URL', value=DEFAULT_URL, key='source02')
+        st.caption('初期取得先は池袋駅です。別の地域では、その地域の物件一覧URLと地図の中心駅を変更してください。')
+        limit = st.selectbox('取得上限（物件ページ数）', [60, 120, 180, 240], index=1, key='limit02')
+        st.caption('最大3一覧ページ。少数の取得では、街全体の相場を代表しない場合があります。物件ページは同時2件、1時間キャッシュします。')
+        if st.button('この間取りの物件を取得・更新', key='fetch02'):
+            if not safe_source_url(source_url):
+                st.error('https://www.homes.co.jp/chintai/ で始まる物件一覧URLを指定してください。')
             else:
-                groups.append([a, b, line])
-        st.write(f'自宅 → 徒歩{home_walk}分 → {selected}')
-        for a, b, line in groups:
-            st.write(f'{LINES[line]["name"]}：{a} → {b}')
-        st.write(f'{destination} → 徒歩{work_walk}分 → 勤務先')
-        st.caption('待ち時間3分、乗り換え1回5分を加算。駅間直線距離×1.15・時速40kmの簡易計算。時刻表・急行・直通は未対応。')
-        start, end = BY_NAME[selected], BY_NAME[destination]
-        params = urlencode({'api': 1, 'origin': f'{start["lat"]},{start["lng"]}',
-                            'destination': f'{end["lat"]},{end["lng"]}', 'travelmode': 'transit'})
-        st.link_button('実際の時刻・経路を確認', 'https://www.google.com/maps/dir/?'+params)
-        st.markdown('**利用路線の朝の混雑率**')
-        seen_lines = list(dict.fromkeys(leg[2] for leg in r['legs']))
-        if seen_lines:
-            st.dataframe([{'路線': LINES[i]['name'], '混雑率': f'{LINES[i]["rate"]}%',
-                           '公表区間': LINES[i]['section'], '調査時間帯': LINES[i]['period']} for i in seen_lines],
-                         hide_index=True, width='stretch')
-        else:
-            st.caption('この簡易経路では電車を利用しません。')
-        st.caption('2025年度実績。路線の代表的な最混雑区間の1時間平均です。選択経路・方向・時刻の混雑率ではありません。')
-        st.link_button('国土交通省の原資料', CROWD_SOURCE)
-        if state.facilities:
-            st.dataframe([{'施設': f['name'], '駅からの直線距離（m）': f['meters']} for f in state.facilities],
-                         hide_index=True, width='stretch')
-        st.link_button('周辺施設をGoogle マップで確認', 'https://www.google.com/maps/search/?'+
-                       urlencode({'api': 1, 'query': selected+' '+category}))
-        st.caption('OpenStreetMap登録施設。駅から半径1km、最大60件。未登録・閉店・位置誤差がある場合があります。')
-    with st.expander('候補エリア一覧', expanded=False):
-        st.dataframe([{'駅': r['name'], '地域': r['region'], '月額下限（万円）': r['low'],
-                       '月額上限（万円）': r['high'], '通勤概算（分）': r['door'],
-                       '乗り換え（回）': r['route']['transfers'],
-                       '家賃の出所': '入力物件' if r['properties'] else '架空サンプル'} for r in rows],
-                     hide_index=True, width='stretch')
-    with st.expander('見つけた物件の家賃・管理費を入力'):
-        with st.form('property_form', clear_on_submit=True):
-            name = st.text_input('物件名', max_chars=60)
-            station = st.selectbox('物件の最寄り駅', list(BY_NAME), index=list(BY_NAME).index(selected or '東京'))
-            p_layout = st.selectbox('物件の間取り', LAYOUTS, index=LAYOUTS.index(layout))
-            rent = st.number_input('家賃（円）', min_value=1, max_value=10_000_000, value=150000, step=1000)
-            management = st.number_input('管理費（円）', 0, 10_000_000, 0, 1000)
-            common = st.number_input('共益費（円）', 0, 10_000_000, 0, 1000)
-            st.caption('「管理費・共益費」と一括記載された同じ費用は、片方だけに入力してください。')
-            url = st.text_input('物件ページURL（任意）')
-            if st.form_submit_button('月額総額で比較に追加'):
-                if not name.strip():
-                    st.error('物件名を入力してください。')
-                elif url.strip() and not safe_url(url.strip()):
-                    st.error('URLはhttpまたはhttpsで入力してください。')
-                elif len(state.properties) >= 1000:
-                    st.error('入力物件は1,000件までです。')
-                else:
-                    state.properties.append(dict(id=str(uuid.uuid4()), name=name.strip(), station=station,
-                                                 layout=p_layout, rent=rent, management=management,
-                                                 common=common, url=url.strip()))
-                    state.flash = f'{name.strip()}を追加しました。間取り・予算によって表示対象が変わります。'
-                    st.rerun()
-    with st.expander('入力物件の確認・削除・CSV保存'):
-        st.caption('物件は現在のセッション内で保持します。再接続・再起動で失われる場合があります。CSVで保存・復元してください。')
-        if state.properties:
-            st.dataframe([{'物件名': p['name'], '駅': p['station'], '間取り': p['layout'],
-                           '家賃（円）': p['rent'], '管理費（円）': p['management'], '共益費（円）': p['common'],
-                           '月額総額（円）': p['rent']+p['management']+p['common']} for p in state.properties],
-                         hide_index=True, width='stretch')
-            for p in state.properties:
-                if p['url']:
-                    st.link_button(p['name']+'：物件ページ', p['url'])
-            delete_labels = [f'{i+1}. {p["name"]} / {p["station"]}' for i, p in enumerate(state.properties)]
-            delete_label = st.selectbox('削除する物件', delete_labels)
-            delete_id = state.properties[delete_labels.index(delete_label)]['id']
-            if st.button('選択した物件を削除'):
-                state.properties = [p for p in state.properties if p['id'] != delete_id]
-                st.rerun()
-        st.download_button('入力物件をCSVで保存', export_properties(state.properties), 'sumai_properties.csv', 'text/csv')
-        uploaded = st.file_uploader('保存したCSVを読み込む', type=['csv'])
-        st.caption('読み込みは追加ではなく、現在の入力物件をCSVの内容で置き換えます。')
-        if st.button('CSVの内容で復元する', disabled=uploaded is None):
+                progress = st.progress(0.0, text='物件一覧を取得しています…')
+                def update(n, total, ok):
+                    progress.progress(n/max(1,total), text=f'{n}/{total}ページを確認 · {ok}物件を取得')
+                try:
+                    records, info = collect(source_url, layout, limit, progress=update)
+                    if records:
+                        # Preserve other layouts from the same source; replace this layout atomically.
+                        old = [p for p in state.records02 if p['layout'] != layout] if state.info02.get('source_url') == source_url else []
+                        state.records02 = deduplicate(old+records)
+                        state.info02 = info
+                        state.flash02 = f'{len(records)}物件の掲載座標・家賃・管理費等を取得しました。'
+                        st.rerun()
+                    else:
+                        st.error('座標・間取り・費用を確認できる物件がありません。前回の取得データを保持しています。')
+                        for warning in info['warnings']:
+                            st.warning(warning)
+                except (requests.RequestException, ValueError) as error:
+                    st.error(f'取得できませんでした（{type(error).__name__}）。前回データを保持しています。CSVの読み込みも利用できます。')
+                finally:
+                    progress.empty()
+    origin = BY_NAME[station_name]
+    all_layout = [p for p in state.records02 if p['layout'] == layout]
+    nearby = [p for p in all_layout if distance(p, origin)*1000 <= radius]
+    displayed = [p for p in nearby if p['rent']+p['fees'] <= budget*10000]
+    cells = mesh(nearby, origin, cell, radius, interpolate, reach)
+    if state.facility_origin02 != station_name:
+        state.facilities02 = []
+        state.facility_origin02 = station_name
+    st_folium(make_map(origin, cells, displayed, state.facilities02), height=560, use_container_width=True,
+              key=f'mesh02_{station_name}_{layout}_{cell}_{radius}_{interpolate}_{reach}', returned_objects=[])
+    labels = ['15万円以下', '15〜20万円', '20〜22.5万円', '22.5〜25万円', '25〜27.5万円', '27.5〜30万円', '30〜35万円', '35万円超']
+    st.markdown('<div style="display:flex;flex-wrap:wrap;gap:10px;margin:6px 0">'+''.join(
+        f'<span style="font-size:13px;color:#173a5e"><i style="display:inline-block;width:13px;height:13px;background:{color};margin-right:4px"></i>{label}</span>'
+        for color, label in zip(COLORS, labels))+'</div>', unsafe_allow_html=True)
+    st.caption('家賃＋管理費等の月額総額｜濃い面：そのメッシュの掲載額集計 / 薄い破線の面：近隣建物からの推定 / 無色：データ不足｜ドットは掲載座標')
+    observed_count = sum(c['kind'] == '掲載物件の集計' for c in cells)
+    c1, c2, c3 = st.columns(3)
+    c1.metric('範囲内の募集住戸', f'{len(nearby)}件')
+    c2.metric('掲載建物の位置数', f'{len({(round(p["lat"],5),round(p["lng"],5)) for p in nearby})}箇所')
+    c3.metric('色分けメッシュ', f'{len(cells)}区画')
+    st.caption(f'直接集計 {observed_count}区画 / 近隣推定 {len(cells)-observed_count}区画。募集住戸は同じ位置・間取り・階・面積・金額の重複を除いています。')
+    info = state.info02
+    if info:
+        stamp = info.get('fetched_at', '')
+        try:
+            from zoneinfo import ZoneInfo
+            stamp = datetime.fromisoformat(stamp).astimezone(ZoneInfo('Asia/Tokyo')).strftime('%Y/%m/%d %H:%M（日本時間）')
+        except (ValueError, TypeError):
+            pass
+        st.caption(f'取得日時：{stamp}｜取得元：{info.get("source_url", "CSV")}')
+        for warning in info.get('warnings', []):
+            st.caption(warning)
+    if not nearby:
+        st.info('この地域・間取りの取得データがありません。「地域・色分け・物件取得の設定」で取得するか、座標付きCSVを読み込んでください。架空の家賃で塗り分けは行いません。')
+    elif len({(round(p['lat'],5),round(p['lng'],5)) for p in nearby}) < 3:
+        st.info('建物の位置数が少ないため、近隣メッシュの推定範囲が限られます。')
+    st.caption('掲載位置には誤差がある場合があります。建物ごとの募集総額中央値を集計・推定するため、築年数や面積の違いも色に影響します。各物件の募集ページで現在の条件を確認してください。')
+    if displayed:
+        with st.expander('地図内の物件一覧・通勤を確認', expanded=False):
+            st.dataframe([{'物件名': p['name'], '総額（万円）': (p['rent']+p['fees'])/10000,
+                           '家賃（円）': p['rent'], '管理費等（円）': p['fees'], '面積（㎡）': p['area'],
+                           '所在階': p['floor'], '住所': p['address'], '掲載更新日': p['modified'],
+                           '募集ページ': p['url']} for p in sorted(displayed, key=lambda x: x['rent']+x['fees'])],
+                         hide_index=True, width='stretch', column_config={'募集ページ': st.column_config.LinkColumn('募集ページ')})
+            options = [f'{i+1}. {p["name"]} / {(p["rent"]+p["fees"])/10000:g}万 / {p["area"]:g}㎡' for i,p in enumerate(displayed)]
+            chosen = st.selectbox('通勤を確認する物件', options, key='property02')
+            property_data = displayed[options.index(chosen)]
+            destination = st.selectbox('勤務先の最寄り駅', list(BY_NAME), key='destination02')
+            work_walk = st.number_input('駅 → 勤務先（徒歩・分）', 0, 60, 8, key='work_walk02')
+            closest = min(STATIONS, key=lambda s: distance(property_data,s))
+            walk_distance = distance(property_data,closest)*1.25
+            home_walk = math.ceil(walk_distance/.08)
+            r = route(closest['name'], destination)
+            total = math.ceil(home_walk+r['time']+work_walk+(3 if r['legs'] else 0))
+            c1,c2 = st.columns(2)
+            c1.metric('ドアツードア概算', f'約{total}分')
+            c2.metric('乗り換え（登録路線）', f'{r["transfers"]}回')
+            st.caption(f'登録41駅のうち最も近い {closest["name"]}駅へ徒歩約{home_walk}分（直線距離×1.25で推定）。実際には未登録駅を使う方が便利な場合があります。')
+            st.caption(f'総移動距離の概算：{walk_distance+r["km"]+work_walk*.08:.1f}km。時刻表・急行・直通運転・住所単位の徒歩経路は未対応。')
+            route_url = 'https://www.google.com/maps/dir/?'+urlencode({'api':1,'origin':f'{property_data["lat"]},{property_data["lng"]}',
+                          'destination':f'{BY_NAME[destination]["lat"]},{BY_NAME[destination]["lng"]}','travelmode':'transit'})
+            st.link_button('実際の通勤経路・時刻を確認', route_url)
+            used = list(dict.fromkeys(l[2] for l in r['legs']))
+            if used:
+                st.dataframe([{'利用路線':LINES[i]['name'],'混雑率':f'{LINES[i]["rate"]}%',
+                               '公表区間':LINES[i]['section'],'調査時間帯':LINES[i]['period']} for i in used],hide_index=True,width='stretch')
+            st.caption('混雑率は国交省2025年度・代表区間の朝1時間平均。選択した経路・方向・時刻の混雑ではありません。')
+            st.link_button('混雑率の原資料', CROWD_SOURCE)
+    with st.expander('スーパーなど周辺施設を表示'):
+        category = st.selectbox('施設の種類', list(FACILITY_FILTERS), key='facility02')
+        if st.button('中心駅から1kmの施設を取得',key='facility_fetch02'):
             try:
-                imported = parse_properties(uploaded.getvalue())
-                state.properties = imported
-                state.flash = f'{len(imported)}件の物件を復元しました。'
+                state.facilities02 = fetch_facilities_at(origin['lat'],origin['lng'],category)
+                state.flash02 = f'{len(state.facilities02)}施設を取得しました。'
                 st.rerun()
-            except (ValueError, UnicodeError, csv.Error) as error:
+            except (requests.RequestException,ValueError,TypeError):
+                st.error('施設を取得できませんでした。Google マップで確認してください。')
+        st.link_button('Google マップで周辺施設を確認','https://www.google.com/maps/search/?'+urlencode({'api':1,'query':station_name+' '+category}))
+        st.caption('OpenStreetMap登録施設を使用。登録漏れ・閉店・位置誤差がある場合があります。')
+    with st.expander('物件データをCSVで保存・読み込み'):
+        st.caption('取得データはこのセッションで保持します。保存しておく場合はCSVをダウンロードしてください。v01の駅単位CSVには物件位置がないため使用できません。')
+        st.download_button('取得した物件データを保存',export_records(state.records02),'sumai_geo_properties.csv','text/csv')
+        upload = st.file_uploader('座標付き物件CSV',type=['csv'])
+        if st.button('CSVで現在の物件データを置き換え',disabled=upload is None):
+            try:
+                imported = validate_records(upload.getvalue())
+                state.records02 = imported
+                state.info02 = dict(source_url='CSV',fetched_at=datetime.now(timezone.utc).isoformat(timespec='seconds'),warnings=[])
+                state.flash02 = f'{len(imported)}物件を読み込みました。'
+                st.rerun()
+            except (ValueError,UnicodeError,csv.Error) as error:
                 st.error(str(error))
-    with st.expander('データと計算方法'):
-        st.write('家賃：初期値は架空のサンプルです。入力物件がある駅では、その間取りの入力総額範囲を表示します。家賃帯の下限が予算内なら候補に含みます。')
-        st.write('通勤：登録した41駅・11路線で最短時間を探索。距離は駅間直線距離×1.15＋徒歩80m/分です。住所単位の正確なドアツードア検索、最新物件の自動取得には未対応です。')
-        st.write('混雑率：国土交通省2025年度実績（2026年7月28日公表）。リアルタイム情報ではありません。')
-        st.write('地図・施設：OpenStreetMap / Overpass API。外部サービスへの接続が必要です。施設は30分キャッシュします。')
+    with st.expander('集計・推定・データ取得の方法'):
+        st.write('家賃は実際の募集額＋管理費等。敷金・礼金・駐車場・その他の月額サービス料は含みません。管理費等が確認できない物件、掲載座標がない物件は除外します。')
+        st.write('直接集計：各建物位置の募集住戸総額の中央値を求め、そのメッシュ内の建物中央値をさらに集計します。掲載位置が同一の建物は同じ位置群として扱います。')
+        st.write('近隣推定：メッシュ中心から指定距離内に3建物位置以上ある場合だけ、距離の逆二乗で加重平均します。これは近隣の募集額を使った推定であり、その場所に実在する募集中の物件価格ではありません。駅の一つの家賃を全域に広げる計算ではありません。')
+        st.write('募集状況は取得日時の公開ページ情報。取得一覧の順番・件数上限で偏りがあり、地域全体の相場推計ではありません。自動取得は公開ページの構造・接続状況で停止することがあります。認証やアクセス制限の回避は行いません。')
+        st.write('背景地図：© OpenStreetMap contributors。初期データは池袋駅の2LDKの取得結果。間取りや地域を変更した場合は、新しいデータの取得が必要です。')
 
 
 if __name__ == '__main__':
-    # Apply map selections before creating the widget, avoiding Streamlit widget-state errors.
-    if 'pending_selection' in st.session_state:
-        st.session_state.selected = st.session_state.pop('pending_selection')
     main()
