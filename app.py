@@ -1,4 +1,4 @@
-"""住まいコンパス — Streamlit版 v11（安定化並列 / 即時保存 / 位置精度強化 / SRC・築20年以内 / HOME'S・SUUMO）
+"""住まいコンパス — Streamlit版 v13（軽量起動 / 手動検索再開 / 即時保存 / SRC・築20年以内 / HOME'S・SUUMO）
 実行: streamlit run app.py
 依存: streamlit>=1.50,<2 / folium>=0.18,<1 / streamlit-folium>=0.24,<1 / requests>=2.32,<3
 実物件の家賃メッシュ表示。通勤は概算。公開情報取得はサイトの仕様・接続状況に依存。
@@ -2429,7 +2429,7 @@ _SUUMO_HTTP = threading.local()
 
 # Network work is I/O-bound, but nested parallelism must not starve Streamlit's
 # websocket/custom-component traffic. Crawling starts only after an explicit user action.
-BACKGROUND_ENGINE_VERSION = 'v12-ui-safe-startup'
+BACKGROUND_ENGINE_VERSION = 'v13-manual-light-startup'
 REGION_LOOKUP_WORKERS = 8
 REGION_TASK_WORKERS = 4
 HOMES_BUILDING_WORKERS = 5
@@ -2542,15 +2542,16 @@ def region_matches_address(address, region):
     return bool(target and target in address_n)
 
 
-def visible_regions(bounds):
+def visible_regions(bounds, should_stop=None):
     bounds = normalize_bounds(bounds)
     if not bounds:
         raise ValueError('地図の表示範囲を確認できません。')
+    if should_stop and should_stop():
+        return []
     south, west, north, east = bounds
     mid_lat = (south+north)/2
     height_m = max(1.0, (north-south)*111320)
     width_m = max(1.0, (east-west)*111320*math.cos(math.radians(mid_lat)))
-    # Wide views deliberately take longer: keep sampling near 250 m and allow up to 40 x 40 points.
     rows = min(40, max(3, math.ceil(height_m/250)))
     cols = min(40, max(3, math.ceil(width_m/250)))
     points = []
@@ -2562,8 +2563,22 @@ def visible_regions(bounds):
             lng = west + (east-west)*fx
             points.append((lat, lng))
     regions, seen = [], set()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(REGION_LOOKUP_WORKERS, len(points))) as pool:
-        for region in pool.map(lambda xy: gsi_reverse_region(xy[0], xy[1]), points):
+    def lookup(xy):
+        if should_stop and should_stop():
+            return None
+        return gsi_reverse_region(xy[0], xy[1])
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=min(REGION_LOOKUP_WORKERS, len(points)))
+    jobs = [pool.submit(lookup, xy) for xy in points]
+    try:
+        for job in concurrent.futures.as_completed(jobs):
+            if should_stop and should_stop():
+                for pending in jobs:
+                    pending.cancel()
+                break
+            try:
+                region = job.result()
+            except Exception:
+                region = None
             if not region:
                 continue
             key = (region['muni_code'], _normalize_place_text(region['town']))
@@ -2572,13 +2587,15 @@ def visible_regions(bounds):
             seen.add(key)
             regions.append(region)
             if len(regions) >= 250:
+                for pending in jobs:
+                    pending.cancel()
                 break
-    if not regions:
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+    if not regions and not (should_stop and should_stop()):
         raise ValueError('表示範囲の地域名を取得できませんでした。地図を少し動かして再試行してください。')
     return regions
 
-
-@functools.lru_cache(maxsize=8192)
 def gsi_geocode_address(address):
     address = str(address).strip()
     if not address:
@@ -2889,27 +2906,31 @@ def verify_homes_detail(url, bounds, region, layout, extra_hints=None):
     return p
 
 
-def collect_homes_region(bounds, layout, region, limit=40, on_record=None):
+def collect_homes_region(bounds, layout, region, limit=40, on_record=None, should_stop=None):
+    if should_stop and should_stop():
+        return [], ['検索を停止しました。']
     if not map_robots_allowed():
         raise ValueError('LIFULL HOME’Sは現在、自動取得を許可していません。')
     warnings, candidates, used_term = [], {}, ''
     for term in region_search_terms(region):
+        if should_stop and should_stop():
+            return [], warnings + ['検索を停止しました。']
         candidates, local = homes_candidates(bounds, layout, term)
         warnings.extend(local)
         if candidates:
             used_term = term
             break
-    if not candidates:
+    if not candidates and not (should_stop and should_stop()):
         candidates, more = homes_candidates(bounds, layout, '')
         warnings.extend(more)
     keys = sorted(candidates, key=lambda k: distance(
         {'lat':float(candidates[k]['lat']),'lng':float(candidates[k]['lon'])}, region))
     keys = keys[:max(1, limit*5)]
 
-    # Ask HOME'S for each building key separately. This is slower, but preserves the
-    # building coordinate as an explicit hint for every room URL instead of losing it in an 8-building batch.
     link_hints = {}
     def fetch_building_links(key):
+        if should_stop and should_stop():
+            return key, candidates[key], [], None
         row = candidates[key]
         data = map_condition(layout, used_term)
         data['cond[tykey]'] = key
@@ -2918,10 +2939,15 @@ def collect_homes_region(bounds, layout, region, limit=40, on_record=None):
             return key, row, urls, None
         except (requests.RequestException, ValueError) as error:
             return key, row, [], error
-    if keys:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(HOMES_BUILDING_WORKERS, len(keys))) as pool:
-            jobs = [pool.submit(fetch_building_links, key) for key in keys]
+    if keys and not (should_stop and should_stop()):
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=min(HOMES_BUILDING_WORKERS, len(keys)))
+        jobs = [pool.submit(fetch_building_links, key) for key in keys]
+        try:
             for job in concurrent.futures.as_completed(jobs):
+                if should_stop and should_stop():
+                    for pending in jobs:
+                        pending.cancel()
+                    break
                 key, row, urls, error = job.result()
                 if error is not None:
                     warnings.append(f'HOME’Sの建物候補 {key} を確認できませんでした（{type(error).__name__}）。')
@@ -2929,29 +2955,44 @@ def collect_homes_region(bounds, layout, region, limit=40, on_record=None):
                 hint = {'lat':float(row['lat']), 'lng':float(row['lon']), 'source':"HOME'S検索地図・建物座標", 'priority':99}
                 for url in urls:
                     link_hints.setdefault(url, []).append(hint)
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
     links = list(link_hints)[:max(1,limit*8)]
     records, failed = [], 0
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(HOMES_DETAIL_WORKERS, max(1, len(links)))) as pool:
-        jobs = [pool.submit(verify_homes_detail,u,bounds,region,layout,link_hints.get(u)) for u in links]
-        for job in concurrent.futures.as_completed(jobs):
-            try:
-                p = job.result()
-                if p:
-                    records.append(p)
-                    if on_record:
-                        on_record(p)
-                    if len(records) >= limit:
-                        for pending in jobs:
-                            pending.cancel()
-                        break
-                else:
+    def verify_one(url):
+        if should_stop and should_stop():
+            return None
+        return verify_homes_detail(url,bounds,region,layout,link_hints.get(url))
+    if links and not (should_stop and should_stop()):
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=min(HOMES_DETAIL_WORKERS, len(links)))
+        jobs = [pool.submit(verify_one,u) for u in links]
+        try:
+            for job in concurrent.futures.as_completed(jobs):
+                if should_stop and should_stop():
+                    for pending in jobs:
+                        pending.cancel()
+                    break
+                try:
+                    p = job.result()
+                    if p:
+                        records.append(p)
+                        if on_record:
+                            on_record(p)
+                        if len(records) >= limit:
+                            for pending in jobs:
+                                pending.cancel()
+                            break
+                    else:
+                        failed += 1
+                except (requests.RequestException, ValueError, KeyError, TypeError, AttributeError):
                     failed += 1
-            except (requests.RequestException, ValueError, KeyError, TypeError, AttributeError):
-                failed += 1
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
     if failed:
         warnings.append(f'HOME’S「{region["town"]}」{layout}で{failed}件をSRC・築20年以内・地図位置の照合後に除外しました。')
+    if should_stop and should_stop():
+        warnings.append('検索を停止しました。')
     return deduplicate(records), warnings
-
 
 def safe_suumo_url(url):
     try:
@@ -3104,7 +3145,9 @@ def verify_suumo_detail(p, bounds, region):
     return p if target_property(p) and inside(p,bounds) else None
 
 
-def collect_suumo_region(bounds, layout, region, limit=40, on_record=None):
+def collect_suumo_region(bounds, layout, region, limit=40, on_record=None, should_stop=None):
+    if should_stop and should_stop():
+        return [], ['検索を停止しました。']
     if not suumo_robots_allowed():
         raise ValueError('SUUMOは現在、自動取得を許可していません。')
     warnings, candidates = [], []
@@ -3115,9 +3158,13 @@ def collect_suumo_region(bounds, layout, region, limit=40, on_record=None):
     seen_urls=set()
     candidate_budget=max(limit*5,100)
     for term in search_terms:
+        if should_stop and should_stop():
+            return [], warnings + ['検索を停止しました。']
         empty_streak=0
         max_pages=min(20,max(2,math.ceil(candidate_budget/50)+2))
         for page in range(1,max_pages+1):
+            if should_stop and should_stop():
+                return [], warnings + ['検索を停止しました。']
             try:
                 rows=parse_suumo_list(suumo_fetch_html(suumo_search_url(region,layout,page,term)),
                                       layout,region,candidate_budget)
@@ -3138,35 +3185,49 @@ def collect_suumo_region(bounds, layout, region, limit=40, on_record=None):
         if candidates:
             break
     records=[]; rejected=0
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(SUUMO_DETAIL_WORKERS, max(1, len(candidates)))) as pool:
-        jobs=[pool.submit(verify_suumo_detail,p,bounds,region) for p in candidates]
-        for job in concurrent.futures.as_completed(jobs):
-            try:
-                p=job.result()
-                if p:
-                    records.append(p)
-                    if on_record:
-                        on_record(p)
-                    if len(records)>=limit:
-                        for pending in jobs: pending.cancel()
-                        break
-                else:
+    def verify_one(p):
+        if should_stop and should_stop():
+            return None
+        return verify_suumo_detail(p,bounds,region)
+    if candidates and not (should_stop and should_stop()):
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=min(SUUMO_DETAIL_WORKERS, len(candidates)))
+        jobs=[pool.submit(verify_one,p) for p in candidates]
+        try:
+            for job in concurrent.futures.as_completed(jobs):
+                if should_stop and should_stop():
+                    for pending in jobs:
+                        pending.cancel()
+                    break
+                try:
+                    p=job.result()
+                    if p:
+                        records.append(p)
+                        if on_record:
+                            on_record(p)
+                        if len(records)>=limit:
+                            for pending in jobs: pending.cancel()
+                            break
+                    else:
+                        rejected += 1
+                except (requests.RequestException,ValueError,TypeError,AttributeError,KeyError):
                     rejected += 1
-            except (requests.RequestException,ValueError,TypeError,AttributeError,KeyError):
-                rejected += 1
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
     if rejected:
         warnings.append(f'SUUMO「{region["town"]}」{layout}で{rejected}件をSRC・築20年以内・地図位置の多段確認後に除外しました。')
+    if should_stop and should_stop():
+        warnings.append('検索を停止しました。')
     return deduplicate(records),warnings
 
-
-
-def collect_visible_regions(bounds, limit=40, progress=None, save_chunk=None, completed=None, status_hook=None):
+def collect_visible_regions(bounds, limit=40, progress=None, save_chunk=None, completed=None, status_hook=None, should_stop=None):
     bounds = normalize_bounds(bounds)
     if not bounds:
         raise ValueError('地図の表示範囲を確認できません。')
     if not (34.8 <= bounds[0] < bounds[2] <= 36.5 and 138.5 <= bounds[1] < bounds[3] <= 140.9):
         raise ValueError('首都圏の範囲で取得してください。')
-    regions = visible_regions(bounds)
+    if should_stop and should_stop():
+        return [], {'layout':'ALL','bounds':bounds,'regions':[],'received':0,'warnings':['検索を停止しました。']}, set(completed or [])
+    regions = visible_regions(bounds, should_stop=should_stop)
     completed = set(completed or [])
     total_steps = len(regions)*len(SEARCHABLE_LAYOUTS)*2
     warnings=[]; all_records=[]
@@ -3189,7 +3250,11 @@ def collect_visible_regions(bounds, limit=40, progress=None, save_chunk=None, co
 
     def run_task(spec):
         region,raw_layout,source_name,collector,task_key=spec
+        if should_stop and should_stop():
+            return spec,[],['検索を停止しました。'],False
         def persist_one(record):
+            if should_stop and should_stop():
+                return
             if not save_chunk:
                 return
             chunk_info=dict(layout='ALL',layouts=list(TARGET_LAYOUTS),bounds=bounds,region=region['label'],
@@ -3201,38 +3266,49 @@ def collect_visible_regions(bounds, limit=40, progress=None, save_chunk=None, co
             save_chunk([record],chunk_info)
         local_warnings=[]
         try:
-            records,local_warnings=collector(bounds,raw_layout,region,limit,on_record=persist_one)
+            records,local_warnings=collector(bounds,raw_layout,region,limit,on_record=persist_one,should_stop=should_stop)
             records=[p for p in records if target_property(p)]
         except (requests.RequestException,ValueError,KeyError,TypeError) as error:
             records=[]; local_warnings=[str(error)]
-        return spec,records,local_warnings
+        finished = not (should_stop and should_stop())
+        return spec,records,local_warnings,finished
 
-    if task_specs:
+    if task_specs and not (should_stop and should_stop()):
         workers=min(REGION_TASK_WORKERS,len(task_specs))
-        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-            jobs=[pool.submit(run_task,spec) for spec in task_specs]
+        pool=concurrent.futures.ThreadPoolExecutor(max_workers=workers)
+        jobs=[pool.submit(run_task,spec) for spec in task_specs]
+        try:
             for job in concurrent.futures.as_completed(jobs):
-                spec,records,local_warnings=job.result()
+                if should_stop and should_stop():
+                    for pending in jobs:
+                        pending.cancel()
+                    break
+                spec,records,local_warnings,finished=job.result()
                 region,raw_layout,source_name,collector,task_key=spec
                 with result_lock:
                     warnings.extend(local_warnings)
                     if records:
                         all_records.extend(records)
-                    completed.add(task_key)
-                    finished_count += 1
+                    if finished:
+                        completed.add(task_key)
+                        finished_count += 1
                     current_finished=finished_count
                     current_accepted=len(all_records)
                     current_warnings=list(warnings)
                 if progress:
                     progress(current_finished,total_steps,
                              f'処理タスク {current_finished}/{total_steps}｜{region["label"]}｜{raw_layout}｜{source_name} 完了')
-                if status_hook:
+                if status_hook and finished:
                     status_hook(current_finished,total_steps,completed,region,raw_layout,source_name,
                                 current_accepted,current_warnings)
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
     combined=deduplicate(all_records)
     final_raw_counts={layout:sum(p['layout']==layout for p in combined) for layout in TARGET_LAYOUTS}
     group_counts={group:sum(layout_matches_group(p['layout'],group) for p in combined) for group in LAYOUTS}
     final_source_counts={name:sum(p.get('source')==name for p in combined) for name in ("LIFULL HOME'S",'SUUMO')}
+    if should_stop and should_stop():
+        warnings.append('画面終了または新しいセッション開始を検知したため検索を停止しました。')
     info=dict(layout='ALL',layouts=list(TARGET_LAYOUTS),layout_groups={k:list(v) for k,v in LAYOUT_GROUPS.items()},
               bounds=bounds,regions=[r['label'] for r in regions],per_region_layout_source_limit=limit,
               received=len(combined),source_counts=final_source_counts,raw_layout_counts=final_raw_counts,
@@ -3242,11 +3318,38 @@ def collect_visible_regions(bounds, limit=40, progress=None, save_chunk=None, co
               source_url="LIFULL HOME'S + SUUMO",fetched_at=datetime.now(timezone.utc).isoformat(timespec='seconds'))
     return combined,info,completed
 
-
 _BACKGROUND_LOCK=threading.Lock()
 _BACKGROUND_JOBS={}
 _BACKGROUND_THREADS={}
 _BACKGROUND_SAVED_IDS={}
+_BACKGROUND_CANCEL_EVENTS={}
+_BACKGROUND_HEARTBEATS={}
+BACKGROUND_HEARTBEAT_TIMEOUT = 30.0
+
+
+def _heartbeat_background_job(job_id):
+    with _BACKGROUND_LOCK:
+        _BACKGROUND_HEARTBEATS[job_id] = time.monotonic()
+
+
+def _background_should_stop(job_id):
+    with _BACKGROUND_LOCK:
+        event = _BACKGROUND_CANCEL_EVENTS.get(job_id)
+        last = _BACKGROUND_HEARTBEATS.get(job_id)
+    if event is not None and event.is_set():
+        return True
+    if last is not None and time.monotonic() - last > BACKGROUND_HEARTBEAT_TIMEOUT:
+        return True
+    return False
+
+
+def cancel_all_background_jobs():
+    """Stop crawlers left alive by an earlier browser session."""
+    with _BACKGROUND_LOCK:
+        events = list(_BACKGROUND_CANCEL_EVENTS.values())
+    for event in events:
+        event.set()
+
 
 
 def background_job_id(bounds, limit):
@@ -3299,24 +3402,32 @@ def _persist_job(job_id, job, settings):
     save_metadata('background_latest',payload,settings)
 
 
-def background_worker(job_id,bounds,limit,settings,resume_completed=None):
+def background_worker(job_id,bounds,limit,settings,resume_payload=None):
+    resume_payload = dict(resume_payload or {})
+    resume_completed = set(resume_payload.get('completed') or [])
     started=datetime.now(timezone.utc).isoformat(timespec='seconds')
-    resume_payload = persisted_job(job_id, settings) if resume_completed else {}
+    _heartbeat_background_job(job_id)
     job=_job_update(job_id,state='running',engine_version=BACKGROUND_ENGINE_VERSION,
                     bounds=list(bounds),limit=int(limit),step=0,total=1,
                     message='表示地域を確認しています…',accepted=int(resume_payload.get('accepted',0) or 0),
                     save_attempted=int(resume_payload.get('save_attempted',0) or 0),
                     save_errors=0,last_save_error='',started_at=started,
-                    updated_at=started,error='',completed=set(resume_completed or []))
+                    updated_at=started,error='',completed=set(resume_completed))
     try:
         _persist_job(job_id,job,settings)
     except StorageError:
         pass
     last_persist=[0]
+    def should_stop():
+        return _background_should_stop(job_id)
     def progress(step,total,message):
+        if should_stop():
+            return
         _job_update(job_id,step=step,total=max(1,total),message=message,
                     updated_at=datetime.now(timezone.utc).isoformat(timespec='seconds'))
     def save_chunk(records,info):
+        if should_stop():
+            return
         _job_increment(job_id,'save_attempted',len(records))
         try:
             confirmed_ids=save_incremental_records(records,settings=settings)
@@ -3331,7 +3442,8 @@ def background_worker(job_id,bounds,limit,settings,resume_completed=None):
                 try:_persist_job(job_id,job_snapshot,settings)
                 except StorageError:pass
     def status_hook(step,total,completed,region,raw_layout,source_name,accepted,warnings):
-        # accepted is a task-local aggregate; keep the independently incremented persisted count intact.
+        if should_stop():
+            return
         job=_job_update(job_id,step=step,total=total,completed=set(completed),
                         message=f'{region["label"]}｜{raw_layout}｜{source_name} 完了',
                         updated_at=datetime.now(timezone.utc).isoformat(timespec='seconds'))
@@ -3340,10 +3452,17 @@ def background_worker(job_id,bounds,limit,settings,resume_completed=None):
             except StorageError:pass
             last_persist[0]=step
     try:
-        records,info,completed=collect_visible_regions(bounds,limit,progress=progress,save_chunk=save_chunk,
-                                                       completed=resume_completed,status_hook=status_hook)
-        # A resumed job may skip tasks already saved in an earlier process. Build the final summary
-        # from the persistent store so the completed cache always describes the whole viewport.
+        records,info,completed=collect_visible_regions(
+            bounds,limit,progress=progress,save_chunk=save_chunk,
+            completed=resume_completed,status_hook=status_hook,should_stop=should_stop)
+        if should_stop():
+            finished=datetime.now(timezone.utc).isoformat(timespec='seconds')
+            job=_job_update(job_id,state='paused',completed=set(completed),
+                            message='画面終了または新しいセッション開始を検知したため検索を停止しました。',
+                            finished_at=finished,updated_at=finished)
+            try:_persist_job(job_id,job,settings)
+            except StorageError:pass
+            return
         stored,_=load_store(settings=settings)
         visible=deduplicate([p for p in stored if target_property(p) and inside(p,bounds)])
         info['received']=len(visible)
@@ -3379,19 +3498,22 @@ def start_background_job(bounds,limit,settings,resume_payload=None):
     with _BACKGROUND_LOCK:
         thread=_BACKGROUND_THREADS.get(job_id)
         if thread and thread.is_alive():
+            _BACKGROUND_HEARTBEATS[job_id]=time.monotonic()
             return job_id
-        # Keep only one crawler active per Streamlit server process to avoid duplicate load.
         for active_id, active_thread in _BACKGROUND_THREADS.items():
             if active_thread.is_alive():
-                return active_id
-    completed=set((resume_payload or {}).get('completed') or [])
-    thread=threading.Thread(target=background_worker,args=(job_id,bounds,limit,settings,completed),
+                event=_BACKGROUND_CANCEL_EVENTS.get(active_id)
+                if event is not None:
+                    event.set()
+        cancel_event=threading.Event()
+        _BACKGROUND_CANCEL_EVENTS[job_id]=cancel_event
+        _BACKGROUND_HEARTBEATS[job_id]=time.monotonic()
+    thread=threading.Thread(target=background_worker,args=(job_id,bounds,limit,settings,resume_payload or {}),
                             name='sumai-'+job_id,daemon=True)
     with _BACKGROUND_LOCK:
         _BACKGROUND_THREADS[job_id]=thread
     thread.start()
     return job_id
-
 
 def background_thread_alive(job_id):
     with _BACKGROUND_LOCK:
@@ -3421,10 +3543,14 @@ def main():
     st.title('住まいコンパス')
     st.caption('掲載物件の総額家賃を、街の中で比較')
     state = st.session_state
+    if 'startup_light_init02' not in state:
+        # A new browser session never inherits or resumes a crawler from an older session.
+        # Cancel any still-running in-process workers before loading the map.
+        cancel_all_background_jobs()
+        state.startup_light_init02 = True
+        state.background_job_id = None
     if 'records02' not in state:
-        # Keep the first render intentionally light. Loading every saved Supabase row before
-        # streamlit-folium initializes can delay the page long enough for the component asset
-        # request to time out. Saved data is loaded immediately after the map has returned bounds.
+        # Zero network access on startup: no Supabase load, no saved-job lookup, no crawler resume.
         state.records02 = []
         state.info02 = {}
         state.store_loaded02 = False
@@ -3477,26 +3603,33 @@ def main():
                 zoom = data.get('zoom')
                 if isinstance(zoom, (int, float)) and 1 <= zoom <= 20:
                     state.zoom03 = int(zoom)
-    st_folium(make_map(view, cells, displayed, state.facilities02), height=560, use_container_width=True,
-              key=f'map03_{station_name}', returned_objects=['bounds', 'zoom'],
-              center=tuple(state.view_center03), zoom=state.zoom03, on_change=remember_view)
-    # Load persistent property data only after the map component has successfully initialized.
-    # This moves the largest Supabase read away from the critical first-paint path.
-    if state.get('bounds03') is not None and not state.get('store_loaded02', False):
-        try:
-            with st.spinner('保存済み物件データを読み込んでいます…'):
-                records, info = load_store()
-                if not records:
-                    records = save_store(list(SNAPSHOT), dict(SNAPSHOT_INFO))
-                    _, info = load_store()
-            state.records02, state.info02 = records, info
-            state.store_loaded02 = True
-            state.store_load_error02 = ''
+    if 'map_enabled02' not in state:
+        state.map_enabled02 = False
+    if not state.map_enabled02:
+        st.info('起動を軽くするため、地図コンポーネントは自動起動しません。下のボタンを押したときだけ読み込みます。')
+        if st.button('地図を表示', type='primary', key='enable_map02'):
+            state.map_enabled02 = True
             st.rerun()
-        except StorageError as error:
-            state.store_load_error02 = str(error)
-            st.error(str(error))
-            show_storage_setup()
+    else:
+        st_folium(make_map(view, cells, displayed, state.facilities02), height=560, use_container_width=True,
+                  key=f'map03_{station_name}', returned_objects=['bounds', 'zoom'],
+                  center=tuple(state.view_center03), zoom=state.zoom03, on_change=remember_view)
+    # Startup stays completely local. Persistent data is loaded only on explicit user action.
+    if not state.get('store_loaded02', False):
+        st.caption('起動を軽くするため、保存済み物件は自動読み込みしません。必要なときだけ下のボタンで読み込みます。')
+        if st.button('保存済み物件をSupabaseから読み込む', key='load_saved_properties02'):
+            try:
+                with st.spinner('保存済み物件データを読み込んでいます…'):
+                    records, info = load_store()
+                state.records02, state.info02 = records, info
+                state.store_loaded02 = True
+                state.store_load_error02 = ''
+                state.flash02 = f'Supabaseから{len(records)}物件を読み込みました。'
+                st.rerun()
+            except StorageError as error:
+                state.store_load_error02 = str(error)
+                st.error(str(error))
+                show_storage_setup()
     st.caption('取得ボタンを押すと、表示中の地域・丁目を細かく判定し、SRC・築20年以内をHOME’S・SUUMOでバックグラウンド検索します。各物件は掲載地図・埋込座標・検索地図座標を順に照合し、住所が不完全でも地図位置を逆ジオコーディングして、確認できた物件から1件ずつSupabaseへ即時保存します。地域・間取り・取得元も複数タスクを並列処理します。')
     refresh = st.checkbox('保存済み範囲も再取得する', value=True, key='refresh03')
     if st.button('表示範囲をバックグラウンド取得・保存', type='primary', disabled=bounds is None, key='fetch03'):
@@ -3526,43 +3659,32 @@ def main():
     @st.fragment(run_every=10)
     def background_status_panel():
         jid=state.get('background_job_id')
-        job={}
-        if jid:
-            job=get_job(jid) or persisted_job(jid)
-        else:
-            # Read the last persisted job only once per browser session. Never auto-resume it:
-            # starting crawlers while streamlit-folium is still loading can starve the component.
-            latest=state.get('latest_background_snapshot')
-            if latest is None:
-                latest=latest_persisted_job()
-                state.latest_background_snapshot=latest
-            if (latest.get('job_id') and latest.get('state')=='running'
-                    and latest.get('engine_version')==BACKGROUND_ENGINE_VERSION):
-                st.warning('前回のバックグラウンド検索はサーバー再起動などで中断されています。地図を先に読み込むため自動再開はしません。')
-                if st.button('前回の検索を再開', key='resume_previous_bg'):
-                    try:
-                        settings=supabase_settings()
-                        jid=start_background_job(latest.get('bounds'),int(latest.get('limit',limit)),settings,latest)
-                        state.background_job_id=jid
-                        state['job_applied_'+jid]=False
-                        state.pop('latest_background_snapshot',None)
-                        st.rerun()
-                    except (StorageError,ValueError,TypeError) as error:
-                        st.error(str(error))
+        if not jid:
             return
+        _heartbeat_background_job(jid)
+        job=get_job(jid)
+        if not job:
+            # Only an explicitly started job may trigger a persisted-job lookup.
+            job=persisted_job(jid)
         if not job:
             return
         status=job.get('state','')
-        # A persisted "running" job without a live thread is paused, not actually running.
         if status=='running' and not background_thread_alive(jid):
-            if job.get('engine_version') != BACKGROUND_ENGINE_VERSION:
-                st.info('旧バージョンの検索履歴があります。現在版では自動再開しません。')
-                return
-            st.warning('バックグラウンド検索は現在停止しています。保存済み物件はSupabaseに残っています。')
-            if st.button('この検索を再開', key='resume_current_bg'):
+            st.warning('検索処理は停止しています。保存済み物件はSupabaseに残っています。自動再開はしません。')
+            if st.button('この検索を手動で再開', key='resume_current_bg'):
                 try:
                     settings=supabase_settings()
-                    start_background_job(job.get('bounds'),int(job.get('limit',limit)),settings,job)
+                    state.background_job_id=start_background_job(job.get('bounds'),int(job.get('limit',limit)),settings,job)
+                    st.rerun()
+                except (StorageError,ValueError,TypeError) as error:
+                    st.error(str(error))
+            return
+        if status=='paused':
+            st.warning(job.get('message','検索は停止しています。'))
+            if st.button('停止した検索を手動で再開', key='resume_paused_bg'):
+                try:
+                    settings=supabase_settings()
+                    state.background_job_id=start_background_job(job.get('bounds'),int(job.get('limit',limit)),settings,job)
                     st.rerun()
                 except (StorageError,ValueError,TypeError) as error:
                     st.error(str(error))
@@ -3573,26 +3695,31 @@ def main():
             attempted=int(job.get("save_attempted",0) or 0)
             saved=int(job.get("accepted",0) or 0)
             save_errors=int(job.get("save_errors",0) or 0)
-            st.caption(f'バックグラウンドで継続中｜保存試行 {attempted}件｜Supabase保存確認済み {saved}件｜保存エラー {save_errors}件。上の {step}/{total} は地域×間取り×取得元の処理タスク数です。')
-            st.caption('検索中は地図コンポーネントを自動再読込しません。途中結果を確認するときだけ下のボタンを押してください。')
+            st.caption(f'バックグラウンドで継続中｜保存試行 {attempted}件｜Supabase保存確認済み {saved}件｜保存エラー {save_errors}件。')
+            st.caption('この画面から離れると約30秒で検索を停止します。次回起動時には自動再開しません。')
+            c1,c2=st.columns(2)
+            if c1.button('検索を停止',key='stop_bg'):
+                with _BACKGROUND_LOCK:
+                    event=_BACKGROUND_CANCEL_EVENTS.get(jid)
+                if event is not None:
+                    event.set()
+                st.rerun()
+            if c2.button('保存済みの途中物件を地図へ読み込む',key='reload_partial_bg'):
+                records,info=load_store(); state.records02,state.info02=records,info; state.store_loaded02=True; st.rerun()
             if attempted == 0:
-                st.info('現時点では、SRC・築20年以内・間取り条件・地図位置確認をすべて通過した物件がまだありません。')
+                st.info('現時点では、保存条件をすべて通過した物件がまだありません。')
             elif saved == 0:
-                st.error('保存対象は見つかっていますが、Supabaseで保存確認できた物件が0件です。保存エラー表示を確認してください。')
+                st.error('保存対象は見つかっていますが、Supabaseで保存確認できた物件が0件です。')
             if save_errors:
                 st.error('直近のSupabase保存エラー：'+str(job.get('last_save_error','不明')))
-            if st.button('保存済みの途中物件を地図へ再読み込み',key='reload_partial_bg'):
-                records,info=load_store(); state.records02,state.info02=records,info; state.store_loaded02=True; st.rerun()
         elif status=='completed':
             st.success(job.get('message','バックグラウンド取得が完了しました。'))
-            applied='job_applied_'+jid
-            if not state.get(applied):
+            if st.button('完了した保存データを地図へ読み込む',key='load_completed_bg'):
                 try:
                     records,info=load_store(); state.records02,state.info02=records,job.get('info') or info; state.store_loaded02=True
-                    state[applied]=True
                     st.rerun()
-                except StorageError:
-                    pass
+                except StorageError as error:
+                    st.error(str(error))
         elif status=='failed':
             st.error(f'バックグラウンド取得停止：{job.get("error","")}')
     background_status_panel()
@@ -3600,7 +3727,10 @@ def main():
         st.caption('非常に広い表示ではメッシュ描画だけを省略します。検索自体はバックグラウンドで継続できます。')
     if bounds is None:
         st.caption('地図を初期化中です。初回表示では負荷の高い家賃メッシュ計算とバックグラウンド検索を開始しません。地図が表示された後に少し動かすと取得ボタンが有効になります。')
-    st.caption(f'Supabaseから読み込み済み：{len(state.records02)}物件。取得後は自動保存し、次回起動時もSupabaseから読み込みます。')
+    if state.get('store_loaded02', False):
+        st.caption(f'Supabaseから手動読み込み済み：{len(state.records02)}物件。検索で確認できた物件は即時保存されます。')
+    else:
+        st.caption('起動時はSupabase物件データを読み込みません。検索結果の保存だけはバックグラウンドで即時実行します。')
     labels = ['15万円以下', '15〜20万円', '20〜22.5万円', '22.5〜25万円', '25〜27.5万円', '27.5〜30万円', '30〜35万円', '35万円超']
     st.markdown('<div style="display:flex;flex-wrap:wrap;gap:10px;margin:6px 0">'+''.join(
         f'<span style="font-size:13px;color:#173a5e"><i style="display:inline-block;width:13px;height:13px;background:{color};margin-right:4px"></i>{label}</span>'
