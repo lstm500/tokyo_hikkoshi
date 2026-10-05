@@ -1,4 +1,4 @@
-"""住まいコンパス — Streamlit版 v10（高並列 / 即時保存 / 位置精度強化 / SRC・築20年以内 / HOME'S・SUUMO）
+"""住まいコンパス — Streamlit版 v11（安定化並列 / 即時保存 / 位置精度強化 / SRC・築20年以内 / HOME'S・SUUMO）
 実行: streamlit run app.py
 依存: streamlit>=1.50,<2 / folium>=0.18,<1 / streamlit-folium>=0.24,<1 / requests>=2.32,<3
 実物件の家賃メッシュ表示。通勤は概算。公開情報取得はサイトの仕様・接続状況に依存。
@@ -1706,7 +1706,8 @@ def safe_source_url(url):
 def fetch_html(url):
     if not safe_source_url(url):
         raise ValueError('LIFULL HOME’Sの賃貸ページURLを指定してください。')
-    response = http_session().get(url, headers=HEADERS, timeout=(20, 20))
+    with _HOMES_REQUEST_SEMAPHORE:
+        response = http_session().get(url, headers=HEADERS, timeout=(20, 20))
     response.raise_for_status()
     if not safe_source_url(response.url):
         raise ValueError('物件ページ以外に移動しました。')
@@ -1718,7 +1719,8 @@ def fetch_html(url):
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def check_robots():
-    response = http_session().get('https://www.homes.co.jp/robots.txt', headers=HEADERS, timeout=(20, 20))
+    with _HOMES_REQUEST_SEMAPHORE:
+        response = http_session().get('https://www.homes.co.jp/robots.txt', headers=HEADERS, timeout=(20, 20))
     response.raise_for_status()
     rp = urllib.robotparser.RobotFileParser()
     rp.parse(response.text.splitlines())
@@ -2099,7 +2101,7 @@ def fetch_facilities_at(lat, lng, category):
 
 
 def make_map(origin, cells, records, facilities):
-    m = folium.Map(location=[origin['lat'], origin['lng']], zoom_start=st.session_state.get('zoom03', 15), tiles='OpenStreetMap', control_scale=True)
+    m = folium.Map(location=[origin['lat'], origin['lng']], zoom_start=st.session_state.get('zoom03', 15), tiles='OpenStreetMap', control_scale=True, prefer_canvas=True)
     for c in cells:
         estimated = c['kind'] == '近隣からの推定'
         tip = (f'{c["price"]/10000:.1f}万円/月 · {c["kind"]}<br>'
@@ -2256,7 +2258,7 @@ def load_store(settings=None):
 
 
 def query_key(bounds, layout, limit):
-    value = json.dumps(['v10-high-parallel-incremental-save-location-precision-src-age20', list(map(lambda x: round(x,5), bounds)),
+    value = json.dumps(['v11-stable-map-balanced-concurrency', list(map(lambda x: round(x,5), bounds)),
                         'ALL_TARGET_LAYOUTS', int(limit)], ensure_ascii=False)
     return hashlib.sha256(value.encode()).hexdigest()
 
@@ -2332,7 +2334,7 @@ def save_store(records, info, bounds=None, layout=None, limit=None, reload_after
 
 
 def save_incremental_records(records, settings=None):
-    """Persist verified listings immediately without rewriting last_fetch metadata per item."""
+    """Persist verified listings immediately and confirm the write from Supabase."""
     settings = settings or supabase_settings()
     _, _, namespace = settings
     try:
@@ -2340,7 +2342,7 @@ def save_incremental_records(records, settings=None):
     except (ValueError, KeyError, TypeError, csv.Error):
         raise StorageError('保存する物件データの形式を確認してください。') from None
     if not records:
-        return 0
+        return []
     now = datetime.now(timezone.utc).isoformat(timespec='seconds')
     unique = {}
     for p in records:
@@ -2356,10 +2358,27 @@ def save_incremental_records(records, settings=None):
         previous = unique.get(identity)
         if previous is None or str(previous['fetched_at']) <= str(p['fetched_at']):
             unique[identity] = p
+
     rows = [{'namespace':namespace,'identity':identity,'payload':p,'fetched_at':p['fetched_at']}
             for identity,p in unique.items()]
-    _upsert_rows('sumai_properties', rows, 'namespace,identity', settings)
-    return len(rows)
+    confirmed = []
+    for batch_start in range(0, len(rows), 50):
+        batch = rows[batch_start:batch_start+50]
+        result = supabase_request(
+            'POST','sumai_properties',settings=settings,
+            params={'on_conflict':'namespace,identity','select':'identity'},
+            payload=batch,
+            extra_headers={'Prefer':'resolution=merge-duplicates,return=representation'},
+            allow_empty=False)
+        if not isinstance(result, list):
+            raise StorageError('Supabaseへの物件保存結果を確認できませんでした。')
+        expected = {row['identity'] for row in batch}
+        actual = {str(row.get('identity','')) for row in result if isinstance(row,dict)}
+        missing = expected - actual
+        if missing:
+            raise StorageError(f'Supabaseへの保存確認が不足しています（{len(missing)}件）。')
+        confirmed.extend(sorted(expected))
+    return confirmed
 
 
 def show_storage_setup():
@@ -2390,13 +2409,20 @@ SUUMO_HEADERS = {'User-Agent': 'SumaiCompass/8.0 (personal rental map)'}
 GSI_HEADERS = {'User-Agent': 'SumaiCompass/8.0 (personal rental map)'}
 _SUUMO_HTTP = threading.local()
 
-# Network work is I/O-bound. Run several independent region/layout/source tasks at once,
-# while keeping per-source pools bounded so precision checks remain enabled for every listing.
-REGION_LOOKUP_WORKERS = 16
-REGION_TASK_WORKERS = 8
-HOMES_BUILDING_WORKERS = 8
-HOMES_DETAIL_WORKERS = 8
-SUUMO_DETAIL_WORKERS = 6
+# Network work is I/O-bound, but excessive nested concurrency can starve the Streamlit
+# frontend/custom-component channel. Keep task parallelism high while globally limiting
+# simultaneous outbound requests per provider.
+REGION_LOOKUP_WORKERS = 10
+REGION_TASK_WORKERS = 6
+HOMES_BUILDING_WORKERS = 6
+HOMES_DETAIL_WORKERS = 6
+SUUMO_DETAIL_WORKERS = 5
+HOMES_REQUEST_SLOTS = 12
+SUUMO_REQUEST_SLOTS = 8
+GSI_REQUEST_SLOTS = 10
+_HOMES_REQUEST_SEMAPHORE = threading.BoundedSemaphore(HOMES_REQUEST_SLOTS)
+_SUUMO_REQUEST_SEMAPHORE = threading.BoundedSemaphore(SUUMO_REQUEST_SLOTS)
+_GSI_REQUEST_SEMAPHORE = threading.BoundedSemaphore(GSI_REQUEST_SLOTS)
 
 
 def suumo_session():
@@ -2408,7 +2434,8 @@ def suumo_session():
 @functools.lru_cache(maxsize=1)
 def gsi_municipalities():
     try:
-        r = requests.get(GSI_MUNI_URL, headers=GSI_HEADERS, timeout=(5, 15), allow_redirects=False)
+        with _GSI_REQUEST_SEMAPHORE:
+            r = requests.get(GSI_MUNI_URL, headers=GSI_HEADERS, timeout=(5, 15), allow_redirects=False)
         r.raise_for_status()
         if len(r.content) > 3_000_000:
             return {}
@@ -2428,8 +2455,9 @@ def gsi_municipalities():
 @functools.lru_cache(maxsize=8192)
 def gsi_reverse_region(lat, lng):
     try:
-        r = requests.get(GSI_REVERSE_URL, params={'lat': round(float(lat), 7), 'lon': round(float(lng), 7)},
-                         headers=GSI_HEADERS, timeout=(5, 15), allow_redirects=False)
+        with _GSI_REQUEST_SEMAPHORE:
+            r = requests.get(GSI_REVERSE_URL, params={'lat': round(float(lat), 7), 'lon': round(float(lng), 7)},
+                             headers=GSI_HEADERS, timeout=(5, 15), allow_redirects=False)
         r.raise_for_status()
         if len(r.content) > 500_000:
             return None
@@ -2538,8 +2566,9 @@ def gsi_geocode_address(address):
     if not address:
         return None
     try:
-        r = requests.get(GSI_SEARCH_URL, params={'q': address}, headers=GSI_HEADERS,
-                         timeout=(5, 15), allow_redirects=False)
+        with _GSI_REQUEST_SEMAPHORE:
+            r = requests.get(GSI_SEARCH_URL, params={'q': address}, headers=GSI_HEADERS,
+                             timeout=(5, 15), allow_redirects=False)
         r.raise_for_status()
         if len(r.content) > 2_000_000:
             return None
@@ -2750,7 +2779,8 @@ def resolve_property_location(html, soup, address, bounds, region, provider, ext
 
 @functools.lru_cache(maxsize=1)
 def map_robots_allowed():
-    response = http_session().get('https://www.homes.co.jp/robots.txt',headers=HEADERS,timeout=(20,20))
+    with _HOMES_REQUEST_SEMAPHORE:
+        response = http_session().get('https://www.homes.co.jp/robots.txt',headers=HEADERS,timeout=(20,20))
     response.raise_for_status()
     rp = urllib.robotparser.RobotFileParser()
     rp.parse(response.text.splitlines())
@@ -2759,7 +2789,8 @@ def map_robots_allowed():
 
 @functools.lru_cache(maxsize=1)
 def suumo_robots_allowed():
-    response = suumo_session().get('https://suumo.jp/robots.txt', headers=SUUMO_HEADERS, timeout=(10,20))
+    with _SUUMO_REQUEST_SEMAPHORE:
+        response = suumo_session().get('https://suumo.jp/robots.txt', headers=SUUMO_HEADERS, timeout=(10,20))
     response.raise_for_status()
     rp = urllib.robotparser.RobotFileParser()
     rp.parse(response.text.splitlines())
@@ -2774,7 +2805,8 @@ def tile_xy(lat, lng, zoom=15):
 def map_request(url, data):
     if url not in (MAP_TILE_URL, MAP_INFO_URL):
         raise ValueError('取得先が不正です。')
-    r = http_session().post(url,data=data,headers=HEADERS,timeout=(20,20),allow_redirects=False)
+    with _HOMES_REQUEST_SEMAPHORE:
+        r = http_session().post(url,data=data,headers=HEADERS,timeout=(20,20),allow_redirects=False)
     if 300 <= r.status_code < 400:
         raise ValueError('取得元が別ページへ移動しました。')
     r.raise_for_status()
@@ -2927,7 +2959,8 @@ def suumo_fetch_html(url):
     p = urlparse(url)
     if not (p.scheme == 'https' and p.hostname == 'suumo.jp' and p.path == urlparse(SUUMO_SEARCH_URL).path):
         raise ValueError('SUUMOの検索URLが不正です。')
-    r = suumo_session().get(url,headers=SUUMO_HEADERS,timeout=(10,30),allow_redirects=False)
+    with _SUUMO_REQUEST_SEMAPHORE:
+        r = suumo_session().get(url,headers=SUUMO_HEADERS,timeout=(10,30),allow_redirects=False)
     if 300 <= r.status_code < 400:
         raise ValueError('SUUMOの検索ページが移動しました。')
     r.raise_for_status()
@@ -2940,7 +2973,8 @@ def suumo_fetch_html(url):
 def suumo_fetch_detail(url):
     if not safe_suumo_url(url):
         raise ValueError('SUUMOの物件URLが不正です。')
-    r = suumo_session().get(url,headers=SUUMO_HEADERS,timeout=(10,30),allow_redirects=False)
+    with _SUUMO_REQUEST_SEMAPHORE:
+        r = suumo_session().get(url,headers=SUUMO_HEADERS,timeout=(10,30),allow_redirects=False)
     if 300 <= r.status_code < 400:
         raise ValueError('SUUMOの物件ページが移動しました。')
     r.raise_for_status()
@@ -3194,10 +3228,11 @@ def collect_visible_regions(bounds, limit=40, progress=None, save_chunk=None, co
 _BACKGROUND_LOCK=threading.Lock()
 _BACKGROUND_JOBS={}
 _BACKGROUND_THREADS={}
+_BACKGROUND_SAVED_IDS={}
 
 
 def background_job_id(bounds, limit):
-    raw=json.dumps(['v10',list(map(lambda x:round(x,5),bounds)),int(limit)],ensure_ascii=False)
+    raw=json.dumps(['v11',list(map(lambda x:round(x,5),bounds)),int(limit)],ensure_ascii=False)
     return hashlib.sha256(raw.encode()).hexdigest()[:20]
 
 
@@ -3222,6 +3257,20 @@ def _job_increment(job_id, field, delta=1):
         return dict(job)
 
 
+def _job_mark_saved(job_id, identities):
+    identities = [str(x) for x in identities if x]
+    with _BACKGROUND_LOCK:
+        seen = _BACKGROUND_SAVED_IDS.setdefault(job_id, set())
+        before = len(seen)
+        seen.update(identities)
+        newly_confirmed = len(seen) - before
+        job = dict(_BACKGROUND_JOBS.get(job_id,{}))
+        job['accepted'] = int(job.get('accepted',0) or 0) + newly_confirmed
+        job['last_saved_at'] = datetime.now(timezone.utc).isoformat(timespec='seconds')
+        _BACKGROUND_JOBS[job_id] = job
+        return dict(job), newly_confirmed
+
+
 def _persist_job(job_id, job, settings):
     payload=dict(job)
     payload['job_id']=job_id
@@ -3234,8 +3283,11 @@ def _persist_job(job_id, job, settings):
 
 def background_worker(job_id,bounds,limit,settings,resume_completed=None):
     started=datetime.now(timezone.utc).isoformat(timespec='seconds')
+    resume_payload = persisted_job(job_id, settings) if resume_completed else {}
     job=_job_update(job_id,state='running',bounds=list(bounds),limit=int(limit),step=0,total=1,
-                    message='表示地域を確認しています…',accepted=0,started_at=started,
+                    message='表示地域を確認しています…',accepted=int(resume_payload.get('accepted',0) or 0),
+                    save_attempted=int(resume_payload.get('save_attempted',0) or 0),
+                    save_errors=0,last_save_error='',started_at=started,
                     updated_at=started,error='',completed=set(resume_completed or []))
     try:
         _persist_job(job_id,job,settings)
@@ -3246,9 +3298,19 @@ def background_worker(job_id,bounds,limit,settings,resume_completed=None):
         _job_update(job_id,step=step,total=max(1,total),message=message,
                     updated_at=datetime.now(timezone.utc).isoformat(timespec='seconds'))
     def save_chunk(records,info):
-        written=save_incremental_records(records,settings=settings)
-        if written:
-            _job_increment(job_id,'accepted',written)
+        _job_increment(job_id,'save_attempted',len(records))
+        try:
+            confirmed_ids=save_incremental_records(records,settings=settings)
+        except StorageError as error:
+            _job_increment(job_id,'save_errors',len(records))
+            _job_update(job_id,last_save_error=str(error),
+                        updated_at=datetime.now(timezone.utc).isoformat(timespec='seconds'))
+            raise
+        if confirmed_ids:
+            job_snapshot,new_count=_job_mark_saved(job_id,confirmed_ids)
+            if new_count and int(job_snapshot.get('accepted',0) or 0) % 10 == 0:
+                try:_persist_job(job_id,job_snapshot,settings)
+                except StorageError:pass
     def status_hook(step,total,completed,region,raw_layout,source_name,accepted,warnings):
         # accepted is a task-local aggregate; keep the independently incremented persisted count intact.
         job=_job_update(job_id,step=step,total=total,completed=set(completed),
@@ -3419,7 +3481,7 @@ def main():
         except (StorageError,ValueError,TypeError) as error:
             st.error(str(error))
 
-    @st.fragment(run_every=2)
+    @st.fragment(run_every=5)
     def background_status_panel():
         jid=state.get('background_job_id')
         if not jid:
@@ -3440,9 +3502,24 @@ def main():
         step=int(job.get('step',0) or 0); total=max(1,int(job.get('total',1) or 1))
         if status=='running':
             st.progress(min(1.0,step/total), text=f'処理タスク {step}/{total} · {job.get("message","検索中")}')
-            st.caption(f'バックグラウンドで継続中｜Supabaseへ即時保存した物件 {int(job.get("accepted",0) or 0)}件。上の {step}/{total} は物件数ではなく、地域×間取り×取得元の処理タスク数です。')
+            attempted=int(job.get("save_attempted",0) or 0)
+            saved=int(job.get("accepted",0) or 0)
+            save_errors=int(job.get("save_errors",0) or 0)
+            st.caption(f'バックグラウンドで継続中｜保存条件を満たしSupabase保存を試行 {attempted}件｜保存確認済み {saved}件｜保存エラー {save_errors}件。上の {step}/{total} は物件数ではなく、地域×間取り×取得元の処理タスク数です。')
+            st.caption('地図の安定性を優先し、検索中は地図コンポーネントを自動再読込しません。途中結果を見たい場合だけ下の再読み込みボタンを押してください。')
+            if attempted == 0:
+                st.info('現時点では、SRC・築20年以内・間取り条件・地図位置確認をすべて通過した物件がまだ0件のため、Supabaseへの物件保存処理自体がまだ発生していません。')
+            elif saved == 0:
+                st.error('保存対象の物件は見つかっていますが、Supabaseで保存確認できた物件が0件です。保存エラー表示を確認してください。')
+            if save_errors:
+                st.error('直近のSupabase保存エラー：'+str(job.get('last_save_error','不明')))
+            auto_key='partial_auto_loaded_'+jid
+            # Do not trigger an automatic full-page rerun while the crawler is active.
+            # Recreating st_folium every few seconds can make its frontend component fail to load,
+            # especially while many network workers are active. The status fragment keeps updating
+            # independently; map data is reloaded only on explicit request or once at completion.
             if st.button('保存済みの途中物件を地図へ再読み込み',key='reload_partial_bg'):
-                records,info=load_store(); state.records02,state.info02=records,info; st.rerun()
+                records,info=load_store(); state.records02,state.info02=records,info; state[auto_key]=saved; st.rerun()
         elif status=='completed':
             st.success(job.get('message','バックグラウンド取得が完了しました。'))
             applied='job_applied_'+jid
