@@ -1,4 +1,4 @@
-"""住まいコンパス — Streamlit版 v08（SRC・築20年以内 / 広域バックグラウンド取得 / HOME'S・SUUMO）
+"""住まいコンパス — Streamlit版 v09（位置精度強化 / SRC・築20年以内 / 広域バックグラウンド取得 / HOME'S・SUUMO）
 実行: streamlit run app.py
 依存: streamlit>=1.50,<2 / folium>=0.18,<1 / streamlit-folium>=0.24,<1 / requests>=2.32,<3
 実物件の家賃メッシュ表示。通勤は概算。公開情報取得はサイトの仕様・接続状況に依存。
@@ -1686,7 +1686,8 @@ def http_session():
         _HTTP.session = requests.Session()
     return _HTTP.session
 
-REAL_FIELDS = ['id', 'name', 'address', 'lat', 'lng', 'layout', 'rent', 'fees', 'area', 'floor',
+REAL_FIELDS = ['id', 'name', 'address', 'map_address', 'address_match', 'location_confidence',
+               'lat', 'lng', 'layout', 'rent', 'fees', 'area', 'floor',
                'structure', 'building_age', 'built_year', 'coordinate_source',
                'url', 'fetched_at', 'modified', 'source']
 COLORS = ['#2166ac', '#1d8fa7', '#48aa96', '#87b85c', '#d2be42', '#e9a248', '#df7245', '#c94049']
@@ -1857,7 +1858,7 @@ def layout_matches_group(raw_layout, group):
     return str(raw_layout or '').strip() in LAYOUT_GROUPS.get(group, ())
 
 
-def parse_listing(html, url, fetched_at):
+def parse_listing(html, url, fetched_at, bounds=None, region=None, extra_hints=None):
     soup = BeautifulSoup(html, 'html.parser')
     for script in soup.find_all('script', type='application/ld+json'):
         try:
@@ -1874,14 +1875,12 @@ def parse_listing(html, url, fetched_at):
                 continue
             if offer.get('priceCurrency') != 'JPY':
                 continue
-            geo = entity.get('geo', {})
             try:
-                lat, lng = float(geo['latitude']), float(geo['longitude'])
                 rent = money(offer['price'])
                 size = float(entity.get('floorSize', {}).get('value', 0))
             except (KeyError, ValueError, TypeError):
                 continue
-            if not (34 <= lat <= 37 and 138 <= lng <= 141 and 0 < rent <= 10_000_000 and math.isfinite(size) and size > 0):
+            if not (0 < rent <= 10_000_000 and math.isfinite(size) and size > 0):
                 continue
             attrs = {a.get('name'): a.get('value') for a in entity.get('additionalProperty', []) if isinstance(a, dict)}
             layout = str(attrs.get('間取り', '')).strip()
@@ -1898,19 +1897,21 @@ def parse_listing(html, url, fetched_at):
                 continue
             structure, building_age, built_year = extract_structure_age(soup, entity, attrs, data)
             address = entity.get('address', {})
-            if not isinstance(address, dict):
+            addr = ''.join(str(address.get(k, '')) for k in ('addressRegion', 'addressLocality', 'streetAddress')) if isinstance(address, dict) else ''
+            location = resolve_property_location(html, soup, addr, bounds, region, "HOME'S", extra_hints)
+            if not location:
                 continue
-            addr = ''.join(str(address.get(k, '')) for k in ('addressRegion', 'addressLocality', 'streetAddress'))
             image = entity.get('image', [])
             caption = image[0].get('caption') if isinstance(image, list) and image and isinstance(image[0], dict) else None
             canonical = data.get('url', url)
             if not safe_source_url(canonical):
                 canonical = url
             return dict(id=canonical.rstrip('/').split('/')[-1], name=caption or entity.get('name', '物件'),
-                        address=addr, lat=lat, lng=lng, layout=layout, rent=rent, fees=fees,
-                        area=size, floor=str(entity.get('floorLevel', '')), structure=structure,
-                        building_age=building_age if building_age is not None else '',
-                        built_year=built_year if built_year is not None else '', coordinate_source="HOME'S掲載座標",
+                        address=addr, map_address=location['map_address'], address_match=location['address_match'],
+                        location_confidence=location['location_confidence'], lat=location['lat'], lng=location['lng'],
+                        layout=layout, rent=rent, fees=fees, area=size, floor=str(entity.get('floorLevel', '')),
+                        structure=structure, building_age=building_age if building_age is not None else '',
+                        built_year=built_year if built_year is not None else '', coordinate_source=location['coordinate_source'],
                         url=canonical, fetched_at=fetched_at, modified=str(data.get('dateModified', '')),
                         source="LIFULL HOME'S")
     return None
@@ -2053,7 +2054,7 @@ def validate_records(raw, maximum=20000):
             if not (34 <= p['lat'] <= 37 and 138 <= p['lng'] <= 141 and math.isfinite(p['area']) and p['area'] > 0
                     and 0 < p['rent'] <= 10_000_000 and 0 <= p['fees'] <= 10_000_000 and p['layout'] in STORAGE_LAYOUTS):
                 raise ValueError()
-            for field in ('name', 'id', 'address', 'floor', 'structure', 'coordinate_source'):
+            for field in ('name', 'id', 'address', 'map_address', 'address_match', 'location_confidence', 'floor', 'structure', 'coordinate_source'):
                 p[field] = str(p.get(field, ''))[:200]
                 if p[field].startswith("'") and p[field][1:].startswith(('=', '+', '-', '@')):
                     p[field] = p[field][1:]
@@ -2112,7 +2113,8 @@ def make_map(origin, cells, records, facilities):
         safe = urlparse(url).scheme in ('http', 'https') and bool(urlparse(url).netloc)
         detail = (f'<b>{escape(p["name"])}</b><br>{escape(p["layout"])} / {p["area"]:g}㎡ / {escape(p["floor"])}<br>'
                   f'総額 {(p["rent"]+p["fees"])/10000:g}万円（月額）<br>'
-                  f'家賃 {p["rent"]:,}円 ＋ 管理費等 {p["fees"]:,}円<br>{escape(p["address"])}<br>'
+                  f'家賃 {p["rent"]:,}円 ＋ 管理費等 {p["fees"]:,}円<br>掲載住所：{escape(p.get("address",""))}<br>'
+                  f'地図判定：{escape(p.get("map_address",""))} / 精度 {escape(p.get("location_confidence",""))}<br>'
                   +(f'<a href="{escape(url, quote=True)}" target="_blank" rel="noopener">募集ページを確認</a>' if safe else 'CSV入力'))
         folium.CircleMarker([p['lat'], p['lng']], radius=5, color='white', weight=1,
                             fill=True, fill_color=color_for(p['rent']+p['fees']), fill_opacity=1,
@@ -2254,7 +2256,7 @@ def load_store(settings=None):
 
 
 def query_key(bounds, layout, limit):
-    value = json.dumps(['v08-src-age20-background-wide', list(map(lambda x: round(x,5), bounds)),
+    value = json.dumps(['v09-location-precision-src-age20-background-wide', list(map(lambda x: round(x,5), bounds)),
                         'ALL_TARGET_LAYOUTS', int(limit)], ensure_ascii=False)
     return hashlib.sha256(value.encode()).hexdigest()
 
@@ -2526,6 +2528,187 @@ def gsi_geocode_address(address):
         return None
 
 
+def _compact_address(value):
+    return re.sub(r'[\s　]+', '', unicodedata.normalize('NFKC', str(value or '')))
+
+
+def _address_is_precise(value):
+    text = _compact_address(value)
+    if not text:
+        return False
+    return bool(
+        re.search(r'丁目\d+', text)
+        or re.search(r'\d+(?:-|−|ー)\d+', text)
+        or re.search(r'\d+番(?:地)?(?:\d+)?', text)
+        or re.search(r'\d+号', text)
+    )
+
+
+def _address_match_status(address, reverse_region):
+    if not reverse_region:
+        return '未確認'
+    if not address:
+        return '地図位置のみ'
+    if region_matches_address(address, reverse_region):
+        return '一致'
+    address_n = _normalize_place_text(address)
+    base = _normalize_place_text(reverse_region.get('town_base', ''))
+    muni = _normalize_place_text(reverse_region.get('municipality', ''))
+    if base and base in address_n and (not muni or muni in address_n):
+        return '一部一致'
+    return '不一致'
+
+
+def _append_coordinate_candidate(out, lat, lng, source, priority):
+    try:
+        lat, lng = float(lat), float(lng)
+    except (TypeError, ValueError):
+        return
+    if not (34 <= lat <= 37 and 138 <= lng <= 141 and math.isfinite(lat) and math.isfinite(lng)):
+        return
+    key = (round(lat, 7), round(lng, 7), source)
+    if key not in {(round(x['lat'],7), round(x['lng'],7), x['source']) for x in out}:
+        out.append({'lat':lat, 'lng':lng, 'source':source, 'priority':int(priority)})
+
+
+def _coordinates_from_url(value, out, source='掲載地図URL'):
+    raw = str(value or '')
+    if not raw:
+        return
+    decoded = raw.replace('&amp;', '&')
+    # Google/OSM-style paths and embed parameters.
+    for m in re.finditer(r'@\s*(3[4-7]\.\d+)\s*,\s*(1(?:3[8-9]|40)\.\d+)', decoded):
+        _append_coordinate_candidate(out, m.group(1), m.group(2), source, 98)
+    for m in re.finditer(r'!3d(3[4-7]\.\d+)!4d(1(?:3[8-9]|40)\.\d+)', decoded):
+        _append_coordinate_candidate(out, m.group(1), m.group(2), source, 98)
+    try:
+        parsed = urlparse(decoded if '://' in decoded else 'https://dummy.invalid/?'+decoded.lstrip('?'))
+        params = dict(parse_qsl(parsed.query, keep_blank_values=True))
+        lat = next((params[k] for k in ('lat','latitude','mlat') if k in params), None)
+        lng = next((params[k] for k in ('lng','lon','longitude','mlon') if k in params), None)
+        if lat is not None and lng is not None:
+            _append_coordinate_candidate(out, lat, lng, source, 98)
+        for key in ('q','query','ll','center','sll','cp'):
+            if key not in params:
+                continue
+            m = re.search(r'(3[4-7]\.\d+)\s*[, ]\s*(1(?:3[8-9]|40)\.\d+)', str(params[key]))
+            if m:
+                _append_coordinate_candidate(out, m.group(1), m.group(2), source, 98)
+    except (ValueError, TypeError):
+        pass
+
+
+def extract_coordinate_candidates(html, soup, extra_hints=None):
+    out = []
+    # Structured data is normally the most reliable source.
+    for script in soup.find_all('script', type='application/ld+json'):
+        try:
+            data = json.loads(script.string or script.get_text())
+            for lat,lng in _json_coordinates(data):
+                _append_coordinate_candidate(out, lat, lng, '掲載JSON-LD座標', 100)
+        except (ValueError, TypeError):
+            pass
+
+    # Explicit map/data attributes on the listing page.
+    for tag in soup.find_all(True):
+        attrs = tag.attrs if isinstance(tag.attrs, dict) else {}
+        lowered = {str(k).lower(): v for k,v in attrs.items()}
+        lat = next((lowered[k] for k in ('data-lat','data-latitude','lat','latitude') if k in lowered), None)
+        lng = next((lowered[k] for k in ('data-lng','data-lon','data-longitude','lng','lon','longitude') if k in lowered), None)
+        if isinstance(lat, (str,int,float)) and isinstance(lng, (str,int,float)):
+            _append_coordinate_candidate(out, lat, lng, '掲載地図データ属性', 99)
+        for key in ('href','src','data-src','data-url','data-map-url'):
+            value = attrs.get(key)
+            if isinstance(value, str) and any(token in value.lower() for token in ('map','lat','lon','lng','@','center','query=')):
+                _coordinates_from_url(value, out, '掲載地図リンク座標')
+
+    # JavaScript variables used by map widgets. Keep these below explicit map sources.
+    normalized = unicodedata.normalize('NFKC', html)
+    patterns = [
+        r'["\'](?:lat|latitude|maplat|map_lat)["\']?\s*[:=]\s*["\']?(3[4-7]\.\d+)["\']?.{0,400}?["\']?(?:lng|lon|longitude|maplng|map_lng)["\']?\s*[:=]\s*["\']?(1(?:3[8-9]|40)\.\d+)',
+        r'["\']?(?:lng|lon|longitude|maplng|map_lng)["\']?\s*[:=]\s*["\']?(1(?:3[8-9]|40)\.\d+)["\']?.{0,400}?["\']?(?:lat|latitude|maplat|map_lat)["\']?\s*[:=]\s*["\']?(3[4-7]\.\d+)'
+    ]
+    for i,pat in enumerate(patterns):
+        for m in re.finditer(pat, normalized, flags=re.I|re.S):
+            a,b = float(m.group(1)), float(m.group(2))
+            _append_coordinate_candidate(out, a if i == 0 else b, b if i == 0 else a, '掲載ページ埋込地図座標', 90)
+
+    for hint in extra_hints or []:
+        if isinstance(hint, dict):
+            _append_coordinate_candidate(out, hint.get('lat'), hint.get('lng'),
+                                         hint.get('source') or '検索地図座標', hint.get('priority', 97))
+        elif isinstance(hint, (tuple,list)) and len(hint) >= 2:
+            _append_coordinate_candidate(out, hint[0], hint[1], '検索地図座標', 97)
+    return out
+
+
+def resolve_property_location(html, soup, address, bounds, region, provider, extra_hints=None):
+    candidates = extract_coordinate_candidates(html, soup, extra_hints)
+    geocoded = gsi_geocode_address(address) if _address_is_precise(address) else None
+    ranked = []
+    for c in candidates:
+        point = {'lat':c['lat'], 'lng':c['lng']}
+        if bounds and not inside(point, bounds):
+            continue
+        # A coordinate tied to another town/ward on the same page is usually a station or agency marker.
+        if region and distance(point, region) > 6.0:
+            continue
+        score = c['priority']
+        if geocoded:
+            delta = distance(point, geocoded)
+            if delta <= .10:
+                score += 35
+            elif delta <= .30:
+                score += 22
+            elif delta <= .80:
+                score += 8
+            elif delta > 2.0:
+                score -= 35
+        ranked.append((score, c))
+    ranked.sort(key=lambda x:x[0], reverse=True)
+
+    # Reverse-geocode the strongest map candidates and reject clear town/address conflicts.
+    for score,c in ranked[:12]:
+        rev = gsi_reverse_region(c['lat'], c['lng'])
+        match = _address_match_status(address, rev)
+        if region and rev:
+            same_muni = str(rev.get('muni_code','')) == str(region.get('muni_code',''))
+            same_town = (_normalize_place_text(rev.get('town','')) == _normalize_place_text(region.get('town',''))
+                         or _normalize_place_text(rev.get('town_base','')) == _normalize_place_text(region.get('town_base','')))
+            if not same_muni or not same_town:
+                score -= 90
+        if match == '一致':
+            score += 30
+        elif match == '一部一致':
+            score += 15
+        elif match == '不一致':
+            score -= 80
+        if score < 75:
+            continue
+        confidence = '高' if c['priority'] >= 97 and match in ('一致','一部一致','地図位置のみ') else '中'
+        map_address = rev.get('label','') if rev else ''
+        return {'lat':c['lat'], 'lng':c['lng'], 'coordinate_source':f'{provider}:{c["source"]}',
+                'map_address':map_address, 'address_match':match, 'location_confidence':confidence}
+
+    # Last resort: use the national address search only when the listing contains a sufficiently precise address.
+    # Town-only addresses are intentionally not placed at a representative centroid.
+    if geocoded:
+        point = {'lat':geocoded['lat'], 'lng':geocoded['lng']}
+        if (not bounds or inside(point,bounds)) and (not region or distance(point,region) <= 6.0):
+            rev = gsi_reverse_region(point['lat'], point['lng'])
+            match = _address_match_status(address, rev)
+            region_ok = True
+            if region and rev:
+                region_ok = (str(rev.get('muni_code','')) == str(region.get('muni_code','')) and
+                             (_normalize_place_text(rev.get('town_base','')) == _normalize_place_text(region.get('town_base',''))))
+            if region_ok and match in ('一致','一部一致'):
+                return {'lat':point['lat'], 'lng':point['lng'],
+                        'coordinate_source':'国土地理院住所検索（掲載住所から位置補完）',
+                        'map_address':rev.get('label','') if rev else geocoded.get('title',''),
+                        'address_match':match, 'location_confidence':'中'}
+    return None
+
+
 @functools.lru_cache(maxsize=1)
 def map_robots_allowed():
     response = http_session().get('https://www.homes.co.jp/robots.txt',headers=HEADERS,timeout=(20,20))
@@ -2608,7 +2791,16 @@ def homes_candidates(bounds, layout, freeword):
     return candidates, warnings
 
 
-def collect_homes_region(bounds, layout, region, limit=40):
+def verify_homes_detail(url, bounds, region, layout, extra_hints=None):
+    html = fetch_html(url)
+    p = parse_listing(html, url, datetime.now(timezone.utc).isoformat(timespec='seconds'),
+                      bounds=bounds, region=region, extra_hints=extra_hints)
+    if not p or p.get('layout') != layout or not target_property(p) or not inside(p,bounds):
+        return None
+    return p
+
+
+def collect_homes_region(bounds, layout, region, limit=40, on_record=None):
     if not map_robots_allowed():
         raise ValueError('LIFULL HOME’Sは現在、自動取得を許可していません。')
     warnings, candidates, used_term = [], {}, ''
@@ -2623,44 +2815,44 @@ def collect_homes_region(bounds, layout, region, limit=40):
         warnings.extend(more)
     keys = sorted(candidates, key=lambda k: distance(
         {'lat':float(candidates[k]['lat']),'lng':float(candidates[k]['lon'])}, region))
-    # SRC rejection happens after opening the detail page, so inspect more candidates than the desired accepted count.
-    keys = keys[:max(1, limit*4)]
-    links = []
-    for start_i in range(0,len(keys),8):
+    keys = keys[:max(1, limit*5)]
+
+    # Ask HOME'S for each building key separately. This is slower, but preserves the
+    # building coordinate as an explicit hint for every room URL instead of losing it in an 8-building batch.
+    link_hints = {}
+    for key in keys:
+        row = candidates[key]
         data = map_condition(layout, used_term)
-        data['cond[tykey]'] = ','.join(keys[start_i:start_i+8])
+        data['cond[tykey]'] = key
         try:
-            links.extend(room_links(map_request(MAP_INFO_URL,data).text))
+            urls = room_links(map_request(MAP_INFO_URL,data).text)
         except (requests.RequestException, ValueError) as error:
-            warnings.append(f'HOME’Sの候補一覧を一部取得できませんでした（{type(error).__name__}）。')
-    if not links and keys:
-        for start_i in range(0,len(keys),8):
-            data = map_condition(layout, '')
-            data['cond[tykey]'] = ','.join(keys[start_i:start_i+8])
-            try:
-                links.extend(room_links(map_request(MAP_INFO_URL,data).text))
-            except (requests.RequestException, ValueError):
-                pass
-    links = list(dict.fromkeys(links))[:max(1,limit*6)]
+            warnings.append(f'HOME’Sの建物候補 {key} を確認できませんでした（{type(error).__name__}）。')
+            continue
+        hint = {'lat':float(row['lat']), 'lng':float(row['lon']), 'source':"HOME'S検索地図・建物座標", 'priority':99}
+        for url in urls:
+            link_hints.setdefault(url, []).append(hint)
+    links = list(link_hints)[:max(1,limit*8)]
     records, failed = [], 0
-    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
-        jobs = [pool.submit(fetch_listing,u) for u in links]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        jobs = [pool.submit(verify_homes_detail,u,bounds,region,layout,link_hints.get(u)) for u in links]
         for job in concurrent.futures.as_completed(jobs):
             try:
                 p = job.result()
-                if (p and p['layout'] == layout and target_property(p) and inside(p,bounds)
-                        and region_matches_address(p.get('address',''), region)):
+                if p:
                     records.append(p)
+                    if on_record:
+                        on_record(p)
                     if len(records) >= limit:
                         for pending in jobs:
                             pending.cancel()
                         break
                 else:
                     failed += 1
-            except (requests.RequestException, ValueError, KeyError, TypeError):
+            except (requests.RequestException, ValueError, KeyError, TypeError, AttributeError):
                 failed += 1
     if failed:
-        warnings.append(f'HOME’S「{region["town"]}」{layout}で{failed}件をSRC・築20年以内・位置・費用の確認後に除外しました。')
+        warnings.append(f'HOME’S「{region["town"]}」{layout}で{failed}件をSRC・築20年以内・地図位置の照合後に除外しました。')
     return deduplicate(records), warnings
 
 
@@ -2727,8 +2919,10 @@ def parse_suumo_list(html, layout, region, limit):
         address_el = building.select_one('.cassetteitem_detail-col1')
         name = title.get_text(' ',strip=True) if title else 'SUUMO掲載物件'
         address = address_el.get_text(' ',strip=True) if address_el else ''
-        if not address or not region_matches_address(address, region):
+        if address and not region_matches_address(address, region):
             continue
+        list_map_candidates = extract_coordinate_candidates(str(building), building)
+        list_hint = max(list_map_candidates, key=lambda x:x['priority']) if list_map_candidates else None
         building_text = building.get_text(' ', strip=True)
         list_age, list_year = building_age_from_values(building_text)
         if list_age is not None and list_age > MAX_BUILDING_AGE:
@@ -2756,10 +2950,13 @@ def parse_suumo_list(html, layout, region, limit):
                 continue
             cells = room.select('td')
             floor = cells[2].get_text(' ',strip=True)[:80] if len(cells) > 2 else ''
-            rows.append(dict(id=url.rstrip('/').split('/')[-1],name=name[:200],address=address[:200],layout=layout,
+            row_data=dict(id=url.rstrip('/').split('/')[-1],name=name[:200],address=address[:200],layout=layout,
                              rent=rent,fees=fees,area=area,floor=floor,url=url,fetched_at=now,
                              modified='',source='SUUMO',structure='',building_age=(list_age if list_age is not None else ''),
-                             built_year=(list_year if list_year is not None else ''),coordinate_source=''))
+                             built_year=(list_year if list_year is not None else ''),coordinate_source='')
+            if list_hint:
+                row_data['_map_hints']=[dict(list_hint, source='SUUMO検索結果地図座標', priority=max(97,list_hint.get('priority',0)))]
+            rows.append(row_data)
             if len(rows) >= limit:
                 return rows
     return rows
@@ -2781,32 +2978,11 @@ def _json_coordinates(value):
                 yield from _json_coordinates(v)
 
 
-def source_coordinates(html, soup, bounds, region):
-    candidates = []
-    for script in soup.find_all('script', type='application/ld+json'):
-        try:
-            data = json.loads(script.string or script.get_text())
-            candidates.extend(_json_coordinates(data))
-        except (ValueError,TypeError):
-            pass
-    normalized = unicodedata.normalize('NFKC', html)
-    patterns = [
-        r'["\']lat(?:itude)?["\']\s*[:=]\s*["\']?(3[4-7]\.\d+)["\']?.{0,120}?["\'](?:lng|lon|longitude)["\']\s*[:=]\s*["\']?(1(?:3[8-9]|40)\.\d+)',
-        r'["\'](?:lng|lon|longitude)["\']\s*[:=]\s*["\']?(1(?:3[8-9]|40)\.\d+)["\']?.{0,120}?["\']lat(?:itude)?["\']\s*[:=]\s*["\']?(3[4-7]\.\d+)'
-    ]
-    for i,pat in enumerate(patterns):
-        for m in re.finditer(pat, normalized, flags=re.I|re.S):
-            a,b = float(m.group(1)), float(m.group(2))
-            candidates.append((a,b) if i == 0 else (b,a))
-    valid=[]
-    for lat,lng in candidates:
-        p={'lat':lat,'lng':lng}
-        if 34 <= lat <= 37 and 138 <= lng <= 141 and inside(p,bounds):
-            valid.append((distance(p,region),lat,lng))
-    if not valid:
+def source_coordinates(html, soup, bounds, region, address='', provider='掲載元', extra_hints=None):
+    location = resolve_property_location(html, soup, address, bounds, region, provider, extra_hints)
+    if not location:
         return None
-    _,lat,lng=min(valid,key=lambda x:x[0])
-    return lat,lng
+    return location
 
 
 def verify_suumo_detail(p, bounds, region):
@@ -2818,17 +2994,18 @@ def verify_suumo_detail(p, bounds, region):
     age, year = building_age_from_values(age_text, soup.get_text(' ',strip=True))
     if structure != TARGET_STRUCTURE or age is None or not (0 <= age <= MAX_BUILDING_AGE):
         return None
-    coords = source_coordinates(html,soup,bounds,region)
-    if not coords:
+    location = source_coordinates(html,soup,bounds,region,p.get('address',''),'SUUMO',p.get('_map_hints'))
+    if not location:
         return None
-    lat,lng=coords
     p=dict(p)
-    p.update(lat=lat,lng=lng,structure='SRC',building_age=age,built_year=year or '',
-             coordinate_source='SUUMO掲載ページ地図座標')
+    p.pop('_map_hints',None)
+    p.update(lat=location['lat'],lng=location['lng'],map_address=location['map_address'],
+             address_match=location['address_match'],location_confidence=location['location_confidence'],
+             structure='SRC',building_age=age,built_year=year or '',coordinate_source=location['coordinate_source'])
     return p if target_property(p) and inside(p,bounds) else None
 
 
-def collect_suumo_region(bounds, layout, region, limit=40):
+def collect_suumo_region(bounds, layout, region, limit=40, on_record=None):
     if not suumo_robots_allowed():
         raise ValueError('SUUMOは現在、自動取得を許可していません。')
     warnings, candidates = [], []
@@ -2869,6 +3046,8 @@ def collect_suumo_region(bounds, layout, region, limit=40):
                 p=job.result()
                 if p:
                     records.append(p)
+                    if on_record:
+                        on_record(p)
                     if len(records)>=limit:
                         for pending in jobs: pending.cancel()
                         break
@@ -2877,7 +3056,7 @@ def collect_suumo_region(bounds, layout, region, limit=40):
             except (requests.RequestException,ValueError,TypeError,AttributeError,KeyError):
                 rejected += 1
     if rejected:
-        warnings.append(f'SUUMO「{region["town"]}」{layout}で{rejected}件をSRC・築20年以内・掲載地図座標の確認後に除外しました。')
+        warnings.append(f'SUUMO「{region["town"]}」{layout}で{rejected}件をSRC・築20年以内・地図位置の多段確認後に除外しました。')
     return deduplicate(records),warnings
 
 
@@ -2906,7 +3085,17 @@ def collect_visible_regions(bounds, limit=40, progress=None, save_chunk=None, co
                     continue
                 if progress: progress(step,total_steps,f'{region["label"]}｜{raw_layout}｜{source_name}を精査中')
                 try:
-                    records,local_warnings=collector(bounds,raw_layout,region,limit)
+                    def persist_one(record):
+                        if not save_chunk:
+                            return
+                        chunk_info=dict(layout='ALL',layouts=list(TARGET_LAYOUTS),bounds=bounds,region=region['label'],
+                                        source=source_name,received=1,filters={'structure':'SRC','max_age':20},
+                                        location={'confidence':record.get('location_confidence',''),
+                                                  'coordinate_source':record.get('coordinate_source','')},
+                                        warnings=[],source_url=('https://www.homes.co.jp/chintai/map/' if source_name.startswith('LIFULL') else SUUMO_SEARCH_URL),
+                                        fetched_at=datetime.now(timezone.utc).isoformat(timespec='seconds'))
+                        save_chunk([record],chunk_info)
+                    records,local_warnings=collector(bounds,raw_layout,region,limit,on_record=persist_one)
                     warnings.extend(local_warnings)
                 except (requests.RequestException,ValueError,KeyError,TypeError) as error:
                     records=[]; warnings.append(str(error))
@@ -2915,12 +3104,6 @@ def collect_visible_regions(bounds, limit=40, progress=None, save_chunk=None, co
                     source_counts[source_name]+=len(records)
                     raw_counts[raw_layout]+=len(records)
                     all_records.extend(records)
-                    if save_chunk:
-                        chunk_info=dict(layout='ALL',layouts=list(TARGET_LAYOUTS),bounds=bounds,region=region['label'],
-                                        source=source_name,received=len(records),filters={'structure':'SRC','max_age':20},
-                                        warnings=[],source_url=('https://www.homes.co.jp/chintai/map/' if source_name.startswith('LIFULL') else SUUMO_SEARCH_URL),
-                                        fetched_at=datetime.now(timezone.utc).isoformat(timespec='seconds'))
-                        save_chunk(records,chunk_info)
                 completed.add(task_key)
                 if status_hook:
                     status_hook(step,total_steps,completed,region,raw_layout,source_name,len(all_records),warnings)
@@ -2942,7 +3125,7 @@ _BACKGROUND_THREADS={}
 
 
 def background_job_id(bounds, limit):
-    raw=json.dumps(['v08',list(map(lambda x:round(x,5),bounds)),int(limit)],ensure_ascii=False)
+    raw=json.dumps(['v09',list(map(lambda x:round(x,5),bounds)),int(limit)],ensure_ascii=False)
     return hashlib.sha256(raw.encode()).hexdigest()[:20]
 
 
@@ -3131,7 +3314,7 @@ def main():
     st_folium(make_map(view, cells, displayed, state.facilities02), height=560, use_container_width=True,
               key=f'map03_{station_name}', returned_objects=['bounds', 'zoom'],
               center=tuple(state.view_center03), zoom=state.zoom03, on_change=remember_view)
-    st.caption('取得ボタンを押すと、表示中の地域・丁目を細かく判定し、SRC・築20年以内をHOME’S・SUUMOでバックグラウンド検索します。取得できた物件から1件ずつ掲載地図座標を確認してSupabaseへ順次保存します。')
+    st.caption('取得ボタンを押すと、表示中の地域・丁目を細かく判定し、SRC・築20年以内をHOME’S・SUUMOでバックグラウンド検索します。各物件は掲載地図・埋込座標・検索地図座標を順に照合し、住所が不完全でも地図位置を逆ジオコーディングして、確認できた物件から1件ずつSupabaseへ保存します。')
     refresh = st.checkbox('保存済み範囲も再取得する', value=True, key='refresh03')
     if st.button('表示範囲をバックグラウンド取得・保存', type='primary', disabled=bounds is None, key='fetch03'):
         try:
@@ -3243,7 +3426,9 @@ def main():
         with st.expander('地図内の物件一覧・通勤を確認', expanded=False):
             st.dataframe([{'物件名': p['name'], '総額（万円）': (p['rent']+p['fees'])/10000,
                            '家賃（円）': p['rent'], '管理費等（円）': p['fees'], '面積（㎡）': p['area'],
-                           '所在階': p['floor'], '構造': p.get('structure',''), '築年数': p.get('building_age',''), '住所': p['address'], '掲載更新日': p['modified'],
+                           '所在階': p['floor'], '構造': p.get('structure',''), '築年数': p.get('building_age',''), '掲載住所': p['address'],
+                           '地図判定住所': p.get('map_address',''), '位置精度': p.get('location_confidence',''),
+                           '座標根拠': p.get('coordinate_source',''), '掲載更新日': p['modified'],
                            '募集ページ': p['url']} for p in sorted(displayed, key=lambda x: x['rent']+x['fees'])],
                          hide_index=True, width='stretch', column_config={'募集ページ': st.column_config.LinkColumn('募集ページ')})
             options = [f'{i+1}. {p["name"]} / {(p["rent"]+p["fees"])/10000:g}万 / {p["area"]:g}㎡' for i,p in enumerate(displayed)]
