@@ -1,4 +1,4 @@
-"""住まいコンパス — Streamlit版 v07（表示地域名 + 全間取り一括取得 + HOME'S / SUUMO・Supabase保存）
+"""住まいコンパス — Streamlit版 v08（SRC・築20年以内 / 広域バックグラウンド取得 / HOME'S・SUUMO）
 実行: streamlit run app.py
 依存: streamlit>=1.50,<2 / folium>=0.18,<1 / streamlit-folium>=0.24,<1 / requests>=2.32,<3
 実物件の家賃メッシュ表示。通勤は概算。公開情報取得はサイトの仕様・接続状況に依存。
@@ -17,6 +17,7 @@ import re
 import statistics
 import time
 import concurrent.futures
+import functools
 import threading
 import urllib.robotparser
 import unicodedata
@@ -119,7 +120,19 @@ LINES = [{'name': '山手線',
   'period': '7:30〜8:30'},
  {'name': '田園都市線', 'seq': ['渋谷', '二子玉川', '溝の口'], 'rate': 138, 'section': '池尻大橋 → 渋谷', 'period': '7:50〜8:50'}]
 BY_NAME = {s['name']: s for s in STATIONS}
-LAYOUTS = ('1LDK', '2LDK', '3LDK', '4LDK')
+LAYOUT_GROUPS = {
+    '1K・1L・1DK': ('1K', '1L', '1DK'),
+    '1LDK・2DK': ('1LDK', '2DK'),
+    '2LDK・3DK': ('2LDK', '3DK'),
+    '3LDK': ('3LDK',),
+}
+LAYOUTS = tuple(LAYOUT_GROUPS)
+TARGET_LAYOUTS = tuple(dict.fromkeys(x for group in LAYOUT_GROUPS.values() for x in group))
+SEARCHABLE_LAYOUTS = TARGET_LAYOUTS
+# Keep legacy values readable so an old Supabase store never blocks startup.
+STORAGE_LAYOUTS = set(TARGET_LAYOUTS) | {'1R','2K','3K','4K','4DK','4LDK'}
+TARGET_STRUCTURE = 'SRC'
+MAX_BUILDING_AGE = 20
 CROWD_SOURCE = 'https://www.mlit.go.jp/report/press/content/002015142.pdf'
 CSV_FIELDS = ['id', 'name', 'station', 'layout', 'rent', 'management', 'common', 'url']
 FACILITY_FILTERS = {'スーパー': '[shop=supermarket]', 'コンビニ': '[shop=convenience]',
@@ -1659,7 +1672,11 @@ SNAPSHOT_INFO = {'layout': '2LDK',
  'warnings': ['16ページは位置・金額・間取りを確認できず除外しました。'],
  'source_url': 'https://www.homes.co.jp/chintai/tokyo/ikebukuro_00488-st/list/',
  'fetched_at': '2026-10-05T12:02:34+00:00'}
-MD_CODES = {'1LDK': '15', '2LDK': '25', '3LDK': '35', '4LDK': '45-'}
+MD_CODES = {
+    '1K':'11', '1DK':'12', '1LDK':'15',
+    '2DK':'22', '2LDK':'25',
+    '3DK':'32', '3LDK':'35',
+}
 DEFAULT_URL = 'https://www.homes.co.jp/chintai/tokyo/ikebukuro_00488-st/list/'
 HEADERS = {'User-Agent': 'SumaiCompass/4.0 (personal rental map)'}
 _HTTP = threading.local()
@@ -1669,7 +1686,9 @@ def http_session():
         _HTTP.session = requests.Session()
     return _HTTP.session
 
-REAL_FIELDS = ['id', 'name', 'address', 'lat', 'lng', 'layout', 'rent', 'fees', 'area', 'floor', 'url', 'fetched_at', 'modified', 'source']
+REAL_FIELDS = ['id', 'name', 'address', 'lat', 'lng', 'layout', 'rent', 'fees', 'area', 'floor',
+               'structure', 'building_age', 'built_year', 'coordinate_source',
+               'url', 'fetched_at', 'modified', 'source']
 COLORS = ['#2166ac', '#1d8fa7', '#48aa96', '#87b85c', '#d2be42', '#e9a248', '#df7245', '#c94049']
 BANDS = [15, 20, 22.5, 25, 27.5, 30, 35]
 
@@ -1747,6 +1766,97 @@ def json_nodes(value):
             yield from json_nodes(value['@graph'])
 
 
+def normalize_structure(value):
+    value = unicodedata.normalize('NFKC', str(value or '')).upper().replace(' ', '')
+    if '鉄骨鉄筋' in value or re.search(r'(^|[^A-Z])SRC([^A-Z]|$)', value):
+        return 'SRC'
+    if '鉄筋コンクリート' in value or re.search(r'(^|[^A-Z])RC([^A-Z]|$)', value):
+        return 'RC'
+    if '軽量鉄骨' in value:
+        return '軽量鉄骨'
+    if '鉄骨' in value:
+        return '鉄骨'
+    if '木造' in value:
+        return '木造'
+    return str(value or '').strip()
+
+
+def building_age_from_values(*values):
+    now = datetime.now(timezone.utc)
+    for raw in values:
+        value = unicodedata.normalize('NFKC', str(raw or '')).strip()
+        if not value:
+            continue
+        if '新築' in value:
+            return 0, now.year
+        match = re.search(r'築\s*(\d{1,3})\s*年', value)
+        if match:
+            age = int(match.group(1))
+            return age, now.year-age
+        match = re.search(r'((?:19|20)\d{2})\s*年\s*(\d{1,2})?\s*月?', value)
+        if match:
+            year = int(match.group(1))
+            month = int(match.group(2) or 1)
+            age = now.year-year-(1 if now.month < month else 0)
+            return max(0, age), year
+        if re.fullmatch(r'(?:19|20)\d{2}', value):
+            year = int(value)
+            return max(0, now.year-year), year
+    return None, None
+
+
+def named_text_value(soup, labels):
+    labels = tuple(labels)
+    for tag in soup.find_all(['th','dt']):
+        label = unicodedata.normalize('NFKC', tag.get_text(' ', strip=True)).replace(' ', '')
+        if any(x in label for x in labels):
+            sibling = tag.find_next_sibling(['td','dd'])
+            if sibling:
+                value = sibling.get_text(' ', strip=True)
+                if value:
+                    return value
+    text = unicodedata.normalize('NFKC', soup.get_text(' ', strip=True))
+    for label in labels:
+        m = re.search(re.escape(label)+r'\s*[:：|]?\s*([^|｜]{1,45})', text)
+        if m:
+            return m.group(1).strip()
+    return ''
+
+
+def extract_structure_age(soup, entity=None, attrs=None, data=None):
+    entity = entity if isinstance(entity, dict) else {}
+    attrs = attrs if isinstance(attrs, dict) else {}
+    data = data if isinstance(data, dict) else {}
+    structure_values = [attrs.get(k) for k in ('建物構造','構造','建物の構造')]
+    structure_values += [entity.get('buildingType'), named_text_value(soup, ('建物構造','構造'))]
+    structure = ''
+    for value in structure_values:
+        candidate = normalize_structure(value)
+        if candidate:
+            structure = candidate
+            if candidate == 'SRC':
+                break
+    age_values = [attrs.get(k) for k in ('築年月','築年数','建築年月','竣工年月')]
+    age_values += [entity.get('yearBuilt'), data.get('dateCreated'),
+                   named_text_value(soup, ('築年月','築年数','建築年月','竣工年月'))]
+    age, year = building_age_from_values(*age_values)
+    return structure, age, year
+
+
+def target_property(p):
+    try:
+        return (str(p.get('layout','')) in TARGET_LAYOUTS
+                and normalize_structure(p.get('structure')) == TARGET_STRUCTURE
+                and p.get('building_age') not in ('', None)
+                and 0 <= int(float(p.get('building_age'))) <= MAX_BUILDING_AGE)
+    except (ValueError, TypeError):
+        return False
+
+
+def layout_matches_group(raw_layout, group):
+    return str(raw_layout or '').strip() in LAYOUT_GROUPS.get(group, ())
+
+
 def parse_listing(html, url, fetched_at):
     soup = BeautifulSoup(html, 'html.parser')
     for script in soup.find_all('script', type='application/ld+json'):
@@ -1775,17 +1885,18 @@ def parse_listing(html, url, fetched_at):
                 continue
             attrs = {a.get('name'): a.get('value') for a in entity.get('additionalProperty', []) if isinstance(a, dict)}
             layout = str(attrs.get('間取り', '')).strip()
-            if layout not in LAYOUTS:
+            if layout not in STORAGE_LAYOUTS:
                 continue
             costs = {a.get('name'): a.get('value') for a in offer.get('additionalProperty', []) if isinstance(a, dict)}
             if '管理費等' not in costs:
-                continue  # Unknown fees are not silently treated as zero.
+                continue
             try:
                 fees = money(costs['管理費等'])
                 if fees > 10_000_000:
                     continue
             except ValueError:
                 continue
+            structure, building_age, built_year = extract_structure_age(soup, entity, attrs, data)
             address = entity.get('address', {})
             if not isinstance(address, dict):
                 continue
@@ -1797,12 +1908,15 @@ def parse_listing(html, url, fetched_at):
                 canonical = url
             return dict(id=canonical.rstrip('/').split('/')[-1], name=caption or entity.get('name', '物件'),
                         address=addr, lat=lat, lng=lng, layout=layout, rent=rent, fees=fees,
-                        area=size, floor=str(entity.get('floorLevel', '')), url=canonical,
-                        fetched_at=fetched_at, modified=str(data.get('dateModified', '')), source="LIFULL HOME'S")
+                        area=size, floor=str(entity.get('floorLevel', '')), structure=structure,
+                        building_age=building_age if building_age is not None else '',
+                        built_year=built_year if built_year is not None else '', coordinate_source="HOME'S掲載座標",
+                        url=canonical, fetched_at=fetched_at, modified=str(data.get('dateModified', '')),
+                        source="LIFULL HOME'S")
     return None
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@functools.lru_cache(maxsize=4096)
 def fetch_listing(url):
     return parse_listing(fetch_html(url), url, datetime.now(timezone.utc).isoformat(timespec='seconds'))
 
@@ -1846,7 +1960,7 @@ def collect(base, layout, limit=120, pages=3, progress=None):
         for number, future in enumerate(concurrent.futures.as_completed(futures), 1):
             try:
                 p = future.result()
-                if p and p['layout'] == layout:
+                if p and p['layout'] == layout and target_property(p):
                     records.append(p)
                 else:
                     failed += 1
@@ -1915,9 +2029,9 @@ def mesh(properties, origin, cell=100, radius=1500, interpolate=True, reach=400,
     return cells
 
 
-def validate_records(raw, maximum=2000):
-    if len(raw) > max(5_000_000, maximum*2500):
-        raise ValueError('CSVは5MB以内にしてください。')
+def validate_records(raw, maximum=20000):
+    if len(raw) > max(20_000_000, maximum*3500):
+        raise ValueError('CSVが大きすぎます。')
     reader = csv.DictReader(io.StringIO(raw.decode('utf-8-sig')))
     required = {'name', 'lat', 'lng', 'layout', 'rent', 'fees', 'area'}
     if not reader.fieldnames or not required <= set(reader.fieldnames):
@@ -1931,12 +2045,16 @@ def validate_records(raw, maximum=2000):
             for key in ('lat', 'lng', 'area'):
                 p[key] = float(row[key])
             for key in ('rent', 'fees'):
-                p[key] = int(row[key])
+                p[key] = int(float(row[key]))
+            if p.get('building_age') not in ('', None):
+                p['building_age'] = int(float(p['building_age']))
+            if p.get('built_year') not in ('', None):
+                p['built_year'] = int(float(p['built_year']))
             if not (34 <= p['lat'] <= 37 and 138 <= p['lng'] <= 141 and math.isfinite(p['area']) and p['area'] > 0
-                    and 0 < p['rent'] <= 10_000_000 and 0 <= p['fees'] <= 10_000_000 and p['layout'] in LAYOUTS):
+                    and 0 < p['rent'] <= 10_000_000 and 0 <= p['fees'] <= 10_000_000 and p['layout'] in STORAGE_LAYOUTS):
                 raise ValueError()
-            for field in ('name', 'id', 'address', 'floor'):
-                p[field] = str(p[field])[:200]
+            for field in ('name', 'id', 'address', 'floor', 'structure', 'coordinate_source'):
+                p[field] = str(p.get(field, ''))[:200]
                 if p[field].startswith("'") and p[field][1:].startswith(('=', '+', '-', '@')):
                     p[field] = p[field][1:]
             p['name'] = p['name'].strip()
@@ -2080,37 +2198,43 @@ def supabase_settings():
     return url, headers, namespace
 
 
-def supabase_request(method, route, *, params=None, payload=None):
-    url, headers, _ = supabase_settings()
+def supabase_request(method, route, *, params=None, payload=None, settings=None, extra_headers=None, allow_empty=False):
+    url, headers, _ = settings or supabase_settings()
     allowed = ('sumai_properties','sumai_fetch_queries','sumai_metadata','rpc/sumai_save_properties')
     if route not in allowed:
         raise StorageError('保存先の指定が不正です。')
+    headers = dict(headers)
+    if extra_headers:
+        headers.update(extra_headers)
     try:
-        # Use a separate one-shot connection: do not share the HOME'S scraping session or headers.
         response = requests.request(method, url+'/rest/v1/'+route, headers=headers,
-                                    params=params, json=payload, timeout=(10,45), allow_redirects=False)
+                                    params=params, json=payload, timeout=(10,60), allow_redirects=False)
     except requests.RequestException:
         raise StorageError('Supabaseに接続できませんでした。Projectの稼働状態・接続設定を確認して再試行してください。') from None
     if not 200 <= response.status_code < 300:
         if response.status_code in (401,403):
             message = 'Supabaseのキーまたはアクセス権が不正です。Secret keyとセットアップSQLを確認してください。'
         elif response.status_code == 404:
-            message = 'Supabaseのテーブルまたは保存用関数がありません。supabase_setup_ver.04.sqlをSQL Editorで実行してください。'
+            message = 'Supabaseのテーブルがありません。supabase_setup_ver.04.sqlをSQL Editorで実行してください。'
         else:
             message = f'Supabaseの読み込み・保存に失敗しました（HTTP {response.status_code}）。保存済みデータは削除していません。'
         raise StorageError(message)
+    if not response.content.strip():
+        return {} if allow_empty else None
     try:
         return response.json()
     except ValueError:
+        if allow_empty:
+            return {}
         raise StorageError('Supabaseの応答を読み取れませんでした。') from None
 
 
-def load_store():
-    _, _, namespace = supabase_settings()
+def load_store(settings=None):
+    _, _, namespace = settings or supabase_settings()
     records, offset = [], 0
     # PostgREST caps one response; read every page with a deterministic primary-key order.
     while True:
-        rows = supabase_request('GET','sumai_properties',params={
+        rows = supabase_request('GET','sumai_properties',settings=settings,params={
             'namespace':'eq.'+namespace, 'select':'identity,payload', 'order':'identity.asc', 'limit':500, 'offset':offset})
         if not isinstance(rows,list) or any(not isinstance(r,dict) or not isinstance(r.get('payload'),dict) for r in rows):
             raise StorageError('Supabaseの物件データ形式が不正です。')
@@ -2118,39 +2242,63 @@ def load_store():
             break
         records.extend(row['payload'] for row in rows)
         offset += len(rows)  # Continue even if the server's configured cap is less than 500.
-    meta = supabase_request('GET','sumai_metadata',params={
+    meta = supabase_request('GET','sumai_metadata',settings=settings,params={
         'namespace':'eq.'+namespace,'select':'payload','identity':'eq.last_fetch','limit':1})
     if not isinstance(meta,list) or (meta and (not isinstance(meta[0],dict) or not isinstance(meta[0].get('payload'),dict))):
         raise StorageError('Supabaseの取得履歴の形式が不正です。')
     try:
-        valid = validate_records(export_records(records),maximum=max(2000,len(records))) if records else []
+        valid = validate_records(export_records(records),maximum=max(20000,len(records))) if records else []
     except (ValueError, KeyError, TypeError, csv.Error):
         raise StorageError('保存済み物件の座標・家賃・間取りを確認できません。Supabaseのデータを確認してください。') from None
     return deduplicate(valid), meta[0]['payload'] if meta else {}
 
 
 def query_key(bounds, layout, limit):
-    # Fetching is now always for all four layouts. Keep layout in the signature for compatibility,
-    # but do not let the display-selected layout create separate cache entries.
-    value = json.dumps(['v07-dense-regions-all-layouts', list(map(lambda x: round(x,5), bounds)),
-                        'ALL_LAYOUTS', limit], ensure_ascii=False)
+    value = json.dumps(['v08-src-age20-background-wide', list(map(lambda x: round(x,5), bounds)),
+                        'ALL_TARGET_LAYOUTS', int(limit)], ensure_ascii=False)
     return hashlib.sha256(value.encode()).hexdigest()
 
 
-def cached_query(bounds, layout, limit):
-    _, _, namespace = supabase_settings()
-    rows = supabase_request('GET','sumai_fetch_queries',params={
+def cached_query(bounds, layout, limit, settings=None):
+    _, _, namespace = settings or supabase_settings()
+    rows = supabase_request('GET','sumai_fetch_queries',settings=settings,params={
         'namespace':'eq.'+namespace,'identity':'eq.'+query_key(bounds,layout,limit),'select':'payload','limit':1})
     if not isinstance(rows,list) or (rows and (not isinstance(rows[0],dict) or not isinstance(rows[0].get('payload'),dict))):
         raise StorageError('Supabaseの範囲キャッシュの形式が不正です。')
     return rows[0]['payload'] if rows else None
 
 
-def save_store(records, info, bounds=None, layout=None, limit=None, reload_after=True):
-    _, _, namespace = supabase_settings()
+def _upsert_rows(route, rows, conflict, settings):
+    if not rows:
+        return
+    for start in range(0, len(rows), 100):
+        supabase_request('POST',route,settings=settings,
+                         params={'on_conflict':conflict}, payload=rows[start:start+100],
+                         extra_headers={'Prefer':'resolution=merge-duplicates,return=minimal'}, allow_empty=True)
+
+
+def save_metadata(identity, payload, settings=None):
+    settings = settings or supabase_settings()
+    _, _, namespace = settings
+    _upsert_rows('sumai_metadata', [{'namespace':namespace,'identity':identity,'payload':payload}],
+                 'namespace,identity', settings)
+
+
+def load_metadata(identity, settings=None):
+    settings = settings or supabase_settings()
+    _, _, namespace = settings
+    rows = supabase_request('GET','sumai_metadata',settings=settings,params={
+        'namespace':'eq.'+namespace,'identity':'eq.'+identity,'select':'payload','limit':1})
+    return rows[0]['payload'] if isinstance(rows,list) and rows and isinstance(rows[0].get('payload'),dict) else {}
+
+
+def save_store(records, info, bounds=None, layout=None, limit=None, reload_after=True,
+               settings=None, mark_query_cache=True):
+    settings = settings or supabase_settings()
+    _, _, namespace = settings
     try:
-        records = validate_records(export_records(records),maximum=5000)
-    except (ValueError, KeyError, TypeError, csv.Error) as error:
+        records = validate_records(export_records(records),maximum=max(20000,len(records)+10))
+    except (ValueError, KeyError, TypeError, csv.Error):
         raise StorageError('保存する物件データの形式を確認してください。') from None
     if not records:
         raise StorageError('保存する物件がありません。')
@@ -2159,26 +2307,26 @@ def save_store(records, info, bounds=None, layout=None, limit=None, reload_after
     for p in records:
         stamp = p.get('fetched_at') or now
         try:
-            parsed = datetime.fromisoformat(stamp.replace('Z','+00:00'))
+            parsed = datetime.fromisoformat(str(stamp).replace('Z','+00:00'))
             if parsed.tzinfo is None:
                 parsed = parsed.replace(tzinfo=timezone.utc)
             p['fetched_at'] = parsed.astimezone(timezone.utc).isoformat(timespec='seconds')
         except (ValueError, TypeError, AttributeError):
             raise StorageError('物件の取得日時を確認してください。') from None
         identity = p.get('url') or str(p['id'])
-        if identity not in unique or unique[identity]['fetched_at'] <= p['fetched_at']:
+        if identity not in unique or str(unique[identity]['fetched_at']) <= str(p['fetched_at']):
             unique[identity] = p
-    result = supabase_request('POST','rpc/sumai_save_properties',payload={
-        'p_namespace':namespace,'p_records':list(unique.values()),'p_info':info,
-        'p_query_key':query_key(bounds,layout,limit) if bounds is not None else None})
-    if not isinstance(result,dict) or result.get('ok') is not True:
-        raise StorageError('Supabaseへの保存完了を確認できませんでした。再読み込みして確認してください。')
+    rows = [{'namespace':namespace,'identity':identity,'payload':p,'fetched_at':p['fetched_at']}
+            for identity,p in unique.items()]
+    _upsert_rows('sumai_properties', rows, 'namespace,identity', settings)
+    save_metadata('last_fetch', info, settings)
+    if bounds is not None and mark_query_cache:
+        _upsert_rows('sumai_fetch_queries', [{
+            'namespace':namespace,'identity':query_key(bounds,layout,limit),'payload':info}],
+            'namespace,identity', settings)
     if not reload_after:
         return list(unique.values())
-    try:
-        return load_store()[0]
-    except StorageError:
-        raise StorageError('Supabaseへの保存は完了しましたが、再読み込みに失敗しました。再接続して確認してください。') from None
+    return load_store(settings=settings)[0]
 
 
 def show_storage_setup():
@@ -2197,12 +2345,16 @@ def show_storage_setup():
 MAP_TILE_URL = 'https://www.homes.co.jp/_ajax/map/realestate_article/tile/'
 MAP_INFO_URL = 'https://www.homes.co.jp/_ajax/map/realestate_article/info_view/'
 SUUMO_SEARCH_URL = 'https://suumo.jp/jj/chintai/ichiran/FR301FC001/'
-SUUMO_MD_CODES = {'1LDK': '04', '2LDK': '07', '3LDK': '10', '4LDK': '13'}
+SUUMO_MD_CODES = {
+    '1K':'02', '1DK':'03', '1LDK':'04',
+    '2DK':'06', '2LDK':'07',
+    '3DK':'09', '3LDK':'10',
+}
 GSI_REVERSE_URL = 'https://mreversegeocoder.gsi.go.jp/reverse-geocoder/LonLatToAddress'
 GSI_SEARCH_URL = 'https://msearch.gsi.go.jp/address-search/AddressSearch'
 GSI_MUNI_URL = 'https://maps.gsi.go.jp/js/muni.js'
-SUUMO_HEADERS = {'User-Agent': 'SumaiCompass/7.0 (personal rental map)'}
-GSI_HEADERS = {'User-Agent': 'SumaiCompass/7.0 (personal rental map)'}
+SUUMO_HEADERS = {'User-Agent': 'SumaiCompass/8.0 (personal rental map)'}
+GSI_HEADERS = {'User-Agent': 'SumaiCompass/8.0 (personal rental map)'}
 _SUUMO_HTTP = threading.local()
 
 
@@ -2212,7 +2364,7 @@ def suumo_session():
     return _SUUMO_HTTP.session
 
 
-@st.cache_data(ttl=86400, show_spinner=False)
+@functools.lru_cache(maxsize=1)
 def gsi_municipalities():
     try:
         r = requests.get(GSI_MUNI_URL, headers=GSI_HEADERS, timeout=(5, 15), allow_redirects=False)
@@ -2232,7 +2384,7 @@ def gsi_municipalities():
         return {}
 
 
-@st.cache_data(ttl=86400, show_spinner=False)
+@functools.lru_cache(maxsize=8192)
 def gsi_reverse_region(lat, lng):
     try:
         r = requests.get(GSI_REVERSE_URL, params={'lat': round(float(lat), 7), 'lon': round(float(lng), 7)},
@@ -2311,10 +2463,9 @@ def visible_regions(bounds):
     mid_lat = (south+north)/2
     height_m = max(1.0, (north-south)*111320)
     width_m = max(1.0, (east-west)*111320*math.cos(math.radians(mid_lat)))
-    # Sample roughly every 250 m, capped at 15 x 15. This captures substantially more
-    # visible town/chome labels than the old 3 x 3 sampling without building a large crawler.
-    rows = min(15, max(3, math.ceil(height_m/250)))
-    cols = min(15, max(3, math.ceil(width_m/250)))
+    # Wide views deliberately take longer: keep sampling near 250 m and allow up to 40 x 40 points.
+    rows = min(40, max(3, math.ceil(height_m/250)))
+    cols = min(40, max(3, math.ceil(width_m/250)))
     points = []
     for iy in range(rows):
         fy = (iy + .5) / rows
@@ -2325,23 +2476,22 @@ def visible_regions(bounds):
             points.append((lat, lng))
     regions, seen = [], set()
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(points))) as pool:
-        found = list(pool.map(lambda xy: gsi_reverse_region(xy[0], xy[1]), points))
-    for region in found:
-        if not region:
-            continue
-        key = (region['muni_code'], _normalize_place_text(region['town']))
-        if key in seen:
-            continue
-        seen.add(key)
-        regions.append(region)
-        if len(regions) >= 60:
-            break
+        for region in pool.map(lambda xy: gsi_reverse_region(xy[0], xy[1]), points):
+            if not region:
+                continue
+            key = (region['muni_code'], _normalize_place_text(region['town']))
+            if key in seen:
+                continue
+            seen.add(key)
+            regions.append(region)
+            if len(regions) >= 250:
+                break
     if not regions:
         raise ValueError('表示範囲の地域名を取得できませんでした。地図を少し動かして再試行してください。')
     return regions
 
 
-@st.cache_data(ttl=604800, show_spinner=False)
+@functools.lru_cache(maxsize=8192)
 def gsi_geocode_address(address):
     address = str(address).strip()
     if not address:
@@ -2376,7 +2526,7 @@ def gsi_geocode_address(address):
         return None
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@functools.lru_cache(maxsize=1)
 def map_robots_allowed():
     response = http_session().get('https://www.homes.co.jp/robots.txt',headers=HEADERS,timeout=(20,20))
     response.raise_for_status()
@@ -2385,7 +2535,7 @@ def map_robots_allowed():
     return all(rp.can_fetch('SumaiCompass', u) for u in (MAP_TILE_URL, MAP_INFO_URL, DEFAULT_URL))
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@functools.lru_cache(maxsize=1)
 def suumo_robots_allowed():
     response = suumo_session().get('https://suumo.jp/robots.txt', headers=SUUMO_HEADERS, timeout=(10,20))
     response.raise_for_status()
@@ -2413,26 +2563,27 @@ def map_request(url, data):
 
 
 def map_condition(layout, freeword=''):
-    return {'cond[mbg][3001]':'3001','cond[mbg][3002]':'3002','cond[mbg][3003]':'3003',
+    data = {'cond[mbg][3001]':'3001','cond[mbg][3002]':'3002','cond[mbg][3003]':'3003',
             'cond[monthmoneyroom]':'0','cond[monthmoneyroomh]':'0','cond[housearea]':'0',
-            'cond[houseareah]':'0','cond[walkminutesh]':'0','cond[houseageh]':'0',
-            'cond[newdate]':'0','cond[freeword]':freeword,'cond[fwtype]':'1','cond[exfreeword]':'',
-            f'cond[madori][{MD_CODES[layout]}]':MD_CODES[layout]}
+            'cond[houseareah]':'0','cond[walkminutesh]':'0','cond[houseageh]':str(MAX_BUILDING_AGE),
+            'cond[newdate]':'0','cond[freeword]':freeword,'cond[fwtype]':'1','cond[exfreeword]':''}
+    code = MD_CODES.get(layout)
+    if code:
+        data[f'cond[madori][{code}]'] = code
+    return data
 
 
 def viewport_tiles(bounds, zoom=15):
     xmin,ymin = tile_xy(bounds[2],bounds[1],zoom)
     xmax,ymax = tile_xy(bounds[0],bounds[3],zoom)
-    tiles = [(x,y) for x in range(xmin,xmax+1) for y in range(ymin,ymax+1)]
-    if len(tiles) > 160:
-        raise ValueError('検索区画が多すぎます。地図を拡大してください。')
-    return tiles
+    return [(x,y) for x in range(xmin,xmax+1) for y in range(ymin,ymax+1)]
 
 
 def homes_candidates(bounds, layout, freeword):
     warnings, candidates, zoom = [], {}, 15
-    for offset in range(0, len(viewport_tiles(bounds, zoom)), 6):
-        part = viewport_tiles(bounds, zoom)[offset:offset+6]
+    tiles = viewport_tiles(bounds, zoom)
+    for offset in range(0, len(tiles), 6):
+        part = tiles[offset:offset+6]
         data = map_condition(layout, freeword)
         data['zoom'] = zoom
         for i,(x,y) in enumerate(part):
@@ -2457,11 +2608,10 @@ def homes_candidates(bounds, layout, freeword):
     return candidates, warnings
 
 
-def collect_homes_region(bounds, layout, region, limit=12):
+def collect_homes_region(bounds, layout, region, limit=40):
     if not map_robots_allowed():
         raise ValueError('LIFULL HOME’Sは現在、自動取得を許可していません。')
     warnings, candidates, used_term = [], {}, ''
-    # Chome as displayed -> numeric chome -> town name. Stop at the first useful result.
     for term in region_search_terms(region):
         candidates, local = homes_candidates(bounds, layout, term)
         warnings.extend(local)
@@ -2471,42 +2621,46 @@ def collect_homes_region(bounds, layout, region, limit=12):
     if not candidates:
         candidates, more = homes_candidates(bounds, layout, '')
         warnings.extend(more)
-        if candidates:
-            warnings.append(f'HOME’Sは「{region["town"]}」の直接候補が0件だったため、表示範囲候補を住所で再確認しました。')
     keys = sorted(candidates, key=lambda k: distance(
         {'lat':float(candidates[k]['lat']),'lng':float(candidates[k]['lon'])}, region))
-    keys = keys[:max(1, limit)]
+    # SRC rejection happens after opening the detail page, so inspect more candidates than the desired accepted count.
+    keys = keys[:max(1, limit*4)]
     links = []
-    for start in range(0,len(keys),8):
+    for start_i in range(0,len(keys),8):
         data = map_condition(layout, used_term)
-        data['cond[tykey]'] = ','.join(keys[start:start+8])
+        data['cond[tykey]'] = ','.join(keys[start_i:start_i+8])
         try:
             links.extend(room_links(map_request(MAP_INFO_URL,data).text))
         except (requests.RequestException, ValueError) as error:
             warnings.append(f'HOME’Sの候補一覧を一部取得できませんでした（{type(error).__name__}）。')
     if not links and keys:
-        for start in range(0,len(keys),8):
+        for start_i in range(0,len(keys),8):
             data = map_condition(layout, '')
-            data['cond[tykey]'] = ','.join(keys[start:start+8])
+            data['cond[tykey]'] = ','.join(keys[start_i:start_i+8])
             try:
                 links.extend(room_links(map_request(MAP_INFO_URL,data).text))
             except (requests.RequestException, ValueError):
                 pass
-    links = list(dict.fromkeys(links))[:max(1, limit)]
+    links = list(dict.fromkeys(links))[:max(1,limit*6)]
     records, failed = [], 0
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
         jobs = [pool.submit(fetch_listing,u) for u in links]
         for job in concurrent.futures.as_completed(jobs):
             try:
                 p = job.result()
-                if p and p['layout'] == layout and inside(p,bounds) and region_matches_address(p.get('address',''), region):
+                if (p and p['layout'] == layout and target_property(p) and inside(p,bounds)
+                        and region_matches_address(p.get('address',''), region)):
                     records.append(p)
+                    if len(records) >= limit:
+                        for pending in jobs:
+                            pending.cancel()
+                        break
                 else:
                     failed += 1
             except (requests.RequestException, ValueError, KeyError, TypeError):
                 failed += 1
     if failed:
-        warnings.append(f'HOME’S「{region["town"]}」{layout}で{failed}ページを範囲・間取り・位置・費用の確認後に除外しました。')
+        warnings.append(f'HOME’S「{region["town"]}」{layout}で{failed}件をSRC・築20年以内・位置・費用の確認後に除外しました。')
     return deduplicate(records), warnings
 
 
@@ -2520,8 +2674,11 @@ def safe_suumo_url(url):
 
 
 def suumo_search_url(region, layout, page=1, term=None):
-    params = {'ar':'030','bs':'040','pc':'50','md':SUUMO_MD_CODES[layout],
-              'sc':region['muni_code'],'fw2':term or region['town'],'page':str(page)}
+    params = {'ar':'030','bs':'040','pc':'50','sc':region['muni_code'],
+              'fw2':term or region['town'],'page':str(page)}
+    code = SUUMO_MD_CODES.get(layout)
+    if code:
+        params['md'] = code
     if region.get('pref_code'):
         params['ta'] = region['pref_code']
     return SUUMO_SEARCH_URL + '?' + urlencode(params)
@@ -2531,13 +2688,25 @@ def suumo_fetch_html(url):
     p = urlparse(url)
     if not (p.scheme == 'https' and p.hostname == 'suumo.jp' and p.path == urlparse(SUUMO_SEARCH_URL).path):
         raise ValueError('SUUMOの検索URLが不正です。')
-    r = suumo_session().get(url,headers=SUUMO_HEADERS,timeout=(10,25),allow_redirects=False)
+    r = suumo_session().get(url,headers=SUUMO_HEADERS,timeout=(10,30),allow_redirects=False)
     if 300 <= r.status_code < 400:
         raise ValueError('SUUMOの検索ページが移動しました。')
     r.raise_for_status()
-    if len(r.content) > 5_000_000:
+    if len(r.content) > 6_000_000:
         raise ValueError('SUUMOの検索結果が大きすぎます。')
-    # SUUMO can be Shift_JIS/CP932. Respect the response when available and fall back safely.
+    r.encoding = r.apparent_encoding or 'utf-8'
+    return r.text
+
+
+def suumo_fetch_detail(url):
+    if not safe_suumo_url(url):
+        raise ValueError('SUUMOの物件URLが不正です。')
+    r = suumo_session().get(url,headers=SUUMO_HEADERS,timeout=(10,30),allow_redirects=False)
+    if 300 <= r.status_code < 400:
+        raise ValueError('SUUMOの物件ページが移動しました。')
+    r.raise_for_status()
+    if len(r.content) > 7_000_000:
+        raise ValueError('SUUMOの物件ページが大きすぎます。')
     r.encoding = r.apparent_encoding or 'utf-8'
     return r.text
 
@@ -2560,6 +2729,10 @@ def parse_suumo_list(html, layout, region, limit):
         address = address_el.get_text(' ',strip=True) if address_el else ''
         if not address or not region_matches_address(address, region):
             continue
+        building_text = building.get_text(' ', strip=True)
+        list_age, list_year = building_age_from_values(building_text)
+        if list_age is not None and list_age > MAX_BUILDING_AGE:
+            continue
         for room in building.select('tr.js-cassette_link'):
             madori = room.select_one('.cassetteitem_madori')
             menseki = room.select_one('.cassetteitem_menseki')
@@ -2569,7 +2742,7 @@ def parse_suumo_list(html, layout, region, limit):
             room_layout = madori.get_text(strip=True) if madori else ''
             if room_layout != layout or not menseki or not rent_el or not link:
                 continue
-            url = urljoin('https://suumo.jp',link.get('href','')).split('?')[0]
+            url = urljoin('https://suumo.jp',link.get('href','')).split('#')[0]
             if not safe_suumo_url(url):
                 continue
             try:
@@ -2585,102 +2758,304 @@ def parse_suumo_list(html, layout, region, limit):
             floor = cells[2].get_text(' ',strip=True)[:80] if len(cells) > 2 else ''
             rows.append(dict(id=url.rstrip('/').split('/')[-1],name=name[:200],address=address[:200],layout=layout,
                              rent=rent,fees=fees,area=area,floor=floor,url=url,fetched_at=now,
-                             modified='',source='SUUMO'))
+                             modified='',source='SUUMO',structure='',building_age=(list_age if list_age is not None else ''),
+                             built_year=(list_year if list_year is not None else ''),coordinate_source=''))
             if len(rows) >= limit:
                 return rows
     return rows
 
 
-def collect_suumo_region(bounds, layout, region, limit=12):
+def _json_coordinates(value):
+    if isinstance(value, list):
+        for item in value:
+            yield from _json_coordinates(item)
+    elif isinstance(value, dict):
+        geo = value.get('geo')
+        if isinstance(geo, dict):
+            try:
+                yield float(geo.get('latitude')), float(geo.get('longitude'))
+            except (ValueError,TypeError):
+                pass
+        for v in value.values():
+            if isinstance(v,(list,dict)):
+                yield from _json_coordinates(v)
+
+
+def source_coordinates(html, soup, bounds, region):
+    candidates = []
+    for script in soup.find_all('script', type='application/ld+json'):
+        try:
+            data = json.loads(script.string or script.get_text())
+            candidates.extend(_json_coordinates(data))
+        except (ValueError,TypeError):
+            pass
+    normalized = unicodedata.normalize('NFKC', html)
+    patterns = [
+        r'["\']lat(?:itude)?["\']\s*[:=]\s*["\']?(3[4-7]\.\d+)["\']?.{0,120}?["\'](?:lng|lon|longitude)["\']\s*[:=]\s*["\']?(1(?:3[8-9]|40)\.\d+)',
+        r'["\'](?:lng|lon|longitude)["\']\s*[:=]\s*["\']?(1(?:3[8-9]|40)\.\d+)["\']?.{0,120}?["\']lat(?:itude)?["\']\s*[:=]\s*["\']?(3[4-7]\.\d+)'
+    ]
+    for i,pat in enumerate(patterns):
+        for m in re.finditer(pat, normalized, flags=re.I|re.S):
+            a,b = float(m.group(1)), float(m.group(2))
+            candidates.append((a,b) if i == 0 else (b,a))
+    valid=[]
+    for lat,lng in candidates:
+        p={'lat':lat,'lng':lng}
+        if 34 <= lat <= 37 and 138 <= lng <= 141 and inside(p,bounds):
+            valid.append((distance(p,region),lat,lng))
+    if not valid:
+        return None
+    _,lat,lng=min(valid,key=lambda x:x[0])
+    return lat,lng
+
+
+def verify_suumo_detail(p, bounds, region):
+    html = suumo_fetch_detail(p['url'])
+    soup = BeautifulSoup(html,'html.parser')
+    structure_text = named_text_value(soup, ('構造','建物構造'))
+    structure = normalize_structure(structure_text)
+    age_text = named_text_value(soup, ('築年月','築年数'))
+    age, year = building_age_from_values(age_text, soup.get_text(' ',strip=True))
+    if structure != TARGET_STRUCTURE or age is None or not (0 <= age <= MAX_BUILDING_AGE):
+        return None
+    coords = source_coordinates(html,soup,bounds,region)
+    if not coords:
+        return None
+    lat,lng=coords
+    p=dict(p)
+    p.update(lat=lat,lng=lng,structure='SRC',building_age=age,built_year=year or '',
+             coordinate_source='SUUMO掲載ページ地図座標')
+    return p if target_property(p) and inside(p,bounds) else None
+
+
+def collect_suumo_region(bounds, layout, region, limit=40):
     if not suumo_robots_allowed():
         raise ValueError('SUUMOは現在、自動取得を許可していません。')
-    warnings, parsed = [], []
-    # Search the visible chome first. If the site returns nothing, broaden only to its town,
-    # while the parser still keeps the original chome.
+    warnings, candidates = [], []
     terms = region_search_terms(region)
-    exact_terms = terms[:-1] if len(terms) > 1 else terms
-    for term in exact_terms:
-        try:
-            parsed = parse_suumo_list(suumo_fetch_html(suumo_search_url(region,layout,1,term)),
-                                      layout,region,max(limit*2,limit))
-        except (requests.RequestException, ValueError, TypeError, AttributeError) as error:
-            raise ValueError(f'SUUMO「{region["town"]}」{layout}を取得できませんでした（{type(error).__name__}）。') from None
-        if parsed:
+    search_terms = terms[:-1] if len(terms)>1 else terms
+    if region.get('town_base') and region['town_base'] not in search_terms:
+        search_terms.append(region['town_base'])
+    seen_urls=set()
+    candidate_budget=max(limit*5,100)
+    for term in search_terms:
+        empty_streak=0
+        max_pages=min(20,max(2,math.ceil(candidate_budget/50)+2))
+        for page in range(1,max_pages+1):
+            try:
+                rows=parse_suumo_list(suumo_fetch_html(suumo_search_url(region,layout,page,term)),
+                                      layout,region,candidate_budget)
+            except (requests.RequestException,ValueError,TypeError,AttributeError) as error:
+                warnings.append(f'SUUMO「{region["town"]}」{layout} {page}ページ目を取得できませんでした（{type(error).__name__}）。')
+                break
+            fresh=[p for p in rows if p['url'] not in seen_urls]
+            if not fresh:
+                empty_streak += 1
+                if empty_streak >= 2:
+                    break
+            else:
+                empty_streak=0
+                for p in fresh:
+                    seen_urls.add(p['url']); candidates.append(p)
+                if len(candidates)>=candidate_budget:
+                    break
+        if candidates:
             break
-    if not parsed and region.get('town_base') and region.get('town_base') != region.get('town'):
-        try:
-            parsed = parse_suumo_list(suumo_fetch_html(suumo_search_url(region,layout,1,region['town_base'])),
-                                      layout,region,max(limit*2,limit))
-        except (requests.RequestException, ValueError, TypeError, AttributeError):
-            parsed = []
-    records, geocode_failed = [], 0
-    for p in parsed:
-        geo = gsi_geocode_address(p['address'])
-        if not geo:
-            geocode_failed += 1
-            continue
-        p['lat'],p['lng'] = geo['lat'],geo['lng']
-        if inside(p,bounds):
-            records.append(p)
-        if len(records) >= limit:
-            break
-    if geocode_failed:
-        warnings.append(f'SUUMO「{region["town"]}」{layout}で{geocode_failed}件は住所位置を確認できず除外しました。')
-    return deduplicate(records), warnings
+    records=[]; rejected=0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+        jobs=[pool.submit(verify_suumo_detail,p,bounds,region) for p in candidates]
+        for job in concurrent.futures.as_completed(jobs):
+            try:
+                p=job.result()
+                if p:
+                    records.append(p)
+                    if len(records)>=limit:
+                        for pending in jobs: pending.cancel()
+                        break
+                else:
+                    rejected += 1
+            except (requests.RequestException,ValueError,TypeError,AttributeError,KeyError):
+                rejected += 1
+    if rejected:
+        warnings.append(f'SUUMO「{region["town"]}」{layout}で{rejected}件をSRC・築20年以内・掲載地図座標の確認後に除外しました。')
+    return deduplicate(records),warnings
 
 
 
-def collect_visible_regions(bounds, limit=120, progress=None, save_chunk=None):
+def collect_visible_regions(bounds, limit=40, progress=None, save_chunk=None, completed=None, status_hook=None):
     bounds = normalize_bounds(bounds)
     if not bounds:
         raise ValueError('地図の表示範囲を確認できません。')
-    center = dict(lat=(bounds[0]+bounds[2])/2,lng=(bounds[1]+bounds[3])/2)
-    if bounds_radius(bounds,center) > 6000:
-        raise ValueError('地図を拡大してください。')
     if not (34.8 <= bounds[0] < bounds[2] <= 36.5 and 138.5 <= bounds[1] < bounds[3] <= 140.9):
         raise ValueError('首都圏の範囲で取得してください。')
     regions = visible_regions(bounds)
-    # The UI's limit is a per-layout budget. Divide it into small region/source chunks.
-    per_source_region = max(1, min(8, math.ceil(limit/max(1,len(regions)*2))))
-    total_steps = len(regions)*len(LAYOUTS)*2
-    step, warnings, all_records = 0, [], []
-    source_counts = {"LIFULL HOME'S":0,'SUUMO':0}
-    layout_counts = {layout:0 for layout in LAYOUTS}
-    source_layout_counts = {layout:{"LIFULL HOME'S":0,'SUUMO':0} for layout in LAYOUTS}
+    completed = set(completed or [])
+    total_steps = len(regions)*len(SEARCHABLE_LAYOUTS)*2
+    step = 0
+    warnings=[]; all_records=[]
+    source_counts={"LIFULL HOME'S":0,'SUUMO':0}
+    raw_counts={layout:0 for layout in TARGET_LAYOUTS}
     for region in regions:
-        for layout in LAYOUTS:
-            for source_name, collector in (("LIFULL HOME'S",collect_homes_region),('SUUMO',collect_suumo_region)):
+        region_key=f'{region["muni_code"]}:{_normalize_place_text(region["town"])}'
+        for raw_layout in SEARCHABLE_LAYOUTS:
+            for source_name,collector in (("LIFULL HOME'S",collect_homes_region),('SUUMO',collect_suumo_region)):
+                task_key=f'{region_key}|{raw_layout}|{source_name}'
                 step += 1
-                if progress:
-                    progress(step,total_steps,f'{region["label"]}｜{layout}｜{source_name}を確認中')
+                if task_key in completed:
+                    if progress: progress(step,total_steps,f'保存済みをスキップ：{region["label"]}｜{raw_layout}｜{source_name}')
+                    continue
+                if progress: progress(step,total_steps,f'{region["label"]}｜{raw_layout}｜{source_name}を精査中')
                 try:
-                    records, local_warnings = collector(bounds,layout,region,per_source_region)
+                    records,local_warnings=collector(bounds,raw_layout,region,limit)
                     warnings.extend(local_warnings)
-                except (requests.RequestException, ValueError, KeyError, TypeError) as error:
-                    records = []
-                    warnings.append(str(error))
+                except (requests.RequestException,ValueError,KeyError,TypeError) as error:
+                    records=[]; warnings.append(str(error))
                 if records:
-                    source_counts[source_name] += len(records)
-                    layout_counts[layout] += len(records)
-                    source_layout_counts[layout][source_name] += len(records)
+                    records=[p for p in records if target_property(p)]
+                    source_counts[source_name]+=len(records)
+                    raw_counts[raw_layout]+=len(records)
                     all_records.extend(records)
                     if save_chunk:
-                        chunk_info = dict(layout=layout,layouts=list(LAYOUTS),bounds=bounds,region=region['label'],
-                                          source=source_name,received=len(records),warnings=[],source_url=(
-                                              'https://www.homes.co.jp/chintai/map/' if source_name.startswith('LIFULL') else SUUMO_SEARCH_URL),
-                                          fetched_at=datetime.now(timezone.utc).isoformat(timespec='seconds'))
+                        chunk_info=dict(layout='ALL',layouts=list(TARGET_LAYOUTS),bounds=bounds,region=region['label'],
+                                        source=source_name,received=len(records),filters={'structure':'SRC','max_age':20},
+                                        warnings=[],source_url=('https://www.homes.co.jp/chintai/map/' if source_name.startswith('LIFULL') else SUUMO_SEARCH_URL),
+                                        fetched_at=datetime.now(timezone.utc).isoformat(timespec='seconds'))
                         save_chunk(records,chunk_info)
-    combined = deduplicate(all_records)
-    # Recalculate visible summary counts after cross-region/source deduplication.
-    final_layout_counts = {layout:sum(p['layout']==layout for p in combined) for layout in LAYOUTS}
-    final_source_counts = {name:sum(p.get('source')==name for p in combined)
-                           for name in ("LIFULL HOME'S", 'SUUMO')}
-    info = dict(layout='ALL',layouts=list(LAYOUTS),bounds=bounds,regions=[r['label'] for r in regions],
-                requested_limit_per_layout=limit,received=len(combined),source_counts=final_source_counts,
-                layout_counts=final_layout_counts,source_layout_counts=source_layout_counts,warnings=warnings,
-                source_url="LIFULL HOME'S + SUUMO",
-                fetched_at=datetime.now(timezone.utc).isoformat(timespec='seconds'))
-    return combined,info
+                completed.add(task_key)
+                if status_hook:
+                    status_hook(step,total_steps,completed,region,raw_layout,source_name,len(all_records),warnings)
+    combined=deduplicate(all_records)
+    final_raw_counts={layout:sum(p['layout']==layout for p in combined) for layout in TARGET_LAYOUTS}
+    group_counts={group:sum(layout_matches_group(p['layout'],group) for p in combined) for group in LAYOUTS}
+    final_source_counts={name:sum(p.get('source')==name for p in combined) for name in ("LIFULL HOME'S",'SUUMO')}
+    info=dict(layout='ALL',layouts=list(TARGET_LAYOUTS),layout_groups={k:list(v) for k,v in LAYOUT_GROUPS.items()},
+              bounds=bounds,regions=[r['label'] for r in regions],per_region_layout_source_limit=limit,
+              received=len(combined),source_counts=final_source_counts,raw_layout_counts=final_raw_counts,
+              layout_counts=group_counts,filters={'structure':'SRC','max_age':20,'walk_limit':None},warnings=warnings[-200:],
+              source_url="LIFULL HOME'S + SUUMO",fetched_at=datetime.now(timezone.utc).isoformat(timespec='seconds'))
+    return combined,info,completed
+
+
+_BACKGROUND_LOCK=threading.Lock()
+_BACKGROUND_JOBS={}
+_BACKGROUND_THREADS={}
+
+
+def background_job_id(bounds, limit):
+    raw=json.dumps(['v08',list(map(lambda x:round(x,5),bounds)),int(limit)],ensure_ascii=False)
+    return hashlib.sha256(raw.encode()).hexdigest()[:20]
+
+
+def _job_update(job_id, **values):
+    with _BACKGROUND_LOCK:
+        job=dict(_BACKGROUND_JOBS.get(job_id,{}))
+        job.update(values)
+        _BACKGROUND_JOBS[job_id]=job
+        return dict(job)
+
+
+def get_job(job_id):
+    with _BACKGROUND_LOCK:
+        return dict(_BACKGROUND_JOBS.get(job_id,{}))
+
+
+def _persist_job(job_id, job, settings):
+    payload=dict(job)
+    payload['job_id']=job_id
+    # Thread objects/sets are never serialized.
+    if isinstance(payload.get('completed'),set):
+        payload['completed']=sorted(payload['completed'])
+    save_metadata('background_job:'+job_id,payload,settings)
+    save_metadata('background_latest',payload,settings)
+
+
+def background_worker(job_id,bounds,limit,settings,resume_completed=None):
+    started=datetime.now(timezone.utc).isoformat(timespec='seconds')
+    job=_job_update(job_id,state='running',bounds=list(bounds),limit=int(limit),step=0,total=1,
+                    message='表示地域を確認しています…',accepted=0,started_at=started,
+                    updated_at=started,error='',completed=set(resume_completed or []))
+    try:
+        _persist_job(job_id,job,settings)
+    except StorageError:
+        pass
+    last_persist=[0]
+    def progress(step,total,message):
+        _job_update(job_id,step=step,total=max(1,total),message=message,
+                    updated_at=datetime.now(timezone.utc).isoformat(timespec='seconds'))
+    def save_chunk(records,info):
+        save_store(records,info,reload_after=False,settings=settings,mark_query_cache=False)
+        current=get_job(job_id)
+        _job_update(job_id,accepted=int(current.get('accepted',0))+len(records))
+    def status_hook(step,total,completed,region,raw_layout,source_name,accepted,warnings):
+        job=_job_update(job_id,step=step,total=total,completed=set(completed),accepted=accepted,
+                        message=f'{region["label"]}｜{raw_layout}｜{source_name} 完了',
+                        updated_at=datetime.now(timezone.utc).isoformat(timespec='seconds'))
+        if step-last_persist[0]>=5 or step>=total:
+            try:_persist_job(job_id,job,settings)
+            except StorageError:pass
+            last_persist[0]=step
+    try:
+        records,info,completed=collect_visible_regions(bounds,limit,progress=progress,save_chunk=save_chunk,
+                                                       completed=resume_completed,status_hook=status_hook)
+        # A resumed job may skip tasks already saved in an earlier process. Build the final summary
+        # from the persistent store so the completed cache always describes the whole viewport.
+        stored,_=load_store(settings=settings)
+        visible=deduplicate([p for p in stored if target_property(p) and inside(p,bounds)])
+        info['received']=len(visible)
+        info['source_counts']={name:sum(p.get('source')==name for p in visible)
+                               for name in ("LIFULL HOME'S",'SUUMO')}
+        info['raw_layout_counts']={name:sum(p.get('layout')==name for p in visible) for name in TARGET_LAYOUTS}
+        info['layout_counts']={group:sum(layout_matches_group(p.get('layout'),group) for p in visible)
+                               for group in LAYOUTS}
+        info['fetched_at']=datetime.now(timezone.utc).isoformat(timespec='seconds')
+        save_metadata('last_fetch',info,settings)
+        _,_,namespace=settings
+        _upsert_rows('sumai_fetch_queries',[{'namespace':namespace,
+                      'identity':query_key(bounds,'ALL',limit),'payload':info}],
+                     'namespace,identity',settings)
+        finished=datetime.now(timezone.utc).isoformat(timespec='seconds')
+        job=_job_update(job_id,state='completed',step=max(1,get_job(job_id).get('total',1)),
+                        message=f'完了：SRC・築20年以内 {len(visible)}件を表示範囲で確認・保存',accepted=len(visible),
+                        completed=set(completed),finished_at=finished,updated_at=finished,info=info)
+        _persist_job(job_id,job,settings)
+    except Exception as error:
+        finished=datetime.now(timezone.utc).isoformat(timespec='seconds')
+        job=_job_update(job_id,state='failed',message='バックグラウンド取得が停止しました。',
+                        error=f'{type(error).__name__}: {error}',finished_at=finished,updated_at=finished)
+        try:_persist_job(job_id,job,settings)
+        except StorageError:pass
+
+
+def start_background_job(bounds,limit,settings,resume_payload=None):
+    bounds=normalize_bounds(bounds)
+    if not bounds:
+        raise ValueError('地図の表示範囲を確認できません。')
+    job_id=background_job_id(bounds,limit)
+    with _BACKGROUND_LOCK:
+        thread=_BACKGROUND_THREADS.get(job_id)
+        if thread and thread.is_alive():
+            return job_id
+        # Keep only one crawler active per Streamlit server process to avoid duplicate load.
+        for active_id, active_thread in _BACKGROUND_THREADS.items():
+            if active_thread.is_alive():
+                return active_id
+    completed=set((resume_payload or {}).get('completed') or [])
+    thread=threading.Thread(target=background_worker,args=(job_id,bounds,limit,settings,completed),
+                            name='sumai-'+job_id,daemon=True)
+    with _BACKGROUND_LOCK:
+        _BACKGROUND_THREADS[job_id]=thread
+    thread.start()
+    return job_id
+
+
+def persisted_job(job_id,settings=None):
+    try:return load_metadata('background_job:'+job_id,settings)
+    except StorageError:return {}
+
+
+def latest_persisted_job(settings=None):
+    try:return load_metadata('background_latest',settings)
+    except StorageError:return {}
 
 
 def main():
@@ -2711,7 +3086,7 @@ def main():
         state.facility_origin02 = None
     if 'flash02' in state:
         st.success(state.pop('flash02'))
-    layout = st.radio('間取り', LAYOUTS, index=1, horizontal=True, key='layout02')
+    layout = st.radio('間取り区分', LAYOUTS, index=1, horizontal=True, key='layout02')
     with st.expander('地域・色分け・物件取得の設定', expanded=False):
         station_name = st.selectbox('地図の中心駅', list(BY_NAME), index=list(BY_NAME).index('池袋'), key='center02')
         c1, c2 = st.columns(2)
@@ -2722,8 +3097,8 @@ def main():
         reach = c2.slider('推定に使う建物の範囲（m）', 200, 700, 400, 50, key='reach02')
         budget = st.number_input('物件一覧・ピンの月額上限（万円）', 1.0, 1000.0, 50.0, 1.0, key='budget02')
         st.caption('家賃の高低を比較できるよう、面の色分けは予算で絞る前の全取得物件を使います。推定は3建物以上ある範囲だけです。')
-        limit = st.selectbox('間取りごとの取得上限（物件ページ数）', [60, 120, 180, 240], index=1, key='limit02')
-        st.caption('取得ボタンでは1LDK・2LDK・3LDK・4LDKをまとめて取得・保存します。上の間取り選択は表示切替だけに使います。')
+        limit = st.selectbox('1地域・1間取り・1取得元あたりの確認上限', [20, 40, 80, 120], index=1, key='limit02')
+        st.caption('取得はSRC・築20年以内だけを対象にします。駅徒歩は絞りません。広い範囲ほど地域数を増やし、バックグラウンドで長時間検索します。')
     origin = BY_NAME[station_name]
     if state.get('map_station03') != station_name:
         state.map_station03 = station_name
@@ -2733,11 +3108,11 @@ def main():
     bounds = state.get('bounds03')
     view = dict(lat=state.view_center03[0], lng=state.view_center03[1], name=station_name)
     render_radius = bounds_radius(bounds, view) if bounds else radius
-    all_layout = [p for p in state.records02 if p['layout'] == layout]
+    all_layout = [p for p in state.records02 if layout_matches_group(p.get('layout'), layout) and target_property(p)]
     nearby = [p for p in all_layout if inside(p, bounds)] if bounds else [p for p in all_layout if distance(p, origin)*1000 <= radius]
     support = [p for p in all_layout if distance(p, view)*1000 <= render_radius+reach]
     displayed = [p for p in nearby if p['rent']+p['fees'] <= budget*10000]
-    cells = mesh(support, view, cell, render_radius, interpolate, reach) if render_radius <= 6000 else []
+    cells = mesh(support, view, cell, render_radius, interpolate, reach) if render_radius <= 12000 else []
     if bounds:
         cells = [c for c in cells if cell_intersects(c, bounds)]
     if state.facility_origin02 != station_name:
@@ -2756,47 +3131,69 @@ def main():
     st_folium(make_map(view, cells, displayed, state.facilities02), height=560, use_container_width=True,
               key=f'map03_{station_name}', returned_objects=['bounds', 'zoom'],
               center=tuple(state.view_center03), zoom=state.zoom03, on_change=remember_view)
-    st.caption('地図を移動・拡大してから取得ボタンを押してください。表示範囲の地域・丁目を細かく判定し、1LDK〜4LDKをHOME’S・SUUMOからまとめて取得してSupabaseへ順次保存します。')
-    refresh = st.checkbox('保存済み範囲も再取得する（通常は保存データを利用）', key='refresh03')
-    if st.button('表示範囲の家賃帯一覧を取得・保存', type='primary', disabled=bounds is None, key='fetch03'):
-        if bounds_radius(bounds, view) > 6000:
-            st.warning('取得対象が広すぎます。対角線が約12km以内になるまで拡大してください。')
-        else:
-            progress = st.progress(0.0, text='表示範囲の物件を検索しています…')
-            try:
-                cached = cached_query(bounds, 'ALL', limit) if not refresh else None
-                if cached:
-                    loaded_records, _ = load_store()
-                    state.records02, state.info02 = loaded_records, cached
-                    state.flash02 = 'この範囲の保存データを読み込みました。最新情報は再取得を選んでください。'
+    st.caption('取得ボタンを押すと、表示中の地域・丁目を細かく判定し、SRC・築20年以内をHOME’S・SUUMOでバックグラウンド検索します。取得できた物件から1件ずつ掲載地図座標を確認してSupabaseへ順次保存します。')
+    refresh = st.checkbox('保存済み範囲も再取得する', value=True, key='refresh03')
+    if st.button('表示範囲をバックグラウンド取得・保存', type='primary', disabled=bounds is None, key='fetch03'):
+        try:
+            settings=supabase_settings()
+            cached=cached_query(bounds,'ALL',limit,settings) if not refresh else None
+            if cached:
+                loaded_records,_=load_store(settings=settings)
+                state.records02,state.info02=loaded_records,cached
+                state.flash02='この範囲の保存済みデータを読み込みました。'
+                st.rerun()
+            resume={}
+            jid=background_job_id(bounds,limit)
+            if refresh:
+                resume=persisted_job(jid,settings)
+                if resume.get('state')=='completed':
+                    resume={}
+                fetch_listing.cache_clear()
+            state.background_job_id=start_background_job(bounds,limit,settings,resume)
+            state['job_applied_'+state.background_job_id]=False
+            st.rerun()
+        except (StorageError,ValueError,TypeError) as error:
+            st.error(str(error))
+
+    @st.fragment(run_every=2)
+    def background_status_panel():
+        jid=state.get('background_job_id')
+        if not jid:
+            latest=latest_persisted_job()
+            if latest.get('job_id') and latest.get('state')=='running':
+                jid=latest['job_id']; state.background_job_id=jid
+                try:
+                    settings=supabase_settings()
+                    start_background_job(latest.get('bounds'),int(latest.get('limit',limit)),settings,latest)
+                except (StorageError,ValueError,TypeError):
+                    pass
+        if not jid:
+            return
+        job=get_job(jid) or persisted_job(jid)
+        if not job:
+            return
+        status=job.get('state','')
+        step=int(job.get('step',0) or 0); total=max(1,int(job.get('total',1) or 1))
+        if status=='running':
+            st.progress(min(1.0,step/total), text=f'{step}/{total} · {job.get("message","検索中")}')
+            st.caption(f'バックグラウンドで継続中｜保存済み候補 {int(job.get("accepted",0) or 0)}件。画面操作中も同じサーバープロセス内で検索を続けます。')
+            if st.button('途中まで保存された物件を地図に反映',key='reload_partial_bg'):
+                records,info=load_store(); state.records02,state.info02=records,info; st.rerun()
+        elif status=='completed':
+            st.success(job.get('message','バックグラウンド取得が完了しました。'))
+            applied='job_applied_'+jid
+            if not state.get(applied):
+                try:
+                    records,info=load_store(); state.records02,state.info02=records,job.get('info') or info
+                    state[applied]=True
                     st.rerun()
-                if refresh:
-                    fetch_listing.clear()
-                records, info = collect_visible_regions(
-                    bounds, limit,
-                    progress=lambda n,total,message: progress.progress(n/max(1,total), text=f'{n}/{total} · {message}'),
-                    save_chunk=lambda chunk,chunk_info: save_store(chunk,chunk_info,reload_after=False))
-                if records:
-                    state.records02 = save_store(records, info, bounds, 'ALL', limit)
-                    state.info02 = info
-                    counts = info.get('source_counts', {})
-                    regions_text = '、'.join(info.get('regions', []))
-                    layout_counts = info.get('layout_counts', {})
-                    layout_text = ' / '.join(f'{name} {layout_counts.get(name,0)}件' for name in LAYOUTS)
-                    state.flash02 = (f'表示地域を細分化し、全間取りで{len(records)}物件を取得・保存しました。'
-                                     f' {layout_text}。HOME’S {counts.get("LIFULL HOME'S",0)}件 / SUUMO {counts.get("SUUMO",0)}件。'
-                                     +(f' 対象：{regions_text}' if regions_text else ''))
-                    st.rerun()
-                else:
-                    st.warning('表示範囲内の物件を確認できませんでした。保存済みデータは保持しています。')
-                    for warning in info.get('warnings', []):
-                        st.caption(warning)
-            except (requests.RequestException, StorageError, OSError, ValueError, KeyError, TypeError) as error:
-                st.error(str(error) if isinstance(error, StorageError) else f'取得できませんでした（{type(error).__name__}）。保存済みデータは保持しています。')
-            finally:
-                progress.empty()
-    if render_radius > 6000:
-        st.caption('広域表示ではピン・一覧のみ表示します。拡大すると100m単位の色分けと取得が利用できます。')
+                except StorageError:
+                    pass
+        elif status=='failed':
+            st.error(f'バックグラウンド取得停止：{job.get("error","")}')
+    background_status_panel()
+    if render_radius > 12000:
+        st.caption('非常に広い表示ではメッシュ描画だけを省略します。検索自体はバックグラウンドで継続できます。')
     if bounds is None:
         st.caption('地図の表示範囲を読み込み中です。地図を少し動かすと取得ボタンが有効になります。')
     st.caption(f'Supabaseから読み込み済み：{len(state.records02)}物件。取得後は自動保存し、次回起動時もSupabaseから読み込みます。')
@@ -2831,7 +3228,7 @@ def main():
             st.caption('表示範囲から判定した地域：'+'、'.join(info['regions']))
         if info.get('layout_counts'):
             counts_by_layout = info['layout_counts']
-            st.caption('今回取得（間取り別）：'+' / '.join(f'{name} {counts_by_layout.get(name,0)}件' for name in LAYOUTS))
+            st.caption('今回取得（区分別）：'+' / '.join(f'{name} {counts_by_layout.get(name,0)}件' for name in LAYOUTS))
         if info.get('source_counts'):
             counts = info['source_counts']
             st.caption(f'取得元別：HOME’S {counts.get("LIFULL HOME'S",0)}件 / SUUMO {counts.get("SUUMO",0)}件')
@@ -2846,7 +3243,7 @@ def main():
         with st.expander('地図内の物件一覧・通勤を確認', expanded=False):
             st.dataframe([{'物件名': p['name'], '総額（万円）': (p['rent']+p['fees'])/10000,
                            '家賃（円）': p['rent'], '管理費等（円）': p['fees'], '面積（㎡）': p['area'],
-                           '所在階': p['floor'], '住所': p['address'], '掲載更新日': p['modified'],
+                           '所在階': p['floor'], '構造': p.get('structure',''), '築年数': p.get('building_age',''), '住所': p['address'], '掲載更新日': p['modified'],
                            '募集ページ': p['url']} for p in sorted(displayed, key=lambda x: x['rent']+x['fees'])],
                          hide_index=True, width='stretch', column_config={'募集ページ': st.column_config.LinkColumn('募集ページ')})
             options = [f'{i+1}. {p["name"]} / {(p["rent"]+p["fees"])/10000:g}万 / {p["area"]:g}㎡' for i,p in enumerate(displayed)]
@@ -2910,9 +3307,9 @@ def main():
         st.write('家賃は実際の募集額＋管理費等。敷金・礼金・駐車場・その他の月額サービス料は含みません。管理費等が確認できない物件、掲載座標がない物件は除外します。')
         st.write('直接集計：各建物位置の募集住戸総額の中央値を求め、そのメッシュ内の建物中央値をさらに集計します。掲載位置が同一の建物は同じ位置群として扱います。')
         st.write('近隣推定：メッシュ中心から指定距離内に3建物位置以上ある場合だけ、距離の逆二乗で加重平均します。これは近隣の募集額を使った推定であり、その場所に実在する募集中の物件価格ではありません。駅の一つの家賃を全域に広げる計算ではありません。')
-        st.write('取得時は表示範囲を約250m間隔（最大15×15地点）で確認し、見えている町名・丁目を細かく拾います。各地域について1LDK・2LDK・3LDK・4LDKをHOME’SとSUUMOから少量ずつ取得し、Supabaseへ順次保存します。HOME’Sは掲載座標、SUUMOは一覧住所を座標化し、表示範囲外は除外します。')
+        st.write('取得時は表示範囲を約250m間隔（最大40×40地点）で確認し、町名・丁目を細かく拾います。対象はSRC・築20年以内、駅徒歩は無制限です。HOME’Sは掲載座標を、SUUMOは物件詳細ページに掲載された地図座標を確認できた物件だけ保存し、概算座標では保存しません。')
         st.write('募集状況は取得日時の公開ページ情報。取得できる候補・件数上限で偏りがあり、地域全体の相場推計ではありません。自動取得は公開ページの構造・接続状況で停止することがあります。認証やアクセス制限の回避は行いません。')
-        st.write('背景地図：© OpenStreetMap contributors。初期データは池袋駅の2LDKの取得結果です。一度表示範囲を取得した後は、1LDK〜4LDKの切替だけでは再取得は不要です。地域を変えた場合は新しい範囲を取得してください。')
+        st.write('背景地図：© OpenStreetMap contributors。表示区分は「1K・1L・1DK」「1LDK・2DK」「2LDK・3DK」「3LDK」です。1LはHOME’S・SUUMOの標準検索項目にないため、掲載側で1L表記が返った場合のみ第1区分に含めます。')
 
 
 if __name__ == '__main__':
