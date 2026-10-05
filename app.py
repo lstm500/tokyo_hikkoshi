@@ -1,4 +1,4 @@
-"""住まいコンパス — Streamlit版 v09（位置精度強化 / SRC・築20年以内 / 広域バックグラウンド取得 / HOME'S・SUUMO）
+"""住まいコンパス — Streamlit版 v10（高並列 / 即時保存 / 位置精度強化 / SRC・築20年以内 / HOME'S・SUUMO）
 実行: streamlit run app.py
 依存: streamlit>=1.50,<2 / folium>=0.18,<1 / streamlit-folium>=0.24,<1 / requests>=2.32,<3
 実物件の家賃メッシュ表示。通勤は概算。公開情報取得はサイトの仕様・接続状況に依存。
@@ -2256,7 +2256,7 @@ def load_store(settings=None):
 
 
 def query_key(bounds, layout, limit):
-    value = json.dumps(['v09-location-precision-src-age20-background-wide', list(map(lambda x: round(x,5), bounds)),
+    value = json.dumps(['v10-high-parallel-incremental-save-location-precision-src-age20', list(map(lambda x: round(x,5), bounds)),
                         'ALL_TARGET_LAYOUTS', int(limit)], ensure_ascii=False)
     return hashlib.sha256(value.encode()).hexdigest()
 
@@ -2331,6 +2331,37 @@ def save_store(records, info, bounds=None, layout=None, limit=None, reload_after
     return load_store(settings=settings)[0]
 
 
+def save_incremental_records(records, settings=None):
+    """Persist verified listings immediately without rewriting last_fetch metadata per item."""
+    settings = settings or supabase_settings()
+    _, _, namespace = settings
+    try:
+        records = validate_records(export_records(records), maximum=max(20, len(records)+5))
+    except (ValueError, KeyError, TypeError, csv.Error):
+        raise StorageError('保存する物件データの形式を確認してください。') from None
+    if not records:
+        return 0
+    now = datetime.now(timezone.utc).isoformat(timespec='seconds')
+    unique = {}
+    for p in records:
+        stamp = p.get('fetched_at') or now
+        try:
+            parsed = datetime.fromisoformat(str(stamp).replace('Z','+00:00'))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            p['fetched_at'] = parsed.astimezone(timezone.utc).isoformat(timespec='seconds')
+        except (ValueError, TypeError, AttributeError):
+            raise StorageError('物件の取得日時を確認してください。') from None
+        identity = p.get('url') or str(p['id'])
+        previous = unique.get(identity)
+        if previous is None or str(previous['fetched_at']) <= str(p['fetched_at']):
+            unique[identity] = p
+    rows = [{'namespace':namespace,'identity':identity,'payload':p,'fetched_at':p['fetched_at']}
+            for identity,p in unique.items()]
+    _upsert_rows('sumai_properties', rows, 'namespace,identity', settings)
+    return len(rows)
+
+
 def show_storage_setup():
     st.info('保存・読み込み先はSupabaseです。接続設定が完了すると地図を表示します。')
     st.markdown('1. SupabaseのSQL Editorで **supabase_setup_ver.04.sql** を実行。\n'
@@ -2358,6 +2389,14 @@ GSI_MUNI_URL = 'https://maps.gsi.go.jp/js/muni.js'
 SUUMO_HEADERS = {'User-Agent': 'SumaiCompass/8.0 (personal rental map)'}
 GSI_HEADERS = {'User-Agent': 'SumaiCompass/8.0 (personal rental map)'}
 _SUUMO_HTTP = threading.local()
+
+# Network work is I/O-bound. Run several independent region/layout/source tasks at once,
+# while keeping per-source pools bounded so precision checks remain enabled for every listing.
+REGION_LOOKUP_WORKERS = 16
+REGION_TASK_WORKERS = 8
+HOMES_BUILDING_WORKERS = 8
+HOMES_DETAIL_WORKERS = 8
+SUUMO_DETAIL_WORKERS = 6
 
 
 def suumo_session():
@@ -2477,7 +2516,7 @@ def visible_regions(bounds):
             lng = west + (east-west)*fx
             points.append((lat, lng))
     regions, seen = [], set()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(points))) as pool:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(REGION_LOOKUP_WORKERS, len(points))) as pool:
         for region in pool.map(lambda xy: gsi_reverse_region(xy[0], xy[1]), points):
             if not region:
                 continue
@@ -2820,21 +2859,29 @@ def collect_homes_region(bounds, layout, region, limit=40, on_record=None):
     # Ask HOME'S for each building key separately. This is slower, but preserves the
     # building coordinate as an explicit hint for every room URL instead of losing it in an 8-building batch.
     link_hints = {}
-    for key in keys:
+    def fetch_building_links(key):
         row = candidates[key]
         data = map_condition(layout, used_term)
         data['cond[tykey]'] = key
         try:
             urls = room_links(map_request(MAP_INFO_URL,data).text)
+            return key, row, urls, None
         except (requests.RequestException, ValueError) as error:
-            warnings.append(f'HOME’Sの建物候補 {key} を確認できませんでした（{type(error).__name__}）。')
-            continue
-        hint = {'lat':float(row['lat']), 'lng':float(row['lon']), 'source':"HOME'S検索地図・建物座標", 'priority':99}
-        for url in urls:
-            link_hints.setdefault(url, []).append(hint)
+            return key, row, [], error
+    if keys:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(HOMES_BUILDING_WORKERS, len(keys))) as pool:
+            jobs = [pool.submit(fetch_building_links, key) for key in keys]
+            for job in concurrent.futures.as_completed(jobs):
+                key, row, urls, error = job.result()
+                if error is not None:
+                    warnings.append(f'HOME’Sの建物候補 {key} を確認できませんでした（{type(error).__name__}）。')
+                    continue
+                hint = {'lat':float(row['lat']), 'lng':float(row['lon']), 'source':"HOME'S検索地図・建物座標", 'priority':99}
+                for url in urls:
+                    link_hints.setdefault(url, []).append(hint)
     links = list(link_hints)[:max(1,limit*8)]
     records, failed = [], 0
-    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(HOMES_DETAIL_WORKERS, max(1, len(links)))) as pool:
         jobs = [pool.submit(verify_homes_detail,u,bounds,region,layout,link_hints.get(u)) for u in links]
         for job in concurrent.futures.as_completed(jobs):
             try:
@@ -3039,7 +3086,7 @@ def collect_suumo_region(bounds, layout, region, limit=40, on_record=None):
         if candidates:
             break
     records=[]; rejected=0
-    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(SUUMO_DETAIL_WORKERS, max(1, len(candidates)))) as pool:
         jobs=[pool.submit(verify_suumo_detail,p,bounds,region) for p in candidates]
         for job in concurrent.futures.as_completed(jobs):
             try:
@@ -3070,43 +3117,66 @@ def collect_visible_regions(bounds, limit=40, progress=None, save_chunk=None, co
     regions = visible_regions(bounds)
     completed = set(completed or [])
     total_steps = len(regions)*len(SEARCHABLE_LAYOUTS)*2
-    step = 0
     warnings=[]; all_records=[]
-    source_counts={"LIFULL HOME'S":0,'SUUMO':0}
-    raw_counts={layout:0 for layout in TARGET_LAYOUTS}
+    result_lock = threading.Lock()
+    task_specs=[]
+    skipped=0
     for region in regions:
         region_key=f'{region["muni_code"]}:{_normalize_place_text(region["town"])}'
         for raw_layout in SEARCHABLE_LAYOUTS:
             for source_name,collector in (("LIFULL HOME'S",collect_homes_region),('SUUMO',collect_suumo_region)):
                 task_key=f'{region_key}|{raw_layout}|{source_name}'
-                step += 1
                 if task_key in completed:
-                    if progress: progress(step,total_steps,f'保存済みをスキップ：{region["label"]}｜{raw_layout}｜{source_name}')
-                    continue
-                if progress: progress(step,total_steps,f'{region["label"]}｜{raw_layout}｜{source_name}を精査中')
-                try:
-                    def persist_one(record):
-                        if not save_chunk:
-                            return
-                        chunk_info=dict(layout='ALL',layouts=list(TARGET_LAYOUTS),bounds=bounds,region=region['label'],
-                                        source=source_name,received=1,filters={'structure':'SRC','max_age':20},
-                                        location={'confidence':record.get('location_confidence',''),
-                                                  'coordinate_source':record.get('coordinate_source','')},
-                                        warnings=[],source_url=('https://www.homes.co.jp/chintai/map/' if source_name.startswith('LIFULL') else SUUMO_SEARCH_URL),
-                                        fetched_at=datetime.now(timezone.utc).isoformat(timespec='seconds'))
-                        save_chunk([record],chunk_info)
-                    records,local_warnings=collector(bounds,raw_layout,region,limit,on_record=persist_one)
+                    skipped += 1
+                else:
+                    task_specs.append((region,raw_layout,source_name,collector,task_key))
+    finished_count=skipped
+    if progress:
+        progress(finished_count,total_steps,
+                 f'並列取得を開始：未処理 {len(task_specs)}タスク / 保存済み {skipped}タスク')
+
+    def run_task(spec):
+        region,raw_layout,source_name,collector,task_key=spec
+        def persist_one(record):
+            if not save_chunk:
+                return
+            chunk_info=dict(layout='ALL',layouts=list(TARGET_LAYOUTS),bounds=bounds,region=region['label'],
+                            source=source_name,received=1,filters={'structure':'SRC','max_age':20},
+                            location={'confidence':record.get('location_confidence',''),
+                                      'coordinate_source':record.get('coordinate_source','')},
+                            warnings=[],source_url=('https://www.homes.co.jp/chintai/map/' if source_name.startswith('LIFULL') else SUUMO_SEARCH_URL),
+                            fetched_at=datetime.now(timezone.utc).isoformat(timespec='seconds'))
+            save_chunk([record],chunk_info)
+        local_warnings=[]
+        try:
+            records,local_warnings=collector(bounds,raw_layout,region,limit,on_record=persist_one)
+            records=[p for p in records if target_property(p)]
+        except (requests.RequestException,ValueError,KeyError,TypeError) as error:
+            records=[]; local_warnings=[str(error)]
+        return spec,records,local_warnings
+
+    if task_specs:
+        workers=min(REGION_TASK_WORKERS,len(task_specs))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+            jobs=[pool.submit(run_task,spec) for spec in task_specs]
+            for job in concurrent.futures.as_completed(jobs):
+                spec,records,local_warnings=job.result()
+                region,raw_layout,source_name,collector,task_key=spec
+                with result_lock:
                     warnings.extend(local_warnings)
-                except (requests.RequestException,ValueError,KeyError,TypeError) as error:
-                    records=[]; warnings.append(str(error))
-                if records:
-                    records=[p for p in records if target_property(p)]
-                    source_counts[source_name]+=len(records)
-                    raw_counts[raw_layout]+=len(records)
-                    all_records.extend(records)
-                completed.add(task_key)
+                    if records:
+                        all_records.extend(records)
+                    completed.add(task_key)
+                    finished_count += 1
+                    current_finished=finished_count
+                    current_accepted=len(all_records)
+                    current_warnings=list(warnings)
+                if progress:
+                    progress(current_finished,total_steps,
+                             f'処理タスク {current_finished}/{total_steps}｜{region["label"]}｜{raw_layout}｜{source_name} 完了')
                 if status_hook:
-                    status_hook(step,total_steps,completed,region,raw_layout,source_name,len(all_records),warnings)
+                    status_hook(current_finished,total_steps,completed,region,raw_layout,source_name,
+                                current_accepted,current_warnings)
     combined=deduplicate(all_records)
     final_raw_counts={layout:sum(p['layout']==layout for p in combined) for layout in TARGET_LAYOUTS}
     group_counts={group:sum(layout_matches_group(p['layout'],group) for p in combined) for group in LAYOUTS}
@@ -3115,6 +3185,8 @@ def collect_visible_regions(bounds, limit=40, progress=None, save_chunk=None, co
               bounds=bounds,regions=[r['label'] for r in regions],per_region_layout_source_limit=limit,
               received=len(combined),source_counts=final_source_counts,raw_layout_counts=final_raw_counts,
               layout_counts=group_counts,filters={'structure':'SRC','max_age':20,'walk_limit':None},warnings=warnings[-200:],
+              parallel={'region_tasks':REGION_TASK_WORKERS,'homes_buildings':HOMES_BUILDING_WORKERS,
+                        'homes_details':HOMES_DETAIL_WORKERS,'suumo_details':SUUMO_DETAIL_WORKERS},
               source_url="LIFULL HOME'S + SUUMO",fetched_at=datetime.now(timezone.utc).isoformat(timespec='seconds'))
     return combined,info,completed
 
@@ -3125,7 +3197,7 @@ _BACKGROUND_THREADS={}
 
 
 def background_job_id(bounds, limit):
-    raw=json.dumps(['v09',list(map(lambda x:round(x,5),bounds)),int(limit)],ensure_ascii=False)
+    raw=json.dumps(['v10',list(map(lambda x:round(x,5),bounds)),int(limit)],ensure_ascii=False)
     return hashlib.sha256(raw.encode()).hexdigest()[:20]
 
 
@@ -3140,6 +3212,14 @@ def _job_update(job_id, **values):
 def get_job(job_id):
     with _BACKGROUND_LOCK:
         return dict(_BACKGROUND_JOBS.get(job_id,{}))
+
+
+def _job_increment(job_id, field, delta=1):
+    with _BACKGROUND_LOCK:
+        job=dict(_BACKGROUND_JOBS.get(job_id,{}))
+        job[field]=int(job.get(field,0) or 0)+int(delta)
+        _BACKGROUND_JOBS[job_id]=job
+        return dict(job)
 
 
 def _persist_job(job_id, job, settings):
@@ -3166,11 +3246,12 @@ def background_worker(job_id,bounds,limit,settings,resume_completed=None):
         _job_update(job_id,step=step,total=max(1,total),message=message,
                     updated_at=datetime.now(timezone.utc).isoformat(timespec='seconds'))
     def save_chunk(records,info):
-        save_store(records,info,reload_after=False,settings=settings,mark_query_cache=False)
-        current=get_job(job_id)
-        _job_update(job_id,accepted=int(current.get('accepted',0))+len(records))
+        written=save_incremental_records(records,settings=settings)
+        if written:
+            _job_increment(job_id,'accepted',written)
     def status_hook(step,total,completed,region,raw_layout,source_name,accepted,warnings):
-        job=_job_update(job_id,step=step,total=total,completed=set(completed),accepted=accepted,
+        # accepted is a task-local aggregate; keep the independently incremented persisted count intact.
+        job=_job_update(job_id,step=step,total=total,completed=set(completed),
                         message=f'{region["label"]}｜{raw_layout}｜{source_name} 完了',
                         updated_at=datetime.now(timezone.utc).isoformat(timespec='seconds'))
         if step-last_persist[0]>=5 or step>=total:
@@ -3314,7 +3395,7 @@ def main():
     st_folium(make_map(view, cells, displayed, state.facilities02), height=560, use_container_width=True,
               key=f'map03_{station_name}', returned_objects=['bounds', 'zoom'],
               center=tuple(state.view_center03), zoom=state.zoom03, on_change=remember_view)
-    st.caption('取得ボタンを押すと、表示中の地域・丁目を細かく判定し、SRC・築20年以内をHOME’S・SUUMOでバックグラウンド検索します。各物件は掲載地図・埋込座標・検索地図座標を順に照合し、住所が不完全でも地図位置を逆ジオコーディングして、確認できた物件から1件ずつSupabaseへ保存します。')
+    st.caption('取得ボタンを押すと、表示中の地域・丁目を細かく判定し、SRC・築20年以内をHOME’S・SUUMOでバックグラウンド検索します。各物件は掲載地図・埋込座標・検索地図座標を順に照合し、住所が不完全でも地図位置を逆ジオコーディングして、確認できた物件から1件ずつSupabaseへ即時保存します。地域・間取り・取得元も複数タスクを並列処理します。')
     refresh = st.checkbox('保存済み範囲も再取得する', value=True, key='refresh03')
     if st.button('表示範囲をバックグラウンド取得・保存', type='primary', disabled=bounds is None, key='fetch03'):
         try:
@@ -3358,9 +3439,9 @@ def main():
         status=job.get('state','')
         step=int(job.get('step',0) or 0); total=max(1,int(job.get('total',1) or 1))
         if status=='running':
-            st.progress(min(1.0,step/total), text=f'{step}/{total} · {job.get("message","検索中")}')
-            st.caption(f'バックグラウンドで継続中｜保存済み候補 {int(job.get("accepted",0) or 0)}件。画面操作中も同じサーバープロセス内で検索を続けます。')
-            if st.button('途中まで保存された物件を地図に反映',key='reload_partial_bg'):
+            st.progress(min(1.0,step/total), text=f'処理タスク {step}/{total} · {job.get("message","検索中")}')
+            st.caption(f'バックグラウンドで継続中｜Supabaseへ即時保存した物件 {int(job.get("accepted",0) or 0)}件。上の {step}/{total} は物件数ではなく、地域×間取り×取得元の処理タスク数です。')
+            if st.button('保存済みの途中物件を地図へ再読み込み',key='reload_partial_bg'):
                 records,info=load_store(); state.records02,state.info02=records,info; st.rerun()
         elif status=='completed':
             st.success(job.get('message','バックグラウンド取得が完了しました。'))
