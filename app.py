@@ -1992,6 +1992,7 @@ def color_for(yen):
 
 
 def mesh(properties, origin, cell=100, radius=1500, interpolate=True, reach=400, minimum=3):
+    """Build rent cells with a small spatial index so large saved datasets do not block UI startup."""
     buildings = {}
     for p in properties:
         x, y = project(p['lat'], p['lng'], origin)
@@ -1999,15 +2000,22 @@ def mesh(properties, origin, cell=100, radius=1500, interpolate=True, reach=400,
             continue
         key = (round(p['lat'], 5), round(p['lng'], 5))
         buildings.setdefault(key, []).append(p)
+
     observed = {}
     points = []
+    bucket_size = max(float(reach), float(cell), 1.0)
+    buckets = {}
     for ps in buildings.values():
         x, y = project(ps[0]['lat'], ps[0]['lng'], origin)
         point = dict(x=x, y=y, price=statistics.median(p['rent']+p['fees'] for p in ps), count=len(ps))
         points.append(point)
         observed.setdefault((math.floor(x/cell), math.floor(y/cell)), []).append(point)
+        bkey = (math.floor(x/bucket_size), math.floor(y/bucket_size))
+        buckets.setdefault(bkey, []).append(point)
+
     cells = []
     extent = math.ceil(radius/cell)
+    bucket_span = max(1, math.ceil(reach/bucket_size))
     for ix in range(-extent, extent):
         for iy in range(-extent, extent):
             cx, cy = (ix+.5)*cell, (iy+.5)*cell
@@ -2018,13 +2026,23 @@ def mesh(properties, origin, cell=100, radius=1500, interpolate=True, reach=400,
                 price = statistics.median(p['price'] for p in own)
                 kind, support, farthest = '掲載物件の集計', own, 0
             elif interpolate:
-                support = [p for p in points if math.hypot(p['x']-cx, p['y']-cy) <= reach]
+                bx, by = math.floor(cx/bucket_size), math.floor(cy/bucket_size)
+                candidates = []
+                for dx in range(-bucket_span, bucket_span+1):
+                    for dy in range(-bucket_span, bucket_span+1):
+                        candidates.extend(buckets.get((bx+dx, by+dy), ()))
+                support = []
+                for point in candidates:
+                    d = math.hypot(point['x']-cx, point['y']-cy)
+                    if d <= reach:
+                        support.append((point, d))
                 if len(support) < minimum:
                     continue
-                weighted = [(p['price'], 1/max(50, math.hypot(p['x']-cx, p['y']-cy))**2) for p in support]
+                weighted = [(point['price'], 1/max(50, d)**2) for point, d in support]
                 price = sum(value*w for value, w in weighted)/sum(w for _, w in weighted)
                 kind = '近隣からの推定'
-                farthest = round(max(math.hypot(p['x']-cx, p['y']-cy) for p in support))
+                farthest = round(max(d for _, d in support))
+                support = [point for point, _ in support]
             else:
                 continue
             cells.append(dict(bounds=[unproject(ix*cell, iy*cell, origin), unproject((ix+1)*cell, (iy+1)*cell, origin)],
@@ -2258,7 +2276,7 @@ def load_store(settings=None):
 
 
 def query_key(bounds, layout, limit):
-    value = json.dumps(['v11-stable-map-balanced-concurrency', list(map(lambda x: round(x,5), bounds)),
+    value = json.dumps([BACKGROUND_ENGINE_VERSION, list(map(lambda x: round(x,5), bounds)),
                         'ALL_TARGET_LAYOUTS', int(limit)], ensure_ascii=False)
     return hashlib.sha256(value.encode()).hexdigest()
 
@@ -2409,17 +2427,17 @@ SUUMO_HEADERS = {'User-Agent': 'SumaiCompass/8.0 (personal rental map)'}
 GSI_HEADERS = {'User-Agent': 'SumaiCompass/8.0 (personal rental map)'}
 _SUUMO_HTTP = threading.local()
 
-# Network work is I/O-bound, but excessive nested concurrency can starve the Streamlit
-# frontend/custom-component channel. Keep task parallelism high while globally limiting
-# simultaneous outbound requests per provider.
-REGION_LOOKUP_WORKERS = 10
-REGION_TASK_WORKERS = 6
-HOMES_BUILDING_WORKERS = 6
-HOMES_DETAIL_WORKERS = 6
-SUUMO_DETAIL_WORKERS = 5
-HOMES_REQUEST_SLOTS = 12
-SUUMO_REQUEST_SLOTS = 8
-GSI_REQUEST_SLOTS = 10
+# Network work is I/O-bound, but nested parallelism must not starve Streamlit's
+# websocket/custom-component traffic. Crawling starts only after an explicit user action.
+BACKGROUND_ENGINE_VERSION = 'v12-ui-safe-startup'
+REGION_LOOKUP_WORKERS = 8
+REGION_TASK_WORKERS = 4
+HOMES_BUILDING_WORKERS = 5
+HOMES_DETAIL_WORKERS = 5
+SUUMO_DETAIL_WORKERS = 4
+HOMES_REQUEST_SLOTS = 8
+SUUMO_REQUEST_SLOTS = 6
+GSI_REQUEST_SLOTS = 6
 _HOMES_REQUEST_SEMAPHORE = threading.BoundedSemaphore(HOMES_REQUEST_SLOTS)
 _SUUMO_REQUEST_SEMAPHORE = threading.BoundedSemaphore(SUUMO_REQUEST_SLOTS)
 _GSI_REQUEST_SEMAPHORE = threading.BoundedSemaphore(GSI_REQUEST_SLOTS)
@@ -3232,7 +3250,7 @@ _BACKGROUND_SAVED_IDS={}
 
 
 def background_job_id(bounds, limit):
-    raw=json.dumps(['v11',list(map(lambda x:round(x,5),bounds)),int(limit)],ensure_ascii=False)
+    raw=json.dumps([BACKGROUND_ENGINE_VERSION,list(map(lambda x:round(x,5),bounds)),int(limit)],ensure_ascii=False)
     return hashlib.sha256(raw.encode()).hexdigest()[:20]
 
 
@@ -3284,7 +3302,8 @@ def _persist_job(job_id, job, settings):
 def background_worker(job_id,bounds,limit,settings,resume_completed=None):
     started=datetime.now(timezone.utc).isoformat(timespec='seconds')
     resume_payload = persisted_job(job_id, settings) if resume_completed else {}
-    job=_job_update(job_id,state='running',bounds=list(bounds),limit=int(limit),step=0,total=1,
+    job=_job_update(job_id,state='running',engine_version=BACKGROUND_ENGINE_VERSION,
+                    bounds=list(bounds),limit=int(limit),step=0,total=1,
                     message='表示地域を確認しています…',accepted=int(resume_payload.get('accepted',0) or 0),
                     save_attempted=int(resume_payload.get('save_attempted',0) or 0),
                     save_errors=0,last_save_error='',started_at=started,
@@ -3374,6 +3393,12 @@ def start_background_job(bounds,limit,settings,resume_payload=None):
     return job_id
 
 
+def background_thread_alive(job_id):
+    with _BACKGROUND_LOCK:
+        thread = _BACKGROUND_THREADS.get(job_id)
+        return bool(thread and thread.is_alive())
+
+
 def persisted_job(job_id,settings=None):
     try:return load_metadata('background_job:'+job_id,settings)
     except StorageError:return {}
@@ -3397,17 +3422,13 @@ def main():
     st.caption('掲載物件の総額家賃を、街の中で比較')
     state = st.session_state
     if 'records02' not in state:
-        try:
-            records, info = load_store()
-            if not records:
-                # First connection only: persist the existing, dated real Ikebukuro snapshot.
-                records = save_store(list(SNAPSHOT), dict(SNAPSHOT_INFO))
-                _, info = load_store()
-            state.records02, state.info02 = records, info
-        except StorageError as error:
-            st.error(str(error))
-            show_storage_setup()
-            st.stop()
+        # Keep the first render intentionally light. Loading every saved Supabase row before
+        # streamlit-folium initializes can delay the page long enough for the component asset
+        # request to time out. Saved data is loaded immediately after the map has returned bounds.
+        state.records02 = []
+        state.info02 = {}
+        state.store_loaded02 = False
+        state.store_load_error02 = ''
         state.facilities02 = []
         state.facility_origin02 = None
     if 'flash02' in state:
@@ -3436,9 +3457,11 @@ def main():
     render_radius = bounds_radius(bounds, view) if bounds else radius
     all_layout = [p for p in state.records02 if layout_matches_group(p.get('layout'), layout) and target_property(p)]
     nearby = [p for p in all_layout if inside(p, bounds)] if bounds else [p for p in all_layout if distance(p, origin)*1000 <= radius]
-    support = [p for p in all_layout if distance(p, view)*1000 <= render_radius+reach]
+    support = [p for p in all_layout if distance(p, view)*1000 <= render_radius+reach] if bounds else []
     displayed = [p for p in nearby if p['rent']+p['fees'] <= budget*10000]
-    cells = mesh(support, view, cell, render_radius, interpolate, reach) if render_radius <= 12000 else []
+    # The first page render must stay light so streamlit-folium can load its frontend assets.
+    # Build the expensive interpolation mesh only after the component has returned real bounds.
+    cells = mesh(support, view, cell, render_radius, interpolate, reach) if bounds and render_radius <= 12000 else []
     if bounds:
         cells = [c for c in cells if cell_intersects(c, bounds)]
     if state.facility_origin02 != station_name:
@@ -3457,6 +3480,23 @@ def main():
     st_folium(make_map(view, cells, displayed, state.facilities02), height=560, use_container_width=True,
               key=f'map03_{station_name}', returned_objects=['bounds', 'zoom'],
               center=tuple(state.view_center03), zoom=state.zoom03, on_change=remember_view)
+    # Load persistent property data only after the map component has successfully initialized.
+    # This moves the largest Supabase read away from the critical first-paint path.
+    if state.get('bounds03') is not None and not state.get('store_loaded02', False):
+        try:
+            with st.spinner('保存済み物件データを読み込んでいます…'):
+                records, info = load_store()
+                if not records:
+                    records = save_store(list(SNAPSHOT), dict(SNAPSHOT_INFO))
+                    _, info = load_store()
+            state.records02, state.info02 = records, info
+            state.store_loaded02 = True
+            state.store_load_error02 = ''
+            st.rerun()
+        except StorageError as error:
+            state.store_load_error02 = str(error)
+            st.error(str(error))
+            show_storage_setup()
     st.caption('取得ボタンを押すと、表示中の地域・丁目を細かく判定し、SRC・築20年以内をHOME’S・SUUMOでバックグラウンド検索します。各物件は掲載地図・埋込座標・検索地図座標を順に照合し、住所が不完全でも地図位置を逆ジオコーディングして、確認できた物件から1件ずつSupabaseへ即時保存します。地域・間取り・取得元も複数タスクを並列処理します。')
     refresh = st.checkbox('保存済み範囲も再取得する', value=True, key='refresh03')
     if st.button('表示範囲をバックグラウンド取得・保存', type='primary', disabled=bounds is None, key='fetch03'):
@@ -3466,6 +3506,7 @@ def main():
             if cached:
                 loaded_records,_=load_store(settings=settings)
                 state.records02,state.info02=loaded_records,cached
+                state.store_loaded02=True
                 state.flash02='この範囲の保存済みデータを読み込みました。'
                 st.rerun()
             resume={}
@@ -3477,55 +3518,77 @@ def main():
                 fetch_listing.cache_clear()
             state.background_job_id=start_background_job(bounds,limit,settings,resume)
             state['job_applied_'+state.background_job_id]=False
+            state.pop('latest_background_snapshot', None)
             st.rerun()
         except (StorageError,ValueError,TypeError) as error:
             st.error(str(error))
 
-    @st.fragment(run_every=5)
+    @st.fragment(run_every=10)
     def background_status_panel():
         jid=state.get('background_job_id')
-        if not jid:
-            latest=latest_persisted_job()
-            if latest.get('job_id') and latest.get('state')=='running':
-                jid=latest['job_id']; state.background_job_id=jid
-                try:
-                    settings=supabase_settings()
-                    start_background_job(latest.get('bounds'),int(latest.get('limit',limit)),settings,latest)
-                except (StorageError,ValueError,TypeError):
-                    pass
-        if not jid:
+        job={}
+        if jid:
+            job=get_job(jid) or persisted_job(jid)
+        else:
+            # Read the last persisted job only once per browser session. Never auto-resume it:
+            # starting crawlers while streamlit-folium is still loading can starve the component.
+            latest=state.get('latest_background_snapshot')
+            if latest is None:
+                latest=latest_persisted_job()
+                state.latest_background_snapshot=latest
+            if (latest.get('job_id') and latest.get('state')=='running'
+                    and latest.get('engine_version')==BACKGROUND_ENGINE_VERSION):
+                st.warning('前回のバックグラウンド検索はサーバー再起動などで中断されています。地図を先に読み込むため自動再開はしません。')
+                if st.button('前回の検索を再開', key='resume_previous_bg'):
+                    try:
+                        settings=supabase_settings()
+                        jid=start_background_job(latest.get('bounds'),int(latest.get('limit',limit)),settings,latest)
+                        state.background_job_id=jid
+                        state['job_applied_'+jid]=False
+                        state.pop('latest_background_snapshot',None)
+                        st.rerun()
+                    except (StorageError,ValueError,TypeError) as error:
+                        st.error(str(error))
             return
-        job=get_job(jid) or persisted_job(jid)
         if not job:
             return
         status=job.get('state','')
+        # A persisted "running" job without a live thread is paused, not actually running.
+        if status=='running' and not background_thread_alive(jid):
+            if job.get('engine_version') != BACKGROUND_ENGINE_VERSION:
+                st.info('旧バージョンの検索履歴があります。現在版では自動再開しません。')
+                return
+            st.warning('バックグラウンド検索は現在停止しています。保存済み物件はSupabaseに残っています。')
+            if st.button('この検索を再開', key='resume_current_bg'):
+                try:
+                    settings=supabase_settings()
+                    start_background_job(job.get('bounds'),int(job.get('limit',limit)),settings,job)
+                    st.rerun()
+                except (StorageError,ValueError,TypeError) as error:
+                    st.error(str(error))
+            return
         step=int(job.get('step',0) or 0); total=max(1,int(job.get('total',1) or 1))
         if status=='running':
             st.progress(min(1.0,step/total), text=f'処理タスク {step}/{total} · {job.get("message","検索中")}')
             attempted=int(job.get("save_attempted",0) or 0)
             saved=int(job.get("accepted",0) or 0)
             save_errors=int(job.get("save_errors",0) or 0)
-            st.caption(f'バックグラウンドで継続中｜保存条件を満たしSupabase保存を試行 {attempted}件｜保存確認済み {saved}件｜保存エラー {save_errors}件。上の {step}/{total} は物件数ではなく、地域×間取り×取得元の処理タスク数です。')
-            st.caption('地図の安定性を優先し、検索中は地図コンポーネントを自動再読込しません。途中結果を見たい場合だけ下の再読み込みボタンを押してください。')
+            st.caption(f'バックグラウンドで継続中｜保存試行 {attempted}件｜Supabase保存確認済み {saved}件｜保存エラー {save_errors}件。上の {step}/{total} は地域×間取り×取得元の処理タスク数です。')
+            st.caption('検索中は地図コンポーネントを自動再読込しません。途中結果を確認するときだけ下のボタンを押してください。')
             if attempted == 0:
-                st.info('現時点では、SRC・築20年以内・間取り条件・地図位置確認をすべて通過した物件がまだ0件のため、Supabaseへの物件保存処理自体がまだ発生していません。')
+                st.info('現時点では、SRC・築20年以内・間取り条件・地図位置確認をすべて通過した物件がまだありません。')
             elif saved == 0:
-                st.error('保存対象の物件は見つかっていますが、Supabaseで保存確認できた物件が0件です。保存エラー表示を確認してください。')
+                st.error('保存対象は見つかっていますが、Supabaseで保存確認できた物件が0件です。保存エラー表示を確認してください。')
             if save_errors:
                 st.error('直近のSupabase保存エラー：'+str(job.get('last_save_error','不明')))
-            auto_key='partial_auto_loaded_'+jid
-            # Do not trigger an automatic full-page rerun while the crawler is active.
-            # Recreating st_folium every few seconds can make its frontend component fail to load,
-            # especially while many network workers are active. The status fragment keeps updating
-            # independently; map data is reloaded only on explicit request or once at completion.
             if st.button('保存済みの途中物件を地図へ再読み込み',key='reload_partial_bg'):
-                records,info=load_store(); state.records02,state.info02=records,info; state[auto_key]=saved; st.rerun()
+                records,info=load_store(); state.records02,state.info02=records,info; state.store_loaded02=True; st.rerun()
         elif status=='completed':
             st.success(job.get('message','バックグラウンド取得が完了しました。'))
             applied='job_applied_'+jid
             if not state.get(applied):
                 try:
-                    records,info=load_store(); state.records02,state.info02=records,job.get('info') or info
+                    records,info=load_store(); state.records02,state.info02=records,job.get('info') or info; state.store_loaded02=True
                     state[applied]=True
                     st.rerun()
                 except StorageError:
@@ -3536,7 +3599,7 @@ def main():
     if render_radius > 12000:
         st.caption('非常に広い表示ではメッシュ描画だけを省略します。検索自体はバックグラウンドで継続できます。')
     if bounds is None:
-        st.caption('地図の表示範囲を読み込み中です。地図を少し動かすと取得ボタンが有効になります。')
+        st.caption('地図を初期化中です。初回表示では負荷の高い家賃メッシュ計算とバックグラウンド検索を開始しません。地図が表示された後に少し動かすと取得ボタンが有効になります。')
     st.caption(f'Supabaseから読み込み済み：{len(state.records02)}物件。取得後は自動保存し、次回起動時もSupabaseから読み込みます。')
     labels = ['15万円以下', '15〜20万円', '20〜22.5万円', '22.5〜25万円', '25〜27.5万円', '27.5〜30万円', '30〜35万円', '35万円超']
     st.markdown('<div style="display:flex;flex-wrap:wrap;gap:10px;margin:6px 0">'+''.join(
@@ -3630,6 +3693,7 @@ def main():
             try:
                 records, info = load_store()
                 state.records02, state.info02 = records, info
+                state.store_loaded02 = True
                 state.flash02 = f'Supabaseから{len(records)}物件を読み込みました。'
                 st.rerun()
             except StorageError as error:
