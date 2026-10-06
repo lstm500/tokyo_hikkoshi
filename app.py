@@ -1,11 +1,11 @@
-"""住まいコンパス v23 - verified red-button foreground search / progress
+"""住まいコンパス v24 - verified red-button foreground search / progress
 
 設計方針:
 - 起動時は外部通信を行わない。
 - streamlit-folium、子プロセス、常駐バックグラウンドスレッドを使わない。
 - 物件取得はユーザーがボタンを押した時だけ実行する。
 - 検索中は、地域判定・検索元・進捗・保存件数を文字で逐次表示する。
-- 取得は地域 x 取得元単位で最大6並列。ネストしたThreadPoolは作らない。
+- 取得は地域 x 取得元単位で最大8並列。ネストしたThreadPoolは作らない。
 - HOME'S / SUUMO の公開ページから候補を集め、SRC・築20年以内・対象間取り・位置情報を確認する。
 - 確認済み物件はタスク完了ごとにSupabaseへ保存し、途中までの成果を残す。
 - 地図表示はStreamlit標準 st.map のみを使う。
@@ -20,6 +20,7 @@ import json
 import math
 import os
 import re
+import queue
 import threading
 import time
 import unicodedata
@@ -30,7 +31,7 @@ from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 import streamlit as st
 
 
-APP_VERSION = "v23-red-button-search-final"
+APP_VERSION = "v24-direct-search-progress"
 TARGET_STRUCTURE = "SRC"
 MAX_BUILDING_AGE = 20
 
@@ -549,19 +550,22 @@ def discover_regions(bounds, update_text):
 
     regions = {}
     done = 0
+    started = time.monotonic()
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(points))) as pool:
-        futures = [pool.submit(gsi_reverse_region, lat, lng) for lat, lng in points]
-        for future in concurrent.futures.as_completed(futures):
-            done += 1
-            try:
-                region = future.result()
-            except Exception:
-                region = None
-            if region:
-                key = (region["muni_code"], normalize_place_text(region["town"]))
-                regions.setdefault(key, region)
-            if done == 1 or done % 10 == 0 or done == len(points):
-                update_text(f"地域判定 {done}/{len(points)}地点｜確認できた地域 {len(regions)}件")
+        pending = {pool.submit(gsi_reverse_region, lat, lng) for lat, lng in points}
+        while pending:
+            finished, pending = concurrent.futures.wait(
+                pending, timeout=0.5, return_when=concurrent.futures.FIRST_COMPLETED)
+            for future in finished:
+                done += 1
+                try:
+                    region = future.result()
+                except Exception:
+                    region = None
+                if region:
+                    key = (region["muni_code"], normalize_place_text(region["town"]))
+                    regions.setdefault(key, region)
+            update_text(f"地域判定 {done}/{len(points)}地点｜確認できた地域 {len(regions)}件｜経過 {int(time.monotonic()-started)}秒")
     return list(regions.values())
 
 
@@ -619,7 +623,7 @@ def homes_condition(freeword=""):
     }
 
 
-def homes_candidates(bounds, freeword, candidate_limit):
+def homes_candidates(bounds, freeword, candidate_limit, report=None):
     candidates = {}
     tiles = viewport_tiles(bounds, 15)
     # 地域タスク内での負荷を制御するため最大24タイルまで。
@@ -627,6 +631,8 @@ def homes_candidates(bounds, freeword, candidate_limit):
         step = max(1, len(tiles) // 24)
         tiles = tiles[::step][:24]
     for offset in range(0, len(tiles), 6):
+        if report:
+            report(f"地図候補の取得 {offset + 1}〜{min(offset + 6, len(tiles))}/{len(tiles)}タイル")
         data = homes_condition(freeword)
         data["zoom"] = 15
         for i, (x, y) in enumerate(tiles[offset:offset + 6]):
@@ -731,14 +737,16 @@ def parse_homes_detail(html: str, url: str, bounds, region, map_hint=None):
     return None
 
 
-def collect_homes_region(bounds, region, limit):
+def collect_homes_region(bounds, region, limit, report=None):
     stats = {"candidate": 0, "detail": 0, "accepted": 0, "rejected": 0, "warnings": []}
+    if report:
+        report("取得可否を確認中")
     if not homes_robots_allowed():
         stats["warnings"].append("HOME'S robots.txt により自動取得を実行しませんでした。")
         return [], stats
     candidates = {}
     for term in region_search_terms(region) + [""]:
-        candidates = homes_candidates(bounds, term, max(20, limit * 3))
+        candidates = homes_candidates(bounds, term, max(20, limit * 3), report)
         if candidates:
             break
     stats["candidate"] = len(candidates)
@@ -750,7 +758,9 @@ def collect_homes_region(bounds, region, limit):
     )
     room_links = []
     hint_by_url = {}
-    for key, row in ordered[: max(10, limit * 2)]:
+    for number, (key, row) in enumerate(ordered[: max(10, limit * 2)], 1):
+        if report:
+            report(f"建物候補 {number}/{min(len(ordered), max(10, limit * 2))}の部屋リンクを確認中")
         data = homes_condition(region.get("town", ""))
         data["cond[tykey]"] = key
         try:
@@ -768,7 +778,9 @@ def collect_homes_region(bounds, region, limit):
             break
 
     records = []
-    for url in room_links:
+    for number, url in enumerate(room_links, 1):
+        if report:
+            report(f"詳細確認 {number}/{len(room_links)}件｜条件適合 {len(records)}件")
         if len(records) >= limit:
             break
         stats["detail"] += 1
@@ -902,8 +914,10 @@ def verify_suumo_detail(p: dict, bounds, region):
     return out if target_property(out) else None
 
 
-def collect_suumo_region(bounds, region, limit):
+def collect_suumo_region(bounds, region, limit, report=None):
     stats = {"candidate": 0, "detail": 0, "accepted": 0, "rejected": 0, "warnings": []}
+    if report:
+        report("取得可否を確認中")
     if not suumo_robots_allowed():
         stats["warnings"].append("SUUMO robots.txt により自動取得を実行しませんでした。")
         return [], stats
@@ -912,6 +926,8 @@ def collect_suumo_region(bounds, region, limit):
     max_pages = min(6, max(2, math.ceil(max(limit * 3, 50) / 50)))
     empty = 0
     for page in range(1, max_pages + 1):
+        if report:
+            report(f"検索一覧 {page}/{max_pages}ページを取得中")
         try:
             r = source_get(suumo_search_url(region, page), "suumo.jp", "/jj/chintai/ichiran/", timeout=(6, 22))
             parsed = parse_suumo_list(r.text, region, max(limit * 4, 80))
@@ -932,7 +948,9 @@ def collect_suumo_region(bounds, region, limit):
             break
     stats["candidate"] = len(candidates)
     records = []
-    for p in candidates:
+    for number, p in enumerate(candidates, 1):
+        if report:
+            report(f"詳細確認 {number}/{len(candidates)}件｜条件適合 {len(records)}件")
         if len(records) >= limit:
             break
         stats["detail"] += 1
@@ -1049,94 +1067,111 @@ def load_range(center_lat, center_lng, radius_m, layouts):
 def run_search(center_lat, center_lng, radius_m, per_region_limit, worker_count, progress_bar, status_box, log_box):
     bounds = bounds_from_center(center_lat, center_lng, radius_m)
     logs = []
-
+    started = time.monotonic()
     def log(message):
-        stamp = datetime.now().strftime("%H:%M:%S")
-        logs.append(f"{stamp}  {message}")
+        logs.append(f"{datetime.now().strftime('%H:%M:%S')}  {message}")
         del logs[:-18]
         log_box.code("\n".join(logs), language=None)
-
     log("検索ボタン受付完了。検索処理を開始しました。")
-    log(f"検索範囲: 中心({center_lat:.5f}, {center_lng:.5f}) / 半径 {radius_m/1000:g}km")
-    progress_bar.progress(0.02, text="ステップ1/3：地域・丁目を判定中")
-    status_box.warning("🔎 検索実行中｜ステップ1/3：地域・丁目を判定しています。")
-
-    def region_progress(text):
-        status_box.warning(f"🔎 検索実行中｜ステップ1/3：{text}")
-        log(text)
-
+    progress_bar.progress(0.0, text="ステップ1/3：地域・丁目を判定中")
+    def region_progress(message):
+        status_box.info("🔎 検索実行中｜ステップ1/3：" + message)
+        match = re.search(r"地域判定 (\d+)/(\d+)", message)
+        if match:
+            progress_bar.progress(0.1 * int(match[1]) / max(1, int(match[2])), text=message)
     regions = discover_regions(bounds, region_progress)
     if not regions:
-        raise RuntimeError("検索範囲の地域名を判定できませんでした。")
-    log(f"地域判定完了: {len(regions)}地域。HOME'S / SUUMO を地域単位で確認します。")
-    progress_bar.progress(0.08, text=f"ステップ2/3：{len(regions)}地域をHOME'S・SUUMOで検索中")
-    status_box.info(f"🔎 検索実行中｜ステップ2/3：{len(regions)}地域 × 2取得元を確認します。")
-
-    tasks = []
-    for region in regions:
-        tasks.append((region, "HOME'S"))
-        tasks.append((region, "SUUMO"))
+        raise RuntimeError("地域名を判定できませんでした。国土地理院への接続を確認して再検索してください。")
+    log(f"地域判定完了：{len(regions)}地域")
+    tasks = [(region, source) for region in regions for source in ("HOME'S", "SUUMO")]
     total = len(tasks)
-    saved_total = 0
-    accepted_total = 0
-    rejected_total = 0
-    error_total = 0
-    collected = []
-
-    def run_one(task):
-        region, source = task
-        if source == "HOME'S":
-            records, stats = collect_homes_region(bounds, region, per_region_limit)
-        else:
-            records, stats = collect_suumo_region(bounds, region, per_region_limit)
-        return region, source, records, stats
-
-    status_box.info(f"物件取得中: 0/{total}タスク")
+    collected, saved_ids, warnings = [], set(), []
+    rejected_total = error_total = done = 0
+    events = queue.Queue()
+    active = {}
+    def run_one(index, region, source):
+        def report(message):
+            events.put((index, region['label'] + "｜" + source + "｜" + message))
+        report("検索開始")
+        collector = collect_homes_region if source == "HOME'S" else collect_suumo_region
+        return collector(bounds, region, per_region_limit, report=report)
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(worker_count, total)) as pool:
-        futures = [pool.submit(run_one, task) for task in tasks]
-        for index, future in enumerate(concurrent.futures.as_completed(futures), 1):
-            try:
-                region, source, records, stats = future.result()
-                accepted = len(records)
-                accepted_total += accepted
-                rejected_total += int(stats.get("rejected", 0))
-                if records:
-                    try:
-                        saved = save_records(records)
-                    except StorageError as exc:
-                        saved = 0
-                        error_total += 1
-                        log(f"保存エラー | {region['label']} | {source} | {exc}")
-                    saved_total += saved
+        pending = {pool.submit(run_one, index, *task): (index, *task) for index, task in enumerate(tasks)}
+        while pending:
+            finished, remaining = concurrent.futures.wait(
+                pending, timeout=0.5, return_when=concurrent.futures.FIRST_COMPLETED)
+            while True:
+                try:
+                    index, message = events.get_nowait()
+                    active[index] = message
+                except queue.Empty:
+                    break
+            for future in finished:
+                index, region, source = pending[future]
+                active.pop(index, None)
+                done += 1
+                try:
+                    records, stats = future.result()
                     collected.extend(records)
-                warn = " / ".join(stats.get("warnings", [])[:1])
-                line = (
-                    f"{index}/{total} | {region['label']} | {source} | "
-                    f"候補 {stats.get('candidate',0)} | 詳細 {stats.get('detail',0)} | "
-                    f"条件適合 {accepted} | 累計保存 {saved_total}"
-                )
-                if warn:
-                    line += f" | {warn}"
-                log(line)
-            except Exception as exc:
-                error_total += 1
-                log(f"{index}/{total} | タスク失敗 | {type(exc).__name__}: {exc}")
-            fraction = 0.08 + 0.90 * (index / max(1, total))
-            progress_bar.progress(
-                min(0.98, fraction),
-                text=f"ステップ2/3：取得元確認 {index}/{total}タスク｜保存 {saved_total}件",
-            )
+                    rejected_total += int(stats.get("rejected", 0))
+                    for warning in stats.get("warnings", []):
+                        warnings.append(region['label'] + "｜" + source + "｜" + warning)
+                        log(warnings[-1])
+                    if records:
+                        status_box.info(f"🔎 検索実行中｜{region['label']}｜{source}｜{len(records)}件をSupabaseへ保存中")
+                        try:
+                            save_records(records)
+                            saved_ids.update(p.get('url') or p.get('id') for p in records)
+                        except StorageError as exc:
+                            error_total += 1
+                            log(f"保存エラー｜{region['label']}｜{source}｜{exc}")
+                    log(f"{done}/{total}完了｜{region['label']}｜{source}｜候補 {stats.get('candidate',0)}｜詳細 {stats.get('detail',0)}｜条件適合 {len(records)}｜保存確認 {len(saved_ids)}")
+                except Exception as exc:
+                    error_total += 1
+                    log(f"取得エラー｜{region['label']}｜{source}｜{type(exc).__name__}: {exc}")
+                # Keep intermediate results if a later task encounters an error.
+                st.session_state.records = deduplicate(collected)
+            pending = {future: pending[future] for future in remaining}
+            progress_bar.progress(0.1 + 0.85 * done / total,
+                                  text=f"ステップ2/3：{done}/{total}タスク完了｜保存確認 {len(saved_ids)}件")
             status_box.info(
-                f"🔎 物件検索中｜{index}/{total}タスク完了｜条件適合 {accepted_total}件｜Supabase保存 {saved_total}件｜除外 {rejected_total}件｜エラー {error_total}件"
-            )
-
+                f"🔎 検索実行中｜{done}/{total}タスク完了｜保存確認 {len(saved_ids)}件｜除外 {rejected_total}件｜エラー {error_total}件｜経過 {int(time.monotonic()-started)}秒\n\n"
+                + "\n\n".join(active.values()))
     records = deduplicate(collected)
-    progress_bar.progress(1.0, text="ステップ3/3：検索・保存完了")
-    log(f"検索完了。今回確認 {len(records)}件 / Supabase保存確認 {saved_total}件。")
-    status_box.success(
-        f"✅ 検索完了｜今回の条件適合 {len(records)}件｜Supabase保存確認 {saved_total}件｜エラー {error_total}件"
-    )
+    progress_bar.progress(1.0, text="ステップ3/3：結果を表示します")
+    st.session_state.search_result_v24 = {
+        "saved": len(saved_ids), "errors": error_total, "warnings": warnings,
+        "tasks": total, "logs": logs, "elapsed": int(time.monotonic()-started)}
     return records
+
+
+def request_search(station, radius, per_region_limit, worker_count):
+    # A click callback stores only this click's settings. No persisted job or resume state is consulted.
+    st.session_state.search_request_v24 = (station, radius, per_region_limit, worker_count)
+
+
+def execute_search(search_request):
+    station, radius, limit, workers = search_request
+    state = st.session_state
+    state.last_search_summary = ""
+    state.search_result_v24 = {}
+    st.info(f"🔎 検索を開始しました｜{station}を中心に半径{radius/1000:g}km")
+    progress_bar = st.progress(0.0, text="検索開始済み｜地域を判定します")
+    status_box, log_box = st.empty(), st.empty()
+    status_box.info("🔎 検索実行中｜地域・丁目を確認しています")
+    try:
+        records = run_search(*STATIONS[station], radius, limit, workers, progress_bar, status_box, log_box)
+        state.records = records
+        state.last_search_records = records
+        result = state.search_result_v24
+        state.last_search_summary = (f"検索完了｜今回確認 {len(records)}件｜保存確認 {result['saved']}件"
+                                     f"｜エラー {result['errors']}件｜所要 {result['elapsed']}秒")
+        state.search_message_kind_v24 = "error" if result['errors'] else "info" if result['warnings'] or not records else "success"
+    except Exception as exc:
+        state.last_search_summary = f"検索エラー｜{type(exc).__name__}: {exc}"
+        state.search_message_kind_v24 = "error"
+    # Only rerun AFTER work has finished, to draw the new map and restore the search button.
+    st.rerun()
 
 
 def main():
@@ -1158,12 +1193,16 @@ def main():
         unsafe_allow_html=True,
     )
     st.caption("赤い『この範囲の物件を取得・保存』を押すと、そのクリックで検索を開始します。停止・再開モードはありません。")
-    st.success("最新版確認: BUILD v23-red-button-search-final / 実行ファイル app.py")
+
 
     state = st.session_state
     state.setdefault("records", [])
     state.setdefault("last_search_records", [])
     state.setdefault("last_search_summary", "")
+    search_request = state.pop("search_request_v24", None)
+    if search_request is not None:
+        execute_search(search_request)
+        return
 
     with st.expander("地域・物件取得の設定", expanded=True):
         station = st.selectbox("中心駅", list(STATIONS), index=list(STATIONS).index("池袋"))
@@ -1189,7 +1228,11 @@ def main():
         st.map([{"lat": center_lat, "lon": center_lng}], latitude="lat", longitude="lon", use_container_width=True)
 
     if state.last_search_summary:
-        st.info(state.last_search_summary)
+        getattr(st, state.get("search_message_kind_v24", "info"))(state.last_search_summary)
+        result = state.get("search_result_v24", {})
+        if result.get("logs"):
+            with st.expander("前回の検索ログ"):
+                st.code("\n".join(result["logs"]), language=None)
 
     c1, c2, c3 = st.columns(3)
     if c1.button("Supabase接続確認"):
@@ -1211,90 +1254,13 @@ def main():
         except StorageError as exc:
             st.error(str(exc))
 
-    # The red button is the search action itself. There is no queued/paused/resume state.
-    # On the click rerun we replace the button immediately, render an unmistakable status,
-    # and only then enter network/search work.
-    button_slot = c3.empty()
-    start_search = button_slot.button(
-        "🔎 この範囲の物件を取得・保存",
-        type="primary",
-        key="start_property_search_v23",
-        use_container_width=True,
-    )
-
-    if start_search:
-        button_slot.empty()
-        button_slot.button(
-            "🔎 検索中です…",
-            type="primary",
-            disabled=True,
-            key="search_running_v23",
-            use_container_width=True,
-        )
-
-        started_at = datetime.now()
-        state.last_search_summary = ""
-        st.toast("検索を開始しました", icon="🔎")
-
-        st.markdown(
-            f"""
-            <div style="border:4px solid #ff4b4b;background:#fff1f1;padding:18px 20px;border-radius:14px;margin:12px 0;">
-              <div style="font-size:26px;font-weight:900;color:#b42318;">🔎 検索を開始しました</div>
-              <div style="font-size:16px;font-weight:700;color:#173a5e;margin-top:7px;">
-                {html_lib.escape(station)}を中心に半径{radius/1000:g}km｜HOME'S・SUUMOの取得処理を開始します
-              </div>
-              <div style="font-size:14px;color:#667085;margin-top:5px;">
-                開始時刻 {started_at.strftime('%H:%M:%S')}｜この下に進捗が逐次表示されます
-              </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-        search_status = st.status("🔎 検索開始済み｜ステップ1/3：地域・丁目を判定します", expanded=True)
-        search_status.write("赤い取得ボタンの入力を受け付けました。物件検索処理を開始しています。")
-        progress_bar = st.progress(0.01, text="検索開始済み｜地域・丁目の判定を開始")
-        status_box = st.empty()
-        log_box = st.empty()
-        status_box.warning("🔎 検索開始済み｜現在：地域・丁目を判定しています")
-        log_box.code(f"{started_at.strftime('%H:%M:%S')}  検索開始｜{station}｜半径 {radius/1000:g}km", language=None)
-
-        # UI開始表示を先にブラウザへ送るための短い描画猶予。ここより前に外部検索通信は行わない。
-        time.sleep(0.35)
-
-        try:
-            records = run_search(
-                center_lat,
-                center_lng,
-                radius,
-                per_region_limit,
-                worker_count,
-                progress_bar,
-                status_box,
-                log_box,
-            )
-            state.last_search_records = records
-            state.records = deduplicate(records)
-            elapsed = int((datetime.now() - started_at).total_seconds())
-            state.last_search_summary = f"検索完了｜今回確認 {len(state.records)}件｜所要 {elapsed}秒"
-            search_status.update(
-                label=f"✅ 検索完了｜今回確認 {len(state.records)}件｜所要 {elapsed}秒",
-                state="complete",
-                expanded=True,
-            )
-            st.success(state.last_search_summary)
-        except Exception as exc:
-            elapsed = int((datetime.now() - started_at).total_seconds())
-            state.last_search_summary = f"検索停止｜{type(exc).__name__}: {exc}｜経過 {elapsed}秒"
-            search_status.update(
-                label="❌ 検索を停止しました",
-                state="error",
-                expanded=True,
-            )
-            st.error(state.last_search_summary)
+    c3.button(
+        "🔎 この範囲の物件を取得・保存", type="primary", key="start_property_search_v24",
+        use_container_width=True, on_click=request_search,
+        args=(station, radius, per_region_limit, worker_count))
 
     if state.records:
-        selected = [p for p in state.records if p.get("layout") in LAYOUT_GROUPS[layout_group] and target_property(p)]
+        selected = displayed
         st.caption(f"現在メモリ上の物件 {len(state.records)}件 / 選択間取り {len(selected)}件")
         st.dataframe(
             [
