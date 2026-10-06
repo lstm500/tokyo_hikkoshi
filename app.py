@@ -30,7 +30,7 @@ from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 import streamlit as st
 
 
-APP_VERSION = "v19-click-ack-before-search"
+APP_VERSION = "v20-direct-search-start"
 TARGET_STRUCTURE = "SRC"
 MAX_BUILDING_AGE = 20
 
@@ -1147,21 +1147,18 @@ def main():
         .stApp{background:white;color:#173a5e;color-scheme:light}
         .block-container{padding-top:1rem;padding-bottom:2rem;max-width:1200px}
         h1,h2,h3,p,label{color:#173a5e}
+        div[data-testid="stStatusWidget"]{border:2px solid #ff4b4b;border-radius:12px}
         </style>
         """,
         unsafe_allow_html=True,
     )
     st.title("住まいコンパス")
-    st.caption(f"{APP_VERSION}｜軽量起動・文字進捗付き物件取得")
+    st.caption(f"{APP_VERSION}｜赤い取得ボタン＝検索開始")
 
     state = st.session_state
     state.setdefault("records", [])
     state.setdefault("last_search_records", [])
-    state.setdefault("search_phase", "idle")
-    state.setdefault("search_request", None)
-    state.setdefault("search_message", "")
-    state.setdefault("search_started_at", None)
-    state.setdefault("search_acknowledged_at", None)
+    state.setdefault("last_search_summary", "")
 
     with st.expander("地域・物件取得の設定", expanded=True):
         station = st.selectbox("中心駅", list(STATIONS), index=list(STATIONS).index("池袋"))
@@ -1186,33 +1183,17 @@ def main():
     else:
         st.map([{"lat": center_lat, "lon": center_lng}], latitude="lat", longitude="lon", use_container_width=True)
 
-    phase = state.get("search_phase", "idle")
-    if phase in ("queued", "acknowledged", "running"):
-        elapsed = 0
-        if state.get("search_started_at"):
-            elapsed = max(0, int(time.time() - float(state.search_started_at)))
-        st.markdown(
-            f"""
-            <div style="border:3px solid #ff4b4b;background:#fff3f3;padding:16px 18px;border-radius:12px;margin:12px 0 14px 0;">
-              <div style="font-size:24px;font-weight:800;color:#b42318;">🔎 物件検索を開始しました</div>
-              <div style="font-size:16px;font-weight:700;color:#173a5e;margin-top:6px;">{html_lib.escape(state.get('search_message') or '検索準備中です。')}</div>
-              <div style="font-size:13px;color:#667085;margin-top:4px;">経過 {elapsed}秒｜検索が終わるまでこの画面を開いたままにしてください。</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-    elif phase == "completed":
-        st.success(state.get("search_message") or "物件検索が完了しました。")
-    elif phase == "failed":
-        st.error(state.get("search_message") or "物件検索が停止しました。")
-    else:
-        st.caption("検索待機中です。下の赤い取得ボタンを押すと、直後に『物件検索を開始しました』と表示します。")
+    if state.last_search_summary:
+        st.info(state.last_search_summary)
 
     c1, c2, c3 = st.columns(3)
     if c1.button("Supabase接続確認"):
         try:
             _, _, namespace = supabase_settings()
-            rows = supabase_request("GET", "sumai_properties", params={"namespace": "eq." + namespace, "select": "identity", "limit": 1})
+            rows = supabase_request(
+                "GET", "sumai_properties",
+                params={"namespace": "eq." + namespace, "select": "identity", "limit": 1},
+            )
             st.success("Supabase接続OK。")
         except StorageError as exc:
             st.error(str(exc))
@@ -1220,110 +1201,88 @@ def main():
     if c2.button("保存済み物件をこの範囲だけ読み込む"):
         try:
             state.records = load_range(center_lat, center_lng, radius, TARGET_LAYOUTS)
-            st.success(f"保存済み物件 {len(state.records)}件を読み込みました。")
+            state.last_search_summary = f"保存済み物件を{len(state.records)}件読み込みました。"
             st.rerun()
         except StorageError as exc:
             st.error(str(exc))
 
-    def queue_search_request():
-        # on_click callback is executed before Streamlit performs the next full rerun.
-        # This guarantees that the next render already knows the click was accepted.
-        state.search_phase = "queued"
-        state.search_started_at = time.time()
-        state.search_acknowledged_at = None
-        state.search_message = f"検索ボタン受付完了｜{station}を中心に半径{radius/1000:g}kmを検索準備中"
-        state.search_request = {
-            "center_lat": center_lat,
-            "center_lng": center_lng,
-            "radius": radius,
-            "per_region_limit": per_region_limit,
-            "worker_count": worker_count,
-            "station": station,
-        }
-
-    search_busy = phase in ("queued", "acknowledged", "running")
-    search_label = "🔎 検索中です…" if search_busy else "🔎 この範囲の物件を取得・保存"
-    c3.button(
-        search_label,
+    # The red button is the search action itself. There is no queued/paused/resume state.
+    # On the click rerun we replace the button immediately, render an unmistakable status,
+    # and only then enter network/search work.
+    button_slot = c3.empty()
+    start_search = button_slot.button(
+        "🔎 この範囲の物件を取得・保存",
         type="primary",
-        disabled=search_busy,
-        on_click=queue_search_request,
-        key="start_property_search",
+        key="start_property_search_v20",
+        use_container_width=True,
     )
 
-    # Two-stage start: first render a visible acknowledgement, then start the heavy
-    # network work on the fragment's next tick. This prevents the first fetch from
-    # blocking the browser before the user sees that the button press was accepted.
-    if state.get("search_phase") in ("queued", "acknowledged", "running"):
-        @st.fragment(run_every=1)
-        def search_controller():
-            current_phase = state.get("search_phase", "idle")
+    if start_search:
+        button_slot.empty()
+        button_slot.button(
+            "🔎 検索中です…",
+            type="primary",
+            disabled=True,
+            key="search_running_v20",
+            use_container_width=True,
+        )
 
-            if current_phase == "queued":
-                state.search_phase = "acknowledged"
-                state.search_acknowledged_at = time.time()
-                state.search_message = "検索ボタンを受け付けました｜1秒後に地域・丁目の判定を開始します"
-                st.markdown(
-                    "<div style='border:3px solid #ff4b4b;background:#fff3f3;padding:16px;border-radius:12px;'>"
-                    "<div style='font-size:22px;font-weight:800;color:#b42318;'>✅ 検索ボタンを受け付けました</div>"
-                    "<div style='margin-top:6px;font-weight:700;color:#173a5e;'>この表示が出てから検索処理を開始します。</div>"
-                    "</div>",
-                    unsafe_allow_html=True,
-                )
-                st.info("現在の状態：受付完了 → 検索開始待ち（約1秒）")
-                return
+        started_at = datetime.now()
+        state.last_search_summary = ""
 
-            if current_phase == "acknowledged":
-                req = dict(state.get("search_request") or {})
-                if not req:
-                    state.search_phase = "failed"
-                    state.search_message = "検索条件を保持できなかったため開始できませんでした。"
-                    st.error(state.search_message)
-                    return
+        st.markdown(
+            f"""
+            <div style="border:4px solid #ff4b4b;background:#fff1f1;padding:18px 20px;border-radius:14px;margin:12px 0;">
+              <div style="font-size:26px;font-weight:900;color:#b42318;">🔎 検索を開始しました</div>
+              <div style="font-size:16px;font-weight:700;color:#173a5e;margin-top:7px;">
+                {html_lib.escape(station)}を中心に半径{radius/1000:g}km｜HOME'S・SUUMOの取得処理を開始します
+              </div>
+              <div style="font-size:14px;color:#667085;margin-top:5px;">
+                開始時刻 {started_at.strftime('%H:%M:%S')}｜この下に進捗が逐次表示されます
+              </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
-                state.search_phase = "running"
-                state.search_message = "検索実行中｜ステップ1/3：検索範囲の地域・丁目を判定しています"
-                st.markdown(
-                    "<div style='border:3px solid #ff4b4b;background:#fff3f3;padding:16px;border-radius:12px;'>"
-                    "<div style='font-size:22px;font-weight:800;color:#b42318;'>🔎 物件検索を実行中です</div>"
-                    "<div style='margin-top:6px;font-weight:700;color:#173a5e;'>HOME'S・SUUMOの確認を開始しました。</div>"
-                    "</div>",
-                    unsafe_allow_html=True,
-                )
-                progress_bar = st.progress(0.01, text="検索開始：地域・丁目を判定中")
-                status_box = st.empty()
-                log_box = st.empty()
-                status_box.warning("ステップ1/3｜地域・丁目を判定しています。")
-                try:
-                    records = run_search(
-                        req["center_lat"],
-                        req["center_lng"],
-                        req["radius"],
-                        req["per_region_limit"],
-                        req["worker_count"],
-                        progress_bar,
-                        status_box,
-                        log_box,
-                    )
-                    state.last_search_records = records
-                    state.records = deduplicate(records)
-                    state.search_phase = "completed"
-                    state.search_message = f"検索完了｜今回確認できた物件 {len(state.records)}件"
-                    status_box.success(state.search_message)
-                except Exception as exc:
-                    state.search_phase = "failed"
-                    state.search_message = f"物件取得を停止しました：{type(exc).__name__}: {exc}"
-                    status_box.error(state.search_message)
-                finally:
-                    state.search_request = None
-                # Return to a normal full render so the button is enabled again and
-                # the final status remains visible outside the fragment.
-                st.rerun()
+        search_status = st.status("🔎 検索開始済み｜ステップ1/3：地域・丁目を判定します", expanded=True)
+        search_status.write("赤い取得ボタンの入力を受け付けました。物件検索処理を開始しています。")
+        progress_bar = st.progress(0.01, text="検索開始済み｜地域・丁目の判定を開始")
+        status_box = st.empty()
+        log_box = st.empty()
+        status_box.warning("🔎 検索開始済み｜現在：地域・丁目を判定しています")
+        log_box.code(f"{started_at.strftime('%H:%M:%S')}  検索開始｜{station}｜半径 {radius/1000:g}km", language=None)
 
-            if current_phase == "running":
-                st.info("検索処理を実行中です。進捗表示を更新しています。")
-
-        search_controller()
+        try:
+            records = run_search(
+                center_lat,
+                center_lng,
+                radius,
+                per_region_limit,
+                worker_count,
+                progress_bar,
+                status_box,
+                log_box,
+            )
+            state.last_search_records = records
+            state.records = deduplicate(records)
+            elapsed = int((datetime.now() - started_at).total_seconds())
+            state.last_search_summary = f"検索完了｜今回確認 {len(state.records)}件｜所要 {elapsed}秒"
+            search_status.update(
+                label=f"✅ 検索完了｜今回確認 {len(state.records)}件｜所要 {elapsed}秒",
+                state="complete",
+                expanded=True,
+            )
+            st.success(state.last_search_summary)
+        except Exception as exc:
+            elapsed = int((datetime.now() - started_at).total_seconds())
+            state.last_search_summary = f"検索停止｜{type(exc).__name__}: {exc}｜経過 {elapsed}秒"
+            search_status.update(
+                label="❌ 検索を停止しました",
+                state="error",
+                expanded=True,
+            )
+            st.error(state.last_search_summary)
 
     if state.records:
         selected = [p for p in state.records if p.get("layout") in LAYOUT_GROUPS[layout_group] and target_property(p)]
@@ -1350,14 +1309,12 @@ def main():
             column_config={"募集ページ": st.column_config.LinkColumn("募集ページ")},
         )
     else:
-        st.caption("まだ物件データはありません。取得ボタンを押すと、進捗を文字で表示しながら検索します。")
+        st.caption("まだ物件データはありません。赤い取得ボタンを押すと、その場で検索を開始します。")
 
     with st.expander("取得方式"):
-        st.write("起動時はHOME'S・SUUMO・国土地理院・Supabaseへ通信しません。外部通信はボタン操作時だけです。")
-        st.write("物件取得は前景処理です。検索中はこの画面を開いたままにしてください。子プロセスや自動再開は使いません。")
-        st.write("検索は地域×取得元の単位で並列化し、HOME'S/SUUMO内部にさらにThreadPoolを重ねません。")
-        st.write("条件適合した物件は地域タスクが完了するたびにSupabaseへ保存確認を行うため、全検索完了前でも途中成果が残ります。")
-        st.write("位置は掲載ページのJSON-LD・埋込地図座標を優先し、座標がない場合は具体的な掲載住所だけ国土地理院住所検索で補完します。")
+        st.write("赤い取得ボタンを押した実行の中で、そのまま検索を開始します。queued/paused/手動再開/自動再開は使いません。")
+        st.write("検索開始時は『検索を開始しました』を表示し、検索中は地域判定・HOME'S/SUUMO・保存件数・除外件数・エラー件数を文字で逐次更新します。")
+        st.write("検索は地域×取得元の単位で並列化します。確認済み物件は各地域タスクの完了時にSupabaseへ保存します。")
 
 
 if __name__ == "__main__":
