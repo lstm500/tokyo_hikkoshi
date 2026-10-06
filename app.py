@@ -1,6 +1,6 @@
 """住まいコンパス / REBUILD 01 — complete independent implementation.
 Run: streamlit run app.py
-Dependencies: streamlit>=1.50,<2, requests>=2.32,<3, beautifulsoup4>=4.13,<5, folium>=0.18,<1, streamlit-folium==0.24.0.
+Dependencies: streamlit>=1.50,<2, requests>=2.32,<3, beautifulsoup4>=4.13,<5, folium>=0.18,<1, streamlit-folium==0.24.0, numpy>=1.26,<3, Pillow>=10,<12.
 Persistent storage: Supabase housing_units_v1, housing_searches_v1, housing_places_v1.
 Search and available-field storage run on server worker threads; UI polls snapshots.
 New flexible listings are JSON records in housing_searches_v1; old housing_units_v1 records remain readable.
@@ -37,7 +37,7 @@ import streamlit as st
 from streamlit_folium import st_folium
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v37"
+BUILD = "REBUILD-01-v38"
 DEFAULT_CENTER = (35.7303,139.711)
 UNIT_TABLE = "housing_units_v1"
 SEARCH_TABLE = "housing_searches_v1"
@@ -396,12 +396,35 @@ def partial_listing(provider,url,title,address,layout,rent,fees,area,region,boun
                       map_address=region.get('label','') if region else '',address_match='町丁目単位')
     row=dict(key=hashlib.sha256(url.encode()).hexdigest(),title=str(title or '掲載募集'),address=str(address or ''),layout=layout,
              rent=rent if rent and rent>0 else None,fees=fees,area=area,floor=floor,structure=structure,age=age,built_ym=built_ym,
-             provider=provider,listing_url=url,fetched_at=utc_now(),coordinate_precision='building' if precise else 'town',
+             provider=provider,listing_url=url,fetched_at=utc_now(),coordinate_precision=location.pop('coordinate_precision','building') if precise else 'town',
              region_label=region.get('label','') if region else '',search_bounds=list(bounds),**location)
     row['price_basis']='管理費込み' if fees is not None else '家賃のみ・管理費未確認'
     row['missing_fields']=[k for k in ('rent','fees','area','structure','age') if row.get(k) is None]
     if not precise:row['missing_fields'].append('building_location')
     return row if valid_unit(row) else None
+
+
+def merge_listing(old,new):
+    """Incomplete new observations must not erase previously acquired fields or map points."""
+    if not old:return dict(new)
+    out=dict(old);retained=[]
+    for k,v in new.items():
+        if v is not None and v!='' and k!='missing_fields':out[k]=v
+        elif old.get(k) is not None and old.get(k)!='':retained.append(k)
+    rank={'town':1,'address':2,'building':3,'listing_map':4}
+    if has_point(old) and (not has_point(new) or rank.get(old.get('coordinate_precision'),0)>rank.get(new.get('coordinate_precision'),0)):
+        for k in ('latitude','longitude','coordinate_precision','location_method','map_address','inferred_address','position_source_url','address_precision','address_match'):
+            if k in old:out[k]=old[k];retained.append(k)
+    elif has_point(new) and ((new.get('latitude'),new.get('longitude'))!=(old.get('latitude'),old.get('longitude')) or new.get('position_source_url')!=old.get('position_source_url')):
+        for k in ('map_address','inferred_address','address_precision','address_match','position_source_url','location_method'):
+            out[k]=new.get(k,'')
+    a,b=address_key(old.get('address','')),address_key(new.get('address',''))
+    if a and b and b in a and len(a)>len(b):out['address']=old['address'];retained.append('address')
+    out['missing_fields']=[k for k in ('rent','fees','area','structure','age') if out.get(k) is None]
+    if not has_point(out) or out.get('coordinate_precision') in ('town','address'):out['missing_fields'].append('building_location')
+    out['price_basis']='管理費込み' if out.get('fees') is not None else '家賃のみ・管理費未確認'
+    if retained:out['retained_fields_from_previous']=sorted(set(retained))
+    return out
 
 
 def rental_network_settings():
@@ -478,13 +501,30 @@ class Database:
             rows=self.call('GET',table,{'namespace':'eq.'+self.namespace,'select':select,'limit':1})
             if not isinstance(rows,list): raise AppError('保存テーブルの応答形式が不正です。')
     def save_units(self,rows):
-        unique={r['key']:r for r in rows if valid_unit(r)}
+        unique={}
+        for r in rows:
+            if valid_unit(r):unique[r['key']]=merge_listing(unique.get(r['key']),r)
         if len(unique)!=len({r.get('key') for r in rows}):raise AppError('募集URL・家賃・間取りの保存形式を確認してください。')
         if not unique:return set()
-        payload=[dict(namespace=self.namespace,id='listing.'+key,status='rental_listing',started_at=row.get('fetched_at') or utc_now(),
-                      finished_at=None,conditions={'record_type':'rental_listing','schema':2},summary={'listing':row}) for key,row in unique.items()]
-        result=self.call('POST',SEARCH_TABLE,{'on_conflict':'namespace,id','select':'id'},payload,'resolution=merge-duplicates,return=representation')
-        saved={r.get('id') for r in result if isinstance(r,dict)} if isinstance(result,list) else set()
+        saved=set();items=list(unique.items())
+        for offset in range(0,len(items),100):
+            batch=items[offset:offset+100];ids=['listing.'+key for key,row in batch]
+            previous=self.call('GET',SEARCH_TABLE,{'namespace':'eq.'+self.namespace,'id':'in.('+','.join(ids)+')','select':'id,summary'})
+            if not isinstance(previous,list):raise AppError('既存の物件情報を確認できないため、情報を上書きせず保存を保留しました。')
+            old={r.get('id'):(r.get('summary') or {}).get('listing') for r in previous if isinstance(r,dict)}
+            missing=[key for key,row in batch if not old.get('listing.'+key)]
+            if missing:
+                try:
+                    legacy=self.call('GET',UNIT_TABLE,{'namespace':'eq.'+self.namespace,'key':'in.('+','.join(missing)+')','select':'*'})
+                    if isinstance(legacy,list):
+                        for row in legacy:
+                            if isinstance(row,dict) and valid_unit(row):old['listing.'+row['key']]=row
+                except AppError as exc:
+                    if not any(code in str(exc) for code in ('PGRST205','42P01')):raise
+            payload=[dict(namespace=self.namespace,id='listing.'+key,status='rental_listing',started_at=row.get('fetched_at') or utc_now(),
+                          finished_at=None,conditions={'record_type':'rental_listing','schema':2},summary={'listing':merge_listing(old.get('listing.'+key),row)}) for key,row in batch]
+            result=self.call('POST',SEARCH_TABLE,{'on_conflict':'namespace,id','select':'id'},payload,'resolution=merge-duplicates,return=representation')
+            saved.update(r.get('id') for r in result if isinstance(r,dict)) if isinstance(result,list) else None
         if not {'listing.'+k for k in unique}<=saved:raise AppError('Supabaseから募集情報の保存確認が得られません。')
         return set(unique)
     def save_search(self,search):
@@ -673,7 +713,7 @@ class PublicWeb:
             error=AppError(host+'：取得経路の待機中です（直前の403・429等）。設定した全経路の待機が終わってから再検索してください。');error.diagnostic={'skipped_routes':skipped};raise error
         return last
     def fetch(self,url,method='GET',**kwargs):
-        allowed=('www.homes.co.jp','suumo.jp','mreversegeocoder.gsi.go.jp','msearch.gsi.go.jp','maps.gsi.go.jp','cyberjapandata.gsi.go.jp','japanese-addresses-v2.geoloniamaps.com','geolonia.github.io')
+        allowed=('www.homes.co.jp','suumo.jp','mreversegeocoder.gsi.go.jp','msearch.gsi.go.jp','maps.gsi.go.jp','cyberjapandata.gsi.go.jp','japanese-addresses-v2.geoloniamaps.com','geolonia.github.io','img01.suumo.com','img02.suumo.com','maps.googleapis.com','maps.google.com')
         u=urlparse(url)
         if u.scheme!='https' or u.hostname not in allowed or u.username or u.password: raise AppError('取得先が不正です。')
         if method=='GET' and not kwargs.get('params') and url in self.http_cache:
@@ -926,93 +966,197 @@ def json_nodes(value):
 
 def coordinate(soup,text,hint=None):
     candidates=[]
-    for script in soup.select('script[type="application/ld+json"]'):
-        try: data=json.loads(script.get_text())
-        except ValueError: continue
-        for node in json_nodes(data):
-            geo=node.get('geo')
-            if isinstance(geo,dict):
-                try: candidates.append((float(geo['latitude']),float(geo['longitude']),'掲載JSON-LD',3))
-                except (ValueError,TypeError,KeyError): pass
-    pattern=r'["\']lat(?:itude)?["\']\s*[:=]\s*["\']?(3[4-7]\.\d+)["\']?.{0,120}?["\'](?:lng|lon|longitude)["\']\s*[:=]\s*["\']?(1(?:3[89]|40)\.\d+)'
-    for match in re.finditer(pattern,text,re.S|re.I): candidates.append((float(match[1]),float(match[2]),'掲載地図',2))
-    reverse_pattern=r'["\'](?:lng|lon|longitude)["\']\s*[:=]\s*["\']?(1(?:3[89]|40)\.\d+)["\']?.{0,120}?["\']lat(?:itude)?["\']\s*[:=]\s*["\']?(3[4-7]\.\d+)'
-    for match in re.finditer(reverse_pattern,text,re.S|re.I):
-        candidates.append((float(match[2]),float(match[1]),'掲載地図',2))
-    for match in re.finditer(r'/@(3[4-7]\.\d+),(1(?:3[89]|40)\.\d+)',text):
-        candidates.append((float(match[1]),float(match[2]),'掲載地図',2))
-    # Public map URL parameters, hidden inputs and JavaScript LatLng constructors.
-    for tag in soup.select('[href],[src]'):
-        url=html.unescape(tag.get('href') or tag.get('src') or '')
-        params=parse_qs(urlparse(url).query)
-        for key in ('ll','center','q','query'):
-            for value in params.get(key,[]):
-                match=re.fullmatch(r'\s*(3[4-7]\.\d+)\s*,\s*(1(?:3[89]|40)\.\d+)\s*',value)
-                if match:candidates.append((float(match[1]),float(match[2]),'掲載地図URL',2))
-    fields={str(tag.get('name') or tag.get('id') or '').lower():tag.get('value','') for tag in soup.select('input[value]')}
-    for la,lo in (('lat','lng'),('latitude','longitude'),('ido','keido')):
+    def add(lat,lng,method,priority):
         try:
-            a,b=float(fields[la]),float(fields[lo])
-            if 34<=a<=37 and 138<=b<=141:candidates.append((a,b,'掲載座標入力項目',2))
-        except (KeyError,ValueError,TypeError):pass
-    for match in re.finditer(r'(?:LatLng|setView)\s*\(\s*\[?\s*(3[4-7]\.\d+)\s*,\s*(1(?:3[89]|40)\.\d+)',text):
-        candidates.append((float(match[1]),float(match[2]),'掲載地図設定',2))
-    for tag in soup.select('[data-lat][data-lng]'):
-        try:candidates.append((float(tag['data-lat']),float(tag['data-lng']),'掲載地図属性',2))
+            lat,lng=float(lat),float(lng)
+            if math.isfinite(lat) and math.isfinite(lng) and 34<=lat<=37 and 138<=lng<=141:
+                item=(lat,lng,method,priority)
+                if item not in candidates:candidates.append(item)
         except (ValueError,TypeError):pass
-    if hint: candidates.append((*hint,'HOME’S検索地図',2))
+    pair=r'(3[4-7]\.\d+)\s*[,;| ]\s*(1(?:3[89]|40)\.\d+)'
+    for script in soup.select('script[type="application/ld+json"]'):
+        try:data=json.loads(script.get_text())
+        except ValueError:continue
+        for node in json_nodes(data):
+            types=node.get('@type',[]);types=[types] if isinstance(types,str) else types
+            if any(t in ('Organization','RealEstateAgent','LocalBusiness','Place','Store') for t in types):continue
+            geo=node.get('geo')
+            if isinstance(geo,dict):add(geo.get('latitude'),geo.get('longitude'),'掲載物件JSON-LD',6)
+    regex_text=re.sub(r'<script[^>]*type=[\"\']application/ld\+json[\"\'][^>]*>.*?</script>', '',text,flags=re.I|re.S)
+    # Handle quoted and unquoted JS fields, property-prefixed names, and both pair orders.
+    la=r'(?:bukken|property|building|map|center)?(?:lat|latitude|ido)'
+    lo=r'(?:bukken|property|building|map|center)?(?:lng|lon|longitude|keido)'
+    for pattern,reverse_pair in [(rf'(?<!\w)["\']?{la}["\']?\s*[:=]\s*["\']?(3[4-7]\.\d+)["\']?.{{0,160}}?(?<!\w)["\']?{lo}["\']?\s*[:=]\s*["\']?(1(?:3[89]|40)\.\d+)',False),
+                                 (rf'(?<!\w)["\']?{lo}["\']?\s*[:=]\s*["\']?(1(?:3[89]|40)\.\d+)["\']?.{{0,160}}?(?<!\w)["\']?{la}["\']?\s*[:=]\s*["\']?(3[4-7]\.\d+)',True)]:
+        for match in re.finditer(pattern,html.unescape(regex_text),re.S|re.I):
+            names=re.findall(r'(?<!\w)["\']?('+la+'|'+lo+r')["\']?\s*[:=]',match[0],re.I)
+            explicit=len(names)>=2 and all(re.match(r'(?:bukken|property|building)',n,re.I) for n in (names[0],names[-1]))
+            add(match[2] if reverse_pair else match[1],match[1] if reverse_pair else match[2],'掲載物件の座標設定' if explicit else '地図中心候補（未検証）',5 if explicit else 1)
+    for tag in soup.select('input[value],[data-lat],[data-latitude],[data-ido]'):
+        attrs={str(k).lower():v for k,v in tag.attrs.items()}
+        for a,b in [('data-lat','data-lng'),('data-lat','data-lon'),('data-latitude','data-longitude'),('data-ido','data-keido')]:
+            if a in attrs and b in attrs:add(attrs[a],attrs[b],'掲載地図属性',5 if re.search(r'bukken|property|building',str(tag.attrs),re.I) else 1)
+        name=str(tag.get('name') or tag.get('id') or '').lower();value=html.unescape(str(tag.get('value','')))
+        if re.search(r'(?:map|gmap|bukken|property|coord|latlng)',name):
+            for match in re.finditer(pair,value):add(match[1],match[2],'掲載地図の座標入力',5 if re.search(r'bukken|property|point',name) else 2)
+    fields={re.sub(r'[^a-z]','',str(tag.get('name') or tag.get('id') or '').lower()):tag.get('value','') for tag in soup.select('input[value]')}
+    for prefix in ('','bukken','property','building','map','center','js'):
+        for a,b in [('lat','lng'),('latitude','longitude'),('lat','lon'),('ido','keido')]:
+            if prefix+a in fields and prefix+b in fields:add(fields[prefix+a],fields[prefix+b],'掲載地図の座標入力',5 if prefix in ('bukken','property','building') else 2)
+    for match in re.finditer(r'(?:LatLng|setView)\s*\(\s*\[?\s*'+pair,text,re.I):add(match[1],match[2],'掲載地図設定（中心・未検証）',1)
+    for tag in soup.select('[href],[src],[data-src],[data-url]'):
+        for attr in ('href','src','data-src','data-url'):
+            url=html.unescape(str(tag.get(attr) or ''));params=parse_qs(urlparse(url).query)
+            for key in ('markers','ll','q','query','center'):
+                for value in params.get(key,[]):
+                    for match in re.finditer(pair,value):add(match[1],match[2],'掲載地図URLの物件ピン' if key=='markers' else '掲載地図URL',5 if key=='markers' and re.search(r'物件|bukken|property|building',str(tag.attrs),re.I) and not re.search(r'店舗|会社|営業|アクセス',str(tag.attrs)) else 1)
+            for a,b in [('lat','lng'),('lat','lon'),('latitude','longitude'),('ido','keido')]:
+                if a in params and b in params:add(params[a][0],params[b][0],'掲載地図URLの座標（中心・未検証）',1)
+            for match in re.finditer(r'!3d(3[4-7]\.\d+)!4d(1(?:3[89]|40)\.\d+)',url):add(match[1],match[2],'埋め込み地図の位置（中心・未検証）',1)
+    for match in re.finditer(r'(?:bukken|property|building)(?:Marker|Pin)\s*=\s*(?:L\.)?marker\s*\(\s*\[\s*'+pair,text,re.I):add(match[1],match[2],'物件地図のマーカー座標',5)
+    for match in re.finditer(r'(?:bukken|property|building)(?:Marker|Pin)\s*=.{0,120}?position\s*:\s*new\s+(?:google\.maps\.)?LatLng\s*\(\s*'+pair,text,re.I):add(match[1],match[2],'物件地図のマーカー座標',5)
+    if hint:add(hint[0],hint[1],'HOME’S物件検索地図',6)
     return candidates
 
 
+def image_pin_point(content,center,zoom,scale=1):
+    """Recognize a colored map pin, then project its tip using declared Web Mercator metadata."""
+    import numpy as np
+    from PIL import Image
+    image=Image.open(io.BytesIO(content)).convert('RGB');pixels=np.asarray(image,dtype=np.int16)
+    height,width=pixels.shape[:2];r,g,b=pixels[:,:,0],pixels[:,:,1],pixels[:,:,2]
+    mask=(r>150)&(r-g>65)&(r-b>50) # Red location-pin foreground, not black text/gray roads.
+    seen=np.zeros(mask.shape,dtype=bool);components=[]
+    for y,x in zip(*np.where(mask)):
+        if seen[y,x]:continue
+        stack=[(int(x),int(y))];seen[y,x]=True;pts=[]
+        while stack:
+            xx,yy=stack.pop();pts.append((xx,yy))
+            for nx,ny in ((xx-1,yy),(xx+1,yy),(xx,yy-1),(xx,yy+1)):
+                if 0<=nx<width and 0<=ny<height and mask[ny,nx] and not seen[ny,nx]:seen[ny,nx]=True;stack.append((nx,ny))
+        xs,ys=zip(*pts);w,h=max(xs)-min(xs)+1,max(ys)-min(ys)+1
+        # A pin must have a head and a tapering lower tip; a red road/label isn't enough.
+        if len(pts)<20 or not (5<=w<=80*scale and 8<=h<=100*scale and .8<=h/w<=3.5):continue
+        bottom=[xx for xx,yy in pts if yy>=max(ys)-max(1,int(h*.1))]
+        if not bottom or max(bottom)-min(bottom)+1>w*.65:continue
+        rows_width=[sum(1 for xx,yy in pts if yy==qy) for qy in range(min(ys),max(ys)+1)]
+        if max(rows_width[:max(1,int(h*.08))])>w*.7:continue
+        crop=mask[min(ys):max(ys)+1,min(xs):max(xs)+1];background=~crop;outside=np.zeros(crop.shape,dtype=bool)
+        todo=[(xx,yy) for yy in range(h) for xx in range(w) if background[yy,xx] and (xx in (0,w-1) or yy in (0,h-1))]
+        for xx,yy in todo:outside[yy,xx]=True
+        while todo:
+            xx,yy=todo.pop()
+            for nx,ny in ((xx-1,yy),(xx+1,yy),(xx,yy-1),(xx,yy+1)):
+                if 0<=nx<w and 0<=ny<h and background[ny,nx] and not outside[ny,nx]:outside[ny,nx]=True;todo.append((nx,ny))
+        if int((background & ~outside).sum())<max(4,int(w*h*.02)):continue
+        components.append({'pixel':[statistics.median(bottom),max(ys)],'pixels':len(pts),'bbox':[min(xs),min(ys),max(xs),max(ys)]})
+    components.sort(key=lambda v:-v['pixels'])
+    if not components:return None,{'reason':'画像に物件ピン形状を検出できない','width':width,'height':height}
+    if len(components)>1:return None,{'reason':'同程度のピン候補が複数あり物件ピンを特定できない','candidates':components}
+    pin=components[0];world=256*(2**float(zoom));lat,lng=map(float,center)
+    x=(lng+180)/360*world;y=(1-math.asinh(math.tan(math.radians(lat)))/math.pi)/2*world
+    x+=(pin['pixel'][0]-width/2)/float(scale);y+=(pin['pixel'][1]-height/2)/float(scale)
+    point=(math.degrees(math.atan(math.sinh(math.pi*(1-2*y/world)))),x/world*360-180)
+    return point,{'method':'赤色ピンの連結領域・先端認識＋Web Mercator逆投影','center':list(center),'zoom':zoom,'scale':scale,'pin':pin,'width':width,'height':height,'point':list(point)}
+
+
+def map_image_candidates(web,soup,source_url):
+    results=[]
+    for tag in soup.select('img[src],img[data-src],img[data-original]'):
+        raw=tag.get('data-src') or tag.get('data-original') or tag.get('src') or ''
+        url=urljoin(source_url or '',html.unescape(raw))
+        params=parse_qs(urlparse(url).query);label=' '.join(str(tag.get(k,'') or '') for k in ('alt','id','class'))
+        if not ('staticmap' in url.lower() or re.search('地図|map',label,re.I)):continue
+        if re.search('店舗|会社|営業|アクセス',label):continue
+        if not ('kankyo' in (source_url or '') or 'FR301FD003' in (source_url or '') or re.search('物件|bukken|property',label,re.I)):continue
+        center_text=params.get('center',[tag.get('data-center','')])[0];match=re.fullmatch(r'\s*(3[4-7]\.\d+)\s*,\s*(1(?:3[89]|40)\.\d+)\s*',center_text)
+        try:zoom=float(params.get('zoom',[tag.get('data-zoom')])[0]);scale=float(params.get('scale',[1])[0])
+        except (ValueError,TypeError):zoom=None;scale=1
+        if not match or zoom is None or not math.isfinite(zoom) or not math.isfinite(scale) or not (0<=zoom<=22 and scale in (1,2)):
+            trace(web,'image_georef_missing',{'image_host':urlparse(url).hostname,'reason':'地図画像の基準座標・ズームを読み取れない'},'WARNING','image_location');continue
+        supported=urlparse(url).hostname in ('maps.googleapis.com','maps.google.com') and 'staticmap' in urlparse(url).path
+        size=re.fullmatch(r'(\d+)x(\d+)',params.get('size',[''])[0])
+        if not supported or not size:
+            trace(web,'image_georef_missing',{'reason':'地図画像の投影方式・元の画像サイズを検証できない'},'WARNING','image_location');continue
+        if urlparse(url).hostname not in ('img01.suumo.com','img02.suumo.com','maps.googleapis.com','maps.google.com','suumo.jp','www.homes.co.jp'):continue
+        try:
+            if not web.permitted(url):continue
+            response=web.fetch(url)
+            from PIL import Image
+            actual=Image.open(io.BytesIO(response.content)).size
+            expected=(int(size[1])*int(scale),int(size[2])*int(scale))
+            if actual!=expected:
+                trace(web,'image_georef_missing',{'reason':'元画像と宣言サイズが一致せず、拡縮・切り抜きの可能性','actual_size':list(actual),'expected_size':list(expected)},'WARNING','image_location');continue
+            point,details=image_pin_point(response.content,(float(match[1]),float(match[2])),zoom,scale)
+            details.update(image_url=url,image_sha256=hashlib.sha256(response.content).hexdigest(),projection='Google Static Maps Web Mercator')
+            trace(web,'image_pin_result',details,'INFO' if point else 'WARNING','image_location')
+            if point:
+                if not hasattr(web,'image_point_sources'):web.image_point_sources={}
+                web.image_point_sources[point]=url
+                results.append((*point,'掲載地図画像の物件ピン認識',5))
+        except Exception as exc:trace(web,'image_pin_error',{'exception_type':type(exc).__name__,'message':str(exc) if isinstance(exc,AppError) else '画像を解析できない'},'WARNING','image_location')
+    return results
+
+
+def map_links(soup,source_url):
+    links=[];origin=urlparse(source_url).hostname
+    for tag in soup.select('a[href],iframe[src],[data-url],[data-href],[onclick],form[action]'):
+        label=' '.join([tag.get_text(' ',strip=True),str(tag.get('title') or ''),str(tag.get('id') or ''),str(tag.get('class') or ''),str(tag.get('onclick') or ''),str(tag.get('alt') or ''),str(tag.get('aria-label') or '')]+[str(img.get('alt') or '') for img in tag.select('img')])
+        targets=[str(tag.get(attr) or '') for attr in ('href','src','data-url','data-href','action')]
+        targets.extend(re.findall(r"(?:window\.open|location(?:\.href)?\s*=)\s*\(?\s*['\"]([^'\"]+)['\"]",str(tag.get('onclick') or '')))
+        for raw in targets:
+            target=urljoin(source_url,html.unescape(raw));u=urlparse(target)
+            if not raw or u.scheme!='https' or u.hostname!=origin or u.username or u.password:continue
+            if re.search(r'地図|周辺環境|(?:gmap|map|kankyo|FR301FD003)',label+' '+u.path+' '+u.query,re.I) and target!=source_url and target not in links:links.append(target)
+    return links
+
+
 def locate(web,soup,text,address,bounds,munis,hint=None,source_url=None):
-    all_coordinates=coordinate(soup,text,hint)
-    if not all_coordinates and source_url:
-        seen=set()
-        for tag in soup.select('a[href],iframe[src]'):
-            target=urljoin(source_url,tag.get('href') or tag.get('src') or '')
-            u=urlparse(target)
-            if u.hostname!=urlparse(source_url).hostname or target in seen:continue
-            if not ('地図' in tag.get_text() or re.search(r'(?:gmap|map|FR301FD003)',u.path,re.I)):continue
-            seen.add(target)
+    candidates=coordinate(soup,text,hint);source_by_point={p[:2]:source_url for p in candidates}
+    if not any(p[3]>=5 for p in candidates):candidates.extend(map_image_candidates(web,soup,source_url))
+    # A map-center address lookup must never suppress following the actual property-map link.
+    if source_url:
+        for target in map_links(soup,source_url):
             try:
                 if not web.permitted(target):continue
-                reply=web.fetch(target);all_coordinates.extend(coordinate(BeautifulSoup(reply.text,'html.parser'),reply.text))
-                trace(web,'map_link_result',{'source_url':source_url,'map_url':target,'candidates':all_coordinates},stage='location')
+                reply=web.fetch(target);other=BeautifulSoup(reply.text,'html.parser')
+                extra=coordinate(other,reply.text)
+                if not any(p[3]>=5 for p in extra):extra.extend(map_image_candidates(web,other,target))
+                for p in extra:source_by_point[p[:2]]=target
+                candidates.extend(extra)
+                trace(web,'map_link_result',{'source_url':source_url,'map_url':target,'candidates':extra},stage='location')
             except AppError as exc:trace(web,'location',{'source_url':source_url,'map_url':target,'message':str(exc)},'WARNING','location')
-    candidates=[p for p in all_coordinates if in_rectangle(p[:2],bounds)]
-    trace(web,'location_candidates',{'address':address,'bounds':bounds,'all_candidates':all_coordinates,'in_bounds_candidates':candidates},stage='location')
-    method=''
+    candidates=[p for p in candidates if p[3]>=4]
+    if any(not in_rectangle(p[:2],bounds) for p in candidates):trace(web,'published_point_outside_bounds',{'points':[list(p[:2]) for p in candidates if not in_rectangle(p[:2],bounds)],'retained':True},stage='location')
+    trace(web,'location_candidates',{'address':address,'bounds':bounds,'in_bounds_candidates':candidates},stage='location')
+    location_precision='listing_map'
     if candidates:
-        lat,lng,method,_=max(candidates,key=lambda p:(p[3],-meters(bounds_center(bounds),p[:2])))
+        lat,lng,method,priority=max(candidates,key=lambda p:p[3])
+        distinct={(round(p[0],6),round(p[1],6)) for p in candidates if p[3]==priority}
+        if len(distinct)>1:
+            trace(web,'map_multiple_candidates',{'method':method,'same_priority_candidates':list(distinct),'retained_as_unresolved':True},'WARNING','location');return None
     elif re.search(r'\d+(?:丁目|番|号)|\d+-\d+',normal(address)):
-        data=web.fetch('https://msearch.gsi.go.jp/address-search/AddressSearch',params={'q':address}).json()
-        candidates=[]
+        data=web.fetch('https://msearch.gsi.go.jp/address-search/AddressSearch',params={'q':address}).json();matches=[]
         for item in data if isinstance(data,list) else []:
             try:
-                lng,lat=map(float,item['geometry']['coordinates'])
-                title=normal(item.get('properties',{}).get('title',''))
-                if in_rectangle((lat,lng),bounds) and title and (address_key(title) in address_key(address) or address_key(address) in address_key(title)):
-                    candidates.append((lat,lng))
-            except (TypeError,ValueError,KeyError): continue
-        if not candidates:
-            trace(web,'location',{'address':address,'reason':'住所検索に一致する範囲内座標なし'},'WARNING','location');return None
-        lat,lng=candidates[0];method='住所検索（掲載座標なし）'
-    else:
-        trace(web,'outside' if all_coordinates else 'location',{'address':address,'reason':'範囲内の掲載座標なし・番地のある住所なし'},'WARNING','location');return None
-    try: region=reverse(web,(lat,lng),munis)
-    except Exception: region=None
-    map_address=region['label'] if region else ''
-    a,b=address_key(address),address_key(map_address)
-    if region and a:
-        town_base=re.sub(r'\d+丁目$','',address_key(region['town']))
-        if town_base and town_base not in a:
-            trace(web,'address',{'listing_address':address,'map_address':map_address,'town_base':town_base},'WARNING','location');return None
-    match='未判定' if not a or not b else '一致' if a in b or b in a else '一部一致' if os.path.commonprefix([a,b]) and len(os.path.commonprefix([a,b]))>=5 else '不一致'
-    # A known address conflict is not treated as a verified building location.
-    if match=='不一致':
-        trace(web,'address',{'listing_address':address,'map_address':map_address,'match':match},'WARNING','location');return None
-    trace(web,'location_unverified' if match=='未判定' else 'location_ok',{'listing_address':address,'map_address':map_address,'match':match,'method':method,'point':[lat,lng]},'WARNING' if match=='未判定' else 'INFO','location')
-    return dict(latitude=lat,longitude=lng,location_method=method,map_address=map_address,address_match=match)
+                lng,lat=map(float,item['geometry']['coordinates']);title=normal(item.get('properties',{}).get('title',''))
+                if in_rectangle((lat,lng),bounds) and title and address_key(title)==address_key(address):matches.append((lat,lng))
+            except (KeyError,ValueError,TypeError):continue
+        if not matches:return None
+        lat,lng=matches[0];method='住所検索（地図座標を取得できず）';location_precision='address' if re.search(r'\d+[-番]\d+',normal(address)) else 'town'
+    else:return None
+    try:region=reverse(web,(lat,lng),munis)
+    except Exception as exc:
+        region=None;trace(web,'reverse_address_pending',{'point':[lat,lng],'exception_type':type(exc).__name__,'retained':True},'WARNING','location')
+    inferred=region['label'] if region else '';a,b=address_key(address),address_key(inferred)
+    match='逆算住所未確認' if not b else '掲載住所未確認' if not a else '町字一致・番地未検証' if b in a or a==b else '町字不一致・掲載座標を保持'
+    # Preserve the published map point and both addresses; inverse geocoding isn't a deletion gate.
+    if match=='町字不一致・掲載座標を保持':trace(web,'map_address_difference',{'listing_address':address,'inferred_address':inferred,'point':[lat,lng],'retained':True},'WARNING','location')
+    location={'latitude':lat,'longitude':lng,'location_method':method,'map_address':inferred,'inferred_address':inferred,
+        'address_match':match,'coordinate_precision':location_precision,'position_source_url':getattr(web,'image_point_sources',{}).get((lat,lng)) or source_by_point.get((lat,lng),source_url or ''),
+        'address_precision':'町字（GSI lv01）・番地未確認' if inferred else '未確認'}
+    trace(web,'location_ok',{'listing_address':address,'inferred_address':inferred,'match':match,'location':location},stage='location')
+    return location
 
 
 def create_unit(provider,url,title,address,layout,rent,fees,area,floor,age,built_ym,location):
@@ -1129,8 +1273,9 @@ def suumo_collect(web,region,bounds,munis,emit):
                 text=web.fetch(url).text;soup=BeautifulSoup(text,'html.parser')
                 structure=labeled(soup,('構造','建物構造')) or None
                 age,ym=age_info(labeled(soup,('築年月','築年数')))
-                try:location=locate(web,soup,text,values[1],bounds,munis,source_url=url)
+                try:location=locate(web,soup,text,labeled(soup,('所在地','住所','物件所在地')) or values[1],bounds,munis,source_url=url)
                 except AppError as exc:location=None;trace(web,'location',{'url':url,'message':str(exc)},'WARNING','location')
+                if location and labeled(soup,('所在地','住所','物件所在地')):values=(values[0],labeled(soup,('所在地','住所','物件所在地')),*values[2:])
                 enriched=partial_listing('SUUMO',url,*values,region,bounds,location,structure,age,ym,labeled(soup,('階建','所在階')))
                 if enriched:emit('unit',enriched)
                 trace(web,'detail_fields',{'url':url,'structure':structure,'age':age,'built_ym':ym,'retained':True,'missing_fields':enriched['missing_fields'] if enriched else row['missing_fields']},stage='parser')
@@ -1271,8 +1416,8 @@ def search_all(db,conditions,screen,state=None):
                     elif kind=='issue':
                         issues.append(label+'｜'+str(value));log(issues[-1])
                     elif kind=='unit':
-                        units[value['key']]=value
-                        batch.append(value) # Save enrichment even if basic fields were already persisted.
+                        units[value['key']]=merge_listing(units.get(value['key']),value)
+                        batch.append(units[value['key']])
                 if batch:
                     screen['status'].info(f'検索実行中｜確認した{len(batch)}件をSupabaseへ保存しています')
                     try:
@@ -1349,6 +1494,13 @@ DIAG_ADVICE={
  'location_pending':('条件に合う募集だが建物位置が未確認','記録したURLと掲載項目を用いて掲載地図・正確な番地を確認する。地図の250m区画へ町丁目代表点を入れない。位置を確認した後に再取得・保存する。'),
  'map_link_result':('掲載ページから地図ページを追加確認','座標の出所と掲載住所を照合する。町丁目の代表点を建物座標として扱わない。'),
  'http_empty':('HTTP 202の空応答で掲載データが未到着','公開ページを手動で確認し、取得元のアクセス条件と公開API/データ提供を確認する。空本文をHTML解析失敗や間取り欠落と扱わない。'),
+ 'image_georef_missing':('地図画像の基準座標・縮尺が不明','画像URLや埋め込み地図の中心座標・ズームを確認する。基準のない画像から緯度経度を捏造しない。'),
+ 'image_pin_result':('地図画像の物件ピン認識結果','認識ピクセル位置・地図基準座標・ズーム・逆投影後の座標を確認する。'),
+ 'position_pending':('掲載地図の位置再取得が未完了','掲載URL、地図リンク、画像認識・HTTPエラーのイベントを確認する。元の募集データは保持する。'),
+ 'position_repaired':('掲載地図から位置と住所を更新','position_source_urlと推定住所を比較する。番地を読み取れていない場合は町丁目までの推定として扱う。'),
+ 'reverse_address_pending':('地図位置は保持・逆算住所は未確認','国土地理院の通信結果と市区町村コード表を確認する。逆算住所の未確認で地図位置を捨てない。'),
+ 'map_multiple_candidates':('物件の座標候補が競合','候補の出所を照合する。店や地図中心の座標で代用しない。'),
+ 'map_address_difference':('掲載住所と逆算町字が異なる','掲載地図の座標と逆算住所を別項目で確認する。番地の一致とは扱わない。'),
  'unknown':('現時点で理由を特定できない','前後の通信・解析・除外イベントを照合する。再現URLと読取項目を追加してから修正する。原因を断定しない。')}
 
 def diagnosis_code(message):
@@ -1480,9 +1632,10 @@ DISPLAY_REASONS={
  'invalid':'保存レコードのURL・家賃等が不正',
  'bounds':'現在の地図範囲外（位置不明なら検索範囲の重なりで判定）',
  'location_missing':'位置未確認：取得情報は保持・地図配置は保留',
+ 'address':'1募集を住所検索の概算位置に表示（掲載地図の位置は未確認）',
  'unpriced':'家賃未確認：1募集の灰色の点として表示',
  'town':'1募集を1点として表示（町丁目の位置・建物位置未確認）',
- 'building':'1募集を建物座標の1点として表示'}
+ 'building':'1募集を掲載地図等から取得した座標の1点として表示'}
 
 
 def display_pipeline(units,bounds,load=None):
@@ -1496,18 +1649,18 @@ def display_pipeline(units,bounds,load=None):
             if not has_point(r):reason='location_missing'
             else:
                 points.append((r['latitude'],r['longitude']))
-                reason='unpriced' if not r.get('rent') else 'town' if r.get('coordinate_precision')=='town' else 'building'
+                reason='unpriced' if not r.get('rent') else 'town' if r.get('coordinate_precision')=='town' else 'address' if r.get('coordinate_precision')=='address' else 'building'
         counts[reason]+=1
         records.append({'key':r.get('key'),'title':r.get('title'),'provider':r.get('provider'),'listing_url':r.get('listing_url'),
             'layout':r.get('layout'),'rent':r.get('rent'),'fees':r.get('fees'),'monthly':monthly_price(r) if r.get('rent') else None,
             'region':r.get('region_label') or r.get('address'),'latitude':r.get('latitude'),'longitude':r.get('longitude'),
-            'coordinate_precision':r.get('coordinate_precision'),'location_method':r.get('location_method'),
+            'coordinate_precision':r.get('coordinate_precision'),'location_method':r.get('location_method'),'inferred_address':r.get('inferred_address'),'position_source_url':r.get('position_source_url'),
             'reason_code':reason,'reason':DISPLAY_REASONS[reason],'merged_into':None})
     report={'schema':2,'build':BUILD,'time':utc_now(),'filters':{'bounds':bounds,'layouts':None,'monthly_limit':None,'structure':None,'age':None},
         'aggregation':False,'load':load,'stages':{'loaded':len(units),'in_bounds':len(rows),'individual_points':len(points)},
-        'reason_counts':counts,'map':{'markers_total':len(points),'colored_points':counts['town']+counts['building'],
+        'reason_counts':counts,'map':{'markers_total':len(points),'colored_points':counts['town']+counts['address']+counts['building'],
         'gray_points':counts['unpriced'],'unique_positions':len(set(points)), 'overlapping_points':len(points)-len(set(points)),
-        'renderer':'Canvas','aggregation':False}, 'records':records,
+        'renderer':'Canvas','aggregation':False,'unconfirmed_positions':sum(not has_point(r) or r.get('coordinate_precision') in ('town','address') for r in rows)}, 'records':records,
         'improvements':['位置未確認の場合は掲載URL・住所・掲載地図の読取結果を確認して座標取得を改善する。取得済み募集は捨てない。',
             '町丁目しか分からない募集はその位置を明記する。同じ座標の点は重なるが、件数をまとめたり実在しない位置へ散らしたりしない。',
             '家賃未確認の場合は一覧・詳細の金額の読取箇所を確認する。管理費未確認なら読み取れた家賃で色分けする。']}
@@ -1516,7 +1669,7 @@ def display_pipeline(units,bounds,load=None):
 
 def display_diagnostic_downloads(report):
     stages=report['stages'];mapping=report['map']
-    st.caption(f"読み込んだ募集 {stages['loaded']}件｜現在の範囲 {stages['in_bounds']}件｜1件ずつ地図へ描画 {mapping['markers_total']}件｜位置未確認 {report['reason_counts']['location_missing']}件")
+    st.caption(f"読み込んだ募集 {stages['loaded']}件｜現在の範囲 {stages['in_bounds']}件｜1件ずつ地図へ描画 {mapping['markers_total']}件｜位置未確認 {mapping['unconfirmed_positions']}件")
     st.caption(f"家賃帯で色付け {mapping['colored_points']}点｜家賃未確認の灰色 {mapping['gray_points']}点｜同じ座標への重なり {mapping['overlapping_points']}点。月額上限・間取りによる除外、募集の集約は行いません。")
     with st.expander('表示が少ない原因・全募集の診断ログ'):
         st.dataframe([{'理由':DISPLAY_REASONS[k],'募集件数':v} for k,v in report['reason_counts'].items()],hide_index=True)
@@ -1597,7 +1750,7 @@ class IndividualRentPoints(MacroElement):
             if not has_point(r):continue
             self.items.append({'key':r['key'],'lat':r['latitude'],'lng':r['longitude'],
                 'color':rent_color(monthly_price(r)) if r.get('rent') else '#777777',
-                'approx':r.get('coordinate_precision')=='town'})
+                'approx':r.get('coordinate_precision') in ('town','address')})
         self.payload=json.dumps(self.items,ensure_ascii=False,separators=(',',':')).replace('<','\\u003c').replace('>','\\u003e').replace('&','\\u0026')
 
 
@@ -1643,8 +1796,8 @@ def fetch_facilities(center,kind):
 
 def csv_bytes(rows):
     keys=['key','title','address','latitude','longitude','layout','rent','fees','area','floor','structure','age','built_ym',
-          'location_method','map_address','address_match','provider','listing_url','fetched_at','coordinate_precision','region_label','price_basis','search_bounds']
-    file=io.StringIO();writer=csv.DictWriter(file,fieldnames=keys,extrasaction='ignore');writer.writeheader();writer.writerows([{**r,'search_bounds':json.dumps(r.get('search_bounds'))} for r in rows])
+          'location_method','map_address','address_match','provider','listing_url','fetched_at','coordinate_precision','region_label','price_basis','search_bounds','inferred_address','position_source_url','address_precision','missing_fields']
+    file=io.StringIO();writer=csv.DictWriter(file,fieldnames=keys,extrasaction='ignore');writer.writeheader();writer.writerows([{**r,'search_bounds':json.dumps(r.get('search_bounds')),'missing_fields':json.dumps(r.get('missing_fields',[]),ensure_ascii=False)} for r in rows])
     return file.getvalue().encode('utf-8-sig')
 
 
@@ -1655,6 +1808,9 @@ def read_csv(content):
             for key in ('latitude','longitude','area'): row[key]=float(row[key]) if row.get(key) else None
             for key in ('rent','fees','age'): row[key]=int(row[key]) if row.get(key) else None
             row['search_bounds']=json.loads(row.get('search_bounds') or 'null')
+            for optional in ('latitude','longitude','area'):
+                if row.get(optional) is not None and not math.isfinite(row[optional]):row[optional]=None
+            row['missing_fields']=json.loads(row.get('missing_fields') or '[]')
             row['built_ym']=row.get('built_ym') or None
             if not valid_unit(row): raise ValueError()
             row['key']=hashlib.sha256(row['listing_url'].encode()).hexdigest()
@@ -1716,6 +1872,76 @@ class SearchJob:
             return dict(progress=self.progress,message=self.message,log=self.text,finished=self.finished,
                         units=list(self.state.new_units),saved=list(self.state.new_saved_keys),result=self.state.new_search)
 
+class PositionRepairJob(SearchJob):
+    def __init__(self,db,rows,bounds,saved):
+        self.lock=threading.RLock();self.state=WorkerState();self.state.new_units=[dict(r) for r in rows];self.state.new_saved_keys=list(saved)
+        self.conditions={'bounds':list(bounds),'mode':'published_map_position_repair','providers':list({r['provider'] for r in rows})}
+        self.audit=AuditLog(self.conditions,(getattr(db,'key',''),));self.state.audit=self.audit
+        self.progress=0.;self.message='掲載物件の地図から位置と住所を再取得しています';self.text='';self.finished=False;self.updated=0
+        self.thread=threading.Thread(target=self.run,args=(db,self.conditions),daemon=True,name='housing-map-position')
+    def run(self,db,conditions):
+        rows=[dict(r) for r in self.state.new_units];saved=set(self.state.new_saved_keys);issues=[];updated=0;attempted=0
+        history={'id':self.audit.search_id,'status':'started','conditions':conditions,'summary':{},'started_at':utc_now(),'finished_at':None}
+        web=PublicWeb();web.audit=self.audit
+        if hasattr(web,'configure'):web.configure(getattr(db,'web_config',{}))
+        try:
+            try:db.save_search(history)
+            except Exception as exc:issues.append('位置確認の開始履歴を保存できません');self.audit.add('database','save','WARNING',{'stage':'position_start_history','exception_type':type(exc).__name__})
+            try:munis=municipalities(web)
+            except Exception as exc:munis={};self.audit.add('location','reverse_address_pending','WARNING',{'reason':'市区町村コード表を取得できない','exception_type':type(exc).__name__})
+            targets=[i for i,r in enumerate(rows) if needs_position_repair(r)]
+            for done,i in enumerate(targets,1):
+                old=rows[i];attempted+=1;point=None
+                with self.lock:self.message=f'物件地図の位置確認 {done}/{len(targets)}件｜改善 {updated}件'
+                self.audit.add('location','position_repair_start','INFO',{'listing_url':old['listing_url'],'old_point':[old.get('latitude'),old.get('longitude')],'old_precision':old.get('coordinate_precision')})
+                try:
+                    if not web.permitted(old['listing_url']):raise AppError('掲載物件の自動取得ルールで取得できません。')
+                    reply=web.fetch(old['listing_url']);soup=BeautifulSoup(reply.text,'html.parser')
+                    address=labeled(soup,('所在地','住所','物件所在地')) or old.get('address','')
+                    point=locate(web,soup,reply.text,address,conditions['bounds'],munis,source_url=old['listing_url'])
+                    if point and point.get('coordinate_precision')=='listing_map':
+                        rows[i]=merge_listing(old,dict(old,**point,address=address))
+                        try:
+                            saved.update(db.save_units([rows[i]]));updated+=1
+                            self.audit.add('location','position_repaired','INFO',{'listing_url':old['listing_url'],'new_position':point,'saved':True})
+                        except Exception as exc:saved.discard(old['key']);issues.append('位置更新の保存を確認できません');self.audit.add('database','save','ERROR',{'listing_url':old['listing_url'],'exception_type':type(exc).__name__})
+                        self.audit.add('location','position_extracted','INFO',{'listing_url':old['listing_url'],'new_position':point,'saved':old['key'] in saved})
+                    else:self.audit.add('location','position_pending','WARNING',{'listing_url':old['listing_url'],'reason':'掲載地図の座標または画像の基準位置を取得できない','retained':True})
+                except Exception as exc:
+                    issues.append(str(exc) if isinstance(exc,AppError) else '掲載地図の読取失敗')
+                    self.audit.add('location','position_pending','WARNING',{'listing_url':old['listing_url'],'exception_type':type(exc).__name__,'message':str(exc) if isinstance(exc,AppError) else '掲載地図の読取失敗','retained':True})
+                with self.lock:
+                    self.state.new_units=list(rows);self.state.new_saved_keys=list(saved);self.progress=done/max(1,len(targets));self.updated=updated
+                    self.text=f'確認 {done}/{len(targets)}件｜位置改善 {updated}件｜全募集 {len(rows)}件を保持'
+                self.audit.persist(db)
+            history.update(status='partial' if issues or any(needs_position_repair(r) for r in rows) else 'completed',finished_at=utc_now(),
+                summary={'confirmed':len(rows),'saved':len(saved),'position_attempted':attempted,'position_updated':updated,
+                    'position_pending':sum(needs_position_repair(r) for r in rows),'issues':list(dict.fromkeys(issues)),'individual_positions':len({(r.get('latitude'),r.get('longitude')) for r in rows if has_point(r)})})
+            self.audit.add('location','position_repair_finish','INFO',history['summary']);self.audit.persist(db,force=True)
+            db.save_search(history)
+        except Exception as exc:
+            history.update(status='partial',finished_at=utc_now(),summary={**history.get('summary',{}),'confirmed':len(rows),'saved':len(saved),'issues':[str(exc) if isinstance(exc,AppError) else '位置更新の保存・ログ処理に失敗しました']})
+            self.audit.add('location','position_pending','ERROR',{'exception_type':type(exc).__name__,'retained':len(rows)})
+        finally:
+            with self.lock:self.state.new_search=history;self.finished=True
+
+
+def needs_position_repair(row):
+    return not has_point(row) or row.get('coordinate_precision')=='town' or str(row.get('location_method') or '').startswith('住所検索')
+
+
+def start_position_repair(rows,bounds,db=None):
+    if not rows or not bounds or not any(needs_position_repair(r) for r in rows):return
+    jobs,lock=job_registry();state=st.session_state
+    token=state.setdefault('new_job_token',hashlib.sha256(os.urandom(32)).hexdigest())
+    with lock:
+        old=jobs.get(token)
+        if old and not old.snapshot()['finished']:return
+        db=db or Database();db.web_config=rental_network_settings()
+        job=PositionRepairJob(db,rows,bounds,state.get('new_saved_keys',[]));jobs[token]=job;job.created=time.monotonic();job.thread.start()
+    state.new_search=None
+
+
 @st.cache_resource
 def job_registry():
     return {},threading.RLock()
@@ -1744,7 +1970,9 @@ def background_status():
     job=active_job()
     if job is None: return
     snap=job.snapshot()
-    st.session_state.new_units=snap['units'];st.session_state.new_saved_keys=snap['saved']
+    if not snap['finished'] or st.session_state.get('finished_snapshot_applied')!=job.audit.search_id:
+        st.session_state.new_units=snap['units'];st.session_state.new_saved_keys=snap['saved']
+        if snap['finished']:st.session_state.finished_snapshot_applied=job.audit.search_id
     audit_cache=st.session_state.get('diagnostic_export_cache')
     if not audit_cache or audit_cache['id']!=job.audit.search_id or time.monotonic()-audit_cache['at']>=10 or snap['finished'] and audit_cache['count']!=job.audit.count:
         audit_cache={'id':job.audit.search_id,'at':time.monotonic(),'count':job.audit.count,'events':job.audit.records()};st.session_state.diagnostic_export_cache=audit_cache
@@ -1756,7 +1984,9 @@ def background_status():
         if not st.session_state.get('new_job_rendered')==id(job):
             st.session_state.new_job_rendered=id(job);st.rerun()
         return
-    st.progress(min(.99,snap['progress']),text='バックグラウンドで検索・保存しています')
+    if (job.updated if isinstance(job,PositionRepairJob) else len(snap['units']))!=st.session_state.get('position_rendered_count') and time.monotonic()-st.session_state.get('position_rendered_at',0)>3:
+        st.session_state.position_rendered_count=job.updated if isinstance(job,PositionRepairJob) else len(snap['units']);st.session_state.position_rendered_at=time.monotonic();st.rerun()
+    st.progress(min(.99,snap['progress']),text='バックグラウンドで地図位置・住所を確認しています' if isinstance(job,PositionRepairJob) else 'バックグラウンドで検索・保存しています')
     st.info(snap['message'])
     if snap['log']: st.code(snap['log'],language=None)
     st.caption('画面を操作しても検索と保存は継続します。サーバーの休止・再起動では実行が終了します。')
@@ -1777,6 +2007,7 @@ def main():
     with tabs[0]:
         st.subheader('地図を動かして、探す地域を表示してください')
         st.caption('地図に見えている四角い範囲が検索対象です。駅名の選択や取得件数の上限はありません。')
+        st.button('取得済み物件の掲載地図から位置・住所を再取得',key='position_repair',disabled=not state.new_units or not state.get('new_bounds') or bool(active_job() and not active_job().snapshot()['finished']),on_click=lambda:start_position_repair(state.new_units,state.get('new_bounds')))
         st.caption('全間取り・全家賃の募集を1件ずつ表示します。町丁目の位置しか分からない募集も1件ずつ保持し、破線の点として表示します。')
         st.caption('家賃帯は読み取れた家賃と管理費で色分けします。管理費が不明なら家賃のみ。家賃未確認の点と背景はモノトーンです。')
         bounds=state.get('new_bounds')
@@ -1808,6 +2039,7 @@ def main():
         result=state.new_search
         if result:
             summary=result['summary'];saved=summary.get('saved',0);confirmed=summary.get('confirmed',0)
+            if result.get('conditions',{}).get('mode')=='published_map_position_repair':st.info(f"位置の再確認：{summary.get('position_attempted',0)}件｜位置改善 {summary.get('position_updated',0)}件｜未確認 {summary.get('position_pending',0)}件｜全募集を保持")
             if result['status']=='completed': st.success(f'検索完了｜取得 {confirmed}件・保存確認 {saved}件')
             elif result['status']=='partial': st.error(f'検索終了｜取得 {confirmed}件・保存確認 {saved}件。一部の取得・保存に失敗しました。')
             else: st.error('検索を完了できませんでした。以下の原因を確認してください。')
@@ -1823,7 +2055,7 @@ def main():
         c1,c2,c3=st.columns(3)
         c1.metric('現在の範囲の募集',len(rows))
         c2.metric('家賃帯で色付けした募集',display_report['map']['colored_points'])
-        c3.metric('位置未確認の募集',display_report['reason_counts']['location_missing'])
+        c3.metric('位置未確認の募集',display_report['map']['unconfirmed_positions'])
         if not rows:st.info('この範囲の募集データがありません。検索するか、保存データを読み込んでください。')
         if rows:
             with st.expander('募集を1件ずつ確認'):
@@ -1838,26 +2070,30 @@ def main():
     with tabs[1]:
         st.subheader('Supabaseに保存した物件')
         st.caption('自動読み込みは行いません。地図に表示中の範囲にある物件データを読み込みます。')
-        if st.button('表示範囲の保存物件を読み込む',key='new_load',use_container_width=True,disabled=not bounds):
+        if st.button('表示範囲の保存物件を読み込む',key='new_load',use_container_width=True,disabled=not bounds or bool(active_job() and not active_job().snapshot()['finished'])):
             try:
                 with st.spinner('Supabaseから読み込んでいます'):
                     db=Database();rows=db.load_units(bounds)
                     state.new_load_diagnostic=getattr(db,'last_load_diagnostic',{'returned':len(rows),'bounds':bounds,'time':utc_now()})
                 state.new_units=rows;state.new_saved_keys=[r['key'] for r in rows];state.new_search=None
-                state.new_notice=f'{len(rows)}件をSupabaseから読み込みました。';st.rerun()
+                state.pop('new_job_token',None)
+                start_position_repair(rows,bounds,db)
+                state.new_notice=f'{len(rows)}件をSupabaseから読み込みました。町丁目の位置しかない募集は掲載地図から位置・住所を再取得します。';st.rerun()
             except AppError as exc: st.error(str(exc))
         if state.get('new_notice'): st.success(state.new_notice)
         st.caption('読み込んだ募集は1件ずつ地図に表示します。位置未確認や同じ座標への重なりは「住まいを探す」の表示原因ログで確認できます。')
         st.download_button('現在の物件データをCSVで保存',csv_bytes(state.new_units),'sumai_rebuild_units.csv','text/csv',use_container_width=True)
         upload=st.file_uploader('このアプリのCSVを追加する',type=['csv'])
-        if st.button('CSVの物件をSupabaseへ保存',disabled=upload is None,key='new_import'):
+        if st.button('CSVの物件をSupabaseへ保存',disabled=upload is None or bool(active_job() and not active_job().snapshot()['finished']),key='new_import'):
             try:
                 rows=read_csv(upload.getvalue());saved=Database().save_units(rows)
-                state.new_units=list({r['key']:r for r in state.new_units+rows}.values())
+                combined={r['key']:r for r in state.new_units}
+                for r in rows:combined[r['key']]=merge_listing(combined.get(r['key']),r)
+                state.new_units=list(combined.values())
                 state.new_saved_keys=list(set(state.new_saved_keys)|saved)
                 state.new_notice=f'CSVから{len(saved)}件を保存しました。';st.rerun()
             except AppError as exc: st.error(str(exc))
-        if st.button('画面上の未保存物件を再保存',key='new_retry_save',disabled=not state.new_units):
+        if st.button('画面上の未保存物件を再保存',key='new_retry_save',disabled=not state.new_units or bool(active_job() and not active_job().snapshot()['finished'])):
             try:
                 saved=Database().save_units(state.new_units);state.new_saved_keys=list(set(state.new_saved_keys)|saved)
                 state.new_notice=f'{len(saved)}件の保存を確認しました。';st.rerun()
@@ -1951,7 +2187,7 @@ def main():
         st.write('間取りを読み取れない場合は単独検索で指定した間取りを採用し、補完したことを詳細ログへ記録します。掲載間取りが指定と異なる場合は除外します。構造・築年月・位置は間取りから推測しません。')
         st.write('間取り・家賃・地域の取得済み項目を保存します。構造・築年数・管理費・面積・建物位置の未確認で募集全体を除外しません。未確認項目は空欄として保持します。')
         st.write('募集情報は既存SupabaseのJSON保存領域へ保存するため、追加SQLは不要です。以前に保存した物件も読み込みます。')
-        st.write('掲載地図座標を優先し、番地のある住所は一致する住所検索結果で補完します。住所と地図判定に明確な不一致がある物件は除外します。')
+        st.write('掲載地図座標を優先し、番地のある住所は一致する住所検索結果で補完します。住所と逆算した町字が異なる場合も掲載座標と両方の住所を保持し、相違を詳細ログに記録します。')
         st.write('地図範囲内の居住地名タイルと100m間隔の地点・範囲の端から地名・丁目を判定します。候補数・物件数・ページ数による打ち切りは行いません。通信失敗やページ送りの異常は未完了として表示します。掲載サイト側の非公開情報・取得制限や、地名データの欠落は取得できません。')
         st.write('全間取り・全家賃の募集を1件につき1点としてCanvasで表示します。位置未確認の募集も保持します。町丁目の座標は建物位置として扱わず明記します。募集や家賃を平均・中央値へ集約しません。')
         st.write('検索と保存はサーバーのバックグラウンドで実行し、画面は1秒ごとに進捗を表示します。サーバーの休止・再起動を越えて実行することはできません。募集終了物件の自動削除は行いません。')
