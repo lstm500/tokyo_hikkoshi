@@ -1,4 +1,4 @@
-"""住まいコンパス v24 - verified red-button foreground search / progress
+"""住まいコンパス v25 - verified red-button foreground search / progress
 
 設計方針:
 - 起動時は外部通信を行わない。
@@ -31,7 +31,7 @@ from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 import streamlit as st
 
 
-APP_VERSION = "v24-direct-search-progress"
+APP_VERSION = "v25-search-storage-light"
 TARGET_STRUCTURE = "SRC"
 MAX_BUILDING_AGE = 20
 
@@ -189,10 +189,21 @@ def supabase_request(method: str, route: str, *, params=None, payload=None, pref
     if response.status_code in (401, 403):
         raise StorageError("SupabaseのSecret keyまたは権限を確認してください。")
     if response.status_code == 404:
-        raise StorageError("Supabase v05のテーブル/列を確認してください。")
+        raise StorageError("Supabaseのsumai_propertiesテーブルが見つかりません。公開先の接続設定を確認してください。")
     if not 200 <= response.status_code < 300:
-        body = response.text[:300].replace("\n", " ")
-        raise StorageError(f"Supabase処理失敗 HTTP {response.status_code}: {body}")
+        try:
+            error_code = str(response.json().get("code", ""))
+        except (ValueError, AttributeError):
+            error_code = ""
+        if error_code in ("42703", "PGRST204"):
+            message = "sumai_propertiesの必須列（namespace・identity・payload・fetched_at）を確認してください。"
+        elif error_code == "42P10":
+            message = "sumai_propertiesのnamespace・identityに複合UNIQUE制約が必要です。"
+        elif response.status_code == 429 or response.status_code >= 500:
+            message = "Supabaseが一時的に応答できません。検索結果は画面に保持しています。再試行してください。"
+        else:
+            message = "Supabaseのテーブル設定・接続状態を確認してください。"
+        raise StorageError(f"Supabase処理失敗 HTTP {response.status_code}: {message}")
     if not response.content.strip():
         return None
     try:
@@ -987,33 +998,10 @@ def deduplicate(records):
 def property_row(p: dict, namespace: str):
     identity = str(p.get("url") or p.get("id") or "")
     if not identity:
-        raise ValueError("identity missing")
-    fetched_at = str(p.get("fetched_at") or datetime.now(timezone.utc).isoformat(timespec="seconds"))
-    return {
-        "namespace": namespace,
-        "identity": identity,
-        "payload": p,
-        "fetched_at": fetched_at,
-        "source": p.get("source", ""),
-        "listing_id": str(p.get("id", "")),
-        "name": p.get("name", ""),
-        "address": p.get("address", ""),
-        "map_address": p.get("map_address", ""),
-        "lat": float(p["lat"]),
-        "lng": float(p["lng"]),
-        "layout": p.get("layout", ""),
-        "rent": int(p["rent"]),
-        "fees": int(p.get("fees", 0)),
-        "area": float(p["area"]),
-        "floor": p.get("floor", ""),
-        "structure": "SRC",
-        "building_age": int(p["building_age"]),
-        "built_year": int(p["built_year"]) if str(p.get("built_year", "")).isdigit() else None,
-        "coordinate_source": p.get("coordinate_source", ""),
-        "location_confidence": p.get("location_confidence", ""),
-        "url": p.get("url", ""),
-        "modified": p.get("modified", ""),
-    }
+        raise ValueError("物件の識別情報がありません")
+    # v04 and v05 share these columns. Optional indexing columns are not required.
+    return {"namespace": namespace, "identity": identity, "payload": p,
+            "fetched_at": str(p.get("fetched_at") or datetime.now(timezone.utc).isoformat(timespec="seconds"))}
 
 
 def save_records(records):
@@ -1040,28 +1028,33 @@ def save_records(records):
 
 def load_range(center_lat, center_lng, radius_m, layouts):
     _, _, namespace = supabase_settings()
-    south, west, north, east = bounds_from_center(center_lat, center_lng, radius_m)
-    params = {
-        "namespace": "eq." + namespace,
-        "select": "payload",
-        "and": f"(lat.gte.{south},lat.lte.{north},lng.gte.{west},lng.lte.{east})",
-        "structure": "eq.SRC",
-        "building_age": f"lte.{MAX_BUILDING_AGE}",
-        "layout": "in.(" + ",".join(layouts) + ")",
-        "order": "fetched_at.desc",
-        "limit": 3000,
-    }
-    rows = supabase_request("GET", "sumai_properties", params=params)
-    if not isinstance(rows, list):
-        return []
-    out = []
-    for row in rows:
-        p = row.get("payload") if isinstance(row, dict) and isinstance(row.get("payload"), dict) else None
-        if not p or not target_property(p):
-            continue
-        if distance_m(center_lat, center_lng, float(p["lat"]), float(p["lng"])) <= radius_m:
-            out.append(p)
+    bounds = bounds_from_center(center_lat, center_lng, radius_m)
+    out, offset = [], 0
+    while True:
+        rows = supabase_request("GET", "sumai_properties", params={
+            "namespace": "eq." + namespace, "select": "identity,payload",
+            "order": "identity.asc", "limit": 500, "offset": offset})
+        if not isinstance(rows, list):
+            raise StorageError("Supabaseからの読み込み結果を確認できませんでした。")
+        if not rows:
+            break
+        for row in rows:
+            p = row.get("payload") if isinstance(row, dict) else None
+            if not isinstance(p, dict) or not target_property(p) or p.get("layout") not in layouts:
+                continue
+            lat, lng = float(p['lat']), float(p['lng'])
+            if inside(lat, lng, bounds) and distance_m(center_lat, center_lng, lat, lng) <= radius_m:
+                out.append(p)
+        offset += len(rows)
     return deduplicate(out)
+
+
+def check_storage():
+    _, _, namespace = supabase_settings()
+    rows = supabase_request("GET", "sumai_properties", params={
+        "namespace": "eq." + namespace, "select": "identity,payload,fetched_at", "limit": 1})
+    if not isinstance(rows, list):
+        raise StorageError("Supabaseの応答形式を確認できませんでした。")
 
 
 def run_search(center_lat, center_lng, radius_m, per_region_limit, worker_count, progress_bar, status_box, log_box):
@@ -1079,6 +1072,9 @@ def run_search(center_lat, center_lng, radius_m, per_region_limit, worker_count,
         match = re.search(r"地域判定 (\d+)/(\d+)", message)
         if match:
             progress_bar.progress(0.1 * int(match[1]) / max(1, int(match[2])), text=message)
+    status_box.info("🔎 検索実行中｜ステップ1/3：Supabaseの接続・必須列を確認しています")
+    check_storage()
+    log("Supabaseの接続・必須列確認OK")
     regions = discover_regions(bounds, region_progress)
     if not regions:
         raise RuntimeError("地域名を判定できませんでした。国土地理院への接続を確認して再検索してください。")
@@ -1182,7 +1178,18 @@ def main():
         .stApp{background:white;color:#173a5e;color-scheme:light}
         .block-container{padding-top:1rem;padding-bottom:2rem;max-width:1200px}
         h1,h2,h3,p,label{color:#173a5e}
-        div[data-testid="stStatusWidget"]{border:2px solid #ff4b4b;border-radius:12px}
+        [data-testid="stAppViewContainer"], [data-testid="stHeader"]{background:#fff;color:#173a5e}
+        [data-testid="stButton"] button{background:#fff!important;color:#173a5e!important;border:1px solid #173a5e!important}
+        [data-testid="stButton"] button *{color:inherit!important}
+        [data-testid="stButton"] button[kind="primary"]{background:#c62828!important;color:#fff!important;border-color:#c62828!important}
+        [data-testid="stButton"] button:disabled{background:#edf2f7!important;color:#526579!important;opacity:1!important}
+        [data-baseweb="select"]>div,[data-baseweb="input"],input,[data-testid="stNumberInput"] button{
+            background:#fff!important;color:#173a5e!important;border-color:#90a4b8!important}
+        [data-baseweb="select"] span,[data-baseweb="select"] svg{color:#173a5e!important;fill:#173a5e}
+        [data-baseweb="popover"],[role="listbox"],[role="option"]{background:#fff!important;color:#173a5e!important}
+        [data-testid="stCode"] pre,[data-testid="stCode"] code{background:#f3f6fa!important;color:#173a5e!important}
+        [data-testid="stAlertContainer"]{color:#173a5e!important}
+        div[data-testid="stStatusWidget"]{border:2px solid #c62828;border-radius:12px}
         </style>
         """,
         unsafe_allow_html=True,
@@ -1201,16 +1208,19 @@ def main():
     state.setdefault("last_search_summary", "")
     search_request = state.pop("search_request_v24", None)
     if search_request is not None:
+        for widget_key in ("station_v25", "layout_v25", "radius_v25", "limit_v25", "workers_v25", "budget_v25"):
+            if widget_key in state:
+                state[widget_key] = state[widget_key]
         execute_search(search_request)
         return
 
     with st.expander("地域・物件取得の設定", expanded=True):
-        station = st.selectbox("中心駅", list(STATIONS), index=list(STATIONS).index("池袋"))
-        layout_group = st.radio("表示する間取り区分", list(LAYOUT_GROUPS), index=1, horizontal=True)
-        radius = st.selectbox("検索・表示半径", [500, 1000, 1500, 2000, 3000], index=2, format_func=lambda x: f"{x/1000:g}km")
-        per_region_limit = st.selectbox("1地域・1取得元あたりの確認上限", [10, 20, 40, 60], index=1)
-        worker_count = st.selectbox("地域検索の並列数", [2, 4, 6, 8], index=2)
-        budget = st.number_input("物件ピンの月額上限（万円）", 1.0, 1000.0, 50.0, 1.0)
+        station = st.selectbox("中心駅", list(STATIONS), index=list(STATIONS).index("池袋"), key="station_v25")
+        layout_group = st.radio("表示する間取り区分", list(LAYOUT_GROUPS), index=1, horizontal=True, key="layout_v25")
+        radius = st.selectbox("検索・表示半径", [500, 1000, 1500, 2000, 3000], index=2, format_func=lambda x: f"{x/1000:g}km", key="radius_v25")
+        per_region_limit = st.selectbox("1地域・1取得元あたりの確認上限", [10, 20, 40, 60], index=1, key="limit_v25")
+        worker_count = st.selectbox("地域検索の並列数", [2, 4, 6, 8], index=2, key="workers_v25")
+        budget = st.number_input("物件ピンの月額上限（万円）", 1.0, 1000.0, 50.0, 1.0, key="budget_v25")
         st.caption("取得対象: 1K・1L・1DK・1LDK・2DK・2LDK・3DK・3LDK / SRC / 築20年以内 / 駅徒歩制限なし。取得時は全間取りをまとめて確認します。")
 
     center_lat, center_lng = STATIONS[station]
@@ -1237,11 +1247,7 @@ def main():
     c1, c2, c3 = st.columns(3)
     if c1.button("Supabase接続確認"):
         try:
-            _, _, namespace = supabase_settings()
-            rows = supabase_request(
-                "GET", "sumai_properties",
-                params={"namespace": "eq." + namespace, "select": "identity", "limit": 1},
-            )
+            check_storage()
             st.success("Supabase接続OK。")
         except StorageError as exc:
             st.error(str(exc))
@@ -1250,6 +1256,8 @@ def main():
         try:
             state.records = load_range(center_lat, center_lng, radius, TARGET_LAYOUTS)
             state.last_search_summary = f"保存済み物件を{len(state.records)}件読み込みました。"
+            state.search_message_kind_v24 = "success"
+            state.search_result_v24 = {}
             st.rerun()
         except StorageError as exc:
             st.error(str(exc))
