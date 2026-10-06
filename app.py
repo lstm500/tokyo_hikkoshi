@@ -26,6 +26,7 @@ import time
 import unicodedata
 import urllib.robotparser
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from urllib.parse import urlencode, urljoin, urlparse, parse_qs, quote
 
 from branca.element import MacroElement, Template
@@ -35,7 +36,7 @@ import streamlit as st
 from streamlit_folium import st_folium
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v32"
+BUILD = "REBUILD-01-v34"
 DEFAULT_CENTER = (35.7303,139.711)
 UNIT_TABLE = "housing_units_v1"
 SEARCH_TABLE = "housing_searches_v1"
@@ -234,15 +235,19 @@ def single_layout_parameters(web,provider,requested):
         cache=getattr(web,'layout_form_cache',None)
         if cache is None:cache={};web.layout_form_cache=cache
         if provider not in cache:
-            url='https://www.homes.co.jp/chintai/tokyo/list/' if provider=='HOME’S' else 'https://suumo.jp/jj/chintai/ichiran/FR301FC001/'
-            try:
-                if not web.permitted(url):raise AppError('間取り条件フォームの自動取得は許可されていません。')
-                reply=web.fetch(url,params={'ar':'030','bs':'040','ta':'13'} if provider=='SUUMO' else {})
-                filters=discover_layout_inputs(BeautifulSoup(reply.text,'html.parser'),provider)
-                if not filters:raise AppError(provider+'の間取り条件フォームを読み取れません。単独の条件を確認できないため一括検索へ切り替えません。')
-                cache[provider]=filters
-                trace(web,'layout_filter_discovered',{'provider':provider,'source_url':url,'filters':filters},stage='search_conditions')
-            except AppError as exc:cache[provider]=str(exc)
+            urls=['https://www.homes.co.jp/chintai/tokyo/list/','https://www.homes.co.jp/chintai/tokyo/','https://www.homes.co.jp/chintai/theme/14130/tokyo/list/'] if provider=='HOME’S' else ['https://suumo.jp/jj/chintai/ichiran/FR301FC001/','https://suumo.jp/chintai/tokyo/']
+            reasons=[]
+            for url in urls:
+                try:
+                    if not web.permitted(url):raise AppError('間取り条件フォームの自動取得は許可されていません。')
+                    reply=web.fetch(url,params={'ar':'030','bs':'040','ta':'13'} if '/FR301FC001/' in url else {})
+                    filters=discover_layout_inputs(BeautifulSoup(reply.text,'html.parser'),provider)
+                    if not filters:raise AppError(provider+'の間取り条件フォームを読み取れません。')
+                    cache[provider]=filters
+                    trace(web,'layout_filter_discovered',{'provider':provider,'source_url':url,'filters':filters},stage='search_conditions');break
+                except AppError as exc:
+                    reasons.append(str(exc));trace(web,'form_alternative',{'provider':provider,'failed_url':url,'message':str(exc),'next_public_page':url!=urls[-1]},'WARNING','search_conditions')
+            if provider not in cache:cache[provider]='／'.join(dict.fromkeys(reasons))+' 単独条件を確認できないため一括検索へ切り替えません。'
         filters=cache[provider]
         if isinstance(filters,str):raise AppError(filters)
         if requested not in filters:raise AppError(provider+'では'+requested+'の単独間取り条件を確認できません。他の間取りの検索は続けます。')
@@ -352,6 +357,29 @@ def valid_unit(row):
                 and 0<int(row['rent'])<=10000000 and 0<=int(row['fees'])<=10000000
                 and bool(row['key']) and safe_url(row['listing_url'],row['provider']))
     except (KeyError,ValueError,TypeError): return False
+
+
+def rental_network_settings():
+    def setting(name,default=None):
+        value=os.environ.get(name)
+        if value is None:
+            try:value=st.secrets.get(name,default)
+            except Exception:value=default
+        return value
+    values=setting('RENTAL_HTTP_PROXIES',[]) or []
+    if isinstance(values,str):values=[x.strip() for x in values.splitlines() if x.strip()]
+    single=setting('RENTAL_HTTP_PROXY','')
+    if single:values=[single,*values]
+    if not isinstance(values,(list,tuple)):raise AppError('RENTAL_HTTP_PROXIESを接続URLの配列で設定してください。')
+    routes=[]
+    for value in values:
+        value=str(value).strip()
+        try:
+            u=urlparse(value)
+            if u.scheme not in ('http','https') or not u.hostname or u.port is None or u.query or u.fragment or any(c.isspace() for c in value):raise ValueError()
+        except ValueError:raise AppError('プロキシURLは http://ユーザー:パスワード@ホスト:ポート の形式で設定してください。') from None
+        if value not in routes:routes.append(value)
+    return {'proxies':routes}
 
 
 class Database:
@@ -484,40 +512,144 @@ class PublicWeb:
     def __init__(self):
         self.local=threading.local()
         self.headers={'User-Agent':'SumaiCompassRebuild/1.0 (personal rental research)', 'Accept-Language':'ja'}
+        self.host_gates={};self.host_last_request={};self.route_cooldowns={};self.session_primed=threading.local();self.proxy_routes=[];self.route_preferred={};self.route_lock=threading.Lock();self.http_cache={};self.headers.update({'Accept':'text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8'})
         self.robots={};self.lock=threading.Lock();self.layout_form_lock=threading.Lock();self.layout_form_cache={};self.unavailable_hosts={};self.failed_detail_urls={}
-    def session(self):
-        if not hasattr(self.local,'session'): self.local.session=requests.Session()
-        return self.local.session
+    def configure(self,config):
+        self.proxy_routes=list((config or {}).get('proxies',[]))
+        trace(self,'transport_config',{'proxy_count':len(self.proxy_routes),'rental_route':'proxy' if self.proxy_routes else 'direct','other_services':'direct'},stage='http_config')
+    def session(self,route=None):
+        if not hasattr(self.local,'sessions'):self.local.sessions={}
+        if route is None and hasattr(self.local,'session'):return self.local.session
+        if route not in self.local.sessions:self.local.sessions[route]=requests.Session()
+        return self.local.sessions[route]
+    def route_request(self,session,method,url,options):
+        host=urlparse(url).hostname
+        if host not in ('www.homes.co.jp','suumo.jp'):
+            headers=dict(self.headers);headers.update(options.get('headers',{}));options={k:v for k,v in options.items() if k!='headers'}
+            return session.request(method,url,headers=headers,timeout=(4,12),allow_redirects=False,**options)
+        with self.route_lock:gate=self.host_gates.setdefault(host,threading.Lock())
+        # All region workers share one gate for each property site.
+        with gate:
+            delay=max(0.,self.host_last_request.get(host,0.)+1.-time.monotonic())
+            if delay:
+                trace(self,'request_spacing',{'host':host,'wait_seconds':round(delay,3)},stage='transport');time.sleep(delay)
+            self.host_last_request[host]=time.monotonic()
+            headers=dict(self.headers);headers.update(options.get('headers',{}));options={k:v for k,v in options.items() if k!='headers'}
+            return session.request(method,url,headers=headers,timeout=(4,12),allow_redirects=False,**options)
+    def response_info(self,response):
+        soup=BeautifulSoup(response.text[:30000],'html.parser') if 'html' in response.headers.get('Content-Type','').lower() else None
+        title=soup.select_one('title') if soup else None
+        title=title.get_text(' ',strip=True)[:160] if title else ''
+        challenge=bool(re.search(r'^(?:just a moment|access denied|attention required|403 forbidden|verify (?:you|your)|security check)',title,re.I))
+        return {'page_title':title,'challenge_page':challenge,'response_sha256':hashlib.sha256(response.content).hexdigest(),
+                'response_headers':{k:response.headers.get(k,'') for k in ('Server','Content-Type','Retry-After','Via','X-Cache','CF-Ray')}}
+    def prime_session(self,session,root,options,route_number):
+        if not hasattr(self.session_primed,'keys'):self.session_primed.keys=set()
+        if not hasattr(self.session_primed,'references'):self.session_primed.references={}
+        key=(root,route_number)
+        if key in self.session_primed.keys:return False
+        parser=self.robots.get(root)
+        if parser is None or not parser.can_fetch(self.headers['User-Agent'],root+'/'):return False
+        self.session_primed.keys.add(key)
+        # Enter the site's published home page using the same route and cookie jar.
+        warm_options={k:v for k,v in options.items() if k in ('proxies',)}
+        reply=self.route_request(session,'GET',root+'/',warm_options)
+        info=self.response_info(reply)
+        trace(self,'session_entry',{'entry_url':root+'/','route_number':route_number,'status':reply.status_code,
+                                  'cookie_count':len(getattr(session,'cookies',[])),**info},stage='transport')
+        okay=reply.status_code==200 and bool(reply.content.strip()) and not info['challenge_page']
+        if okay:self.session_primed.references[key]=root+'/'
+        return okay
+    def request_routes(self,method,url,**kwargs):
+        u=urlparse(url);host=u.hostname;root=u.scheme+'://'+u.netloc
+        rental=host in ('www.homes.co.jp','suumo.jp')
+        routes=self.proxy_routes if rental and self.proxy_routes else [None]
+        with self.route_lock:preferred=self.route_preferred.get(host,0)%len(routes)
+        ordered=list(range(preferred,len(routes)))+list(range(preferred))
+        last=None;skipped=[]
+        for index in ordered:
+            with self.route_lock:until=max(self.route_cooldowns.get((host,index),0.),self.route_cooldowns.get((host,index,u.path),0.))
+            if until>time.monotonic():
+                skipped.append(index+1);trace(self,'route_cooldown',{'host':host,'route_number':index+1,'remaining_seconds':round(until-time.monotonic())},stage='transport');continue
+            route=routes[index];session=self.session(route);options=dict(kwargs)
+            if route:options['proxies']={'http':route,'https':route}
+            referer=getattr(self.session_primed,'references',{}).get((root,index+1))
+            if referer:options['headers']={**options.get('headers',{}),'Referer':referer}
+            for attempt in range(3):
+                try:
+                    response=self.route_request(session,method,url,options);status=response.status_code;info=self.response_info(response)
+                    trace(self,'transport_attempt',{'url':url,'method':method,'route':'proxy' if route else 'direct','route_number':index+1 if route else None,'attempt':attempt+1,'status':status,'bytes':len(response.content),**info},stage='transport')
+                    last=response
+                    blocked=status==403 or info['challenge_page']
+                    if rental and blocked and attempt==0 and u.path not in ('/','/robots.txt'):
+                        if self.prime_session(session,root,options,index+1):
+                            headers=dict(options.get('headers',{}));headers['Referer']=root+'/';options['headers']=headers
+                            trace(self,'session_retry',{'url':url,'route_number':index+1,'change':'same-route public entry cookies and actual Referer'},stage='transport');continue
+                    retry=status in (429,500,502,503,504)
+                    if retry:
+                        raw=response.headers.get('Retry-After','')
+                        try:delay=max(0.,float(raw))
+                        except (ValueError,TypeError):
+                            try:delay=max(0.,(parsedate_to_datetime(raw)-datetime.now(timezone.utc)).total_seconds())
+                            except (ValueError,TypeError,OverflowError):delay=2**attempt
+                        if delay>30:
+                            with self.route_lock:self.route_cooldowns[(host,index)]=time.monotonic()+delay
+                            trace(self,'route_cooldown',{'host':host,'route_number':index+1,'remaining_seconds':round(delay),'reason':'Retry-After'},stage='transport');break
+                        if attempt<2:
+                            trace(self,'http_retry',{'url':url,'status':status,'wait_seconds':delay,'route_number':index+1 if route else None},'WARNING','transport');time.sleep(delay);continue
+                    if blocked:
+                        with self.route_lock:self.route_cooldowns[(host,index,u.path)]=time.monotonic()+60
+                        if info['challenge_page'] and status<400:
+                            error=AppError(host+'：物件本文ではなくアクセス検証画面が返りました。');error.diagnostic={'status':status,**info};last=error
+                        break
+                    if status==202 and not response.content.strip() or retry:break
+                    with self.route_lock:self.route_preferred[host]=index
+                    return response
+                except (requests.Timeout,requests.ConnectionError) as exc:
+                    trace(self,'proxy_error' if route else 'network',{'url':url,'route_number':index+1 if route else None,'attempt':attempt+1,'exception_type':type(exc).__name__},'WARNING','transport')
+                    last=exc
+                    if attempt<2:time.sleep(2**attempt);continue
+                    break
+            if len(ordered)>1:trace(self,'proxy_switch',{'url':url,'failed_route_number':index+1,'remaining_routes':len(ordered)-ordered.index(index)-1},'WARNING','transport')
+        if isinstance(last,Exception):raise last
+        if last is None:
+            error=AppError(host+'：取得経路の待機中です（直前の403・429等）。設定した全経路の待機が終わってから再検索してください。');error.diagnostic={'skipped_routes':skipped};raise error
+        return last
     def fetch(self,url,method='GET',**kwargs):
         allowed=('www.homes.co.jp','suumo.jp','mreversegeocoder.gsi.go.jp','msearch.gsi.go.jp','maps.gsi.go.jp','cyberjapandata.gsi.go.jp','japanese-addresses-v2.geoloniamaps.com','geolonia.github.io')
         u=urlparse(url)
         if u.scheme!='https' or u.hostname not in allowed or u.username or u.password: raise AppError('取得先が不正です。')
+        if method=='GET' and not kwargs.get('params') and url in self.http_cache:
+            trace(self,'cache_hit',{'url':url,'source':'successful_detail_http_cache'},stage='http_cache');return self.http_cache[url]
         if u.hostname in self.unavailable_hosts:raise AppError(self.unavailable_hosts[u.hostname])
         if method=='GET' and not kwargs.get('params') and url in self.failed_detail_urls:raise AppError(self.failed_detail_urls[url])
         try:
-            response=self.session().request(method,url,headers=self.headers,timeout=(4,12),allow_redirects=False,**kwargs)
+            response=self.request_routes(method,url,**kwargs)
             for _ in range(3):
                 if response.status_code not in (301,302,303,307,308): break
                 target=urljoin(response.url,response.headers.get('Location',''))
                 v=urlparse(target)
                 if v.scheme!='https' or v.hostname!=u.hostname or not v.path.startswith(u.path.rsplit('/',1)[0]):
                     raise AppError('取得先が別のページに移動しました。')
-                response=self.session().get(target,headers=self.headers,timeout=(4,12),allow_redirects=False)
+                response=self.request_routes('GET',target)
             response.raise_for_status()
             if response.status_code==202 and not response.content.strip():
                 message=f'{u.hostname}：HTTP 202・本文0バイト。掲載データが届いていません。この検索中は同じ取得元への問い合わせを停止します。'
                 self.unavailable_hosts[u.hostname]=message;error=AppError(message);error.diagnostic={'status':202,'bytes':0};raise error
         except requests.Timeout as exc:
-            error=AppError(f'{u.hostname}：接続または応答がタイムアウトしました。');error.diagnostic={'exception_type':type(exc).__name__,'reason':str(exc)[:1000]};raise error from None
+            error=AppError(f'{u.hostname}：接続または応答がタイムアウトしました。');error.diagnostic={'exception_type':type(exc).__name__,'reason':'接続経路の通信失敗'};raise error from None
         except requests.HTTPError as exc:
             message=f'{u.hostname}：HTTP {exc.response.status_code}（公開ページの取得失敗）。'
             if method=='GET' and not kwargs.get('params'):self.failed_detail_urls[url]=message
-            raise AppError(message) from None
+            error=AppError(message);error.diagnostic=self.response_info(exc.response);raise error from None
+        except requests.exceptions.ProxyError:
+            raise AppError('プロキシ接続失敗。接続先・ポート・認証情報・HTTPS CONNECT対応を確認してください。') from None
         except requests.ConnectionError as exc:
-            error=AppError(f'{u.hostname}：接続できません（DNS・ネットワーク・接続先を確認）。');error.diagnostic={'exception_type':type(exc).__name__,'reason':str(exc)[:1000]};raise error from None
+            error=AppError(f'{u.hostname}：接続できません（DNS・ネットワーク・接続先を確認）。');error.diagnostic={'exception_type':type(exc).__name__,'reason':'接続経路の通信失敗'};raise error from None
         except requests.RequestException: raise AppError(f'{u.hostname}：通信処理に失敗しました。') from None
         if len(response.content)>8000000: raise AppError('公開ページの容量が上限を超えました。')
         response.encoding='utf-8' if 'gsi.go.jp' in u.hostname else response.apparent_encoding or 'utf-8'
+        if method=='GET' and not kwargs.get('params') and '/chintai/' in u.path:self.http_cache[url]=response
         return response
     def permitted(self,url):
         u=urlparse(url);root=u.scheme+'://'+u.netloc
@@ -540,6 +672,7 @@ def audited_public_fetch(self,url,method='GET',**kwargs):
     started=time.monotonic()
     details={'url':url,'method':method,'parameters':kwargs.get('params',kwargs.get('data',{}))}
     try:
+        cached=method=='GET' and not kwargs.get('params') and url in self.http_cache
         response=_original_public_fetch(self,url,method,**kwargs)
         details.update(status=response.status_code,elapsed_ms=round((time.monotonic()-started)*1000),bytes=len(response.content),
                        content_type=response.headers.get('Content-Type',''),response_url=response.url,
@@ -548,7 +681,7 @@ def audited_public_fetch(self,url,method='GET',**kwargs):
             soup=BeautifulSoup(response.text,'html.parser');title=soup.select_one('title')
             details['page_title']=title.get_text(' ',strip=True)[:120] if title else ''
             details['selectors']={q:len(soup.select(q)) for q in ('div.cassetteitem','tr.js-cassette_link','script[type="application/ld+json"]','th','dt','a[href]')}
-        trace(self,'http_ok',details,stage='http');return response
+        trace(self,'cache_hit' if cached else 'http_ok',details,stage='http_cache' if cached else 'http');return response
     except Exception as exc:
         details.update(elapsed_ms=round((time.monotonic()-started)*1000),exception_type=type(exc).__name__,technical_exception=getattr(exc,'diagnostic',{}),message=str(exc) if isinstance(exc,AppError) else '応答処理失敗')
         match=re.search(r'HTTP (\d{3})',details['message']);details['status']=int(match[1]) if match else None
@@ -752,12 +885,44 @@ def coordinate(soup,text,hint=None):
         candidates.append((float(match[2]),float(match[1]),'掲載地図',2))
     for match in re.finditer(r'/@(3[4-7]\.\d+),(1(?:3[89]|40)\.\d+)',text):
         candidates.append((float(match[1]),float(match[2]),'掲載地図',2))
+    # Public map URL parameters, hidden inputs and JavaScript LatLng constructors.
+    for tag in soup.select('[href],[src]'):
+        url=html.unescape(tag.get('href') or tag.get('src') or '')
+        params=parse_qs(urlparse(url).query)
+        for key in ('ll','center','q','query'):
+            for value in params.get(key,[]):
+                match=re.fullmatch(r'\s*(3[4-7]\.\d+)\s*,\s*(1(?:3[89]|40)\.\d+)\s*',value)
+                if match:candidates.append((float(match[1]),float(match[2]),'掲載地図URL',2))
+    fields={str(tag.get('name') or tag.get('id') or '').lower():tag.get('value','') for tag in soup.select('input[value]')}
+    for la,lo in (('lat','lng'),('latitude','longitude'),('ido','keido')):
+        try:
+            a,b=float(fields[la]),float(fields[lo])
+            if 34<=a<=37 and 138<=b<=141:candidates.append((a,b,'掲載座標入力項目',2))
+        except (KeyError,ValueError,TypeError):pass
+    for match in re.finditer(r'(?:LatLng|setView)\s*\(\s*\[?\s*(3[4-7]\.\d+)\s*,\s*(1(?:3[89]|40)\.\d+)',text):
+        candidates.append((float(match[1]),float(match[2]),'掲載地図設定',2))
+    for tag in soup.select('[data-lat][data-lng]'):
+        try:candidates.append((float(tag['data-lat']),float(tag['data-lng']),'掲載地図属性',2))
+        except (ValueError,TypeError):pass
     if hint: candidates.append((*hint,'HOME’S検索地図',2))
     return candidates
 
 
-def locate(web,soup,text,address,bounds,munis,hint=None):
+def locate(web,soup,text,address,bounds,munis,hint=None,source_url=None):
     all_coordinates=coordinate(soup,text,hint)
+    if not all_coordinates and source_url:
+        seen=set()
+        for tag in soup.select('a[href],iframe[src]'):
+            target=urljoin(source_url,tag.get('href') or tag.get('src') or '')
+            u=urlparse(target)
+            if u.hostname!=urlparse(source_url).hostname or target in seen:continue
+            if not ('地図' in tag.get_text() or re.search(r'(?:gmap|map|FR301FD003)',u.path,re.I)):continue
+            seen.add(target)
+            try:
+                if not web.permitted(target):continue
+                reply=web.fetch(target);all_coordinates.extend(coordinate(BeautifulSoup(reply.text,'html.parser'),reply.text))
+                trace(web,'map_link_result',{'source_url':source_url,'map_url':target,'candidates':all_coordinates},stage='location')
+            except AppError as exc:trace(web,'location',{'source_url':source_url,'map_url':target,'message':str(exc)},'WARNING','location')
     candidates=[p for p in all_coordinates if in_rectangle(p[:2],bounds)]
     trace(web,'location_candidates',{'address':address,'bounds':bounds,'all_candidates':all_coordinates,'in_bounds_candidates':candidates},stage='location')
     method=''
@@ -927,7 +1092,8 @@ def suumo_collect(web,region,bounds,munis,emit):
                 if not structure or age is None: raise AppError('SUUMO詳細ページの構造・築年月を読み取れません。募集終了またはページ形式の変更を確認してください。')
                 if not is_src(structure) or not 0<=age<=20:
                     trace(web,'structure' if not is_src(structure) else 'age',{'url':url,'structure':structure,'age':age,'built_ym':ym});emit('rejected',1);continue
-                location=locate(web,soup,text,values[1],bounds,munis)
+                location=locate(web,soup,text,values[1],bounds,munis,source_url=url)
+                if not location:trace(web,'location_pending',{'url':url,'listing_fields':{'title':values[0],'address':values[1],'layout':values[2],'rent':values[3],'fees':values[4],'area':values[5]},'structure':structure,'age':age,'built_ym':ym,'reason':'建物位置未確認。掲載項目を保持して位置読取改善後に再照合する。'},'WARNING','location')
                 row=create_unit('SUUMO',url,*values,labeled(soup,('階建','所在階')),age,ym,location) if location else None
                 if row: emit('unit',row)
                 else: emit('rejected',1)
@@ -1007,6 +1173,7 @@ def search_all(db,conditions,screen,state=None):
     screen['status'].info('検索実行中｜保存先の接続・新しいテーブルを確認しています')
     db.check();db.save_search(search);log('保存先確認OK。新しい検索を開始しました。')
     web=PublicWeb();web.audit=audit
+    if hasattr(web,'configure'):web.configure(getattr(db,'web_config',{}))
     def region_update(stage,done,total,count,errors):
         if done and done==total:audit.add('geography','region_progress','INFO',{'stage':stage,'done':done,'total':total,'regions':count,'failures':errors})
         audit.persist(db)
@@ -1021,12 +1188,25 @@ def search_all(db,conditions,screen,state=None):
         log('地名取得完了｜'+search['conditions']['region_source']+'｜'+str(len(regions))+'地域')
         search['conditions']['regions']=[r['label'] for r in regions]
         state.new_regions=[r['label'] for r in regions]
+        available={}
+        for provider in conditions['providers']:
+            available[provider]=[]
+            for layout in LAYOUTS:
+                try:single_layout_parameters(web,provider,layout);available[provider].append(layout)
+                except AppError as exc:
+                    cache=getattr(web,'layout_form_cache',{}).get(provider)
+                    if isinstance(cache,str):
+                        issues.append(provider+'｜'+str(exc));log(issues[-1]);audit.add('search_conditions','provider_unavailable','ERROR',{'provider':provider,'message':str(exc),'proxy_configured':bool(getattr(web,'proxy_routes',[]))});break
+                    issues.append(provider+'｜'+layout+'｜単独検索条件がなく未検索です。')
+                    audit.add('search_conditions','layout_unsupported','WARNING',{'provider':provider,'layout':layout,'message':str(exc)})
+            if not available[provider] and not any(x.startswith(provider+'｜') for x in issues):issues.append(provider+'｜利用できる単独間取り条件がありません。')
         jobs=[(r,'間取り別検索') for r in regions]
         q=queue.Queue();active={};done=0;candidate=detail=rejected=0
         def work(index,region,unused):
             # Each region finishes one layout at every provider before starting the next layout.
             for layout in LAYOUTS:
                 for provider in conditions['providers']:
+                    if layout not in available.get(provider,[]):continue
                     DIAG_CONTEXT.audit=audit;DIAG_CONTEXT.scope={'task':index,'region':region['label'],'town':region['town'],'municipality_code':region['code'],'provider':provider,'search_layout':layout}
                     def emit(kind,value):
                         code=diagnosis_code(value) if kind=='issue' else 'accepted' if kind=='unit' else kind
@@ -1102,7 +1282,7 @@ DIAG_CONTEXT=threading.local()
 
 DIAG_ADVICE={
  'timeout':('接続または応答の時間超過','同じURLをブラウザで確認し、サービス障害とStreamlitからの通信制限を切り分ける。正常時の応答時間を測ってからタイムアウトと同時接続数を調整する。'),
- 'http_403':('公開先がアクセスを拒否','自動取得の許可と公開データ/APIの提供有無を確認する。拒否を回避する処理は追加しない。'),
+ 'http_403':('公開先がアクセスを拒否','通信試行ログの経路番号を確認する。プロキシ設定・認証・HTTPS接続と経路切替後のHTTP状態を比較する。403の解消は成功応答で確認する。'),
  'http_429':('取得先の要求回数制限','同じ自治体・ページの重複要求を減らし、キャッシュと取得間隔を導入する。Retry-Afterがあればその値に従う。'),
  'http_404':('対象のURL・データが存在しない','掲載終了とAPI・タイルURL変更を区別する。現行の公開ページ・公式仕様とURLを照合する。'),
  'http_5xx':('取得先のサーバーエラー','発生時刻とURLを確認して障害を切り分け、復旧後に失敗したタスクだけを再検証する。'),
@@ -1118,11 +1298,29 @@ DIAG_ADVICE={
  'empty':('取得元の一覧に候補がない','地名・自治体コード・検索パラメータをログのURLで照合する。手動検索の件数と比較し、真の0件と検索条件/解析の誤りを区別する。'),
  'location_unverified':('掲載座標はあるが住所照合は未判定','地名照合サービスの失敗ログを確認する。掲載座標と実際の建物位置を手動で照合し、未判定を位置確認済みとして評価しない。'),
  'layout_assumed':('掲載間取りを単独検索の指定値で補完','検索条件・公開フォームの値と結果一覧を照合する。掲載間取りを確認できたら優先し、異なる明示間取りは除外する。補完済みを掲載確認済みとは扱わない。'),
+ 'request_spacing':('取得元への同時接続と頻度を調整','物件サイトごとの同時通信は1件、通信開始は最低1秒間隔。取得件数・ページ数には上限を設けない。'),
+ 'session_entry':('同じ経路で公開トップページを確認','応答状態・Cookie件数と再試行結果を比較する。Cookieの値は保存しない。'),
+ 'session_retry':('公開ページ閲覧後にセッション付き再試行','同じプロキシ・Cookieを使い、実際に訪れたページをRefererとして送る。改善したか後続応答で確認する。'),
+ 'route_cooldown':('拒否された経路またはRetry-Afterの待機','残り待機時間を確認する。403の経路とURLは60秒休止し、他の設定済み経路があれば試す。'),
+ 'form_alternative':('別の公開ページで間取り条件を確認','成功した公開ページのフォーム名と値を確認する。条件が確認できなければ物件取得を開始しない。'),
+ 'http_challenge':('物件本文ではなくアクセス検証画面','実際のHTTP状態・ページタイトル・経路番号を比較する。検証画面を物件ページとして解析しない。'),
+ 'transport_config':('取得経路の設定','プロキシ未設定ならStreamlit SecretsにRENTAL_HTTP_PROXIESを設定する。物件サイトだけに適用する。'),
+ 'transport_attempt':('実際の通信試行','経路番号・HTTP状態・本文バイト数を比較し、取得成功した経路を確認する。'),
+ 'proxy_switch':('別のプロキシ経路へ切替','切替後のHTTP状態を確認する。全経路で403なら取得可能とは表示しない。'),
+ 'proxy_error':('プロキシ経路の接続失敗','プロキシの契約状態、ホスト・ポート・認証情報、HTTPS CONNECT対応を確認する。'),
+ 'http_retry':('一時的なHTTPエラーを再試行','Retry-Afterと再試行後の状態を確認する。繰り返す場合は取得元またはプロキシの接続状況を調べる。'),
+ 'provider_unavailable':('取得元の検索条件を取得できない','通信試行ログを確認する。403が全経路で続く場合はプロキシ接続先と取得元へのアクセス可否を確認する。'),
+ 'layout_unsupported':('取得元に単独検索条件がない','この間取りは検索未実施。取得元の公開フォームに対応する間取りがあるか確認する。'),
+ 'location_pending':('条件に合う募集だが建物位置が未確認','記録したURLと掲載項目を用いて掲載地図・正確な番地を確認する。地図の250m区画へ町丁目代表点を入れない。位置を確認した後に再取得・保存する。'),
+ 'map_link_result':('掲載ページから地図ページを追加確認','座標の出所と掲載住所を照合する。町丁目の代表点を建物座標として扱わない。'),
  'http_empty':('HTTP 202の空応答で掲載データが未到着','公開ページを手動で確認し、取得元のアクセス条件と公開API/データ提供を確認する。空本文をHTML解析失敗や間取り欠落と扱わない。'),
  'unknown':('現時点で理由を特定できない','前後の通信・解析・除外イベントを照合する。再現URLと読取項目を追加してから修正する。原因を断定しない。')}
 
 def diagnosis_code(message):
     text=str(message)
+    if '取得経路の待機中' in text:return 'route_cooldown'
+    if 'アクセス検証画面' in text:return 'http_challenge'
+    if 'プロキシ接続失敗' in text:return 'proxy_error'
     if 'HTTP 202' in text and '0バイト' in text:return 'http_empty'
     for needle,code in [('タイムアウト','timeout'),('HTTP 403','http_403'),('HTTP 429','http_429'),('HTTP 404','http_404')]:
         if needle in text:return code
@@ -1143,6 +1341,7 @@ class AuditLog:
         if isinstance(value,(list,tuple)):return [self.clean(x) for x in value]
         if isinstance(value,str):
             for secret in self.secrets:value=value.replace(secret,'[REDACTED]')
+            value=re.sub(r'(https?://)[^/\s@]+@',r'\1[REDACTED]@',value)
             value=re.sub(r'(sb_secret_[\w-]+|eyJ[\w-]+\.[\w-]+\.[\w-]+)', '[REDACTED]',value)
             value=re.sub(r'(?i)([?&](?:apikey|key|token|password|secret)=)[^&\s]+',r'\1[REDACTED]',value)
             return value
@@ -1447,7 +1646,8 @@ def start_search(conditions):
         old=jobs.get(token)
         if old and not old.snapshot()['finished']: return
         # Secrets are read on the Streamlit thread, before launching a pure Python worker.
-        job=SearchJob(Database(),conditions);jobs[token]=job
+        db=Database();db.web_config=rental_network_settings()
+        job=SearchJob(db,conditions);jobs[token]=job
         # Release finished jobs from other sessions after two hours.
         for key,value in list(jobs.items()):
             if key!=token and value.finished and time.monotonic()-getattr(value,'created',time.monotonic())>7200: jobs.pop(key,None)
@@ -1650,6 +1850,12 @@ def main():
         st.download_button('セットアップSQLをダウンロード',SQL,'supabase_rebuild_01.sql','text/plain')
         st.write('2．StreamlitのSettings → Secretsに、接続先とサーバー用のSecret keyを設定してください。')
         st.code('SUPABASE_URL = "https://プロジェクトID.supabase.co"\nSUPABASE_SECRET_KEY = "sb_secret_から始まるキー"\nSUPABASE_NAMESPACE = "sumai-compass"',language='toml')
+        st.write('物件取得にプロキシを使用する場合は、同じSecretsへ追加してください。Supabase・地名取得には適用しません。')
+        st.code('RENTAL_HTTP_PROXIES = ["http://ユーザー:パスワード@ホスト:ポート", "http://別のユーザー:パスワード@別のホスト:ポート"]',language='toml')
+        try:st.caption('設定済みプロキシ：'+str(len(rental_network_settings()['proxies']))+'経路')
+        except AppError as exc:st.error(str(exc))
+        st.caption('追加対策：同じ経路で公開トップページを確認してCookieを引き継ぎ、物件サイトごとに同時通信1件・最低1秒間隔で取得します。403の経路とURLは60秒休止し、別の公開条件ページも確認します。')
+        st.caption('利用するプロキシサービスの接続URLを設定してください。設定済みの経路で403・空応答・通信失敗が出た場合は別の経路へ切り替えます。認証情報は作業ログへ出力しません。')
         st.write('3．接続確認が成功したら、「住まいを探す」の地図を動かして検索してください。')
         if st.button('新しい保存先の接続を確認',key='new_check'):
             try: Database().check();st.success('物件・検索履歴の新しい保存先に接続できました。')
