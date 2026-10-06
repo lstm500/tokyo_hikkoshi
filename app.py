@@ -37,7 +37,7 @@ import streamlit as st
 from streamlit_folium import st_folium
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v49"
+BUILD = "REBUILD-01-v50"
 PROVIDER_OPTIONS = ("スマイティ","HOMES","SUUMO","カナリー","アットホーム","CHINTAI","Comfy","アパマンショップ")
 PROVIDER_CANONICAL = {"HOMES":"HOME’S","HOME’S":"HOME’S","スマイティ":"スマイティ","SUUMO":"SUUMO","カナリー":"カナリー",
                       "アットホーム":"アットホーム","CHINTAI":"CHINTAI","Comfy":"Comfy","アパマンショップ":"アパマンショップ"}
@@ -663,6 +663,22 @@ GEO_HTTP_CACHE={}
 GEO_HTTP_LOCK=threading.Lock()
 
 
+def response_title(text):
+    match=re.search(r'<title\b[^>]*>(.*?)</title\s*>',(text or '')[:65536],re.I|re.S)
+    return normal(html.unescape(re.sub(r'<[^>]+>',' ',match.group(1))))[:160] if match else ''
+
+def response_encoding(response):
+    content_type=response.headers.get('Content-Type','')
+    charset=re.search(r'charset\s*=\s*[\"\']?([\w.-]+)',content_type,re.I)
+    meta=re.search(br'charset\s*=\s*[\"\']?([\w.-]+)',response.content[:8192],re.I) if not charset else None
+    candidate=charset.group(1) if charset else meta.group(1).decode('ascii') if meta else None
+    if candidate:
+        try:response.content.decode(candidate);return candidate
+        except (LookupError,UnicodeError):pass
+    try:response.content.decode('utf-8');return 'utf-8'
+    except UnicodeError:return response.apparent_encoding or 'utf-8'
+
+
 class PublicWeb:
     def __init__(self):
         self.local=threading.local();self.cancel_event=threading.Event();self.cache_lock=threading.RLock();self.http_flights={};self.host_slots={}
@@ -701,9 +717,7 @@ class PublicWeb:
             return session.request(method,url,headers=headers,timeout=(4,12),allow_redirects=False,**options)
         finally:slots.release()
     def response_info(self,response):
-        soup=BeautifulSoup(response.text[:30000],'html.parser') if 'html' in response.headers.get('Content-Type','').lower() else None
-        title=soup.select_one('title') if soup else None
-        title=title.get_text(' ',strip=True)[:160] if title else ''
+        title=response_title(response.text) if 'html' in response.headers.get('Content-Type','').lower() else ''
         challenge=bool(re.search(r'^(?:just a moment|access denied|attention required|403 forbidden|verify (?:you|your)|security check)',title,re.I))
         return {'page_title':title,'challenge_page':challenge,'response_sha256':hashlib.sha256(response.content).hexdigest(),
                 'response_headers':{k:response.headers.get(k,'') for k in ('Server','Content-Type','Retry-After','Via','X-Cache','CF-Ray')}}
@@ -812,7 +826,7 @@ class PublicWeb:
         except requests.ConnectionError as exc:
             error=AppError(f'{u.hostname}：接続できません（DNS・ネットワーク・接続先を確認）。');error.diagnostic={'exception_type':type(exc).__name__,'reason':'接続経路の通信失敗'};raise error from None
         except requests.RequestException: raise AppError(f'{u.hostname}：通信処理に失敗しました。') from None
-        response.encoding='utf-8' if 'gsi.go.jp' in u.hostname else response.apparent_encoding or 'utf-8'
+        response.encoding='utf-8' if 'gsi.go.jp' in u.hostname else response_encoding(response)
         if method=='GET' and not kwargs.get('params') and '/chintai/' in u.path:self.http_cache[url]=response
         return response
     def fetch(self,url,method='GET',**kwargs):
@@ -871,9 +885,8 @@ def audited_public_fetch(self,url,method='GET',**kwargs):
                        content_type=response.headers.get('Content-Type',''),response_url=response.url,
                        response_sha256=hashlib.sha256(response.content).hexdigest())
         if 'html' in details['content_type'].lower():
-            soup=BeautifulSoup(response.text,'html.parser');title=soup.select_one('title')
-            details['page_title']=title.get_text(' ',strip=True)[:120] if title else ''
-            details['selectors']={q:len(soup.select(q)) for q in ('div.cassetteitem','tr.js-cassette_link','script[type="application/ld+json"]','th','dt','a[href]')}
+            details['page_title']=response_title(response.text)
+            details['html_selector_counts']='取得先の解析工程で記録（通信ログではHTML全体を再解析しない）'
         trace(self,'cache_hit' if cached else 'http_ok',details,stage='http_cache' if cached else 'http');return response
     except Exception as exc:
         details.update(elapsed_ms=round((time.monotonic()-started)*1000),exception_type=type(exc).__name__,technical_exception=getattr(exc,'diagnostic',{}),message=str(exc) if isinstance(exc,AppError) else '応答処理失敗')
@@ -3132,8 +3145,8 @@ def start_search(conditions):
     st.session_state.new_search=None
 
 @st.fragment(run_every='2s')
-def background_progress(anchor=None):
-    """Render live worker progress at an explicit anchor directly below the map."""
+def background_progress():
+    """Render live worker progress and buttons inside the fragment-owned container."""
     job=active_job()
     if job is None:return
     snap=job.snapshot()
@@ -3157,10 +3170,7 @@ def background_progress(anchor=None):
         if st.button('取得済みデータを地図へ反映',key='refresh_live_map'):refresh_map()
         if st.button('検索を中断（取得済みデータは保持）',key='stop_background_job',disabled=bool(snap.get('stopping'))):
             job.request_stop()
-    if anchor is None:
-        render()
-    else:
-        with anchor.container():render()
+    render()
 
 
 @st.fragment(run_every='10s')
@@ -3245,9 +3255,8 @@ def main():
                 job.audit.add('map','render','INFO',{'bounds':bounds,'loaded_units':len(map_units),'aggregation':False,'monthly_limit':None,'renderer':'Canvas','display_stages':display_report['stages'],'display_reasons':display_report['reason_counts'],'display_map':display_report['map']})
         facilities=[f for f in state.new_facilities if bounds and in_rectangle((f['lat'],f['lng']),bounds)]
         interactive_rental_map(pins,cells,facilities)
-        # Fixed DOM position: live progress is rendered into this placeholder and nowhere else.
-        progress_anchor=st.empty()
-        background_progress(progress_anchor)
+        # Fragment owns its widget container directly, including partial reruns.
+        background_progress()
         # Initial component defaults are not real viewport bounds. Only the browser callback makes the search ready.
         bounds=state.get('new_bounds')
         if bounds:
