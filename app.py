@@ -37,7 +37,17 @@ import streamlit as st
 from streamlit_folium import st_folium
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v39"
+BUILD = "REBUILD-01-v40"
+PROVIDER_OPTIONS = ("スマイティ","HOMES","SUUMO","カナリー","アットホーム","CHINTAI","Comfy","アパマンショップ")
+PROVIDER_CANONICAL = {"HOMES":"HOME’S","HOME’S":"HOME’S","スマイティ":"スマイティ","SUUMO":"SUUMO","カナリー":"カナリー",
+                      "アットホーム":"アットホーム","CHINTAI":"CHINTAI","Comfy":"Comfy","アパマンショップ":"アパマンショップ"}
+PROVIDER_DISPLAY = {"HOME’S":"HOMES",**{x:x for x in PROVIDER_OPTIONS if x!="HOMES"}}
+PROVIDER_HOST = {
+    "スマイティ":"sumaity.com","HOME’S":"www.homes.co.jp","SUUMO":"suumo.jp","カナリー":"web.canary-app.jp",
+    "アットホーム":"www.athome.co.jp","CHINTAI":"www.chintai.net","Comfy":"comfy.maison","アパマンショップ":"www.apamanshop.com",
+}
+RENTAL_HOSTS = frozenset(PROVIDER_HOST.values())
+PREF_ALIAS = {"11":"saitama","12":"chiba","13":"tokyo","14":"kanagawa"}
 DEFAULT_CENTER = (35.7303,139.711)
 UNIT_TABLE = "housing_units_v1"
 SEARCH_TABLE = "housing_searches_v1"
@@ -612,7 +622,7 @@ class PublicWeb:
         self.local=threading.local()
         self.headers={'User-Agent':'SumaiCompassRebuild/1.0 (personal rental research)', 'Accept-Language':'ja'}
         self.host_gates={};self.host_last_request={};self.route_cooldowns={};self.session_primed=threading.local();self.proxy_routes=[];self.route_preferred={};self.route_lock=threading.Lock();self.http_cache={};self.headers.update({'Accept':'text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8'})
-        self.robots={};self.lock=threading.Lock();self.layout_form_lock=threading.Lock();self.layout_form_cache={};self.unavailable_hosts={};self.failed_detail_urls={}
+        self.robots={};self.lock=threading.Lock();self.layout_form_lock=threading.Lock();self.layout_form_cache={};self.provider_cache={};self.provider_lock=threading.RLock();self.unavailable_hosts={};self.failed_detail_urls={}
     def configure(self,config):
         self.proxy_routes=list((config or {}).get('proxies',[]))
         trace(self,'transport_config',{'proxy_count':len(self.proxy_routes),'rental_route':'proxy' if self.proxy_routes else 'direct','other_services':'direct'},stage='http_config')
@@ -623,7 +633,7 @@ class PublicWeb:
         return self.local.sessions[route]
     def route_request(self,session,method,url,options):
         host=urlparse(url).hostname
-        if host not in ('www.homes.co.jp','suumo.jp'):
+        if host not in RENTAL_HOSTS:
             headers=dict(self.headers);headers.update(options.get('headers',{}));options={k:v for k,v in options.items() if k!='headers'}
             return session.request(method,url,headers=headers,timeout=(4,12),allow_redirects=False,**options)
         with self.route_lock:gate=self.host_gates.setdefault(host,threading.Lock())
@@ -661,7 +671,7 @@ class PublicWeb:
         return okay
     def request_routes(self,method,url,**kwargs):
         u=urlparse(url);host=u.hostname;root=u.scheme+'://'+u.netloc
-        rental=host in ('www.homes.co.jp','suumo.jp')
+        rental=host in RENTAL_HOSTS
         routes=self.proxy_routes if rental and self.proxy_routes else [None]
         with self.route_lock:preferred=self.route_preferred.get(host,0)%len(routes)
         ordered=list(range(preferred,len(routes)))+list(range(preferred))
@@ -715,7 +725,7 @@ class PublicWeb:
             error=AppError(host+'：取得経路の待機中です（直前の403・429等）。設定した全経路の待機が終わってから再検索してください。');error.diagnostic={'skipped_routes':skipped};raise error
         return last
     def fetch(self,url,method='GET',**kwargs):
-        allowed=('www.homes.co.jp','suumo.jp','mreversegeocoder.gsi.go.jp','msearch.gsi.go.jp','maps.gsi.go.jp','cyberjapandata.gsi.go.jp','japanese-addresses-v2.geoloniamaps.com','geolonia.github.io','img01.suumo.com','img02.suumo.com','maps.googleapis.com','maps.google.com')
+        allowed=tuple(RENTAL_HOSTS)+('mreversegeocoder.gsi.go.jp','msearch.gsi.go.jp','maps.gsi.go.jp','cyberjapandata.gsi.go.jp','japanese-addresses-v2.geoloniamaps.com','geolonia.github.io','img01.suumo.com','img02.suumo.com','maps.googleapis.com','maps.google.com')
         u=urlparse(url)
         if u.scheme!='https' or u.hostname not in allowed or u.username or u.password: raise AppError('取得先が不正です。')
         if method=='GET' and not kwargs.get('params') and url in self.http_cache:
@@ -728,8 +738,8 @@ class PublicWeb:
                 if response.status_code not in (301,302,303,307,308): break
                 target=urljoin(response.url,response.headers.get('Location',''))
                 v=urlparse(target)
-                if v.scheme!='https' or v.hostname!=u.hostname or not v.path.startswith(u.path.rsplit('/',1)[0]):
-                    raise AppError('取得先が別のページに移動しました。')
+                if v.scheme!='https' or v.hostname!=u.hostname:
+                    raise AppError('取得先が別のサイトに移動しました。')
                 response=self.request_routes('GET',target)
             response.raise_for_status()
             if response.status_code==202 and not response.content.strip():
@@ -801,11 +811,24 @@ def audited_db_call(self,method,table,params=None,data=None,prefer=None):
         raise
 Database.call=audited_db_call
 
+def canonical_provider(provider):
+    return PROVIDER_CANONICAL.get(str(provider or ''),str(provider or ''))
+
+
 def safe_url(url,provider):
     try:
-        u=urlparse(url);host={'HOME’S':'www.homes.co.jp','SUUMO':'suumo.jp'}.get(provider)
-        return bool(host and u.scheme=='https' and u.hostname==host and not u.username and not u.password
-                    and u.port in (None,443) and u.path.startswith('/chintai/'))
+        provider=canonical_provider(provider);u=urlparse(url);host=PROVIDER_HOST.get(provider)
+        if not host or u.scheme!='https' or u.hostname!=host or u.username or u.password or u.port not in (None,443):
+            return False
+        path=u.path or '/'
+        prefixes={
+            'スマイティ':('/chintai/',),'HOME’S':('/chintai/',),'SUUMO':('/chintai/',),
+            'カナリー':('/chintai/',),'アットホーム':('/chintai/',),
+            'CHINTAI':('/detail/','/tokyo/','/kanagawa/','/saitama/','/chiba/'),
+            'Comfy':('/properties/','/rooms/','/rentals/','/'),
+            'アパマンショップ':('/chintai/','/tokyo/','/kanagawa/','/saitama/','/chiba/'),
+        }
+        return any(path.startswith(p) for p in prefixes.get(provider,()))
     except (ValueError,TypeError): return False
 
 
@@ -1339,6 +1362,410 @@ def suumo_collect(web,region,bounds,munis,emit):
         page=min(next_pages)
 
 
+
+def provider_city_name(region,munis):
+    row=munis.get(str(region.get('code',''))) if isinstance(munis,dict) else None
+    if isinstance(row,(list,tuple)) and len(row)>=3:return str(row[2])
+    label=normal(region.get('label',''));town=normal(region.get('town',''))
+    prefix=label[:-len(town)] if town and label.endswith(town) else label
+    return re.sub(r'^(?:東京都|神奈川県|千葉県|埼玉県)','',prefix)
+
+
+def town_base_name(town):
+    value=normal(town).replace('　','').replace(' ','')
+    value=re.sub(r'(?:[0-9０-９一二三四五六七八九十]+丁目.*)$','',value)
+    return value or normal(town)
+
+
+def provider_root(provider,region):
+    alias=PREF_ALIAS.get(str(region.get('pref','')))
+    if not alias:raise AppError('追加取得元は東京都・神奈川県・千葉県・埼玉県で利用できます。')
+    roots={
+        'スマイティ':f'https://sumaity.com/chintai/{alias}/',
+        'カナリー':f'https://web.canary-app.jp/chintai/{alias}/areas/',
+        'アットホーム':f'https://www.athome.co.jp/chintai/{alias}/',
+        'CHINTAI':f'https://www.chintai.net/{alias}/',
+        'Comfy':'https://comfy.maison/',
+        'アパマンショップ':f'https://www.apamanshop.com/{alias}/',
+    }
+    if provider not in roots:raise AppError(provider+'の公開検索入口を確認できません。')
+    return roots[provider]
+
+
+def associated_label_text(soup,field):
+    texts=[]
+    fid=field.get('id')
+    if fid:
+        label=soup.find('label',attrs={'for':fid})
+        if label:texts.append(label.get_text(' ',strip=True))
+    parent=field.find_parent('label')
+    if parent:texts.append(parent.get_text(' ',strip=True))
+    for node in (field.previous_sibling,field.next_sibling):
+        if getattr(node,'get_text',None):texts.append(node.get_text(' ',strip=True))
+        elif isinstance(node,str):texts.append(node)
+    if field.name=='option':texts.append(field.get_text(' ',strip=True))
+    texts.extend([str(field.get('aria-label') or ''),str(field.get('data-label') or ''),str(field.get('title') or '')])
+    return ' '.join(x for x in texts if x)
+
+
+def discover_choice(soup,label,name_hint=None):
+    wanted=address_key(label)
+    best=None
+    for field in soup.select('input[value],option[value]'):
+        name=field.get('name') or (field.parent.get('name') if field.parent else '') or ''
+        if name_hint and not re.search(name_hint,name,re.I):continue
+        value=str(field.get('value','')).strip()
+        if not value:continue
+        observed=address_key(associated_label_text(soup,field))
+        if not observed:continue
+        score=3 if observed==wanted else 2 if wanted and wanted in observed else 1 if observed and observed in wanted else 0
+        if score and (best is None or score>best[0]):best=(score,name,value)
+    if best:return best[1],best[2]
+    raw=str(soup)
+    escaped=re.escape(normal(label))
+    uuid=r'([0-9a-f]{8}-[0-9a-f-]{27,36})'
+    patterns=[
+        rf'["\'](?:name|label|title)["\']\s*:\s*["\']{escaped}["\'].{{0,300}}?["\'](?:id|value)["\']\s*:\s*["\']{uuid}["\']',
+        rf'["\'](?:id|value)["\']\s*:\s*["\']{uuid}["\'].{{0,300}}?["\'](?:name|label|title)["\']\s*:\s*["\']{escaped}["\']',
+    ]
+    for pat in patterns:
+        m=re.search(pat,raw,re.I|re.S)
+        if m:return ('cityIds' if '区' in label or '市' in label or '郡' in label else 'areaIds'),m.group(1)
+    return None
+
+
+def find_named_link(soup,base_url,label,host=None,prefer=()):
+    wanted=address_key(label);choices=[]
+    for a in soup.select('a[href]'):
+        href=urljoin(base_url,html.unescape(str(a.get('href') or '')))
+        u=urlparse(href)
+        if u.scheme!='https' or host and u.hostname!=host:continue
+        observed=address_key(a.get_text(' ',strip=True))
+        if not observed:continue
+        score=0
+        if observed==wanted:score=100
+        elif wanted and (observed.startswith(wanted) or wanted in observed):score=80
+        elif observed and observed in wanted:score=60
+        if not score:continue
+        score+=sum(5 for p in prefer if re.search(p,u.path+'?'+u.query,re.I))
+        if re.search(r'/souba/|/rent/|/sitemap/|/theme/',u.path):score-=20
+        choices.append((score,href))
+    return max(choices,key=lambda x:x[0])[1] if choices else None
+
+
+def provider_region_request(web,provider,region,munis,requested):
+    provider=canonical_provider(provider);city=provider_city_name(region,munis);town=town_base_name(region.get('town',''))
+    alias=PREF_ALIAS.get(str(region.get('pref','')))
+    if not alias:raise AppError('対象都県を確認できません。')
+    cache_key=('region_request',provider,str(region.get('code')),town,requested if provider in ('カナリー',) else None)
+    with web.provider_lock:
+        cached=web.provider_cache.get(cache_key)
+    if cached:return dict(cached)
+
+    if provider=='CHINTAI':
+        # CHINTAI exposes municipality pages and town links; never substitute the city page for a town search.
+        city_url=f'https://www.chintai.net/{alias}/area/{region["code"]}/list/'
+        if not web.permitted(city_url):raise AppError('CHINTAIの地域ページの自動取得が許可されていません。')
+        soup=BeautifulSoup(web.fetch(city_url).text,'html.parser')
+        region_url=find_named_link(soup,city_url,town,'www.chintai.net',('area','list'))
+        if not region_url:
+            raise AppError('CHINTAIで'+town+'の公開町域ページを確認できません。市区町村全体を代用しません。')
+        request={'url':region_url,'params':None,'precise':True}
+
+    elif provider=='スマイティ':
+        root=provider_root(provider,region);host=PROVIDER_HOST[provider]
+        if not web.permitted(root):raise AppError('スマイティの地域検索入口の自動取得が許可されていません。')
+        root_soup=BeautifulSoup(web.fetch(root).text,'html.parser')
+        city_url=find_named_link(root_soup,root,city,host,('chintai','list','area'))
+        if not city_url:raise AppError('スマイティで'+city+'の公開地域ページを確認できません。')
+        if not web.permitted(city_url):raise AppError('スマイティの市区町村ページの自動取得が許可されていません。')
+        city_soup=BeautifulSoup(web.fetch(city_url).text,'html.parser')
+        region_url=find_named_link(city_soup,city_url,town,host,('chintai','zip','area'))
+        if not region_url:
+            raise AppError('スマイティで'+town+'の公開町域ページを確認できません。市区町村全体を代用しません。')
+        request={'url':region_url,'params':None,'precise':True}
+
+    elif provider=='アットホーム':
+        # AtHome may reject automated list requests. Discover only public links; do not invent internal endpoints.
+        market_index=f'https://www.athome.co.jp/chintai/souba/{alias}/city/'
+        if not web.permitted(market_index):raise AppError('アットホームの公開地域入口の自動取得が許可されていません。')
+        market_soup=BeautifulSoup(web.fetch(market_index).text,'html.parser')
+        market_city=find_named_link(market_soup,market_index,city,'www.athome.co.jp',('souba',))
+        if not market_city:raise AppError('アットホームで'+city+'の公開地域ページを確認できません。')
+        slug_match=re.search(r'/chintai/souba/'+re.escape(alias)+r'/([^/]+)/?',urlparse(market_city).path)
+        if not slug_match:raise AppError('アットホームの市区町村URLを確認できません。')
+        list_url=f'https://www.athome.co.jp/chintai/{alias}/{slug_match.group(1)}/list/'
+        if not web.permitted(list_url):raise AppError('アットホームの物件一覧の自動取得が許可されていません。')
+        list_soup=BeautifulSoup(web.fetch(list_url).text,'html.parser')
+        region_url=find_named_link(list_soup,list_url,town,'www.athome.co.jp',('chintai','list','area'))
+        if not region_url:
+            raise AppError('アットホームで'+town+'の公開町域ページを確認できません。市区町村全体を代用しません。')
+        request={'url':region_url,'params':None,'precise':True}
+
+    elif provider=='アパマンショップ':
+        # Current public area URLs use the municipality-code suffix (e.g. 13109 -> /tokyo/109/).
+        suffix=str(region.get('code',''))[-3:]
+        city_url=f'https://www.apamanshop.com/{alias}/{suffix}/'
+        if not web.permitted(city_url):raise AppError('アパマンショップの市区町村一覧の自動取得が許可されていません。')
+        # No stable public town-only URL is assumed. Candidate cards are filtered by their explicit address before detail fetch.
+        request={'url':city_url,'params':None,'precise':False,'filter_context_town':True}
+
+    elif provider=='カナリー':
+        root=provider_root(provider,region)
+        if not web.permitted(root):raise AppError('カナリーの地域選択ページの自動取得が許可されていません。')
+        soup=BeautifulSoup(web.fetch(root).text,'html.parser')
+        city_choice=discover_choice(soup,city,r'city')
+        if not city_choice:raise AppError('カナリーで'+city+'の地域IDを公開ページから確認できません。')
+        city_name,city_value=city_choice
+        params={city_name:city_value,'isTotalRent':'false','page':'1','prefectureAlias':alias,'searchType':'1','sortType':'5'}
+        if requested in LAYOUTS:params['layouts']=requested
+        selected=BeautifulSoup(web.fetch(root,params=params).text,'html.parser')
+        town_choice=discover_choice(selected,town,r'(area|town|district)')
+        if not town_choice:
+            raise AppError('カナリーで'+town+'の町域IDを確認できません。市区町村全体を代用しません。')
+        params[town_choice[0]]=town_choice[1]
+        request={'url':root,'params':params,'precise':True}
+
+    elif provider=='Comfy':
+        # Comfy's public location URLs combine a Kanto group, municipality codes and the town master ID.
+        # Build a candidate only from the public Geolonia/ABR town master, then fetch it and verify the page title/text.
+        muni=munis.get(str(region.get('code',''))) if isinstance(munis,dict) else None
+        if not isinstance(muni,(list,tuple)) or len(muni)<3:
+            raise AppError('Comfyの地域URL確認に必要な市区町村情報がありません。')
+        pref_name=str(muni[1]);city_name=str(muni[2]);code=str(region.get('code',''))
+        town_data=catalog_json(web,'https://japanese-addresses-v2.geoloniamaps.com/api/ja/'+quote(pref_name,safe='')+'/'+quote(city_name,safe='')+'.json')
+        exact=[];base=[]
+        wanted=address_key(region.get('town',''));wanted_base=address_key(town)
+        for row in town_data.get('data',[]):
+            if not isinstance(row,dict):continue
+            mid=str(row.get('machiaza_id') or '')
+            if len(mid)<4 or not mid[:4].isdigit():continue
+            label=''.join(str(row.get(k) or '') for k in ('oaza_cho','chome','koaza'))
+            key=address_key(label);oaza=address_key(row.get('oaza_cho',''))
+            if key==wanted:exact.append(mid[:4])
+            if oaza==wanted_base:base.append(mid[:4])
+        town_code=next(iter(dict.fromkeys(exact or base)),None)
+        if not town_code:
+            raise AppError('Comfy用の町域コードを公開住所データから確認できません。')
+        # Designated-city wards use their parent city code in the first segment; Tokyo special wards do not.
+        parent=code
+        if str(region.get('pref')) in ('11','12','14') and '市' in city_name and '区' in city_name and len(code)==5:
+            parent=code[:3]+'00'
+        region_url=f'https://comfy.maison/location/3-{parent}-{code[-3:]}-{town_code}'
+        if not web.permitted(region_url):raise AppError('Comfyの町域ページの自動取得が許可されていません。')
+        reply=web.fetch(region_url);page=normal(BeautifulSoup(reply.text,'html.parser').get_text(' ',strip=True))
+        if address_key(city_name) not in address_key(page) or wanted_base not in address_key(page):
+            raise AppError('Comfyの公開location URLを検証できません。未確認の地域コードは使用しません。')
+        request={'url':region_url,'params':None,'precise':True}
+
+    else:raise AppError(provider+'の検索方式がありません。')
+
+    with web.provider_lock:web.provider_cache[cache_key]=dict(request)
+    trace(web,'provider_region_discovered',{'provider':provider,'region':region.get('label'),'city':city,'town':town,'request':request},stage='search_conditions')
+    return request
+
+def generic_next_page(soup,current_url,provider):
+    host=PROVIDER_HOST.get(provider);candidates=[]
+    for a in soup.select('a[href]'):
+        label=normal(a.get_text(' ',strip=True)).upper()
+        if not (re.search(r'次(?:の)?(?:\d+件|ページ|へ)|NEXT',label,re.I) or label in ('›','»','>','≫')):continue
+        target=urljoin(current_url,html.unescape(str(a.get('href') or '')));u=urlparse(target)
+        if u.scheme=='https' and u.hostname==host and target!=current_url:candidates.append(target)
+    return candidates[0] if candidates else None
+
+
+def _candidate_context(anchor,max_levels=7):
+    parts=[];node=anchor
+    for _ in range(max_levels):
+        node=getattr(node,'parent',None)
+        if node is None:break
+        if getattr(node,'name',None) in ('body','html'):break
+        try:text=node.get_text(' ',strip=True)
+        except Exception:text=''
+        if text:parts.append(text)
+        if getattr(node,'name',None) in ('article','li','tr'):break
+    return normal(' '.join(parts))
+
+
+def detail_link_candidates(soup,base_url,provider,town=None,require_town_context=False):
+    provider=canonical_provider(provider);host=PROVIDER_HOST[provider];out=[];seen=set()
+    strong={
+        'スマイティ':r'^/chintai/[^/]*_prop/prop_\d+/?$',
+        'カナリー':r'^/chintai/(?:rooms?|buildings?|properties?)/[0-9a-f-]+/?$',
+        'アットホーム':r'^/chintai/\d+/?$',
+        'CHINTAI':r'^/detail/bk-[A-Za-z0-9_-]+/?$',
+        'Comfy':r'^/(?:properties|rooms|rentals)/[^/]+/?$',
+        'アパマンショップ':r'^/(?:tokyo|kanagawa|saitama|chiba)/\d{2,3}/b\d+/\d+/?$',
+    }.get(provider,r'')
+    wanted=address_key(town or '')
+    for a in soup.select('a[href]'):
+        url=urljoin(base_url,html.unescape(str(a.get('href') or ''))).split('#')[0];u=urlparse(url)
+        if url in seen or u.scheme!='https' or u.hostname!=host or not safe_url(url,provider):continue
+        label=normal(a.get_text(' ',strip=True));context=_candidate_context(a);path=u.path
+        if re.search(r'/souba/|/sitemap/|/theme/|/rent/|/areas?/?$|/stations?/',path,re.I):continue
+        is_strong=bool(strong and re.search(strong,path,re.I))
+        contextual=bool(re.search(r'詳細|物件|部屋|賃貸',label)) and bool(re.search(r'\d+(?:\.\d+)?\s*万円|\d{4,}\s*円',context))
+        if not (is_strong or contextual):continue
+        if require_town_context and wanted:
+            if not (town_matches(town,context) or wanted in address_key(context)):
+                continue
+        seen.add(url);out.append(url)
+    return out
+
+def generic_labeled(soup,labels):
+    value=labeled(soup,tuple(labels))
+    if value:return value
+    wanted={normal(x).replace(' ','') for x in labels}
+    for row in soup.select('tr'):
+        cells=row.find_all(['th','td'],recursive=False)
+        if len(cells)>=2 and normal(cells[0].get_text(' ',strip=True)).replace(' ','') in wanted:
+            return cells[1].get_text(' ',strip=True)
+    for dt in soup.select('dt'):
+        if normal(dt.get_text(' ',strip=True)).replace(' ','') in wanted:
+            dd=dt.find_next_sibling('dd')
+            if dd:return dd.get_text(' ',strip=True)
+    return ''
+
+
+def json_listing_fields(soup):
+    out={}
+    for script in soup.select('script[type="application/ld+json"]'):
+        try:data=json.loads(script.get_text())
+        except Exception:continue
+        for node in json_nodes(data):
+            if not isinstance(node,dict):continue
+            if not out.get('title') and node.get('name') and node.get('@type') not in ('Organization','RealEstateAgent','LocalBusiness'):
+                out['title']=str(node.get('name'))
+            address=node.get('address')
+            if isinstance(address,dict) and not out.get('address'):
+                out['address']=''.join(str(address.get(k,'') or '') for k in ('addressRegion','addressLocality','streetAddress'))
+            offer=node.get('offers')
+            if isinstance(offer,dict) and not out.get('rent'):out['rent']=offer.get('price')
+            size=node.get('floorSize')
+            if isinstance(size,dict) and not out.get('area'):out['area']=size.get('value')
+            props=node.get('additionalProperty')
+            if isinstance(props,list):
+                for item in props:
+                    if not isinstance(item,dict):continue
+                    name=normal(item.get('name'));value=item.get('value')
+                    if name in ('間取り','間取'):out.setdefault('layout',value)
+                    elif name in ('建物構造','構造'):out.setdefault('structure',value)
+                    elif name in ('築年月','築年数'):out.setdefault('age',value)
+                    elif name in ('管理費等','管理費','共益費'):out.setdefault('fees',value)
+    return out
+
+
+def regex_after_label(text,labels,value_pattern):
+    for label in labels:
+        m=re.search(re.escape(label)+r'\s*[:：]?\s*('+value_pattern+r')',text,re.I)
+        if m:return m.group(1).strip()
+    return ''
+
+
+def generic_detail(web,provider,url,region,bounds,munis,requested):
+    if not web.permitted(url):raise AppError(provider+'の詳細ページの自動取得が許可されていません。')
+    reply=web.fetch(url);soup=BeautifulSoup(reply.text,'html.parser');visible=' '.join(soup.stripped_strings);structured=json_listing_fields(soup)
+    raw_layout=structured.get('layout') or generic_labeled(soup,('間取り','間取')) or regex_after_label(visible,('間取り','間取'),r'(?:ワンルーム|\d+(?:S?LDK|S?DK|SK|LK|K|L|R))')
+    layout=resolve_layout(web,raw_layout,requested,url)
+    if layout is None:return None
+    address=structured.get('address') or generic_labeled(soup,('所在地','住所','物件所在地','所在地住所'))
+    if not address:
+        m=re.search(r'(東京都|神奈川県|千葉県|埼玉県)[^|｜\n]{2,80}?(?=(?:交通|最寄|駅徒歩|間取り|賃料|家賃|築|$))',visible)
+        if m:address=m.group(0).strip()
+    if address and not town_matches(region['town'],address):
+        trace(web,'address',{'provider':provider,'town':region['town'],'listing_address':address,'url':url},'WARNING','parser');return None
+    title=structured.get('title') or (soup.select_one('h1').get_text(' ',strip=True) if soup.select_one('h1') else provider+'掲載募集')
+    raw_rent=structured.get('rent') or generic_labeled(soup,('賃料','家賃'))
+    if not raw_rent:raw_rent=regex_after_label(visible,('賃料','家賃'),r'\d+(?:\.\d+)?\s*万円|\d[\d,]*\s*円')
+    rent=optional_amount(raw_rent)
+    raw_fees=structured.get('fees') or generic_labeled(soup,('管理費等','管理費・共益費','管理費','共益費'))
+    if not raw_fees:raw_fees=regex_after_label(visible,('管理費等','管理費・共益費','管理費','共益費'),r'(?:なし|無料|－|-|\d+(?:\.\d+)?\s*万円|\d[\d,]*\s*円)')
+    fees=optional_amount(raw_fees)
+    raw_area=structured.get('area') or generic_labeled(soup,('専有面積','面積'))
+    if not raw_area:raw_area=regex_after_label(visible,('専有面積','面積'),r'\d+(?:\.\d+)?\s*(?:m2|m²|㎡|平米)')
+    area_match=re.search(r'\d+(?:\.\d+)?',normal(raw_area));area=float(area_match.group(0)) if area_match else None
+    structure=structured.get('structure') or generic_labeled(soup,('建物構造','構造','種別/構造'))
+    raw_age=structured.get('age') or generic_labeled(soup,('築年月','築年数','築年'))
+    if not raw_age:
+        raw_age=regex_after_label(visible,('築年月','築年数','築年'),r'(?:新築|築\s*\d{1,3}年|(?:19|20)\d{2}年\s*\d{1,2}月)')
+    age,ym=age_info(raw_age)
+    floor=generic_labeled(soup,('所在階','階建 / 階','階建/階','階数','階'))
+    try:location=locate(web,soup,reply.text,address,bounds,munis,source_url=url)
+    except AppError as exc:location=None;trace(web,'location',{'provider':provider,'url':url,'message':str(exc)},'WARNING','location')
+    row=partial_listing(provider,url,title,address or region['label'],layout,rent,fees,area,region,bounds,location,structure or None,age,ym,floor)
+    if row:trace(web,'detail_fields',{'provider':provider,'url':url,'layout':layout,'rent':rent,'fees':fees,'area':area,'address':address,'missing_fields':row.get('missing_fields',[])},stage='parser')
+    return row
+
+
+def public_portal_collect(web,region,bounds,munis,emit,provider):
+    provider=canonical_provider(provider);requested=region.get('search_layout')
+    if requested is not None and requested not in LAYOUTS:raise AppError(provider+'の間取り指定を確認してください。')
+    request=provider_region_request(web,provider,region,munis,requested)
+    cache_key=('listing_links',provider,str(region.get('code')),address_key(region.get('town','')),requested if provider=='カナリー' and requested in LAYOUTS else 'all')
+    with web.provider_lock:cached=web.provider_cache.get(cache_key)
+    links=list(cached) if isinstance(cached,list) else []
+    if not links:
+        current=request['url'];params=dict(request.get('params') or {});seen_pages=set();links_seen=set();page=1
+        while current:
+            emit('message',f'{provider} 公開一覧 {page}ページ目')
+            if not web.permitted(current):raise AppError(provider+'の一覧ページの自動取得が許可されていません。')
+            reply=web.fetch(current,params=params or None);params={}
+            soup=BeautifulSoup(reply.text,'html.parser');signature=hashlib.sha256(reply.content).hexdigest()
+            if signature in seen_pages:raise AppError(provider+'のページ送りが同じ一覧を返しました。全ページを確認できていません。')
+            seen_pages.add(signature)
+            found=[u for u in detail_link_candidates(soup,reply.url,provider,region.get('town'),bool(request.get('filter_context_town'))) if u not in links_seen]
+            for u in found:links_seen.add(u);links.append(u)
+            emit('candidate',len(found))
+            next_url=generic_next_page(soup,reply.url,provider)
+            trace(web,'page_end',{'provider':provider,'region':region['label'],'page':page,'new_candidates':len(found),'next_url':next_url},stage='pagination')
+            if not next_url:break
+            current=next_url;page+=1
+        with web.provider_lock:web.provider_cache[cache_key]=list(links)
+    if not links:
+        raise AppError(provider+'で'+region['label']+'の募集詳細URLを公開一覧から確認できません。')
+    accepted=0
+    for i,url in enumerate(links,1):
+        emit('message',f'{provider} 掲載項目の確認 {i}/{len(links)}件');emit('detail',1)
+        try:row=generic_detail(web,provider,url,region,bounds,munis,requested)
+        except Exception as exc:
+            trace(web,'detail_optional_error',{'provider':provider,'url':url,'exception_type':type(exc).__name__,'message':str(exc) if isinstance(exc,AppError) else '詳細追加確認失敗'},'WARNING','collector')
+            emit('issue',provider+'｜'+(str(exc) if isinstance(exc,AppError) else '詳細ページを確認できません。'));continue
+        if row:emit('unit',row);accepted+=1
+        else:emit('rejected',1)
+    trace(web,'provider_collect_finish',{'provider':provider,'region':region['label'],'layout':requested,'detail_links':len(links),'accepted':accepted},stage='collector')
+
+
+def sumaity_collect(web,region,bounds,munis,emit):
+    return public_portal_collect(web,region,bounds,munis,emit,'スマイティ')
+
+
+def canary_collect(web,region,bounds,munis,emit):
+    return public_portal_collect(web,region,bounds,munis,emit,'カナリー')
+
+
+def athome_collect(web,region,bounds,munis,emit):
+    return public_portal_collect(web,region,bounds,munis,emit,'アットホーム')
+
+
+def chintai_collect(web,region,bounds,munis,emit):
+    return public_portal_collect(web,region,bounds,munis,emit,'CHINTAI')
+
+
+def comfy_collect(web,region,bounds,munis,emit):
+    return public_portal_collect(web,region,bounds,munis,emit,'Comfy')
+
+
+def apaman_collect(web,region,bounds,munis,emit):
+    return public_portal_collect(web,region,bounds,munis,emit,'アパマンショップ')
+
+
+PROVIDER_COLLECTORS={
+    'HOME’S':homes_collect,'SUUMO':suumo_collect,'スマイティ':sumaity_collect,'カナリー':canary_collect,
+    'アットホーム':athome_collect,'CHINTAI':chintai_collect,'Comfy':comfy_collect,'アパマンショップ':apaman_collect,
+}
+
+
+
 def search_all(db,conditions,screen,state=None):
     if state is None: state=st.session_state
     bounds=tuple(conditions['bounds']);started=time.monotonic()
@@ -1369,8 +1796,16 @@ def search_all(db,conditions,screen,state=None):
         log('地名取得完了｜'+search['conditions']['region_source']+'｜'+str(len(regions))+'地域')
         search['conditions']['regions']=[r['label'] for r in regions]
         state.new_regions=[r['label'] for r in regions]
+        conditions['providers']=list(dict.fromkeys(canonical_provider(p) for p in conditions['providers']))
         available={}
+        generic_providers=[]
         for provider in conditions['providers']:
+            if provider not in PROVIDER_COLLECTORS:
+                issues.append(provider+'｜未対応の取得元です。');audit.add('search_conditions','provider_unavailable','ERROR',{'provider':provider,'message':'collector not registered'});continue
+            if provider not in ('HOME’S','SUUMO'):
+                available[provider]=['ALL'];generic_providers.append(provider)
+                audit.add('search_conditions','provider_enabled','INFO',{'provider':provider,'layouts':list(LAYOUTS),'filter_mode':'one public town-list crawl + explicit detail layout verification'})
+                continue
             available[provider]=[]
             for layout in LAYOUTS:
                 try:single_layout_parameters(web,provider,layout);available[provider].append(layout)
@@ -1381,25 +1816,31 @@ def search_all(db,conditions,screen,state=None):
                     issues.append(provider+'｜'+layout+'｜単独検索条件がなく未検索です。')
                     audit.add('search_conditions','layout_unsupported','WARNING',{'provider':provider,'layout':layout,'message':str(exc)})
             if not available[provider] and not any(x.startswith(provider+'｜') for x in issues):issues.append(provider+'｜利用できる単独間取り条件がありません。')
-        jobs=[(r,'間取り別検索') for r in regions]
+        jobs=[(r,'取得元別検索') for r in regions]
         q=queue.Queue();active={};done=0;candidate=detail=rejected=0
         def work(index,region,unused):
-            # Each region finishes one layout at every provider before starting the next layout.
+            def run_provider(provider,search_layout,label):
+                DIAG_CONTEXT.audit=audit;DIAG_CONTEXT.scope={'task':index,'region':region['label'],'town':region['town'],'municipality_code':region['code'],'provider':provider,'search_layout':search_layout or 'ALL'}
+                def emit(kind,value):
+                    code=diagnosis_code(value) if kind=='issue' else 'accepted' if kind=='unit' else kind
+                    audit.add('collector',code,'ERROR' if kind=='issue' else 'INFO',{'event':kind,'value':value})
+                    q.put((index,kind,value))
+                emit('message',label+'｜'+provider+'｜検索を開始')
+                collector=PROVIDER_COLLECTORS[provider]
+                try:collector(web,dict(region,search_layout=search_layout),bounds,munis,emit)
+                except Exception as exc:
+                    trace(web,diagnosis_code(str(exc)),{'exception_type':type(exc).__name__,'traceback':traceback.format_exc()},'ERROR','collector_exception')
+                    emit('issue',label+'｜'+provider+'｜'+(str(exc) if isinstance(exc,AppError) else f'取得処理エラー（{type(exc).__name__}）'))
+                audit.add('collector','layout_loop_end','INFO',{'region':region['label'],'provider':provider,'layout':search_layout or 'ALL'})
+
+            # Generic portals expose mixed layouts on the town list: crawl each source once per town.
+            for provider in generic_providers:
+                if available.get(provider)==['ALL']:run_provider(provider,None,'対象8間取り')
+            # HOME’S/SUUMO retain their verified single-layout public-form workflow.
             for layout in LAYOUTS:
                 for provider in conditions['providers']:
-                    if layout not in available.get(provider,[]):continue
-                    DIAG_CONTEXT.audit=audit;DIAG_CONTEXT.scope={'task':index,'region':region['label'],'town':region['town'],'municipality_code':region['code'],'provider':provider,'search_layout':layout}
-                    def emit(kind,value):
-                        code=diagnosis_code(value) if kind=='issue' else 'accepted' if kind=='unit' else kind
-                        audit.add('collector',code,'ERROR' if kind=='issue' else 'INFO',{'event':kind,'value':value})
-                        q.put((index,kind,value))
-                    emit('message',layout+'｜'+provider+'｜単独検索を開始')
-                    collector=homes_collect if provider=='HOME’S' else suumo_collect
-                    try:collector(web,dict(region,search_layout=layout),bounds,munis,emit)
-                    except Exception as exc:
-                        trace(web,diagnosis_code(str(exc)),{'exception_type':type(exc).__name__,'traceback':traceback.format_exc()},'ERROR','collector_exception')
-                        emit('issue',layout+'｜'+provider+'｜'+(str(exc) if isinstance(exc,AppError) else f'取得処理エラー（{type(exc).__name__}）'))
-                    audit.add('collector','layout_loop_end','INFO',{'region':region['label'],'provider':provider,'layout':layout})
+                    if provider not in ('HOME’S','SUUMO') or layout not in available.get(provider,[]):continue
+                    run_provider(provider,layout,layout)
         with futures.ThreadPoolExecutor(max_workers=min(4,len(jobs))) as pool:
             pending={pool.submit(work,i,*job):i for i,job in enumerate(jobs)}
             completed=set()
@@ -1726,7 +2167,8 @@ def listing_card(r,persisted):
     price=f'{monthly_price(r)/10000:g}万円 / 月' if r.get('rent') else '家賃未確認'
     area=f"{r['area']:g}㎡" if r.get('area') else '面積未確認'
     age=f"築{r['age']}年" if r.get('age') is not None else '築年数未確認'
-    return '<div class="unit"><h3>'+html.escape(r['title'])+'</h3><b>'+price+'</b> · '+html.escape(r.get('layout') or '間取り未確認')+' · '+area+' · '+age+'<p>'+html.escape(r.get('address') or '')+'</p><p>'+html.escape(r.get('price_basis','管理費込み'))+' · '+html.escape(r.get('location_method') or '位置未確認')+'</p><a href="'+html.escape(r['listing_url'],quote=True)+'" target="_blank" rel="noopener">募集ページを開く ↗</a><p>'+('保存確認済み' if persisted else '保存未確認')+'</p></div>'
+    provider=PROVIDER_DISPLAY.get(canonical_provider(r.get('provider')),str(r.get('provider') or '取得元未確認'))
+    return '<div class="unit"><h3>'+html.escape(r['title'])+'</h3><b>'+price+'</b> · '+html.escape(r.get('layout') or '間取り未確認')+' · '+area+' · '+age+'<p>'+html.escape(r.get('address') or '')+'</p><p>'+html.escape(provider)+' · '+html.escape(r.get('price_basis','管理費込み'))+' · '+html.escape(r.get('location_method') or '位置未確認')+'</p><a href="'+html.escape(r['listing_url'],quote=True)+'" target="_blank" rel="noopener">募集ページを開く ↗</a><p>'+('保存確認済み' if persisted else '保存未確認')+'</p></div>'
 
 
 class IndividualRentPoints(MacroElement):
@@ -1836,8 +2278,10 @@ def capture_viewport():
 
 def remember_search():
     state=st.session_state
-    providers=list(state.get('new_providers',[]))
+    selected=list(state.get('new_providers',[]))
+    providers=list(dict.fromkeys(canonical_provider(p) for p in selected))
     bounds=state.get('new_bounds')
+    state.new_preferences={'new_providers':selected}
     if not providers or not bounds:
         state.new_search={'status':'failed','summary':{'issues':['地図の表示範囲と取得元を確認してください。'],'saved':0,'confirmed':0}}
         return
@@ -2033,10 +2477,18 @@ def main():
             south,west,north,east=bounds
             st.caption(f'検索する表示範囲：緯度 {south:.5f}〜{north:.5f}／経度 {west:.5f}〜{east:.5f}')
         else: st.info('地図の表示範囲を受信しています。表示後に地図を少し動かしてください。対象は東京と周辺地域です。')
-        providers=st.multiselect('物件の取得元',['HOME’S','SUUMO'],default=preferences.get('new_providers',['HOME’S','SUUMO']),key='new_providers')
+        saved_provider_defaults=preferences.get('new_providers',['HOMES','SUUMO'])
+        provider_defaults=[PROVIDER_DISPLAY.get(canonical_provider(x),x) for x in saved_provider_defaults]
+        provider_defaults=[x for x in dict.fromkeys(provider_defaults) if x in PROVIDER_OPTIONS] or ['HOMES','SUUMO']
+        if 'new_providers' in state:
+            current_provider_state=[PROVIDER_DISPLAY.get(canonical_provider(x),x) for x in list(state.get('new_providers',[]))]
+            current_provider_state=[x for x in dict.fromkeys(current_provider_state) if x in PROVIDER_OPTIONS]
+            if list(state.get('new_providers',[]))!=current_provider_state:state.new_providers=current_provider_state
+        providers=st.multiselect('物件の取得元（複数選択可）',list(PROVIDER_OPTIONS),default=provider_defaults,key='new_providers')
+        st.caption('スマイティ・HOMES・SUUMO・カナリー・アットホーム・CHINTAI・Comfy・アパマンショップから、使う取得元を1つ以上選択できます。')
         st.button('表示中の地名から全件検索・保存',type='primary',use_container_width=True,
                   on_click=remember_search,key='new_start',disabled=not bounds or not providers or bool(active_job() and not active_job().snapshot()['finished']))
-        st.caption('検索開始時の表示範囲を固定し、同じ地名・丁目で1K→1L→1DK→1LDK→2DK→2LDK→3DK→3LDKを1種類ずつ検索し、それぞれ掲載一覧を最後まで確認します。取得・保存・表示に件数上限や月額上限はありません。')
+        st.caption('検索開始時の表示範囲を固定します。HOMES・SUUMOは間取りを1種類ずつ、その他の取得元は町丁目の公開一覧を1回確認して対象8間取りだけを詳細ページで判定します。取得・保存・表示に件数上限や月額上限はありません。')
         background_status()
         result=state.new_search
         if result:
@@ -2067,7 +2519,7 @@ def main():
             with st.expander('取得できた情報をすべて表で見る（未確認も保持）'):
                 st.dataframe([{'物件名':r['title'],'間取り':r['layout'],'月額（万円）':monthly_price(r)/10000 if r.get('rent') else None,'面積':r['area'],
                                '築年数':r['age'],'掲載住所':r['address'],'地図判定住所':r['map_address'],'住所照合':r['address_match'],
-                               '取得元':r['provider'],'掲載ページ':r['listing_url']} for r in physical_units(rows)],hide_index=True,
+                               '取得元':PROVIDER_DISPLAY.get(canonical_provider(r.get('provider')),r.get('provider')),'掲載ページ':r['listing_url']} for r in physical_units(rows)],hide_index=True,
                              column_config={'掲載ページ':st.column_config.LinkColumn()})
     with tabs[1]:
         st.subheader('Supabaseに保存した物件')
