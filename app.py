@@ -37,7 +37,7 @@ import streamlit as st
 from streamlit_folium import st_folium
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v50"
+BUILD = "REBUILD-01-v51"
 PROVIDER_OPTIONS = ("スマイティ","HOMES","SUUMO","カナリー","アットホーム","CHINTAI","Comfy","アパマンショップ")
 PROVIDER_CANONICAL = {"HOMES":"HOME’S","HOME’S":"HOME’S","スマイティ":"スマイティ","SUUMO":"SUUMO","カナリー":"カナリー",
                       "アットホーム":"アットホーム","CHINTAI":"CHINTAI","Comfy":"Comfy","アパマンショップ":"アパマンショップ"}
@@ -3203,7 +3203,8 @@ def background_status():
 def capture_map_fragment():
     had_bounds=bool(st.session_state.get('new_bounds'))
     capture_viewport()
-    if not had_bounds and st.session_state.get('new_bounds'):st.rerun()
+    if not had_bounds and st.session_state.get('new_bounds'):
+        st.session_state['map_initial_bounds_ready']=True
 
 @st.fragment
 def interactive_rental_map(pins,cells,facilities):
@@ -3211,6 +3212,8 @@ def interactive_rental_map(pins,cells,facilities):
     st_folium(rental_map([],DEFAULT_CENTER,1500,[],[]),key='new_map',height=480,use_container_width=True,
         returned_objects=['bounds','zoom'],center=state.get('new_view_center',DEFAULT_CENTER),
         zoom=state.get('new_view_zoom',15),feature_group_to_add=rental_features(pins,cells,facilities),on_change=capture_map_fragment)
+    if state.pop('map_initial_bounds_ready',False):
+        st.rerun()
 
 
 def main():
@@ -3231,7 +3234,7 @@ def main():
     with tabs[0]:
         st.subheader('地図を動かして、探す地域を表示してください')
         st.caption('地図に見えている四角い範囲が検索対象です。駅名の選択や取得件数の上限はありません。')
-        st.caption('検索中も取得済みの物件を地図へ反映します。進捗と中断ボタンは地図のすぐ下に表示します。')
+        st.caption('検索中の取得済み物件は「取得済みデータを地図へ反映」で表示できます。進捗と中断ボタンは地図のすぐ下に表示します。')
         st.caption('保存する募集データは家賃・間取り・詳細住所（推定）・データ取得日時です。地図画像や緯度経度は保存しません。')
         selected_group=state.get('layout_display_group','group1')
         if selected_group not in DISPLAY_LAYOUT_GROUPS:selected_group='group1';state.layout_display_group='group1'
