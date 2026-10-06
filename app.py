@@ -19,6 +19,8 @@ import os
 import queue
 import re
 import statistics
+import tempfile
+import traceback
 import threading
 import time
 import unicodedata
@@ -26,13 +28,14 @@ import urllib.robotparser
 from datetime import datetime, timezone
 from urllib.parse import urlencode, urljoin, urlparse, parse_qs, quote
 
+from branca.element import MacroElement, Template
 import folium
 import requests
 import streamlit as st
 from streamlit_folium import st_folium
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v29"
+BUILD = "REBUILD-01-v31"
 DEFAULT_CENTER = (35.7303,139.711)
 UNIT_TABLE = "housing_units_v1"
 SEARCH_TABLE = "housing_searches_v1"
@@ -312,6 +315,8 @@ class Database:
             response=self.session.request(method,self.url+'/rest/v1/'+table,params=params,json=data,
                                           headers=headers,timeout=(4,15),allow_redirects=False)
         except requests.RequestException: raise AppError('Supabaseに接続できません。検索結果は画面に保持されます。') from None
+        if getattr(self,'audit',None) and not getattr(self,'_saving_audit',False):
+            self.audit.add('database','db_response','INFO' if 200<=response.status_code<300 else 'ERROR',{'method':method,'table':table,'status':response.status_code,'bytes':len(response.content)})
         if response.status_code in (401,403): raise AppError('SupabaseのSecret key・権限を確認してください。')
         if response.status_code==404: raise AppError('新しい保存テーブルがありません。「初期設定」のSQLを実行してください。')
         if not 200<=response.status_code<300: raise AppError(f'Supabase処理失敗（HTTP {response.status_code}）。「初期設定」のSQL・接続先を確認してください。')
@@ -382,9 +387,21 @@ class Database:
             offset+=len(rows)
         return out
     def history(self):
-        rows=self.call('GET',SEARCH_TABLE,{'namespace':'eq.'+self.namespace,'select':'*','order':'started_at.desc','limit':20})
+        rows=self.call('GET',SEARCH_TABLE,{'namespace':'eq.'+self.namespace,'select':'*','order':'started_at.desc','limit':20,'status':'neq.diagnostic_log'})
         if not isinstance(rows,list): raise AppError('検索履歴を読み取れません。')
         return rows
+
+    def load_diagnostics(self,search_id):
+        if not re.fullmatch(r'[0-9a-f]{64}',search_id): raise AppError('検索IDを確認してください。')
+        events=[];offset=0
+        while True:
+            rows=self.call('GET',SEARCH_TABLE,{'namespace':'eq.'+self.namespace,'select':'id,summary','id':'like.'+search_id+'.log.*',
+                                              'status':'eq.diagnostic_log','order':'id.asc','limit':300,'offset':offset})
+            if not isinstance(rows,list):raise AppError('保存ログの形式を確認できません。')
+            if not rows:break
+            for row in rows:events.extend(row.get('summary',{}).get('events',[]))
+            offset+=len(rows)
+        return events
 
 
 class PublicWeb:
@@ -409,9 +426,11 @@ class PublicWeb:
                     raise AppError('取得先が別のページに移動しました。')
                 response=self.session().get(target,headers=self.headers,timeout=(4,12),allow_redirects=False)
             response.raise_for_status()
-        except requests.Timeout: raise AppError(f'{u.hostname}：接続または応答がタイムアウトしました。') from None
+        except requests.Timeout as exc:
+            error=AppError(f'{u.hostname}：接続または応答がタイムアウトしました。');error.diagnostic={'exception_type':type(exc).__name__,'reason':str(exc)[:1000]};raise error from None
         except requests.HTTPError as exc: raise AppError(f'{u.hostname}：HTTP {exc.response.status_code}（公開ページの取得失敗）。') from None
-        except requests.ConnectionError: raise AppError(f'{u.hostname}：接続できません（DNS・ネットワーク・接続先を確認）。') from None
+        except requests.ConnectionError as exc:
+            error=AppError(f'{u.hostname}：接続できません（DNS・ネットワーク・接続先を確認）。');error.diagnostic={'exception_type':type(exc).__name__,'reason':str(exc)[:1000]};raise error from None
         except requests.RequestException: raise AppError(f'{u.hostname}：通信処理に失敗しました。') from None
         if len(response.content)>8000000: raise AppError('公開ページの容量が上限を超えました。')
         response.encoding='utf-8' if 'gsi.go.jp' in u.hostname else response.apparent_encoding or 'utf-8'
@@ -426,8 +445,46 @@ class PublicWeb:
                 if 'HTTP 404' in str(exc): parser=urllib.robotparser.RobotFileParser();parser.parse([])
                 else: raise AppError('自動取得ルールを確認できません：'+str(exc)) from None
             with self.lock: self.robots[root]=parser
-        return parser.can_fetch(self.headers['User-Agent'],url)
+        permitted=parser.can_fetch(self.headers['User-Agent'],url)
+        trace(self,'robots_allowed' if permitted else 'http_403',{'url':url,'rule_source':root+'/robots.txt','permitted':permitted},'INFO' if permitted else 'WARNING','robots')
+        return permitted
 
+
+
+_original_public_fetch=PublicWeb.fetch
+def audited_public_fetch(self,url,method='GET',**kwargs):
+    started=time.monotonic()
+    details={'url':url,'method':method,'parameters':kwargs.get('params',kwargs.get('data',{}))}
+    try:
+        response=_original_public_fetch(self,url,method,**kwargs)
+        details.update(status=response.status_code,elapsed_ms=round((time.monotonic()-started)*1000),bytes=len(response.content),
+                       content_type=response.headers.get('Content-Type',''),response_url=response.url,
+                       response_sha256=hashlib.sha256(response.content).hexdigest())
+        if 'html' in details['content_type'].lower():
+            soup=BeautifulSoup(response.text,'html.parser');title=soup.select_one('title')
+            details['page_title']=title.get_text(' ',strip=True)[:120] if title else ''
+            details['selectors']={q:len(soup.select(q)) for q in ('div.cassetteitem','tr.js-cassette_link','script[type="application/ld+json"]','th','dt','a[href]')}
+        trace(self,'http_ok',details,stage='http');return response
+    except Exception as exc:
+        details.update(elapsed_ms=round((time.monotonic()-started)*1000),exception_type=type(exc).__name__,technical_exception=getattr(exc,'diagnostic',{}),message=str(exc) if isinstance(exc,AppError) else '応答処理失敗')
+        match=re.search(r'HTTP (\d{3})',details['message']);details['status']=int(match[1]) if match else None
+        trace(self,diagnosis_code(details['message']),details,'ERROR','http');raise
+PublicWeb.fetch=audited_public_fetch
+
+_original_db_call=Database.call
+def audited_db_call(self,method,table,params=None,data=None,prefer=None):
+    audit=getattr(self,'audit',None);started=time.monotonic()
+    details={'method':method,'table':table,'row_count':len(data) if isinstance(data,list) else None}
+    try:
+        result=_original_db_call(self,method,table,params,data,prefer)
+        details.update(elapsed_ms=round((time.monotonic()-started)*1000),returned_rows=len(result) if isinstance(result,list) else None)
+        if audit and not getattr(self,'_saving_audit',False):audit.add('database','db_ok','INFO',details)
+        return result
+    except Exception as exc:
+        details.update(elapsed_ms=round((time.monotonic()-started)*1000),message=str(exc) if isinstance(exc,AppError) else type(exc).__name__)
+        if audit and not getattr(self,'_saving_audit',False):audit.add('database','save','ERROR',details)
+        raise
+Database.call=audited_db_call
 
 def safe_url(url,provider):
     try:
@@ -452,6 +509,7 @@ def reverse(web,point,munis):
     data=web.fetch('https://mreversegeocoder.gsi.go.jp/reverse-geocoder/LonLatToAddress',
                    params={'lat':point[0],'lon':point[1]}).json().get('results',{})
     code=str(data.get('muniCd',''));town=str(data.get('lv01Nm',''))
+    trace(web,'reverse_result' if code and town and code in munis else 'parse',{'point':point,'municipality_code':code,'town':town,'known_municipality':code in munis},stage='geography')
     if not code or not town or code not in munis: return None
     pref,prefecture,city=munis[code]
     return dict(code=code,pref=pref,town=town,label=prefecture+city+town,point=point)
@@ -508,7 +566,8 @@ CATALOG_LOCK=threading.Lock()
 
 def catalog_json(web,url):
     with CATALOG_LOCK: cached=CATALOG_CACHE.get(url)
-    if cached and time.monotonic()-cached[0]<86400: return cached[1]
+    if cached and time.monotonic()-cached[0]<86400:
+        trace(web,'cache_hit',{'url':url,'age_seconds':round(time.monotonic()-cached[0])},stage='geography');return cached[1]
     try: data=web.fetch(url).json()
     except ValueError: raise AppError('町丁目データのJSONを読み取れません。') from None
     if not isinstance(data,dict) or not isinstance(data.get('data'),list): raise AppError('町丁目データの形式が不正です。')
@@ -614,7 +673,9 @@ def coordinate(soup,text,hint=None):
 
 
 def locate(web,soup,text,address,bounds,munis,hint=None):
-    candidates=[p for p in coordinate(soup,text,hint) if in_rectangle(p[:2],bounds)]
+    all_coordinates=coordinate(soup,text,hint)
+    candidates=[p for p in all_coordinates if in_rectangle(p[:2],bounds)]
+    trace(web,'location_candidates',{'address':address,'bounds':bounds,'all_candidates':all_coordinates,'in_bounds_candidates':candidates},stage='location')
     method=''
     if candidates:
         lat,lng,method,_=max(candidates,key=lambda p:(p[3],-meters(bounds_center(bounds),p[:2])))
@@ -628,19 +689,24 @@ def locate(web,soup,text,address,bounds,munis,hint=None):
                 if in_rectangle((lat,lng),bounds) and title and (address_key(title) in address_key(address) or address_key(address) in address_key(title)):
                     candidates.append((lat,lng))
             except (TypeError,ValueError,KeyError): continue
-        if not candidates: return None
+        if not candidates:
+            trace(web,'location',{'address':address,'reason':'住所検索に一致する範囲内座標なし'},'WARNING','location');return None
         lat,lng=candidates[0];method='住所検索（掲載座標なし）'
-    else: return None
+    else:
+        trace(web,'outside' if all_coordinates else 'location',{'address':address,'reason':'範囲内の掲載座標なし・番地のある住所なし'},'WARNING','location');return None
     try: region=reverse(web,(lat,lng),munis)
     except Exception: region=None
     map_address=region['label'] if region else ''
     a,b=address_key(address),address_key(map_address)
     if region and a:
         town_base=re.sub(r'\d+丁目$','',address_key(region['town']))
-        if town_base and town_base not in a: return None
+        if town_base and town_base not in a:
+            trace(web,'address',{'listing_address':address,'map_address':map_address,'town_base':town_base},'WARNING','location');return None
     match='未判定' if not a or not b else '一致' if a in b or b in a else '一部一致' if os.path.commonprefix([a,b]) and len(os.path.commonprefix([a,b]))>=5 else '不一致'
     # A known address conflict is not treated as a verified building location.
-    if match=='不一致': return None
+    if match=='不一致':
+        trace(web,'address',{'listing_address':address,'map_address':map_address,'match':match},'WARNING','location');return None
+    trace(web,'location_unverified' if match=='未判定' else 'location_ok',{'listing_address':address,'map_address':map_address,'match':match,'method':method,'point':[lat,lng]},'WARNING' if match=='未判定' else 'INFO','location')
     return dict(latitude=lat,longitude=lng,location_method=method,map_address=map_address,address_match=match)
 
 
@@ -648,7 +714,9 @@ def create_unit(provider,url,title,address,layout,rent,fees,area,floor,age,built
     row=dict(key=hashlib.sha256(url.encode()).hexdigest(),title=str(title or '掲載物件')[:200],address=str(address or '')[:200],
              layout=normal(layout),rent=rent,fees=fees,area=area,floor=str(floor or '')[:80],structure='SRC',age=age,
              built_ym=built_ym,provider=provider,listing_url=url,fetched_at=utc_now(),**location)
-    return row if valid_unit(row) else None
+    if not valid_unit(row):
+        trace(None,'parse',{'reason':'constructed_unit_validation_failed','observed_fields':row},'WARNING','validation');return None
+    return row
 
 
 def homes_detail(web,url,bounds,munis,hint):
@@ -665,9 +733,12 @@ def homes_detail(web,url,bounds,munis,hint):
             attrs={x.get('name'):x.get('value') for x in entity.get('additionalProperty',[]) if isinstance(x,dict)}
             if attrs.get('間取り') and (attrs.get('建物構造') or attrs.get('構造')): recognized=True
             costs={x.get('name'):x.get('value') for x in offer.get('additionalProperty',[]) if isinstance(x,dict)}
-            if not is_src(attrs.get('建物構造') or attrs.get('構造') or labeled(soup,('建物構造','構造'))): continue
+            structure=attrs.get('建物構造') or attrs.get('構造') or labeled(soup,('建物構造','構造'))
+            if not is_src(structure):
+                trace(web,'structure',{'url':url,'structure':structure});continue
             age,ym=age_info(attrs.get('築年月') or attrs.get('築年数') or labeled(soup,('築年月','築年数')))
-            if age is None or not 0<=age<=20 or normal(attrs.get('間取り')) not in LAYOUTS: continue
+            if age is None or not 0<=age<=20 or normal(attrs.get('間取り')) not in LAYOUTS:
+                trace(web,'layout' if normal(attrs.get('間取り')) not in LAYOUTS else 'age',{'url':url,'layout':attrs.get('間取り'),'age':age,'raw_age':attrs.get('築年月') or attrs.get('築年数')});continue
             fees=costs.get('管理費等',costs.get('管理費'))
             if fees is None: raise AppError('HOME’S詳細ページの管理費を読み取れません。保存額を確認できません。')
             addr=entity.get('address') or {}
@@ -686,7 +757,8 @@ def homes_detail(web,url,bounds,munis,hint):
     if not structure or not layout:
         raise AppError('HOME’S詳細ページの構造・間取りを読み取れません。募集終了またはページ形式の変更を確認してください。')
     age,ym=age_info(labeled(soup,('築年月','築年数')))
-    if not is_src(structure) or layout not in LAYOUTS or age is None or not 0<=age<=20: return None
+    if not is_src(structure) or layout not in LAYOUTS or age is None or not 0<=age<=20:
+        trace(web,'structure' if not is_src(structure) else 'layout' if layout not in LAYOUTS else 'age',{'url':url,'structure':structure,'layout':layout,'age':age});return None
     rent=labeled(soup,('賃料','家賃'));fees=labeled(soup,('管理費等','管理費','管理費・共益費'))
     address=labeled(soup,('所在地','住所'));area=labeled(soup,('専有面積','面積'))
     if not rent or not fees or not area: raise AppError('HOME’S詳細の賃料・管理費・面積を読み取れません。')
@@ -725,7 +797,9 @@ def homes_collect(web,region,bounds,munis,emit):
                 try:
                     lat,lng=float(row['lat']),float(row['lon']);key=str(row['tykey'])
                     if re.fullmatch(r'[A-Za-z0-9]+',key) and in_rectangle((lat,lng),bounds): buildings[key]=(lat,lng)
-                except (ValueError,TypeError,KeyError): continue
+                except (ValueError,TypeError,KeyError) as exc:
+                    trace(web,'parse',{'reason':'map_row_coordinates_or_building_key','exception_type':type(exc).__name__,'fields':{k:row.get(k) for k in ('lat','lon','tykey')} if isinstance(row,dict) else str(row)},'WARNING')
+    trace(web,'map_candidates' if buildings else 'empty',{'region':region,'tile_count':len(tiles),'building_candidates':len(buildings)},stage='collector')
     emit('candidate',len(buildings));links={}
     for i,(key,point) in enumerate(sorted(buildings.items(),key=lambda x:meters(region['point'],x[1])),1):
         emit('message',f'建物候補の確認 {i}/{len(buildings)}')
@@ -734,6 +808,7 @@ def homes_collect(web,region,bounds,munis,emit):
         for a in BeautifulSoup(text,'html.parser').select('a[href]'):
             url=urljoin('https://www.homes.co.jp',a['href']).split('#')[0]
             if safe_url(url,'HOME’S'): links[url]=point
+    trace(web,'detail_links' if links else 'empty',{'region':region,'building_count':len(buildings),'detail_links':len(links)},stage='collector')
     accepted=0
     for index,(url,hint) in enumerate(links.items(),1):
         emit('message',f'詳細確認 {index}/{len(links)}件');emit('detail',1)
@@ -756,9 +831,10 @@ def suumo_collect(web,region,bounds,munis,emit):
                 text=web.fetch(url).text;soup=BeautifulSoup(text,'html.parser')
                 structure=labeled(soup,('構造','建物構造'))
                 age,ym=age_info(labeled(soup,('築年月','築年数')))
+                trace(web,'detail_fields',{'url':url,'structure':structure,'raw_built':labeled(soup,('築年月','築年数')),'age':age,'built_ym':ym,'listing_address':values[1],'layout':values[2]},stage='parser')
                 if not structure or age is None: raise AppError('SUUMO詳細ページの構造・築年月を読み取れません。募集終了またはページ形式の変更を確認してください。')
                 if not is_src(structure) or not 0<=age<=20:
-                    emit('rejected',1);continue
+                    trace(web,'structure' if not is_src(structure) else 'age',{'url':url,'structure':structure,'age':age,'built_ym':ym});emit('rejected',1);continue
                 location=locate(web,soup,text,values[1],bounds,munis)
                 row=create_unit('SUUMO',url,*values,labeled(soup,('階建','所在階')),age,ym,location) if location else None
                 if row: emit('unit',row)
@@ -780,24 +856,33 @@ def suumo_collect(web,region,bounds,munis,emit):
             def text(selector,default=''):
                 el=building.select_one(selector);return el.get_text(' ',strip=True) if el else default
             address=text('.cassetteitem_detail-col1')
-            if address_key(region['town']) not in address_key(address): continue
+            if address_key(region['town']) not in address_key(address):
+                trace(web,'address',{'town':region['town'],'listing_address':address,'page':page},'WARNING');continue
             title=text('.cassetteitem_content-title','SUUMO掲載物件')
             for room in building.select('tr.js-cassette_link'):
                 def field(selector):
                     el=room.select_one(selector);return el.get_text(' ',strip=True) if el else ''
                 layout=field('.cassetteitem_madori')
+                trace(web,'room_fields',{'page':page,'title':title,'address':address,'layout':layout,'raw_rent':field('.cassetteitem_price--rent'),'raw_fees':field('.cassetteitem_price--administration'),'raw_area':field('.cassetteitem_menseki')},stage='parser')
                 link=room.select_one('a[href*="/chintai/"]')
-                if layout not in LAYOUTS or not link or room.select_one('.cassetteitem_price--administration') is None: continue
+                if layout not in LAYOUTS:
+                    trace(web,'layout',{'layout':layout,'address':address,'page':page});continue
+                if not link or room.select_one('.cassetteitem_price--administration') is None:
+                    trace(web,'parse',{'missing':'detail_link_or_management_fee','address':address,'page':page},'WARNING');continue
                 url=urljoin('https://suumo.jp',link['href']).split('#')[0]
-                if not safe_url(url,'SUUMO') or url in candidates: continue
+                if not safe_url(url,'SUUMO') or url in candidates:
+                    trace(web,'duplicate' if url in candidates else 'parse',{'url':url,'page':page});continue
                 try:
                     match=re.search(r'\d+(?:\.\d+)?',normal(field('.cassetteitem_menseki')))
-                    if not match: continue
+                    if not match:
+                        trace(web,'parse',{'url':url,'missing':'area','raw':field('.cassetteitem_menseki')},'WARNING');continue
                     rent=amount(field('.cassetteitem_price--rent'));fees=amount(field('.cassetteitem_price--administration'))
-                    if rent<=0: continue
+                    if rent<=0:
+                        trace(web,'parse',{'url':url,'invalid_rent':rent},'WARNING');continue
                     candidates[url]=(title,address,layout,rent,fees,float(match[0]))
                     page_candidates[url]=candidates[url]
-                except AppError: continue
+                except AppError as exc:
+                    trace(web,'parse',{'url':url,'message':str(exc)},'WARNING');continue
         emit('candidate',len(page_candidates));verify_page(page_candidates)
         next_pages=[]
         for a in soup.select('a[href]'):
@@ -806,23 +891,31 @@ def suumo_collect(web,region,bounds,munis,emit):
             try: number=int(parse_qs(target.query).get('page',['0'])[0])
             except ValueError: continue
             if number>page: next_pages.append(number)
-        if not next_pages: break
+        trace(web,'page_end',{'page':page,'buildings':len(buildings),'new_candidates':len(page_candidates),'next_pages':sorted(set(next_pages)),'terminal':not next_pages},stage='pagination')
+        if not next_pages:
+            if not candidates:trace(web,'empty',{'region':region,'pages':page,'reason':'取得した一覧に対象候補なし'},stage='collector')
+            break
         page=min(next_pages)
 
 
 def search_all(db,conditions,screen,state=None):
     if state is None: state=st.session_state
     bounds=tuple(conditions['bounds']);started=time.monotonic()
-    search=dict(id=hashlib.sha256((utc_now()+str(time.time_ns())).encode()).hexdigest(),status='started',
+    audit=getattr(state,'audit',None) or AuditLog(conditions,(getattr(db,'key',''),));state.audit=audit;db.audit=audit
+    DIAG_CONTEXT.audit=audit;DIAG_CONTEXT.scope={}
+    search=dict(id=audit.search_id,status='started',
                 started_at=utc_now(),finished_at=None,conditions=conditions,summary={})
     units={};saved=set();issues=[];logs=[]
     def log(message):
+        audit.add('progress',diagnosis_code(message) if 'エラー' in message or '失敗' in message else 'progress','INFO',{'message':message})
         logs.append(f"{datetime.now().strftime('%H:%M:%S')}  {message}")
         screen['log'].code('\n'.join(logs[-15:]),language=None)
     screen['status'].info('検索実行中｜保存先の接続・新しいテーブルを確認しています')
     db.check();db.save_search(search);log('保存先確認OK。新しい検索を開始しました。')
-    web=PublicWeb()
+    web=PublicWeb();web.audit=audit
     def region_update(stage,done,total,count,errors):
+        if done and done==total:audit.add('geography','region_progress','INFO',{'stage':stage,'done':done,'total':total,'regions':count,'failures':errors})
+        audit.persist(db)
         if stage.startswith('地名取得先を切替'): log(stage)
         screen['bar'].progress(.05+.15*done/max(1,total),text=f'{stage} {done}/{total}')
         screen['status'].info(f'検索実行中｜{stage} {done}/{total}｜{count}地域｜取得失敗 {errors}件｜経過 {int(time.monotonic()-started)}秒')
@@ -837,16 +930,23 @@ def search_all(db,conditions,screen,state=None):
         jobs=[(r,p) for r in regions for p in conditions['providers']]
         q=queue.Queue();active={};done=0;candidate=detail=rejected=0
         def work(index,region,provider):
-            def emit(kind,value): q.put((index,kind,value))
+            DIAG_CONTEXT.audit=audit;DIAG_CONTEXT.scope={'task':index,'region':region['label'],'town':region['town'],'municipality_code':region['code'],'provider':provider}
+            def emit(kind,value):
+                code=diagnosis_code(value) if kind=='issue' else 'accepted' if kind=='unit' else kind
+                audit.add('collector',code,'ERROR' if kind=='issue' else 'INFO',{'event':kind,'value':value})
+                q.put((index,kind,value))
             emit('message','候補検索を開始')
             collector=homes_collect if provider=='HOME’S' else suumo_collect
             try: collector(web,region,bounds,munis,emit)
-            except Exception as exc: emit('issue',str(exc) if isinstance(exc,AppError) else f'取得処理エラー（{type(exc).__name__}）')
+            except Exception as exc:
+                trace(web,diagnosis_code(str(exc)),{'exception_type':type(exc).__name__,'traceback':traceback.format_exc()},'ERROR','collector_exception')
+                emit('issue',str(exc) if isinstance(exc,AppError) else f'取得処理エラー（{type(exc).__name__}）')
         with futures.ThreadPoolExecutor(max_workers=min(4,len(jobs))) as pool:
             pending={pool.submit(work,i,*job):i for i,job in enumerate(jobs)}
             completed=set()
             while pending or not q.empty():
                 ready,_=futures.wait(pending,timeout=.35,return_when=futures.FIRST_COMPLETED) if pending else (set(),set())
+                audit.persist(db)
                 batch=[]
                 while True:
                     try: index,kind,value=q.get_nowait()
@@ -880,15 +980,161 @@ def search_all(db,conditions,screen,state=None):
     except Exception as exc:
         search['status']='failed';issues.append(str(exc) if isinstance(exc,AppError) else f'検索エラー（{type(exc).__name__}）')
         search['summary']={'confirmed':len(units),'saved':len(saved),'issues':issues,'elapsed':int(time.monotonic()-started)}
+    display=conditions.get('display',{});display_group=display.get('group','1LDK・2DK');display_budget=display.get('budget',50.)
+    map_rows=[r for r in units.values() if r['layout'] in GROUPS.get(display_group,LAYOUTS)]
+    map_cells=mesh(map_rows,bounds_center(bounds),bounds_radius(bounds),False,bounds)
+    audit.add('map','data_ready','INFO',{'display_at_search_start':display,'confirmed_units':len(units),'group_units':len(map_rows),'within_budget_units':sum(r['rent']+r['fees']<=display_budget*10000 for r in map_rows),'colored_cells':len(map_cells),'bands':[sum(rent_color(v['price'])==color for v in map_cells) for color in COLORS],'background_tile':'GSI standard map, grayscale base pane; rent overlay retains band colors','no_data_color':False,'monotone_base':True})
+    screen['status'].info('検索が終了しました。詳細作業ログをSupabaseへ保存しています。')
+    audit.add('search','finish','INFO',{'status':search['status'],'summary':search['summary']})
+    audit.persist(db,force=True)
+    search['summary']['diagnostics']={'search_id':audit.search_id,'events':audit.count,'persisted_events':audit.persisted_events}
     search['finished_at']=utc_now()
     try: db.save_search(search)
     except AppError as exc: issues.append('検索履歴｜'+str(exc));search['summary']['issues']=issues;search['status']='partial'
+    audit.persist(db,force=True)
     screen['bar'].progress(1.,text='検索処理が終了しました')
     state.new_units=list(units.values())
     state.new_search=search
     state.new_saved_keys=list(saved)
     return search
 
+
+# Detailed diagnostics are independent of UI and retained in Supabase search-log chunks.
+DIAG_CONTEXT=threading.local()
+
+DIAG_ADVICE={
+ 'timeout':('接続または応答の時間超過','同じURLをブラウザで確認し、サービス障害とStreamlitからの通信制限を切り分ける。正常時の応答時間を測ってからタイムアウトと同時接続数を調整する。'),
+ 'http_403':('公開先がアクセスを拒否','自動取得の許可と公開データ/APIの提供有無を確認する。拒否を回避する処理は追加しない。'),
+ 'http_429':('取得先の要求回数制限','同じ自治体・ページの重複要求を減らし、キャッシュと取得間隔を導入する。Retry-Afterがあればその値に従う。'),
+ 'http_404':('対象のURL・データが存在しない','掲載終了とAPI・タイルURL変更を区別する。現行の公開ページ・公式仕様とURLを照合する。'),
+ 'http_5xx':('取得先のサーバーエラー','発生時刻とURLを確認して障害を切り分け、復旧後に失敗したタスクだけを再検証する。'),
+ 'network':('接続・DNS・TLSの問題の可能性','同一ホストの複数URLと別ホストの結果を比較する。StreamlitログでDNS/TLS・外向き通信を確認する。'),
+ 'parse':('掲載情報の形式を読み取れない','HTTP成功時のページタイトル・ハッシュ・検出件数と現行HTML/JSONを照合し、項目名・セレクタ・ページ送りを修正して同じ例で再検証する。'),
+ 'structure':('SRC条件による除外','実際の構造表記とSRC判定を照合する。RC等の正しい除外と表記ゆれの誤判定を分ける。'),
+ 'age':('築年数条件または築年月の読取','築年月の元表記・解析値・実行日を照合する。築20年超は仕様上の除外であり取得失敗とは扱わない。'),
+ 'layout':('間取り条件または表記の不一致','間取りの元表記を確認し、空白・全角・括弧等を正規化する。対象外間取りは仕様上の除外とする。'),
+ 'address':('地名・住所の照合で不一致','丁目の漢数字・数字、町名表記、市区名の変換を照合する。実際の掲載座標との比較で誤除外がないか確認する。'),
+ 'location':('掲載座標・住所の位置を確認できない','掲載地図・JSON-LD・住所検索の各候補と表示範囲を比較する。番地や掲載座標がない物件を架空座標で補完しない。'),
+ 'outside':('物件が検索開始時の表示範囲外','ログの固定表示範囲と掲載座標を比較する。範囲内の物件を落とす場合は座標順序・境界の判定を修正する。'),
+ 'save':('Supabaseの保存または保存確認の失敗','物件確認数と保存確認数を比較し、キー・テーブル・権限・HTTP応答を確認する。未保存物件の再保存で復旧を検証する。'),
+ 'empty':('取得元の一覧に候補がない','地名・自治体コード・検索パラメータをログのURLで照合する。手動検索の件数と比較し、真の0件と検索条件/解析の誤りを区別する。'),
+ 'location_unverified':('掲載座標はあるが住所照合は未判定','地名照合サービスの失敗ログを確認する。掲載座標と実際の建物位置を手動で照合し、未判定を位置確認済みとして評価しない。'),
+ 'unknown':('現時点で理由を特定できない','前後の通信・解析・除外イベントを照合する。再現URLと読取項目を追加してから修正する。原因を断定しない。')}
+
+def diagnosis_code(message):
+    text=str(message)
+    for needle,code in [('タイムアウト','timeout'),('HTTP 403','http_403'),('HTTP 429','http_429'),('HTTP 404','http_404')]:
+        if needle in text:return code
+    if re.search(r'HTTP 5\d\d',text):return 'http_5xx'
+    if 'Supabase' in text or '保存' in text or '権限' in text:return 'save'
+    if any(x in text for x in ('形式','読み取','JSON','ページ送り')):return 'parse'
+    if any(x in text for x in ('接続','通信','DNS')):return 'network'
+    return 'unknown'
+
+class AuditLog:
+    def __init__(self,conditions,secrets=()):
+        fd,self.path=tempfile.mkstemp(prefix='sumai-log-',suffix='.jsonl');os.close(fd)
+        self.lock=threading.RLock();self.count=0;self.offset=0;self.chunk=0;self.last_save=0.;self.persisted_events=0
+        self.storage_error=None;self.search_id=hashlib.sha256(os.urandom(32)).hexdigest();self.secrets=tuple(str(v) for v in secrets if v)
+        self.add('search','start','INFO',{'build':BUILD,'bounds':conditions.get('bounds'),'providers':conditions.get('providers'),'filters':{'structure':'SRC','max_age':20,'layouts':list(LAYOUTS)},'property_limit':None})
+    def clean(self,value):
+        if isinstance(value,dict):return {str(k):('[REDACTED]' if re.search(r'^(?:key|apikey|api_key|token|access_token|authorization|cookie|password|secret|SUPABASE_.*KEY)$',str(k),re.I) else self.clean(v)) for k,v in value.items()}
+        if isinstance(value,(list,tuple)):return [self.clean(x) for x in value]
+        if isinstance(value,str):
+            for secret in self.secrets:value=value.replace(secret,'[REDACTED]')
+            value=re.sub(r'(sb_secret_[\w-]+|eyJ[\w-]+\.[\w-]+\.[\w-]+)', '[REDACTED]',value)
+            value=re.sub(r'(?i)([?&](?:apikey|key|token|password|secret)=)[^&\s]+',r'\1[REDACTED]',value)
+            return value
+        if isinstance(value,float) and not math.isfinite(value):return str(value)
+        return value
+    def add(self,stage,code,level='INFO',details=None):
+        cause,advice=DIAG_ADVICE.get(code,('進行・確認結果',''))
+        with self.lock:
+            self.count+=1
+            context=getattr(DIAG_CONTEXT,'scope',{})
+            event=self.clean(dict(seq=self.count,time=utc_now(),search_id=self.search_id,stage=stage,code=code,level=level,
+                                 context=context,details=details or {},observed=cause,improvement=advice))
+            with open(self.path,'a',encoding='utf-8') as f:f.write(json.dumps(event,ensure_ascii=False,allow_nan=False)+'\n')
+    def records(self):
+        with self.lock:
+            with open(self.path,encoding='utf-8') as f:return [json.loads(line) for line in f if line.strip()]
+    def persist(self,db,force=False):
+        if not force and time.monotonic()-self.last_save<30:return
+        self.last_save=time.monotonic()
+        while True:
+            with self.lock:
+                with open(self.path,encoding='utf-8') as f:
+                    f.seek(self.offset);events=[]
+                    for _ in range(200):
+                        line=f.readline()
+                        if not line:break
+                        events.append(json.loads(line))
+                    end=f.tell()
+            if not events:
+                self.storage_error=None;return
+            row=dict(id=f'{self.search_id}.log.{self.chunk:08d}',status='diagnostic_log',started_at=events[0]['time'],finished_at=events[-1]['time'],
+                     conditions={'search_id':self.search_id,'build':BUILD,'chunk':self.chunk},summary={'events':events})
+            try:
+                db._saving_audit=True;db.save_search(row)
+            except Exception as exc:
+                self.storage_error=str(exc) if isinstance(exc,AppError) else type(exc).__name__
+                self.add('log_storage','save','ERROR',{'message':self.storage_error,'local_download_available':True});return
+            finally:db._saving_audit=False
+            self.offset=end;self.chunk+=1;self.persisted_events+=len(events)
+            if not force:
+                self.storage_error=None;return
+
+
+def trace(web,code,details=None,level='INFO',stage='parser'):
+    audit=getattr(web,'audit',None) or getattr(DIAG_CONTEXT,'audit',None)
+    if audit:audit.add(stage,code,level,details)
+
+
+def diagnostic_report(events):
+    counts={};examples={}
+    for e in events:
+        if e.get('code') in DIAG_ADVICE:
+            c=e['code'];counts[c]=counts.get(c,0)+1;examples.setdefault(c,e)
+    lines=['住まいコンパス 詳細作業ログ・改善レポート',f"アプリ版：{next((e.get('details',{}).get('build') for e in events if e.get('code')=='start'),BUILD)}｜イベント数：{len(events)}",
+           '事実と改善案を分けています。改善案は調査・修正候補であり、原因の確定や修正済みを意味しません。',
+           '取得精度の評価には正解データとの照合が必要です。このログの確認/保存件数だけでは正確性・網羅性を保証しません。','', '原因別の観測と次の改善：']
+    for code,count in sorted(counts.items(),key=lambda x:-x[1]):
+        cause,advice=DIAG_ADVICE[code];lines.extend([f'・{cause}：{count}イベント',f'  改善候補：{advice}',f'  根拠例：{json.dumps(examples[code].get("details",{}),ensure_ascii=False)}'])
+    lines.extend(['','改善後の確認手順：同じ固定範囲・取得元で再検索し、地名数、候補数、詳細確認数、理由別除外数、座標未判定数、保存確認数を比較する。',
+                  '手動検索で見つかる実在物件のURLを数件用意し、このログで取得・除外・未検出の経路を確認する。','', '詳細イベント（UTC・通番・取得元/地名・通信/解析/除外・改善案）：'])
+    for e in events:lines.append(json.dumps(e,ensure_ascii=False))
+    return ('\n'.join(lines)+'\n').encode('utf-8-sig')
+
+
+
+def log_metrics(events):
+    counts={}
+    for e in events:
+        code=e.get('code','unknown');counts[code]=counts.get(code,0)+1
+    finishes=[e for e in events if e.get('code')=='finish']
+    summary=finishes[-1].get('details',{}).get('summary',{}) if finishes else {}
+    for key in ('candidate','detail','rejected','confirmed','saved'):counts['件数:'+key]=summary.get(key,0)
+    return counts
+
+
+def compare_logs(old,new):
+    a,b=log_metrics(old),log_metrics(new)
+    return [{'項目':key,'前回':a.get(key,0),'今回':b.get(key,0),'差分':b.get(key,0)-a.get(key,0)} for key in sorted(set(a)|set(b))]
+
+def diagnostic_downloads(events,prefix='current'):
+    if not events:return
+    export_key=(events[0].get('search_id'),len(events),events[-1].get('seq'))
+    export=st.session_state.get(prefix+'_log_export')
+    if not export or export['key']!=export_key:
+        export={'key':export_key,'txt':diagnostic_report(events),'json':json.dumps({'schema':1,'events':events},ensure_ascii=False,indent=2).encode('utf-8')};st.session_state[prefix+'_log_export']=export
+    st.download_button('詳細作業ログ・改善案をTXTでダウンロード',export['txt'],'sumai_work_log.txt','text/plain',key=prefix+'_txt',on_click='ignore')
+    st.download_button('解析用の詳細ログをJSONでダウンロード',export['json'],
+                       'sumai_work_log.json','application/json',key=prefix+'_json',on_click='ignore')
+    with st.expander('作業ログの原因別集計と改善案'):
+        st.text(export['txt'].decode('utf-8-sig').split('詳細イベント')[0])
+        st.caption('全イベントはダウンロードに含まれます。画面には最新20イベントを表示します。')
+        st.dataframe([{'時刻UTC':e['time'],'工程':e['stage'],'理由':e['code'],'取得元・地名':str(e.get('context',{})),
+                       '詳細':str(e.get('details',{})),'改善案':e.get('improvement','')} for e in events[-20:]],hide_index=True)
 
 def physical_units(rows):
     grouped={}
@@ -928,17 +1174,30 @@ def mesh(rows,center,radius,interpolate=False,bounds=None):
     return out
 
 
+
+class MonotoneBase(MacroElement):
+    """Desaturate only the base tile pane; rent colors remain untouched."""
+    _template=Template("""{% macro script(this, kwargs) %}
+    {{ this._parent.get_name() }}.getPane('monotoneBase').style.filter = 'grayscale(1)';
+    {{ this._parent.get_name() }}.getPane('monotoneBase').style.webkitFilter = 'grayscale(1)';
+    {{ this._parent.get_name() }}.getContainer().style.backgroundColor = '#ececec';
+    {% endmacro %}""")
+    def __init__(self):
+        super().__init__();self._name='MonotoneBase'
+
 def rental_map(rows,center,radius,cells,facilities):
     m=folium.Map(location=center,zoom_start=15,tiles=None,control_scale=True)
+    folium.map.CustomPane('monotoneBase',z_index=200,pointer_events=False).add_to(m)
+    MonotoneBase().add_to(m)
     folium.TileLayer('https://cyberjapandata.gsi.go.jp/xyz/std/{z}/{x}/{y}.png',
-        attr='国土地理院',name='地名の地図',max_zoom=18).add_to(m)
+        attr='国土地理院',name='駅名・地名のモノトーン地図',max_zoom=18,pane='monotoneBase').add_to(m)
     folium.map.CustomPane('rentAreas',z_index=390,pointer_events=True).add_to(m)
     # Base-map station and town labels stay visible through translucent rent areas.
     # Major station names also have persistent white-backed labels above the colors.
     for name,point in STATIONS.items():
-        folium.CircleMarker(point,radius=2,color='#173a5e',weight=1,fill=True,fill_color='#ffffff',fill_opacity=1,
+        folium.CircleMarker(point,radius=2,color='#303030',weight=1,fill=True,fill_color='#ffffff',fill_opacity=1,
             tooltip=folium.Tooltip(html.escape(name)+'駅',permanent=True,direction='top',
-                style='background:rgba(255,255,255,.94);color:#173a5e;border:0;font-size:12px;font-weight:700;box-shadow:none;padding:2px 4px;')).add_to(m)
+                style='background:rgba(255,255,255,.94);color:#303030;border:0;font-size:12px;font-weight:700;box-shadow:none;padding:2px 4px;')).add_to(m)
     rental_features(rows,cells,facilities).add_to(m)
     return m
 
@@ -949,8 +1208,9 @@ def rental_features(rows,cells,facilities):
         if c.get('estimated') or c.get('count',0)<=0 or not isinstance(c.get('price'),(int,float)) or not math.isfinite(c['price']): continue
         color=rent_color(c['price'])
         tip=f"{c['price']/10000:.1f}万円/月（管理費込み）｜掲載額の中央値｜{c['count']}建物位置"
-        folium.Rectangle(c['bounds'],color=color,weight=.6,opacity=.5,fill=True,fill_color=color,
-                         fill_opacity=.30,pane='rentAreas',tooltip=tip).add_to(m)
+        area=folium.Rectangle(c['bounds'],color=color,weight=.6,opacity=.5,fill=True,fill_color=color,fill_opacity=.30,tooltip=tip)
+        area.options['pane']='rentAreas'
+        area.add_to(m)
     for r in physical_units(rows):
         tip=html.escape(r['title'])+f"｜{(r['rent']+r['fees'])/10000:g}万円"
         popup=(f"<b>{html.escape(r['title'])}</b><br>{html.escape(r['layout'])} / {r['area']:g}㎡<br>"
@@ -960,7 +1220,7 @@ def rental_features(rows,cells,facilities):
                             fill_color=rent_color(r['rent']+r['fees']),fill_opacity=1,
                             tooltip=tip,popup=folium.Popup(popup,max_width=280)).add_to(m)
     for f in facilities:
-        folium.CircleMarker((f['lat'],f['lng']),radius=6,color='#fff',fill=True,fill_color='#203f39',fill_opacity=1,tooltip=html.escape(f['name'])).add_to(m)
+        folium.CircleMarker((f['lat'],f['lng']),radius=6,color='#fff',fill=True,fill_color='#555555',fill_opacity=1,tooltip=html.escape(f['name'])).add_to(m)
     return m
 
 
@@ -1038,7 +1298,7 @@ def remember_search():
     if not providers or not bounds:
         state.new_search={'status':'failed','summary':{'issues':['地図の表示範囲と取得元を確認してください。'],'saved':0,'confirmed':0}}
         return
-    state.new_request=dict(bounds=list(bounds),providers=providers)
+    state.new_request=dict(bounds=list(bounds),providers=providers,display={'group':state.get('new_group','1LDK・2DK'),'budget':state.get('new_budget',50.)})
 
 
 
@@ -1048,7 +1308,7 @@ class WorkerState:
 
 class SearchJob:
     def __init__(self,db,conditions):
-        self.lock=threading.RLock();self.state=WorkerState();self.progress=0.;self.message='バックグラウンド検索を開始しています';self.text='';self.finished=False
+        self.lock=threading.RLock();self.state=WorkerState();self.audit=AuditLog(conditions,(getattr(db,'key',''),));self.state.audit=self.audit;self.progress=0.;self.message='バックグラウンド検索を開始しています';self.text='';self.finished=False
         self.thread=threading.Thread(target=self.run,args=(db,conditions),daemon=True,name='housing-search')
     def run(self,db,conditions):
         job=self
@@ -1062,6 +1322,7 @@ class SearchJob:
         screen={k:Display() for k in ('bar','status','log')}
         try: search_all(db,conditions,screen,self.state)
         except Exception as exc:
+            self.audit.add('search',diagnosis_code(str(exc)),'ERROR',{'message':str(exc) if isinstance(exc,AppError) else type(exc).__name__,'traceback':traceback.format_exc()})
             self.state.new_search={'status':'failed','conditions':conditions,'summary':{'issues':[str(exc) if isinstance(exc,AppError) else '検索処理エラー（'+type(exc).__name__+'）'],'saved':len(self.state.new_saved_keys),'confirmed':len(self.state.new_units)}}
         finally:
             with self.lock: self.finished=True
@@ -1098,6 +1359,12 @@ def background_status():
     if job is None: return
     snap=job.snapshot()
     st.session_state.new_units=snap['units'];st.session_state.new_saved_keys=snap['saved']
+    audit_cache=st.session_state.get('diagnostic_export_cache')
+    if not audit_cache or audit_cache['id']!=job.audit.search_id or time.monotonic()-audit_cache['at']>=10 or snap['finished'] and audit_cache['count']!=job.audit.count:
+        audit_cache={'id':job.audit.search_id,'at':time.monotonic(),'count':job.audit.count,'events':job.audit.records()};st.session_state.diagnostic_export_cache=audit_cache
+    diagnostic_downloads(audit_cache['events'])
+    if job.audit.storage_error:st.error('作業ログのSupabase保存を確認できません。TXTまたはJSONでダウンロードしてください。'+job.audit.storage_error)
+    st.caption(f"ログ {job.audit.count}イベント｜Supabase保存確認 {job.audit.persisted_events}イベント｜実行中のダウンロードは最大10秒前の内容です。")
     if snap['finished']:
         st.session_state.new_search=snap['result']
         if not st.session_state.get('new_job_rendered')==id(job):
@@ -1126,7 +1393,7 @@ def main():
         st.caption('地図に見えている四角い範囲が検索対象です。駅名の選択や取得件数の上限はありません。')
         group=st.radio('間取り',list(GROUPS),index=list(GROUPS).index(preferences.get('new_group','1LDK・2DK')),horizontal=True,key='new_group')
         budget=st.number_input('月額の上限（管理費込み・万円）',min_value=1.,max_value=1000.,value=preferences.get('new_budget',50.),step=1.,key='new_budget')
-        st.caption('家賃帯は管理費込みの月額で色分けします。掲載額のない区画は着色しません。駅名・地名は地図を拡大して確認できます。')
+        st.caption('家賃帯は管理費込みの月額で色分けします。家賃データのない場所はモノトーンです。駅名・地名は地図を拡大して確認できます。')
         bounds=state.get('new_bounds')
         center=bounds_center(bounds) if bounds else state.get('new_view_center',DEFAULT_CENTER)
         radius=bounds_radius(bounds) if bounds else 1500
@@ -1134,6 +1401,12 @@ def main():
               and (bounds is None or in_rectangle((r['latitude'],r['longitude']),bounds))]
         pins=[r for r in rows if r['rent']+r['fees']<=budget*10000]
         cells=mesh(rows,center,radius,False,bounds) if bounds else []
+        job=active_job()
+        if job:
+            map_signature=(tuple(bounds) if bounds else None,group,budget,len(state.new_units),len(cells))
+            if state.get('diagnostic_map_signature')!=map_signature:
+                state.diagnostic_map_signature=map_signature
+                job.audit.add('map','render','INFO',{'bounds':bounds,'group':group,'budget':budget,'loaded_units':len(state.new_units),'visible_units':len(pins),'colored_cells':len(cells),'bands':[sum(rent_color(v['price'])==color for v in cells) for color in COLORS],'no_data_color':False,'monotone_base':True})
         facilities=[f for f in state.new_facilities if bounds and in_rectangle((f['lat'],f['lng']),bounds)]
         data=st_folium(rental_map([],DEFAULT_CENTER,1500,[],[]),key='new_map',height=480,use_container_width=True,
             returned_objects=['bounds','zoom'],center=state.get('new_view_center',DEFAULT_CENTER),
@@ -1163,7 +1436,7 @@ def main():
                     for label in result['conditions']['regions']: st.write(label)
         legend=''.join(f'<span style="display:inline-block;margin:4px 10px 4px 0;color:#203f39;font-size:12px"><b style="color:{color}">■</b> {label}</span>' for color,label in zip(COLORS,['15万円以下','15〜20万円','20〜22.5万円','22.5〜25万円','25〜27.5万円','27.5〜30万円','30〜35万円','35万円超']))
         st.markdown(legend,unsafe_allow_html=True)
-        st.caption('色付き区画：掲載額の中央値（管理費込み）。区画は250m。掲載額のない区画は無着色です。駅名・地名が読めるよう半透明で表示します。家賃帯の集計は月額上限で絞る前のデータです。')
+        st.caption('色付き区画：掲載額の中央値（管理費込み）。区画は250m。掲載額のない区画はモノトーンのままです。駅名・地名が読めるよう家賃帯の色を半透明で表示します。家賃帯の集計は月額上限で絞る前のデータです。')
         c1,c2,c3=st.columns(3)
         c1.metric('条件内の募集',len(physical_units(pins)))
         c2.metric('月額の中央値',f"{statistics.median([r['rent']+r['fees'] for r in pins])/10000:.1f}万円" if pins else '—')
@@ -1209,6 +1482,30 @@ def main():
         if state.get('new_history'):
             st.dataframe([{'開始（UTC）':r['started_at'],'結果':r['status'],'表示範囲':str(r['conditions'].get('bounds','')),
                            '保存確認':r['summary'].get('saved',0)} for r in state.new_history],hide_index=True)
+        if state.get('new_history'):
+            chosen=st.selectbox('作業ログを取り出す検索',state.new_history,format_func=lambda r:r['started_at']+'｜'+r['status'],key='diagnostic_history')
+            if st.button('選んだ検索の詳細作業ログを読み込む',key='diagnostic_load'):
+                try:
+                    state.saved_diagnostics=Database().load_diagnostics(chosen['id'])
+                    if not state.saved_diagnostics:st.info('この検索には保存された詳細ログがありません。v30以降で再検索してください。')
+                except AppError as exc:st.error(str(exc))
+        if state.get('saved_diagnostics'):diagnostic_downloads(state.saved_diagnostics,'saved')
+        with st.expander('前回のログと比較して改善を確認'):
+            baseline=st.file_uploader('前回の解析用JSONログを選択',type=['json'],key='diagnostic_baseline')
+            if baseline:
+                try:
+                    old=json.loads(baseline.getvalue().decode('utf-8-sig')).get('events')
+                    if not isinstance(old,list) or not all(isinstance(e,dict) for e in old):raise ValueError()
+                    compare_target=st.radio('比較する今回のログ',['現在の検索','読み込んだ保存ログ'],key='diagnostic_compare_target')
+                    current=(active_job().audit.records() if active_job() else []) if compare_target=='現在の検索' else state.get('saved_diagnostics',[])
+                    if current:
+                        st.dataframe(compare_logs(old,current),hide_index=True)
+                        old_start=next((e.get('details',{}) for e in old if e.get('code')=='start'),{})
+                        new_start=next((e.get('details',{}) for e in current if e.get('code')=='start'),{})
+                        if old_start.get('bounds')!=new_start.get('bounds') or old_start.get('providers')!=new_start.get('providers'):st.info('表示範囲・取得元が異なります。差分だけで改善効果を判断できません。')
+                        st.caption('差分はログの観測件数です。精度は同じ物件の正解データとの照合で確認してください。')
+                    else:st.info('比較対象として現在の検索ログまたは保存ログを読み込んでください。')
+                except (ValueError,UnicodeError,AttributeError):st.error('このアプリからダウンロードした解析用JSONログを選択してください。')
     with tabs[2]:
         st.subheader('通勤の目安')
         options=physical_units(state.new_units)
