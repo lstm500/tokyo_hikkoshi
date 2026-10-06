@@ -37,7 +37,7 @@ import streamlit as st
 from streamlit_folium import st_folium
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v38"
+BUILD = "REBUILD-01-v39"
 DEFAULT_CENTER = (35.7303,139.711)
 UNIT_TABLE = "housing_units_v1"
 SEARCH_TABLE = "housing_searches_v1"
@@ -524,7 +524,9 @@ class Database:
             payload=[dict(namespace=self.namespace,id='listing.'+key,status='rental_listing',started_at=row.get('fetched_at') or utc_now(),
                           finished_at=None,conditions={'record_type':'rental_listing','schema':2},summary={'listing':merge_listing(old.get('listing.'+key),row)}) for key,row in batch]
             result=self.call('POST',SEARCH_TABLE,{'on_conflict':'namespace,id','select':'id'},payload,'resolution=merge-duplicates,return=representation')
-            saved.update(r.get('id') for r in result if isinstance(r,dict)) if isinstance(result,list) else None
+            # Keep this a statement: Streamlit Magic would render a bare conditional expression in the worker.
+            if isinstance(result,list):
+                saved.update(r.get('id') for r in result if isinstance(r,dict))
         if not {'listing.'+k for k in unique}<=saved:raise AppError('Supabaseから募集情報の保存確認が得られません。')
         return set(unique)
     def save_search(self,search):
