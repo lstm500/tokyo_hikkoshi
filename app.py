@@ -37,7 +37,7 @@ import streamlit as st
 from streamlit_folium import st_folium
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v42"
+BUILD = "REBUILD-01-v45"
 PROVIDER_OPTIONS = ("スマイティ","HOMES","SUUMO","カナリー","アットホーム","CHINTAI","Comfy","アパマンショップ")
 PROVIDER_CANONICAL = {"HOMES":"HOME’S","HOME’S":"HOME’S","スマイティ":"スマイティ","SUUMO":"SUUMO","カナリー":"カナリー",
                       "アットホーム":"アットホーム","CHINTAI":"CHINTAI","Comfy":"Comfy","アパマンショップ":"アパマンショップ"}
@@ -57,7 +57,9 @@ GROUPS = {"1K・1L・1DK": ("1K", "1L", "1DK"), "1LDK・2DK": ("1LDK", "2DK"),
 LAYOUTS = tuple(x for group in GROUPS.values() for x in group)
 SUUMO_LAYOUT_GROUPS = (("1LDK", "2K", "2DK"), ("2LDK", "3K", "3DK"))
 SUUMO_LAYOUTS = tuple(x for group in SUUMO_LAYOUT_GROUPS for x in group)
+SUUMO_LAYOUT_CODES = {"1LDK":"04","2K":"05","2DK":"06","2LDK":"07","3K":"08","3DK":"09"}
 HOMES_LAYOUT_GROUPS = (("1LDK", "2K", "2DK"), ("2LDK", "3K", "3DK"))
+DISPLAY_LAYOUT_GROUPS = {"group1": ("1LDK", "2K", "2DK"), "group2": ("2LDK", "3K", "3DK")}
 HOMES_LAYOUTS = tuple(x for group in HOMES_LAYOUT_GROUPS for x in group)
 ALL_TARGET_LAYOUTS = tuple(dict.fromkeys((*LAYOUTS,*SUUMO_LAYOUTS,*HOMES_LAYOUTS)))
 STATIONS = {
@@ -1384,6 +1386,7 @@ def homes_collect(web,region,bounds,munis,emit):
 
 
 def _field_texts(soup,field):
+    """Collect visible labels even when SUUMO places checkbox text outside <label>."""
     texts=[]
     if field.get('id'):
         label=soup.find('label',attrs={'for':field['id']})
@@ -1392,8 +1395,20 @@ def _field_texts(soup,field):
     if label:texts.append(label.get_text(' ',strip=True))
     if field.name=='option':texts.append(field.get_text(' ',strip=True))
     texts.extend([field.get('aria-label',''),field.get('data-label',''),field.get('title','')])
-    return [normal(x) for x in texts if normal(x)]
-
+    # SUUMO's area modal may render the input and visible town name as siblings.
+    parent=field.parent
+    for _ in range(4):
+        if parent is None:break
+        if getattr(parent,'name',None) in ('li','td','th','div','p','span','dd','dt'):
+            text=parent.get_text(' ',strip=True)
+            if text and len(text)<=160:texts.append(text)
+        parent=getattr(parent,'parent',None)
+    for sibling in (field.previous_sibling,field.next_sibling):
+        if sibling is not None:
+            try:text=sibling.get_text(' ',strip=True)
+            except AttributeError:text=str(sibling)
+            if normal(text):texts.append(text)
+    return list(dict.fromkeys(normal(x) for x in texts if normal(x)))
 
 def _form_control_by_label(soup,wanted,names=None):
     """Return the public form name/value whose own label equals the requested visible option."""
@@ -1425,65 +1440,232 @@ def suumo_area_groups(regions,munis):
     return list(grouped.values())
 
 
+def _suumo_town_selector(soup,raw_html,wanted,base_url):
+    """Resolve SUUMO town selection from links, controls, hidden modal DOM or embedded JSON."""
+    wanted=normal(wanted);wanted_key=address_key(wanted)
+    for a in soup.select('a[href]'):
+        target=urljoin(base_url,a.get('href','')).split('#')[0];u=urlparse(target)
+        if u.hostname!='suumo.jp' or not re.search(r'/chintai/[^/]+/sc_[^/]+/oz_\d+/?$',u.path):continue
+        label=re.sub(r'[（(][\d,]+(?:件)?[）)]$','',normal(a.get_text(' ',strip=True)))
+        if address_key(label)==wanted_key:return {'url':target,'method':'SUUMO町名URL'}
+    control=_form_control_by_label(soup,wanted)
+    if control:return {'control':control,'method':'SUUMO町名フォーム'}
+    for node in soup.find_all(string=lambda x:x and wanted in normal(x)):
+        parent=getattr(node,'parent',None)
+        for _ in range(6):
+            if parent is None:break
+            links=parent.select('a[href]') if hasattr(parent,'select') else []
+            for a in links:
+                target=urljoin(base_url,a.get('href','')).split('#')[0]
+                if re.search(r'/oz_\d+/?$',urlparse(target).path):return {'url':target,'method':'SUUMO町名DOMリンク'}
+            fields=parent.select('input[name][value],option[value]') if hasattr(parent,'select') else []
+            for field in fields:
+                name=field.get('name') or (field.parent.get('name') if field.parent else '')
+                value=str(field.get('value',''))
+                if name and value and (name in ('oz','town','town_code','townCd') or re.fullmatch(r'\d{8,}',value)):
+                    return {'control':(name,value),'method':'SUUMO町名DOM'}
+            parent=getattr(parent,'parent',None)
+    decoded=html.unescape(raw_html or '').replace('\\/','/')
+    for m in re.finditer(re.escape(wanted),decoded):
+        chunk=decoded[max(0,m.start()-2200):min(len(decoded),m.end()+2200)]
+        link=re.search(r"href=[\"']([^\"']*/chintai/[^\"']*/sc_[^\"']*/oz_\d+/?[^\"']*)[\"']",chunk,re.I)
+        if link:return {'url':urljoin(base_url,link.group(1)).split('#')[0],'method':'SUUMO町名埋込URL'}
+        link=re.search(r"(?:https://suumo\.jp)?(/chintai/[^\"'\s]+/sc_[^\"'\s]+/oz_\d+/?)(?:[?&#][^\"'\s]*)?",chunk,re.I)
+        if link:return {'url':urljoin('https://suumo.jp',link.group(1)).split('#')[0],'method':'SUUMO町名埋込URL'}
+        hit=re.search(r"name=[\"'](oz|town|town_code|townCd)[\"'][^>]{0,300}?value=[\"']([^\"']+)[\"']",chunk,re.I)
+        if hit:return {'control':(hit.group(1),hit.group(2)),'method':'SUUMO町名埋込フォーム'}
+        hit=re.search(r"value=[\"']([^\"']+)[\"'][^>]{0,300}?name=[\"'](oz|town|town_code|townCd)[\"']",chunk,re.I)
+        if hit:return {'control':(hit.group(2),hit.group(1)),'method':'SUUMO町名埋込フォーム'}
+        hit=re.search(r"[\"'](?:oz|townCode|town_code)[\"']\s*:\s*[\"'](\d{8,})[\"']",chunk,re.I)
+        if hit:return {'control':('oz',hit.group(1)),'method':'SUUMO町名埋込JSON'}
+    return None
+
+
+def _suumo_canonical_city_url(soup,response_url,raw_html=''):
+    """Resolve the municipality SEO page even when SUUMO hides area controls in script/modal HTML."""
+    response_clean=response_url.split('#')[0];u0=urlparse(response_clean)
+    if u0.scheme=='https' and u0.hostname=='suumo.jp' and re.search(r'/chintai/[^/]+/sc_[^/]+/?$',u0.path):
+        return u0._replace(query='',fragment='').geturl()
+    candidates=[]
+    canonical=soup.select_one('link[rel="canonical"][href]')
+    if canonical:candidates.append(canonical.get('href'))
+    og=soup.select_one('meta[property="og:url"][content]')
+    if og:candidates.append(og.get('content'))
+    for raw in candidates:
+        target=urljoin(response_url,raw or '').split('#')[0];u=urlparse(target)
+        if u.scheme=='https' and u.hostname=='suumo.jp' and re.search(r'/chintai/[^/]+/sc_[^/]+/?$',u.path):return u._replace(query='',fragment='').geturl()
+    for a in soup.select('a[href]'):
+        target=urljoin(response_url,a.get('href','')).split('#')[0];u=urlparse(target)
+        if u.scheme=='https' and u.hostname=='suumo.jp' and re.search(r'/chintai/[^/]+/sc_[^/]+/?$',u.path):return u._replace(query='',fragment='').geturl()
+    decoded=html.unescape(raw_html or '').replace('\\/','/')
+    for match in re.finditer(r'(?:https://suumo\.jp)?(/chintai/[^/"\']+/sc_[^/"\']+/)',decoded,re.I):
+        target=urljoin('https://suumo.jp',match.group(1));u=urlparse(target)
+        if u.hostname=='suumo.jp':return target
+    return None
+
+
+def _suumo_probe_town_url(web,canonical_url,municipality_code,city_name,wanted,max_suffix=120):
+    """Fallback: resolve SUUMO's public oz_ town page without using municipality-wide results."""
+    if not canonical_url:return None
+    u=urlparse(canonical_url)
+    if u.hostname!='suumo.jp' or not re.search(r'/chintai/[^/]+/sc_[^/]+/?$',u.path):return None
+    code=re.sub(r'\D','',str(municipality_code or ''))
+    if not re.fullmatch(r'\d{5}',code):return None
+    cache=getattr(web,'suumo_town_probe_cache',None)
+    if cache is None:cache={};web.suumo_town_probe_cache=cache
+    key=(canonical_url.rstrip('/')+'/',code)
+    state=cache.setdefault(key,{'towns':{},'next_suffix':1,'finished':False})
+    wanted_key=address_key(wanted)
+    if wanted_key in state['towns']:return state['towns'][wanted_key]
+    if state.get('finished'):return None
+    base=canonical_url.rstrip('/')+'/'
+    start=max(1,int(state.get('next_suffix',1)))
+    for suffix in range(start,max_suffix+1):
+        state['next_suffix']=suffix+1
+        target=urljoin(base,f'oz_{code}{suffix:03d}/')
+        try:
+            if not web.permitted(target):continue
+            reply=web.fetch(target);soup=BeautifulSoup(reply.text,'html.parser')
+        except AppError as exc:
+            trace(web,'suumo_town_probe',{'url':target,'suffix':suffix,'status':'unavailable','message':str(exc)},'WARNING','search_conditions')
+            continue
+        heading=normal(soup.select_one('h1').get_text(' ',strip=True) if soup.select_one('h1') else '')
+        page_title=normal(soup.select_one('title').get_text(' ',strip=True) if soup.select_one('title') else '')
+        source=heading or page_title
+        town=''
+        if city_name:
+            match=re.search(re.escape(normal(city_name))+r'(.+?)の賃貸',source)
+            if match:town=normal(match.group(1))
+        if not town:
+            match=re.search(r'^[^ ]+?区(.+?)の賃貸',source)
+            if match:town=normal(match.group(1))
+        if town:
+            state['towns'][address_key(town)]=reply.url.split('#')[0]
+            trace(web,'suumo_town_probe',{'url':reply.url,'suffix':suffix,'status':'found','town':town},stage='search_conditions')
+            if address_key(town)==wanted_key:return reply.url.split('#')[0]
+    state['finished']=True
+    return state['towns'].get(wanted_key)
+
+
 def suumo_prepare_region(web,region):
-    """Follow SUUMO's city selector -> town selector, then discover the visible filter controls."""
+    """Resolve the visible-map municipality/town to a SUUMO search target.
+
+    Preferred route is SUUMO's public town (oz_) page, which is the result of
+    selecting 市区郡 -> 町名.  If SUUMO does not expose the town selector in the
+    returned HTML, use the public FR301 town-word search only as a verified
+    fallback; detail-address checks still restrict results to the visible town.
+    """
     cache=getattr(web,'suumo_region_cache',None)
     if cache is None:cache={};web.suumo_region_cache=cache
-    key=(str(region.get('pref','')),str(region.get('code','')),address_key(region.get('suumo_town') or region.get('town','')))
+    wanted=normal(region.get('suumo_town') or town_base_name(region.get('town','')))
+    key=(str(region.get('pref','')),str(region.get('code','')),address_key(wanted))
     if key in cache:return cache[key]
+
     search='https://suumo.jp/jj/chintai/ichiran/FR301FC001/'
     city_params={'ar':'030','bs':'040','ta':str(region['pref']),'sc':str(region['code']),'pc':'50','srch_navi':'1'}
     if not web.permitted(search):raise AppError('SUUMOの市区郡選択ページの自動取得が許可されていません。')
     trace(web,'suumo_city_selected',{'municipality_code':region['code'],'city':region.get('city_name',''),'source':'表示地図から作成した市区郡・町名リスト'},stage='search_conditions')
+
     city_reply=web.fetch(search,params=city_params);city_soup=BeautifulSoup(city_reply.text,'html.parser')
-    wanted=normal(region.get('suumo_town') or town_base_name(region.get('town','')));wanted_key=address_key(wanted)
-    town_url=None
-    for a in city_soup.select('a[href]'):
-        target=urljoin(search,a.get('href','')).split('#')[0];u=urlparse(target)
-        if u.hostname!='suumo.jp' or not re.search(r'/chintai/[^/]+/sc_[^/]+/oz_\d+/?$',u.path):continue
-        label=re.sub(r'[（(][\d,]+(?:件)?[）)]$','',normal(a.get_text(' ',strip=True)))
-        if address_key(label)==wanted_key:
-            town_url=target;break
-    town_params=dict(city_params)
-    if town_url:
-        base_url=town_url;town_params={'pc':'50'}
-        town_reply=web.fetch(base_url,params=town_params)
-        trace(web,'suumo_town_selected',{'municipality_code':region['code'],'city':region.get('city_name',''),'town':wanted,'method':'SUUMO町名URL','url':base_url},stage='search_conditions')
+    selector=_suumo_town_selector(city_soup,city_reply.text,wanted,city_reply.url)
+    canonical_url=_suumo_canonical_city_url(city_soup,city_reply.url,city_reply.text)
+
+    if not selector and canonical_url:
+        try:
+            if web.permitted(canonical_url):
+                canonical_reply=web.fetch(canonical_url);canonical_soup=BeautifulSoup(canonical_reply.text,'html.parser')
+                selector=_suumo_town_selector(canonical_soup,canonical_reply.text,wanted,canonical_reply.url)
+                trace(web,'suumo_town_selector_page',{'city':region.get('city_name',''),'town':wanted,'url':canonical_url,'found':bool(selector)},stage='search_conditions')
+        except AppError as exc:
+            trace(web,'form_alternative',{'provider':'SUUMO','failed_url':canonical_url,'message':str(exc),'next_public_page':True},'WARNING','search_conditions')
+
+    # The SEO town pages currently use /oz_<municipality><town-seq>/.
+    # Probe only after normal selector parsing fails, and cache every town found.
+    if not selector and canonical_url:
+        probed=_suumo_probe_town_url(web,canonical_url,region.get('code'),region.get('city_name',''),wanted,max_suffix=80)
+        if probed:
+            selector={'url':probed,'method':'SUUMO町名公開ページ確認'}
+            trace(web,'suumo_town_probe_selected',{'city':region.get('city_name',''),'town':wanted,'url':probed},stage='search_conditions')
+
+    if selector and selector.get('url'):
+        base_url=selector['url'].split('#')[0]
+        base_params={'pc':'50'}
+        method=selector.get('method','SUUMO町名URL')
+    elif selector and selector.get('control'):
+        name,value=selector['control'];base_url=search;base_params=dict(city_params);base_params[name]=value
+        method=selector.get('method','SUUMO町名フォーム')
     else:
-        control=_form_control_by_label(city_soup,wanted)
-        if not control:
-            raise AppError('SUUMOの「町名を変更」一覧から'+wanted+'を確認できません。市区郡='+str(region.get('city_name') or region.get('code'))+'。')
-        name,value=control;town_params[name]=value;base_url=search
-        town_reply=web.fetch(base_url,params=town_params)
-        trace(web,'suumo_town_selected',{'municipality_code':region['code'],'city':region.get('city_name',''),'town':wanted,'method':'SUUMO町名フォーム','parameter':{name:value}},stage='search_conditions')
-    soup=BeautifulSoup(town_reply.text,'html.parser');page_text=normal(soup.get_text(' ',strip=True))
-    layout_filters=discover_layout_inputs(soup,'SUUMO')
-    for layout in SUUMO_LAYOUTS:
-        if layout not in layout_filters:
-            try:
-                params=single_layout_parameters(web,'SUUMO',layout)
-                if len(params)==1:layout_filters[layout]=next(iter(params.items()))
-            except AppError:pass
-    missing=[x for x in SUUMO_LAYOUTS if x not in layout_filters]
-    if missing:raise AppError('SUUMOの間取り選択値を確認できません：'+','.join(missing))
-    mansion=_form_control_by_label(soup,'マンション',{'ts'}) or (('ts','1') if 'マンション' in page_text else None)
-    age15=_form_control_by_label(soup,'15年以内',{'cn'}) or (('cn','15') if '15年以内' in page_text else None)
-    if not mansion:raise AppError('SUUMOの「建物の種類：マンション」の公開フォーム値を確認できません。')
-    if not age15:raise AppError('SUUMOの「築年数：15年以内」の公開フォーム値を確認できません。')
-    result={'url':base_url,'base_params':town_params,'layout_filters':layout_filters,'mansion':mansion,'age15':age15,'town':wanted}
+        # Do not stop the entire search merely because the modal DOM changed.
+        # This is still municipality-scoped, and every list/detail address is
+        # checked against the visible-map town before it can be saved.
+        base_url=search;base_params=dict(city_params);base_params['fw2']=wanted
+        method='SUUMO町名選択DOM取得不可→市区郡内の町名検索（詳細住所で再検証）'
+        trace(web,'suumo_town_fallback',{'city':region.get('city_name',''),'municipality_code':region.get('code'),'town':wanted,'url':base_url,'parameters':{'sc':region.get('code'),'fw2':wanted}},'WARNING','search_conditions')
+
+    # Current public SUUMO form/query values.  We also verify every accepted
+    # detail page, so a provider-side parameter change cannot silently admit a
+    # wrong layout/building/age.
+    result={
+        'url':base_url,
+        'base_params':base_params,
+        'town':wanted,
+        'selection_method':method,
+        'mansion':('ts','1'),
+        'age15':('cn','15'),
+        'layout_filters':{layout:('md',code) for layout,code in SUUMO_LAYOUT_CODES.items()},
+    }
     cache[key]=result
-    trace(web,'suumo_filters_ready',{'city':region.get('city_name',''),'town':wanted,'mansion':mansion,'age15':age15,'layout_filters':layout_filters},stage='search_conditions')
+    trace(web,'suumo_filters_ready',{'city':region.get('city_name',''),'town':wanted,'selection_method':method,
+          'mansion':result['mansion'],'age15':result['age15'],'layout_filters':result['layout_filters']},stage='search_conditions')
     return result
 
 
-def suumo_group_params(prepared,layouts,page):
-    params=dict(prepared['base_params']);m_name,m_value=prepared['mansion'];a_name,a_value=prepared['age15']
-    params[m_name]=m_value;params[a_name]=a_value;names=[];values=[]
-    for layout in layouts:
-        name,value=prepared['layout_filters'][layout];names.append(name);values.append(value)
-    if len(set(names))!=1:raise AppError('SUUMOの間取りフォーム名が一致しません。')
-    params[names[0]]=values;params['pc']='50';params['page']=page
+def suumo_group_params(prepared,layouts,page=1):
+    params=dict(prepared['base_params'])
+    params['ts']='1'                 # 建物の種類：マンション
+    params['cn']='15'                # 築年数：15年以内
+    params['md']=[SUUMO_LAYOUT_CODES[x] for x in layouts]
+    params['pc']='50'
+    # SUUMO SEO pages paginate in the path (pnz1N.html), while FR301 may use
+    # either path or query links.  Only add query-page on the FR301 fallback.
+    if '/jj/chintai/ichiran/FR301FC001/' in prepared['url'] and page>1:params['page']=page
     return params
+
+
+def suumo_detail_fields(soup):
+    """Read current SUUMO detail fields without relying on the list address."""
+    visible=' '.join(soup.stripped_strings);structured=json_listing_fields(soup)
+    address=structured.get('address') or generic_labeled(soup,('所在地','住所','物件所在地'))
+    raw_layout=structured.get('layout') or generic_labeled(soup,('間取り','間取'))
+    if not raw_layout:
+        raw_layout=regex_after_label(visible,('間取り','間取'),r'(?:ワンルーム|\d+(?:S?LDK|S?DK|SK|LK|K|L|R))')
+    raw_rent=structured.get('rent') or generic_labeled(soup,('賃料','家賃'))
+    if not raw_rent:
+        # Current SUUMO detail pages show "17.7万円 管理費・共益費: 20000円"
+        # above the specification table, so there may be no 賃料 th/dt cell.
+        m=re.search(r'(?<![\d.])(\d+(?:\.\d+)?)\s*万円\s*管理費(?:・共益費)?',visible)
+        if m:raw_rent=m.group(1)+'万円'
+    if not raw_rent:
+        raw_rent=regex_after_label(visible,('賃料','家賃'),r'\d+(?:\.\d+)?\s*万円|\d[\d,]*\s*円')
+    building_type=generic_labeled(soup,('建物種別','建物の種類','種別'))
+    raw_age=structured.get('age') or generic_labeled(soup,('築年数','築年月','築年'))
+    if not raw_age:
+        raw_age=regex_after_label(visible,('築年数','築年月','築年'),r'(?:新築|築\s*\d{1,3}年|(?:19|20)\d{2}年\s*\d{1,2}月)')
+    return {'visible':visible,'address':normal(address),'raw_layout':normal(raw_layout),'raw_rent':normal(raw_rent),
+            'building_type':normal(building_type),'raw_age':normal(raw_age),'structured':structured}
+
+
+def _suumo_next_url(soup,response_url,filter_params):
+    """Follow SUUMO's current path pagination (pnz12.html etc.) and preserve filters."""
+    target=generic_next_page(soup,response_url,'SUUMO')
+    if not target:return None
+    u=urlparse(target)
+    if not u.query:
+        # Some SEO pagination hrefs omit the current filters in crawled/static HTML.
+        # Reattach only the search filters; the oz_ path itself retains the town.
+        keep={k:v for k,v in filter_params.items() if k in ('ts','cn','md','pc','ar','bs','ta','sc','fw2','srch_navi')}
+        target=u._replace(query=urlencode(keep,doseq=True)).geturl()
+    return target
 
 
 def suumo_kankyo_url(soup,detail_url):
@@ -1525,87 +1707,87 @@ def suumo_location_from_kankyo_image(web,detail_soup,detail_url,published_addres
 
 
 def suumo_collect(web,region,bounds,munis,emit):
-    """SUUMO: visible-map city/town -> mansion, <=15y -> two layout groups -> detail -> kankyo map image."""
+    """SUUMO: map towns -> town page/filter -> detail -> kankyo map -> compact save."""
     prepared=suumo_prepare_region(web,region);seen_urls=set()
     visible_towns=region.get('visible_towns') or [region.get('town','')]
     for group_number,layouts in enumerate(SUUMO_LAYOUT_GROUPS,1):
-        page=1;seen_pages=set();group_candidates=0
+        filter_params=suumo_group_params(prepared,layouts,1)
+        current_url=prepared['url'];current_params=filter_params;seen_pages=set();group_candidates=0;page_number=1
         emit('message',f'SUUMO条件{group_number}｜マンション｜築15年以内｜'+ '・'.join(layouts))
-        while True:
-            params=suumo_group_params(prepared,layouts,page)
-            reply=web.fetch(prepared['url'],params=params);soup=BeautifulSoup(reply.text,'html.parser')
+        while current_url:
+            reply=web.fetch(current_url,params=current_params if current_params else None);soup=BeautifulSoup(reply.text,'html.parser')
             buildings=soup.select('div.cassetteitem')
             if not buildings:
-                if any(t in soup.get_text() for t in ('該当する物件','該当物件','物件が見つかりません','0件')):break
-                raise AppError(f'SUUMO 条件{group_number}・{page}ページ目の一覧を確認できません。')
+                page_text=normal(soup.get_text(' ',strip=True))
+                if any(t in page_text for t in ('該当する物件','該当物件','物件が見つかりません','0件')):break
+                raise AppError(f'SUUMO 条件{group_number}・{page_number}ページ目の一覧を確認できません。')
             signature=hashlib.sha256(str(buildings).encode()).hexdigest()
-            if signature in seen_pages:raise AppError('SUUMOのページ送りが同じ一覧を返しました。全ページを確認できていません。')
+            if signature in seen_pages:
+                raise AppError('SUUMOのページ送りが同じ一覧を返しました。全ページを確認できていません。')
             seen_pages.add(signature);page_candidates=[]
+
             for building in buildings:
-                address_el=building.select_one('.cassetteitem_detail-col1');list_address=address_el.get_text(' ',strip=True) if address_el else ''
-                if visible_towns and not any(town_matches(t,list_address) for t in visible_towns):continue
-                for room in building.select('tr.js-cassette_link'):
+                address_el=building.select_one('.cassetteitem_detail-col1')
+                list_address=normal(address_el.get_text(' ',strip=True) if address_el else '')
+                # The list address is used only to restrict the search area; it is never saved.
+                if visible_towns and list_address and not any(town_matches(t,list_address) for t in visible_towns):continue
+                rooms=building.select('tr.js-cassette_link')
+                if not rooms:
+                    rooms=[x for x in building.select('tr') if x.select_one('a[href*="/chintai/"]')]
+                for room in rooms:
                     links=[]
                     for a in room.select('a[href]'):
-                        label=normal(a.get_text(' ',strip=True));url=urljoin('https://suumo.jp',a['href']).split('#')[0]
-                        if safe_url(url,'SUUMO') and ('詳細を見る' in label or '/chintai/' in urlparse(url).path):links.append((0 if '詳細を見る' in label else 1,url))
+                        label=normal(a.get_text(' ',strip=True));url=urljoin('https://suumo.jp',a.get('href','')).split('#')[0]
+                        if safe_url(url,'SUUMO') and ('詳細を見る' in label or re.search(r'/chintai/(?:bc_|jnc_)',urlparse(url).path)):
+                            links.append((0 if '詳細を見る' in label else 1,url))
                     if not links:continue
                     url=min(links,key=lambda x:x[0])[1]
                     if url in seen_urls:continue
                     seen_urls.add(url);page_candidates.append(url);group_candidates+=1
             emit('candidate',len(page_candidates))
+
             for index,url in enumerate(page_candidates,1):
                 emit('message',f'条件{group_number} 詳細を見る {index}/{len(page_candidates)}件');emit('detail',1)
                 try:
                     if not web.permitted(url):raise AppError('SUUMO詳細ページの自動取得が許可されていません。')
-                    text=web.fetch(url).text;detail=BeautifulSoup(text,'html.parser')
-                    published_address=labeled(detail,('所在地','住所','物件所在地'))
-                    if not published_address:
-                        match=re.search(r'所在地\s*([^\n]{4,120})',normal(detail.get_text(' ',strip=True)));published_address=match.group(1).strip() if match else ''
+                    detail_reply=web.fetch(url);detail=BeautifulSoup(detail_reply.text,'html.parser');fields=suumo_detail_fields(detail)
+                    published_address=fields['address']
                     if visible_towns and published_address and not any(town_matches(t,published_address) for t in visible_towns):
                         emit('rejected',1);trace(web,'address',{'url':url,'visible_towns':visible_towns,'listing_address':published_address,'reason':'detail_not_in_visible_map_towns'},'WARNING');continue
-                    raw_layout=labeled(detail,('間取り','間取'))
-                    if not raw_layout:
-                        m=re.search(r'間取り\s*((?:\d+)(?:LDK|DK|K))',normal(detail.get_text(' ',strip=True)),re.I);raw_layout=m.group(1) if m else ''
-                    layout=parsed_layout(raw_layout)
+
+                    layout=parsed_layout(fields['raw_layout'])
                     if layout not in layouts:
-                        emit('rejected',1);trace(web,'layout',{'url':url,'observed':raw_layout,'parsed':layout,'requested_group':list(layouts),'reason':'detail_layout_not_in_group'},'WARNING');continue
-                    building_type=labeled(detail,('建物種別','建物の種類','種別'))
-                    if not building_type or 'マンション' not in normal(building_type):
-                        emit('rejected',1);trace(web,'structure',{'url':url,'building_type':building_type,'reason':'not_mansion'},'WARNING');continue
-                    raw_age=labeled(detail,('築年数','築年月','築年'))
-                    age,ym=age_info(raw_age)
+                        emit('rejected',1);trace(web,'layout',{'url':url,'observed':fields['raw_layout'],'parsed':layout,'requested_group':list(layouts),'reason':'detail_layout_not_in_group'},'WARNING');continue
+                    if 'マンション' not in fields['building_type']:
+                        emit('rejected',1);trace(web,'structure',{'url':url,'building_type':fields['building_type'],'reason':'not_mansion'},'WARNING');continue
+                    age,ym=age_info(fields['raw_age'])
                     if age is None or age>15:
-                        emit('rejected',1);trace(web,'age',{'url':url,'raw_age':raw_age,'age':age,'reason':'detail_age_not_confirmed_within_15'},'WARNING');continue
-                    rent=optional_amount(labeled(detail,('賃料','家賃')))
+                        emit('rejected',1);trace(web,'age',{'url':url,'raw_age':fields['raw_age'],'age':age,'reason':'detail_age_not_confirmed_within_15'},'WARNING');continue
+                    rent=optional_amount(fields['raw_rent'])
                     if not rent:
-                        emit('rejected',1);trace(web,'parse',{'url':url,'missing':'detail_rent'},'WARNING');continue
-                    fees=optional_amount(labeled(detail,('管理費・共益費','管理費等','管理費','共益費')))
-                    raw_area=labeled(detail,('専有面積','面積'));m=re.search(r'\d+(?:\.\d+)?',normal(raw_area));area=float(m[0]) if m else None
-                    title=detail.select_one('h1');title=title.get_text(' ',strip=True) if title else 'SUUMO掲載募集'
-                    structure=labeled(detail,('構造','建物構造')) or None;floor=labeled(detail,('階建','所在階','階数'))
+                        emit('rejected',1);trace(web,'parse',{'url':url,'missing':'detail_rent','visible_head':fields['visible'][:400]},'WARNING');continue
+
                     try:location=suumo_location_from_kankyo_image(web,detail,url,published_address,bounds,munis)
                     except AppError as exc:
                         location=None;trace(web,'location_pending',{'url':url,'message':str(exc),'source':'SUUMO地図・周辺環境画像'},'WARNING','location')
                     inferred=location.get('inferred_address','') if location else ''
-                    address=inferred or published_address or region.get('label','')
-                    row=partial_listing('SUUMO',url,title,address,layout,rent,fees,area,region,bounds,location,structure,age,ym,floor)
+                    address=inferred or published_address
+                    if not address:
+                        emit('rejected',1);trace(web,'parse',{'url':url,'missing':'detail_or_map_address'},'WARNING');continue
+
+                    # Only these three values survive Database.save_units().
+                    row=partial_listing('SUUMO',url,'SUUMO掲載募集',address,layout,rent,None,None,region,bounds,location,None,age,ym,'')
                     if not row:emit('rejected',1);continue
-                    row['published_address']=published_address;row['address_source']='SUUMO地図・周辺環境の画像認識→GSI逆ジオコード' if inferred else 'SUUMO詳細掲載住所（地図画像位置未確認）'
-                    row['suumo_search_group']=list(layouts);row['suumo_search_filters']={'building_type':'マンション','max_age':15,'town':prepared['town']}
+                    row['published_address']=published_address
+                    row['address_source']='SUUMO地図・周辺環境の画像認識→GSI逆ジオコード' if inferred else 'SUUMO詳細ページ所在地（画像位置未確認時の代替）'
                     emit('unit',row)
                 except (AppError,ValueError,TypeError) as exc:
                     emit('issue','SUUMO詳細確認｜'+str(exc));trace(web,'detail_optional_error',{'url':url,'message':str(exc)},'WARNING','collector')
-            next_pages=[]
-            for a in soup.select('a[href]'):
-                target=urlparse(urljoin(prepared['url'],a['href']))
-                if target.hostname!='suumo.jp' or target.path!=urlparse(prepared['url']).path:continue
-                try:number=int(parse_qs(target.query).get('page',['0'])[0])
-                except ValueError:continue
-                if number>page:next_pages.append(number)
-            trace(web,'page_end',{'provider':'SUUMO','group':list(layouts),'page':page,'buildings':len(buildings),'new_candidates':len(page_candidates),'next_pages':sorted(set(next_pages))},stage='pagination')
-            if not next_pages:break
-            page=min(next_pages)
+
+            next_url=_suumo_next_url(soup,reply.url,filter_params)
+            trace(web,'page_end',{'provider':'SUUMO','group':list(layouts),'page':page_number,'buildings':len(buildings),'new_candidates':len(page_candidates),'next_url':next_url or ''},stage='pagination')
+            if not next_url:break
+            current_url=next_url;current_params=None;page_number+=1
         if not group_candidates:trace(web,'empty',{'provider':'SUUMO','region':region.get('label'),'group':list(layouts),'reason':'条件一覧に候補なし'},stage='collector')
 
 
@@ -2682,6 +2864,10 @@ def start_search(conditions):
     with lock:
         old=jobs.get(token)
         if old and not old.snapshot()['finished']: return
+        # A new search only saves data. Previously loaded map colors must not remain active.
+        st.session_state.new_map_loaded=False
+        st.session_state.new_units=[]
+        st.session_state.new_saved_keys=[]
         # Secrets are read on the Streamlit thread, before launching a pure Python worker.
         db=Database();db.web_config=rental_network_settings()
         job=SearchJob(db,conditions);jobs[token]=job
@@ -2692,19 +2878,14 @@ def start_search(conditions):
     st.session_state.new_search=None
 
 @st.fragment(run_every='1s')
-def background_status():
+def background_progress(anchor=None):
+    """Render live worker progress at an explicit anchor directly below the map."""
     job=active_job()
-    if job is None: return
+    if job is None:return
     snap=job.snapshot()
     if not snap['finished'] or st.session_state.get('finished_snapshot_applied')!=job.audit.search_id:
         st.session_state.new_units=snap['units'];st.session_state.new_saved_keys=snap['saved']
         if snap['finished']:st.session_state.finished_snapshot_applied=job.audit.search_id
-    audit_cache=st.session_state.get('diagnostic_export_cache')
-    if not audit_cache or audit_cache['id']!=job.audit.search_id or time.monotonic()-audit_cache['at']>=10 or snap['finished'] and audit_cache['count']!=job.audit.count:
-        audit_cache={'id':job.audit.search_id,'at':time.monotonic(),'count':job.audit.count,'events':job.audit.records()};st.session_state.diagnostic_export_cache=audit_cache
-    diagnostic_downloads(audit_cache['events'])
-    if job.audit.storage_error:st.error('作業ログのSupabase保存を確認できません。TXTまたはJSONでダウンロードしてください。'+job.audit.storage_error)
-    st.caption(f"ログ {job.audit.count}イベント｜Supabase保存確認 {job.audit.persisted_events}イベント｜実行中のダウンロードは最大10秒前の内容です。")
     if snap['finished']:
         st.session_state.new_search=snap['result']
         if not st.session_state.get('new_job_rendered')==id(job):
@@ -2712,10 +2893,30 @@ def background_status():
         return
     if (job.updated if isinstance(job,PositionRepairJob) else len(snap['units']))!=st.session_state.get('position_rendered_count') and time.monotonic()-st.session_state.get('position_rendered_at',0)>3:
         st.session_state.position_rendered_count=job.updated if isinstance(job,PositionRepairJob) else len(snap['units']);st.session_state.position_rendered_at=time.monotonic();st.rerun()
-    st.progress(min(.99,snap['progress']),text='バックグラウンドで地図位置・住所を確認しています' if isinstance(job,PositionRepairJob) else 'バックグラウンドで検索・保存しています')
-    st.info(snap['message'])
-    if snap['log']: st.code(snap['log'],language=None)
-    st.caption('画面を操作しても検索と保存は継続します。サーバーの休止・再起動では実行が終了します。')
+    def render():
+        st.progress(min(.99,snap['progress']),text='バックグラウンドで地図位置・住所を確認しています' if isinstance(job,PositionRepairJob) else 'バックグラウンドで検索・保存しています')
+        st.caption(snap['message'])
+    if anchor is None:
+        render()
+    else:
+        with anchor.container():render()
+
+
+@st.fragment(run_every='10s')
+def background_status():
+    """Render diagnostics below the search controls; progress itself is shown under the map."""
+    job=active_job()
+    if job is None:return
+    snap=job.snapshot()
+    audit_cache=st.session_state.get('diagnostic_export_cache')
+    if not audit_cache or audit_cache['id']!=job.audit.search_id or time.monotonic()-audit_cache['at']>=10 or snap['finished'] and audit_cache['count']!=job.audit.count:
+        audit_cache={'id':job.audit.search_id,'at':time.monotonic(),'count':job.audit.count,'events':job.audit.records()};st.session_state.diagnostic_export_cache=audit_cache
+    diagnostic_downloads(audit_cache['events'])
+    if job.audit.storage_error:st.error('作業ログのSupabase保存を確認できません。TXTまたはJSONでダウンロードしてください。'+job.audit.storage_error)
+    st.caption(f"ログ {job.audit.count}イベント｜Supabase保存確認 {job.audit.persisted_events}イベント｜実行中のダウンロードは最大10秒前の内容です。")
+    if not snap['finished']:
+        if snap['log']:st.code(snap['log'],language=None)
+        st.caption('画面を操作しても検索と保存は継続します。サーバーの休止・再起動では実行が終了します。')
 
 def main():
     st.set_page_config(page_title='住まいコンパス｜新しい住まいを探す',page_icon='🏡',layout='wide',initial_sidebar_state='collapsed')
@@ -2725,6 +2926,7 @@ def main():
     state.setdefault('new_units',[]);state.setdefault('new_search',None);state.setdefault('new_saved_keys',[])
     state.setdefault('new_facilities',[])
     state.setdefault('new_map_loaded',False);state.setdefault('address_point_cache',{})
+    state.setdefault('layout_display_group','group1')
     request=state.pop('new_request',None)
     if request is not None:
         try: start_search(request)
@@ -2736,10 +2938,19 @@ def main():
         st.caption('地図に見えている四角い範囲が検索対象です。駅名の選択や取得件数の上限はありません。')
         st.caption('検索中はデータベースへの保存だけを行い、地図には色を付けません。「保存データ」で読み込んだ時だけ家賃帯を色付けします。')
         st.caption('保存する募集データは家賃・間取り・住所の3項目だけです。地図画像や緯度経度は保存しません。')
+        selected_group=state.get('layout_display_group','group1')
+        if selected_group not in DISPLAY_LAYOUT_GROUPS:selected_group='group1';state.layout_display_group='group1'
+        g1,g2=st.columns(2)
+        if g1.button('1LDK・2K・2DK',key='layout_group1',type='primary' if selected_group=='group1' else 'secondary',use_container_width=True):
+            if state.layout_display_group!='group1':state.layout_display_group='group1';st.rerun()
+        if g2.button('2LDK・3K・3DK',key='layout_group2',type='primary' if selected_group=='group2' else 'secondary',use_container_width=True):
+            if state.layout_display_group!='group2':state.layout_display_group='group2';st.rerun()
+        selected_group=state.get('layout_display_group','group1');selected_layouts=set(DISPLAY_LAYOUT_GROUPS[selected_group])
+        st.caption('表示中：'+('1LDK・2K・2DK' if selected_group=='group1' else '2LDK・3K・3DK')+'。保存データ自体は変更せず、地図・件数・一覧だけを切り替えます。')
         bounds=state.get('new_bounds')
         center=bounds_center(bounds) if bounds else state.get('new_view_center',DEFAULT_CENTER)
         radius=bounds_radius(bounds) if bounds else 1500
-        map_units=state.new_units if state.get('new_map_loaded') else []
+        map_units=[r for r in state.new_units if r.get('layout') in selected_layouts] if state.get('new_map_loaded') else []
         rows,pins,cells,display_report=display_pipeline(map_units,bounds,state.get('new_load_diagnostic'))
         job=active_job()
         if job:
@@ -2751,6 +2962,9 @@ def main():
         data=st_folium(rental_map([],DEFAULT_CENTER,1500,[],[]),key='new_map',height=480,use_container_width=True,
             returned_objects=['bounds','zoom'],center=state.get('new_view_center',DEFAULT_CENTER),
             zoom=state.get('new_view_zoom',15),feature_group_to_add=rental_features(pins,cells,facilities),on_change=capture_viewport)
+        # Fixed DOM position: live progress is rendered into this placeholder and nowhere else.
+        progress_anchor=st.empty()
+        background_progress(progress_anchor)
         # Initial component defaults are not real viewport bounds. Only the browser callback makes the search ready.
         bounds=state.get('new_bounds')
         if bounds:
