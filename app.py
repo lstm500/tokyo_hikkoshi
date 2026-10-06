@@ -35,7 +35,7 @@ import streamlit as st
 from streamlit_folium import st_folium
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v31"
+BUILD = "REBUILD-01-v32"
 DEFAULT_CENTER = (35.7303,139.711)
 UNIT_TABLE = "housing_units_v1"
 SEARCH_TABLE = "housing_searches_v1"
@@ -177,6 +177,82 @@ def address_key(value):
         return (str(number) if number is not None else text)+'丁目'
     return re.sub(r'([一二三四五六七八九十]+)丁目',convert,value)
 
+
+
+def town_matches(town,address):
+    wanted=address_key(town);actual=address_key(address)
+    match=re.fullmatch(r'(.*?)(\d+)丁目',wanted)
+    if match:
+        base,number=match.groups()
+        return bool(re.search(r'(?:^|[都道府県市区郡町村])'+re.escape(base+number)+r'(?:丁目|[-ー−－番号]|$)',actual))
+    return bool(re.search(r'(?:^|[都道府県市区郡町村])'+re.escape(wanted),actual))
+
+
+def parsed_layout(raw):
+    value=normal(raw).upper().replace('　',' ').strip()
+    match=re.match(r'^(\d+(?:LDK|SLDK|SDK|DK|SK|LK|K|L|R))(?=$|[\s(（+/])',value)
+    return match[1] if match else '1R' if value=='ワンルーム' else None
+
+
+def resolve_layout(web,raw,requested=None,url=''):
+    observed=parsed_layout(raw)
+    if observed:
+        if observed not in LAYOUTS or requested and observed!=requested:
+            trace(web,'layout',{'url':url,'observed':raw,'parsed':observed,'requested':requested,'reason':'explicit_layout_does_not_match_search'});return None
+        return observed
+    if requested in LAYOUTS:
+        trace(web,'layout_assumed',{'url':url,'observed':raw,'assigned':requested,'source':'single_layout_search','confirmed_from_listing':False},'WARNING');return requested
+    trace(web,'layout',{'url':url,'observed':raw,'reason':'no_readable_layout_and_no_single_layout_search'},'WARNING');return None
+
+
+def discover_layout_inputs(soup,provider):
+    result={}
+    for field in soup.select('input[name],select[name] option[value]'):
+        name=field.get('name') or (field.parent.get('name') if field.parent else '')
+        if not name or not ('madori' in name.lower() if provider=='HOME’S' else name=='md'):continue
+        options=[]
+        if field.get('id'):
+            label=soup.find('label',attrs={'for':field['id']})
+            if label:options.append(label.get_text(' ',strip=True))
+        label=field.find_parent('label')
+        if label:options.append(label.get_text(' ',strip=True))
+        if field.name=='option':options.append(field.get_text(' ',strip=True))
+        options.extend([field.get('aria-label',''),field.get('data-label','')])
+        for text in options:
+            layout=parsed_layout(text)
+            if layout in LAYOUTS and str(field.get('value','')):
+                result[layout]=(name,str(field['value']));break
+    return result
+
+
+def single_layout_parameters(web,provider,requested):
+    """Read public form codes rather than guessing undocumented provider identifiers."""
+    if requested not in LAYOUTS:raise AppError('単独検索する間取りを確認してください。')
+    lock=getattr(web,'layout_form_lock',None)
+    if lock is None:lock=threading.Lock();web.layout_form_lock=lock
+    with lock:
+        cache=getattr(web,'layout_form_cache',None)
+        if cache is None:cache={};web.layout_form_cache=cache
+        if provider not in cache:
+            url='https://www.homes.co.jp/chintai/tokyo/list/' if provider=='HOME’S' else 'https://suumo.jp/jj/chintai/ichiran/FR301FC001/'
+            try:
+                if not web.permitted(url):raise AppError('間取り条件フォームの自動取得は許可されていません。')
+                reply=web.fetch(url,params={'ar':'030','bs':'040','ta':'13'} if provider=='SUUMO' else {})
+                filters=discover_layout_inputs(BeautifulSoup(reply.text,'html.parser'),provider)
+                if not filters:raise AppError(provider+'の間取り条件フォームを読み取れません。単独の条件を確認できないため一括検索へ切り替えません。')
+                cache[provider]=filters
+                trace(web,'layout_filter_discovered',{'provider':provider,'source_url':url,'filters':filters},stage='search_conditions')
+            except AppError as exc:cache[provider]=str(exc)
+        filters=cache[provider]
+        if isinstance(filters,str):raise AppError(filters)
+        if requested not in filters:raise AppError(provider+'では'+requested+'の単独間取り条件を確認できません。他の間取りの検索は続けます。')
+        name,value=filters[requested]
+        if provider=='HOME’S':
+            # Public form and map request share the madori identifiers; preserve names already under cond.
+            name=name if name.startswith('cond[') else 'cond[madori]['+value+']'
+        params={name:value}
+        trace(web,'single_layout_query',{'provider':provider,'requested':requested,'parameters':params,'source':'public_form'},stage='search_conditions')
+        return params
 
 def meters(a, b):
     a1,b1,a2,b2 = map(math.radians, (*a,*b))
@@ -408,7 +484,7 @@ class PublicWeb:
     def __init__(self):
         self.local=threading.local()
         self.headers={'User-Agent':'SumaiCompassRebuild/1.0 (personal rental research)', 'Accept-Language':'ja'}
-        self.robots={};self.lock=threading.Lock()
+        self.robots={};self.lock=threading.Lock();self.layout_form_lock=threading.Lock();self.layout_form_cache={};self.unavailable_hosts={};self.failed_detail_urls={}
     def session(self):
         if not hasattr(self.local,'session'): self.local.session=requests.Session()
         return self.local.session
@@ -416,6 +492,8 @@ class PublicWeb:
         allowed=('www.homes.co.jp','suumo.jp','mreversegeocoder.gsi.go.jp','msearch.gsi.go.jp','maps.gsi.go.jp','cyberjapandata.gsi.go.jp','japanese-addresses-v2.geoloniamaps.com','geolonia.github.io')
         u=urlparse(url)
         if u.scheme!='https' or u.hostname not in allowed or u.username or u.password: raise AppError('取得先が不正です。')
+        if u.hostname in self.unavailable_hosts:raise AppError(self.unavailable_hosts[u.hostname])
+        if method=='GET' and not kwargs.get('params') and url in self.failed_detail_urls:raise AppError(self.failed_detail_urls[url])
         try:
             response=self.session().request(method,url,headers=self.headers,timeout=(4,12),allow_redirects=False,**kwargs)
             for _ in range(3):
@@ -426,9 +504,15 @@ class PublicWeb:
                     raise AppError('取得先が別のページに移動しました。')
                 response=self.session().get(target,headers=self.headers,timeout=(4,12),allow_redirects=False)
             response.raise_for_status()
+            if response.status_code==202 and not response.content.strip():
+                message=f'{u.hostname}：HTTP 202・本文0バイト。掲載データが届いていません。この検索中は同じ取得元への問い合わせを停止します。'
+                self.unavailable_hosts[u.hostname]=message;error=AppError(message);error.diagnostic={'status':202,'bytes':0};raise error
         except requests.Timeout as exc:
             error=AppError(f'{u.hostname}：接続または応答がタイムアウトしました。');error.diagnostic={'exception_type':type(exc).__name__,'reason':str(exc)[:1000]};raise error from None
-        except requests.HTTPError as exc: raise AppError(f'{u.hostname}：HTTP {exc.response.status_code}（公開ページの取得失敗）。') from None
+        except requests.HTTPError as exc:
+            message=f'{u.hostname}：HTTP {exc.response.status_code}（公開ページの取得失敗）。'
+            if method=='GET' and not kwargs.get('params'):self.failed_detail_urls[url]=message
+            raise AppError(message) from None
         except requests.ConnectionError as exc:
             error=AppError(f'{u.hostname}：接続できません（DNS・ネットワーク・接続先を確認）。');error.diagnostic={'exception_type':type(exc).__name__,'reason':str(exc)[:1000]};raise error from None
         except requests.RequestException: raise AppError(f'{u.hostname}：通信処理に失敗しました。') from None
@@ -719,7 +803,7 @@ def create_unit(provider,url,title,address,layout,rent,fees,area,floor,age,built
     return row
 
 
-def homes_detail(web,url,bounds,munis,hint):
+def homes_detail(web,url,bounds,munis,hint,search_layout=None):
     text=web.fetch(url).text;soup=BeautifulSoup(text,'html.parser');recognized=False
     for script in soup.select('script[type="application/ld+json"]'):
         try: data=json.loads(script.get_text())
@@ -731,14 +815,15 @@ def homes_detail(web,url,bounds,munis,hint):
             if offer.get('priceCurrency') not in (None,'JPY'): continue
             if offer.get('availability') not in (None,'https://schema.org/InStock','http://schema.org/InStock'): continue
             attrs={x.get('name'):x.get('value') for x in entity.get('additionalProperty',[]) if isinstance(x,dict)}
-            if attrs.get('間取り') and (attrs.get('建物構造') or attrs.get('構造')): recognized=True
+            if attrs.get('建物構造') or attrs.get('構造'): recognized=True
+            layout=resolve_layout(web,attrs.get('間取り'),search_layout,url)
             costs={x.get('name'):x.get('value') for x in offer.get('additionalProperty',[]) if isinstance(x,dict)}
             structure=attrs.get('建物構造') or attrs.get('構造') or labeled(soup,('建物構造','構造'))
             if not is_src(structure):
                 trace(web,'structure',{'url':url,'structure':structure});continue
             age,ym=age_info(attrs.get('築年月') or attrs.get('築年数') or labeled(soup,('築年月','築年数')))
-            if age is None or not 0<=age<=20 or normal(attrs.get('間取り')) not in LAYOUTS:
-                trace(web,'layout' if normal(attrs.get('間取り')) not in LAYOUTS else 'age',{'url':url,'layout':attrs.get('間取り'),'age':age,'raw_age':attrs.get('築年月') or attrs.get('築年数')});continue
+            if age is None or not 0<=age<=20 or layout is None:
+                trace(web,'layout' if layout is None else 'age',{'url':url,'layout':attrs.get('間取り'),'age':age,'raw_age':attrs.get('築年月') or attrs.get('築年数')});continue
             fees=costs.get('管理費等',costs.get('管理費'))
             if fees is None: raise AppError('HOME’S詳細ページの管理費を読み取れません。保存額を確認できません。')
             addr=entity.get('address') or {}
@@ -746,16 +831,16 @@ def homes_detail(web,url,bounds,munis,hint):
             location=locate(web,soup,text,address,bounds,munis,hint)
             if not location: continue
             try:
-                return create_unit('HOME’S',url,entity.get('name') or listing.get('name'),address,attrs.get('間取り'),
+                return create_unit('HOME’S',url,entity.get('name') or listing.get('name'),address,layout,
                                    amount(offer.get('price')),amount(fees),float((entity.get('floorSize') or {}).get('value',0)),
                                    entity.get('floorLevel'),age,ym,location)
             except (AppError,TypeError,ValueError): continue
     if recognized: return None
     # Published HTML tables remain usable when the page has no RealEstateListing JSON-LD.
     structure=labeled(soup,('建物構造','構造'))
-    layout=normal(labeled(soup,('間取り',)))
-    if not structure or not layout:
-        raise AppError('HOME’S詳細ページの構造・間取りを読み取れません。募集終了またはページ形式の変更を確認してください。')
+    layout=resolve_layout(web,labeled(soup,('間取り',)),search_layout,url)
+    if not structure:
+        raise AppError('HOME’S詳細ページの構造を読み取れません。募集終了またはページ形式の変更を確認してください。')
     age,ym=age_info(labeled(soup,('築年月','築年数')))
     if not is_src(structure) or layout not in LAYOUTS or age is None or not 0<=age<=20:
         trace(web,'structure' if not is_src(structure) else 'layout' if layout not in LAYOUTS else 'age',{'url':url,'structure':structure,'layout':layout,'age':age});return None
@@ -775,11 +860,15 @@ def homes_collect(web,region,bounds,munis,emit):
     info_url='https://www.homes.co.jp/_ajax/map/realestate_article/info_view/'
     if not all(web.permitted(u) for u in (tile_url,info_url)):
         raise AppError('HOME’Sの取得可否を確認できない、または自動取得が許可されていません。')
+    requested=region.get('search_layout')
+    if not requested:raise AppError('HOME’Sは間取りを1種類ずつ指定して検索してください。')
+    layout_params=single_layout_parameters(web,'HOME’S',requested)
     tiles=tiles_in_bounds(bounds)
     base={'cond[houseageh]':'20','cond[freeword]':region['town'],'cond[fwtype]':'1','zoom':'15',
           'cond[mbg][3001]':'3001','cond[mbg][3002]':'3002','cond[mbg][3003]':'3003',
           'cond[monthmoneyroom]':'0','cond[monthmoneyroomh]':'0','cond[housearea]':'0','cond[houseareah]':'0',
           'cond[walkminutesh]':'0','cond[newdate]':'0','cond[exfreeword]':''}
+    base.update(layout_params)
     buildings={}
     for offset in range(0,len(tiles),6):
         emit('message',f'地図候補 {offset+1}〜{min(offset+6,len(tiles))}/{len(tiles)}タイル')
@@ -813,7 +902,7 @@ def homes_collect(web,region,bounds,munis,emit):
     for index,(url,hint) in enumerate(links.items(),1):
         emit('message',f'詳細確認 {index}/{len(links)}件');emit('detail',1)
         if not web.permitted(url): emit('issue','詳細ページの自動取得が許可されていません。');continue
-        try: row=homes_detail(web,url,bounds,munis,hint)
+        try: row=homes_detail(web,url,bounds,munis,hint,requested)
         except AppError as exc: emit('issue',str(exc));row=None
         if row: emit('unit',row);accepted+=1
         else: emit('rejected',1)
@@ -822,6 +911,9 @@ def homes_collect(web,region,bounds,munis,emit):
 def suumo_collect(web,region,bounds,munis,emit):
     search='https://suumo.jp/jj/chintai/ichiran/FR301FC001/'
     if not web.permitted(search): raise AppError('SUUMOの取得可否を確認できない、または自動取得が許可されていません。')
+    requested=region.get('search_layout')
+    if not requested:raise AppError('SUUMOは間取りを1種類ずつ指定して検索してください。')
+    layout_params=single_layout_parameters(web,'SUUMO',requested)
     candidates={};page=1;seen_pages=set()
     def verify_page(page_candidates):
         for index,(url,values) in enumerate(page_candidates.items(),1):
@@ -843,6 +935,7 @@ def suumo_collect(web,region,bounds,munis,emit):
     while True:
         emit('message',f'検索一覧 {page}ページ目（件数上限なし）')
         params={'ar':'030','bs':'040','pc':'50','sc':region['code'],'ta':region['pref'],'fw2':region['town'],'page':page}
+        params.update(layout_params)
         soup=BeautifulSoup(web.fetch(search,params=params).text,'html.parser')
         page_candidates={}
         buildings=soup.select('div.cassetteitem')
@@ -856,13 +949,14 @@ def suumo_collect(web,region,bounds,munis,emit):
             def text(selector,default=''):
                 el=building.select_one(selector);return el.get_text(' ',strip=True) if el else default
             address=text('.cassetteitem_detail-col1')
-            if address_key(region['town']) not in address_key(address):
+            if not town_matches(region['town'],address):
                 trace(web,'address',{'town':region['town'],'listing_address':address,'page':page},'WARNING');continue
             title=text('.cassetteitem_content-title','SUUMO掲載物件')
             for room in building.select('tr.js-cassette_link'):
                 def field(selector):
                     el=room.select_one(selector);return el.get_text(' ',strip=True) if el else ''
-                layout=field('.cassetteitem_madori')
+                raw_layout=field('.cassetteitem_madori')
+                layout=resolve_layout(web,raw_layout,requested)
                 trace(web,'room_fields',{'page':page,'title':title,'address':address,'layout':layout,'raw_rent':field('.cassetteitem_price--rent'),'raw_fees':field('.cassetteitem_price--administration'),'raw_area':field('.cassetteitem_menseki')},stage='parser')
                 link=room.select_one('a[href*="/chintai/"]')
                 if layout not in LAYOUTS:
@@ -927,20 +1021,24 @@ def search_all(db,conditions,screen,state=None):
         log('地名取得完了｜'+search['conditions']['region_source']+'｜'+str(len(regions))+'地域')
         search['conditions']['regions']=[r['label'] for r in regions]
         state.new_regions=[r['label'] for r in regions]
-        jobs=[(r,p) for r in regions for p in conditions['providers']]
+        jobs=[(r,'間取り別検索') for r in regions]
         q=queue.Queue();active={};done=0;candidate=detail=rejected=0
-        def work(index,region,provider):
-            DIAG_CONTEXT.audit=audit;DIAG_CONTEXT.scope={'task':index,'region':region['label'],'town':region['town'],'municipality_code':region['code'],'provider':provider}
-            def emit(kind,value):
-                code=diagnosis_code(value) if kind=='issue' else 'accepted' if kind=='unit' else kind
-                audit.add('collector',code,'ERROR' if kind=='issue' else 'INFO',{'event':kind,'value':value})
-                q.put((index,kind,value))
-            emit('message','候補検索を開始')
-            collector=homes_collect if provider=='HOME’S' else suumo_collect
-            try: collector(web,region,bounds,munis,emit)
-            except Exception as exc:
-                trace(web,diagnosis_code(str(exc)),{'exception_type':type(exc).__name__,'traceback':traceback.format_exc()},'ERROR','collector_exception')
-                emit('issue',str(exc) if isinstance(exc,AppError) else f'取得処理エラー（{type(exc).__name__}）')
+        def work(index,region,unused):
+            # Each region finishes one layout at every provider before starting the next layout.
+            for layout in LAYOUTS:
+                for provider in conditions['providers']:
+                    DIAG_CONTEXT.audit=audit;DIAG_CONTEXT.scope={'task':index,'region':region['label'],'town':region['town'],'municipality_code':region['code'],'provider':provider,'search_layout':layout}
+                    def emit(kind,value):
+                        code=diagnosis_code(value) if kind=='issue' else 'accepted' if kind=='unit' else kind
+                        audit.add('collector',code,'ERROR' if kind=='issue' else 'INFO',{'event':kind,'value':value})
+                        q.put((index,kind,value))
+                    emit('message',layout+'｜'+provider+'｜単独検索を開始')
+                    collector=homes_collect if provider=='HOME’S' else suumo_collect
+                    try:collector(web,dict(region,search_layout=layout),bounds,munis,emit)
+                    except Exception as exc:
+                        trace(web,diagnosis_code(str(exc)),{'exception_type':type(exc).__name__,'traceback':traceback.format_exc()},'ERROR','collector_exception')
+                        emit('issue',layout+'｜'+provider+'｜'+(str(exc) if isinstance(exc,AppError) else f'取得処理エラー（{type(exc).__name__}）'))
+                    audit.add('collector','layout_loop_end','INFO',{'region':region['label'],'provider':provider,'layout':layout})
         with futures.ThreadPoolExecutor(max_workers=min(4,len(jobs))) as pool:
             pending={pool.submit(work,i,*job):i for i,job in enumerate(jobs)}
             completed=set()
@@ -1019,10 +1117,13 @@ DIAG_ADVICE={
  'save':('Supabaseの保存または保存確認の失敗','物件確認数と保存確認数を比較し、キー・テーブル・権限・HTTP応答を確認する。未保存物件の再保存で復旧を検証する。'),
  'empty':('取得元の一覧に候補がない','地名・自治体コード・検索パラメータをログのURLで照合する。手動検索の件数と比較し、真の0件と検索条件/解析の誤りを区別する。'),
  'location_unverified':('掲載座標はあるが住所照合は未判定','地名照合サービスの失敗ログを確認する。掲載座標と実際の建物位置を手動で照合し、未判定を位置確認済みとして評価しない。'),
+ 'layout_assumed':('掲載間取りを単独検索の指定値で補完','検索条件・公開フォームの値と結果一覧を照合する。掲載間取りを確認できたら優先し、異なる明示間取りは除外する。補完済みを掲載確認済みとは扱わない。'),
+ 'http_empty':('HTTP 202の空応答で掲載データが未到着','公開ページを手動で確認し、取得元のアクセス条件と公開API/データ提供を確認する。空本文をHTML解析失敗や間取り欠落と扱わない。'),
  'unknown':('現時点で理由を特定できない','前後の通信・解析・除外イベントを照合する。再現URLと読取項目を追加してから修正する。原因を断定しない。')}
 
 def diagnosis_code(message):
     text=str(message)
+    if 'HTTP 202' in text and '0バイト' in text:return 'http_empty'
     for needle,code in [('タイムアウト','timeout'),('HTTP 403','http_403'),('HTTP 429','http_429'),('HTTP 404','http_404')]:
         if needle in text:return code
     if re.search(r'HTTP 5\d\d',text):return 'http_5xx'
@@ -1421,7 +1522,7 @@ def main():
         providers=st.multiselect('物件の取得元',['HOME’S','SUUMO'],default=preferences.get('new_providers',['HOME’S','SUUMO']),key='new_providers')
         st.button('表示中の地名から全件検索・保存',type='primary',use_container_width=True,
                   on_click=remember_search,key='new_start',disabled=not bounds or not providers or bool(active_job() and not active_job().snapshot()['finished']))
-        st.caption('検索開始時の表示範囲を固定し、地名・丁目ごとに取得元の掲載一覧を最後まで確認します。予算・間取りの表示設定は取得件数を制限しません。')
+        st.caption('検索開始時の表示範囲を固定し、同じ地名・丁目で1K→1L→1DK→1LDK→2DK→2LDK→3DK→3LDKを1種類ずつ検索し、それぞれ掲載一覧を最後まで確認します。予算・間取りの表示設定は取得件数を制限しません。')
         background_status()
         result=state.new_search
         if result:
@@ -1556,6 +1657,7 @@ def main():
         st.caption('旧アプリの物件や検索状態を使用しません。旧テーブルのデータは削除しません。')
         st.caption(f'実行中の版：{BUILD}')
     with st.expander('取得・集計の範囲'):
+        st.write('間取りを読み取れない場合は単独検索で指定した間取りを採用し、補完したことを詳細ログへ記録します。掲載間取りが指定と異なる場合は除外します。構造・築年月・位置は間取りから推測しません。')
         st.write('公開ページの掲載情報を取得し、SRC・築20年以内・対象間取り・位置を確認した物件を保存します。架空の物件や家賃は生成しません。')
         st.write('掲載地図座標を優先し、番地のある住所は一致する住所検索結果で補完します。住所と地図判定に明確な不一致がある物件は除外します。')
         st.write('地図範囲内の居住地名タイルと100m間隔の地点・範囲の端から地名・丁目を判定します。候補数・物件数・ページ数による打ち切りは行いません。通信失敗やページ送りの異常は未完了として表示します。掲載サイト側の非公開情報・取得制限や、地名データの欠落は取得できません。')
