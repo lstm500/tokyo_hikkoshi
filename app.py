@@ -1,6 +1,6 @@
 """住まいコンパス / REBUILD 01 — complete independent implementation.
 Run: streamlit run app.py
-Dependencies: streamlit>=1.50,<2, requests>=2.32,<3, beautifulsoup4>=4.13,<5, folium>=0.18,<1.
+Dependencies: streamlit>=1.50,<2, requests>=2.32,<3, beautifulsoup4>=4.13,<5, folium>=0.18,<1, streamlit-folium==0.24.0.
 Persistent storage: Supabase housing_units_v1, housing_searches_v1, housing_places_v1.
 No legacy job, cache, pause, resume, database, or background heartbeat is used.
 """
@@ -24,15 +24,16 @@ import time
 import unicodedata
 import urllib.robotparser
 from datetime import datetime, timezone
-from urllib.parse import urlencode, urljoin, urlparse
+from urllib.parse import urlencode, urljoin, urlparse, parse_qs
 
 import folium
 import requests
 import streamlit as st
-import streamlit.components.v1 as components
+from streamlit_folium import st_folium
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v26"
+BUILD = "REBUILD-01-v27"
+DEFAULT_CENTER = (35.7303,139.711)
 UNIT_TABLE = "housing_units_v1"
 SEARCH_TABLE = "housing_searches_v1"
 PLACE_TABLE = "housing_places_v1"
@@ -189,6 +190,54 @@ def in_rectangle(point, bounds):
     return bounds[0]<=point[0]<=bounds[2] and bounds[1]<=point[1]<=bounds[3]
 
 
+def viewport_bounds(data):
+    try:
+        b=data['bounds'];s=float(b['_southWest']['lat']);w=float(b['_southWest']['lng'])
+        n=float(b['_northEast']['lat']);e=float(b['_northEast']['lng'])
+        if not all(math.isfinite(v) for v in (s,w,n,e)) or not (34<=s<n<=37 and 138<=w<e<=141):
+            return None
+        return (s,w,n,e)
+    except (KeyError,TypeError,ValueError): return None
+
+
+def bounds_center(bounds):
+    s,w,n,e=bounds
+    return ((s+n)/2,(w+e)/2)
+
+
+def bounds_radius(bounds):
+    return max(meters(bounds_center(bounds),p) for p in ((bounds[0],bounds[1]),(bounds[2],bounds[3])))
+
+
+def tiles_in_bounds(bounds,zoom=15):
+    def tile(lat,lng):
+        size=2**zoom
+        return int((lng+180)/360*size),int((1-math.asinh(math.tan(math.radians(lat)))/math.pi)/2*size)
+    s,w,n,e=bounds;x1,y1=tile(n,w);x2,y2=tile(s,e)
+    return [(x,y) for x in range(x1,x2+1) for y in range(y1,y2+1)]
+
+
+def bounded_results(items,fn,workers=6):
+    """Bound simultaneous requests, never the number of items searched."""
+    iterator=iter(items)
+    with futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        pending={}
+        def fill():
+            while len(pending)<workers:
+                try: item=next(iterator)
+                except StopIteration: break
+                pending[pool.submit(fn,item)]=item
+        fill()
+        while pending:
+            ready,_=futures.wait(pending,timeout=.4,return_when=futures.FIRST_COMPLETED)
+            if not ready: yield None,None,None
+            for f in ready:
+                item=pending.pop(f)
+                try: yield item,f.result(),None
+                except Exception as exc: yield item,None,exc
+            fill()
+
+
 def amount(value):
     text=normal(value).replace(",", "").replace(" ", "")
     if text in ("", "-", "―", "なし", "無"): return 0
@@ -289,8 +338,8 @@ class Database:
                          [dict(search,namespace=self.namespace)],'resolution=merge-duplicates,return=representation')
         if not isinstance(result,list) or not any(x.get('id')==search['id'] for x in result if isinstance(x,dict)):
             raise AppError('検索履歴の保存を確認できません。')
-    def load_units(self,center,radius,layouts):
-        s,w,n,e=rectangle(center,radius);out=[];offset=0
+    def load_units(self,bounds,layouts):
+        s,w,n,e=bounds;out=[];offset=0
         while True:
             params={'namespace':'eq.'+self.namespace,'select':'*','order':'key.asc','limit':300,'offset':offset,
                     'and':f'(latitude.gte.{s},latitude.lte.{n},longitude.gte.{w},longitude.lte.{e})',
@@ -307,7 +356,7 @@ class Database:
                         row=dict(row);row['age']=int(row['age'])+max(0,datetime.now(timezone.utc).year-stamp.year)
                     except (ValueError,TypeError):
                         continue
-                if valid_unit(row) and meters(center,(row['latitude'],row['longitude']))<=radius: out.append(row)
+                if valid_unit(row) and in_rectangle((row['latitude'],row['longitude']),bounds): out.append(row)
             offset+=len(rows)
         return list({r['key']:r for r in out}.values())
     def save_places(self,rows,kind):
@@ -347,7 +396,7 @@ class PublicWeb:
         if not hasattr(self.local,'session'): self.local.session=requests.Session()
         return self.local.session
     def fetch(self,url,method='GET',**kwargs):
-        allowed=('www.homes.co.jp','suumo.jp','mreversegeocoder.gsi.go.jp','msearch.gsi.go.jp','maps.gsi.go.jp')
+        allowed=('www.homes.co.jp','suumo.jp','mreversegeocoder.gsi.go.jp','msearch.gsi.go.jp','maps.gsi.go.jp','cyberjapandata.gsi.go.jp')
         u=urlparse(url)
         if u.scheme!='https' or u.hostname not in allowed or u.username or u.password: raise AppError('取得先が不正です。')
         try:
@@ -402,24 +451,46 @@ def reverse(web,point,munis):
     return dict(code=code,pref=pref,town=town,label=prefecture+city+town,point=point)
 
 
-def regional_tasks(web,center,radius,notify):
-    munis=municipalities(web);bounds=rectangle(center,radius)
-    count=min(15,max(3,math.ceil(radius*2/400)))
-    points=[(bounds[0]+(bounds[2]-bounds[0])*(y+.5)/count,
-             bounds[1]+(bounds[3]-bounds[1])*(x+.5)/count) for y in range(count) for x in range(count)]
-    regions={};done=errors=0
-    with futures.ThreadPoolExecutor(max_workers=6) as pool:
-        pending={pool.submit(reverse,web,p,munis) for p in points}
-        while pending:
-            ready,pending=futures.wait(pending,timeout=.4,return_when=futures.FIRST_COMPLETED)
-            for f in ready:
-                done+=1
-                try: region=f.result()
-                except Exception: region=None;errors+=1
-                if region: regions[(region['code'],region['town'])]=region
-            notify(done,len(points),len(regions),errors)
-    if not regions: raise AppError('検索範囲の地域を確認できません。国土地理院への接続を確認してください。')
-    return list(regions.values()),munis,errors
+def regional_tasks(web,bounds,notify):
+    """All residential-label points plus an uncapped 100 m grid and edges."""
+    munis=municipalities(web);s,w,n,e=bounds
+    labels=set();errors=done=0;tiles=tiles_in_bounds(bounds)
+    def label_tile(tile):
+        x,y=tile
+        data=web.fetch(f'https://cyberjapandata.gsi.go.jp/xyz/experimental_nrpt/15/{x}/{y}.geojson').json()
+        if not isinstance(data,dict) or not isinstance(data.get('features'),list):
+            raise AppError('地名タイルの形式を確認できません。')
+        points=[]
+        for f in data['features']:
+            geo=f.get('geometry') or {}
+            if geo.get('type')!='Point': continue
+            try:
+                lng,lat=map(float,geo['coordinates'][:2])
+                if in_rectangle((lat,lng),bounds): points.append((lat,lng))
+            except (KeyError,TypeError,ValueError): continue
+        return points
+    for tile,points,error in bounded_results(tiles,label_tile):
+        if tile is not None:
+            done+=1
+            if error: errors+=1
+            else: labels.update(points)
+        notify('地名タイル',done,len(tiles),len(labels),errors)
+    # Include every edge; no 15x15/sample-count cap. Labels cover small named areas between grid points.
+    ny=max(1,math.ceil((n-s)*111320/100))
+    nx=max(1,math.ceil((e-w)*111320*math.cos(math.radians((s+n)/2))/100))
+    grid=((s+(n-s)*y/ny,w+(e-w)*x/nx) for y in range(ny+1) for x in range(nx+1))
+    import itertools
+    points=itertools.chain(sorted(labels),grid)
+    total=len(labels)+(nx+1)*(ny+1);done=0;regions={}
+    def identify(point): return reverse(web,point,munis)
+    for point,region,error in bounded_results(points,identify):
+        if point is not None:
+            done+=1
+            if error: errors+=1
+            elif region: regions[(region['code'],address_key(region['town']))]=region
+        notify('地名・丁目判定',done,total,len(regions),errors)
+    if not regions: raise AppError('地図範囲の地名を確認できません。国土地理院への接続を確認してください。')
+    return sorted(regions.values(),key=lambda r:r['label']),munis,errors
 
 
 def labeled(soup,labels):
@@ -460,19 +531,19 @@ def coordinate(soup,text,hint=None):
     return candidates
 
 
-def locate(web,soup,text,address,center,radius,munis,hint=None):
-    candidates=[p for p in coordinate(soup,text,hint) if meters(center,p[:2])<=radius]
+def locate(web,soup,text,address,bounds,munis,hint=None):
+    candidates=[p for p in coordinate(soup,text,hint) if in_rectangle(p[:2],bounds)]
     method=''
     if candidates:
-        lat,lng,method,_=max(candidates,key=lambda p:(p[3],-meters(center,p[:2])))
+        lat,lng,method,_=max(candidates,key=lambda p:(p[3],-meters(bounds_center(bounds),p[:2])))
     elif re.search(r'\d+(?:丁目|番|号)|\d+-\d+',normal(address)):
         data=web.fetch('https://msearch.gsi.go.jp/address-search/AddressSearch',params={'q':address}).json()
         candidates=[]
-        for item in data[:5] if isinstance(data,list) else []:
+        for item in data if isinstance(data,list) else []:
             try:
                 lng,lat=map(float,item['geometry']['coordinates'])
                 title=normal(item.get('properties',{}).get('title',''))
-                if meters(center,(lat,lng))<=radius and title and (title in normal(address) or normal(address) in title):
+                if in_rectangle((lat,lng),bounds) and title and (address_key(title) in address_key(address) or address_key(address) in address_key(title)):
                     candidates.append((lat,lng))
             except (TypeError,ValueError,KeyError): continue
         if not candidates: return None
@@ -498,7 +569,7 @@ def create_unit(provider,url,title,address,layout,rent,fees,area,floor,age,built
     return row if valid_unit(row) else None
 
 
-def homes_detail(web,url,center,radius,munis,hint):
+def homes_detail(web,url,bounds,munis,hint):
     text=web.fetch(url).text;soup=BeautifulSoup(text,'html.parser')
     for script in soup.select('script[type="application/ld+json"]'):
         try: data=json.loads(script.get_text())
@@ -518,7 +589,7 @@ def homes_detail(web,url,center,radius,munis,hint):
             if fees is None: continue
             addr=entity.get('address') or {}
             address=''.join(str(addr.get(x,'')) for x in ('addressRegion','addressLocality','streetAddress')) if isinstance(addr,dict) else ''
-            location=locate(web,soup,text,address,center,radius,munis,hint)
+            location=locate(web,soup,text,address,bounds,munis,hint)
             if not location: continue
             try:
                 return create_unit('HOME’S',url,entity.get('name') or listing.get('name'),address,attrs.get('間取り'),
@@ -528,16 +599,12 @@ def homes_detail(web,url,center,radius,munis,hint):
     return None
 
 
-def homes_collect(web,region,center,radius,limit,munis,emit):
+def homes_collect(web,region,bounds,munis,emit):
     tile_url='https://www.homes.co.jp/_ajax/map/realestate_article/tile/'
     info_url='https://www.homes.co.jp/_ajax/map/realestate_article/info_view/'
     if not all(web.permitted(u) for u in (tile_url,info_url)):
         raise AppError('HOME’Sの取得可否を確認できない、または自動取得が許可されていません。')
-    def tile(point):
-        lat,lng=point;n=32768
-        return int((lng+180)/360*n),int((1-math.asinh(math.tan(math.radians(lat)))/math.pi)/2*n)
-    bounds=rectangle(center,radius);xmin,ymin=tile((bounds[2],bounds[1]));xmax,ymax=tile((bounds[0],bounds[3]))
-    tiles=[(x,y) for x in range(xmin,xmax+1) for y in range(ymin,ymax+1)]
+    tiles=tiles_in_bounds(bounds)
     base={'cond[houseageh]':'20','cond[freeword]':region['town'],'cond[fwtype]':'1','zoom':'15',
           'cond[mbg][3001]':'3001','cond[mbg][3002]':'3002','cond[mbg][3003]':'3003',
           'cond[monthmoneyroom]':'0','cond[monthmoneyroomh]':'0','cond[housearea]':'0','cond[houseareah]':'0',
@@ -547,42 +614,66 @@ def homes_collect(web,region,center,radius,limit,munis,emit):
         emit('message',f'地図候補 {offset+1}〜{min(offset+6,len(tiles))}/{len(tiles)}タイル')
         params=dict(base)
         for i,(x,y) in enumerate(tiles[offset:offset+6]): params[f'tiles[{i}][x]']=x;params[f'tiles[{i}][y]']=y
-        data=web.fetch(tile_url,'POST',data=params).json()
+        try:
+            data=web.fetch(tile_url,'POST',data=params).json()
+            if not isinstance(data,dict): raise AppError('HOME’S地図候補の応答形式を確認できません。')
+        except (AppError,ValueError) as exc:
+            emit('issue',str(exc));continue
         for group in data.values() if isinstance(data,dict) else []:
             for row in group.get('row_set',[]) if isinstance(group,dict) else []:
                 try:
                     lat,lng=float(row['lat']),float(row['lon']);key=str(row['tykey'])
-                    if re.fullmatch(r'[A-Za-z0-9]+',key) and meters(center,(lat,lng))<=radius: buildings[key]=(lat,lng)
+                    if re.fullmatch(r'[A-Za-z0-9]+',key) and in_rectangle((lat,lng),bounds): buildings[key]=(lat,lng)
                 except (ValueError,TypeError,KeyError): continue
-        if len(buildings)>=limit*4: break
     emit('candidate',len(buildings));links={}
-    for i,(key,point) in enumerate(sorted(buildings.items(),key=lambda x:meters(region['point'],x[1]))[:limit*3],1):
-        emit('message',f'建物候補の確認 {i}/{min(len(buildings),limit*3)}')
-        text=web.fetch(info_url,'POST',data=dict(base,**{'cond[tykey]':key})).text
+    for i,(key,point) in enumerate(sorted(buildings.items(),key=lambda x:meters(region['point'],x[1])),1):
+        emit('message',f'建物候補の確認 {i}/{len(buildings)}')
+        try: text=web.fetch(info_url,'POST',data=dict(base,**{'cond[tykey]':key})).text
+        except AppError as exc: emit('issue',str(exc));continue
         for a in BeautifulSoup(text,'html.parser').select('a[href]'):
             url=urljoin('https://www.homes.co.jp',a['href']).split('#')[0]
             if safe_url(url,'HOME’S'): links[url]=point
-        if len(links)>=limit*5: break
     accepted=0
     for index,(url,hint) in enumerate(links.items(),1):
         emit('message',f'詳細確認 {index}/{len(links)}件');emit('detail',1)
         if not web.permitted(url): emit('rejected',1);continue
-        try: row=homes_detail(web,url,center,radius,munis,hint)
+        try: row=homes_detail(web,url,bounds,munis,hint)
         except AppError as exc: emit('issue',str(exc));row=None
         if row: emit('unit',row);accepted+=1
         else: emit('rejected',1)
-        if accepted>=limit: break
 
 
-def suumo_collect(web,region,center,radius,limit,munis,emit):
+def suumo_collect(web,region,bounds,munis,emit):
     search='https://suumo.jp/jj/chintai/ichiran/FR301FC001/'
     if not web.permitted(search): raise AppError('SUUMOの取得可否を確認できない、または自動取得が許可されていません。')
-    candidates={}
-    for page in range(1,7):
-        emit('message',f'検索一覧 {page}/6ページ')
+    candidates={};page=1;seen_pages=set()
+    def verify_page(page_candidates):
+        for index,(url,values) in enumerate(page_candidates.items(),1):
+            emit('message',f'詳細確認 {index}/{len(page_candidates)}件');emit('detail',1)
+            if not web.permitted(url): emit('rejected',1);continue
+            try:
+                text=web.fetch(url).text;soup=BeautifulSoup(text,'html.parser')
+                age,ym=age_info(labeled(soup,('築年月','築年数')))
+                if not is_src(labeled(soup,('構造','建物構造'))) or age is None or not 0<=age<=20:
+                    emit('rejected',1);continue
+                location=locate(web,soup,text,values[1],bounds,munis)
+                row=create_unit('SUUMO',url,*values,labeled(soup,('階建','所在階')),age,ym,location) if location else None
+                if row: emit('unit',row)
+                else: emit('rejected',1)
+            except (AppError,ValueError,TypeError) as exc: emit('issue',str(exc));emit('rejected',1)
+    while True:
+        emit('message',f'検索一覧 {page}ページ目（件数上限なし）')
         params={'ar':'030','bs':'040','pc':'50','sc':region['code'],'ta':region['pref'],'fw2':region['town'],'page':page}
-        soup=BeautifulSoup(web.fetch(search,params=params).text,'html.parser');fresh=0
-        for building in soup.select('div.cassetteitem'):
+        soup=BeautifulSoup(web.fetch(search,params=params).text,'html.parser')
+        page_candidates={}
+        buildings=soup.select('div.cassetteitem')
+        if not buildings:
+            if any(t in soup.get_text() for t in ('該当する物件','該当物件','物件が見つかりません','0件')): break
+            raise AppError(f'SUUMO {page}ページ目の一覧を確認できません。')
+        signature=hashlib.sha256(str(buildings).encode()).hexdigest()
+        if signature in seen_pages: raise AppError('SUUMOのページ送りが同じ一覧を返しました。全ページを確認できていません。')
+        seen_pages.add(signature)
+        for building in buildings:
             def text(selector,default=''):
                 el=building.select_one(selector);return el.get_text(' ',strip=True) if el else default
             address=text('.cassetteitem_detail-col1')
@@ -602,28 +693,22 @@ def suumo_collect(web,region,center,radius,limit,munis,emit):
                     rent=amount(field('.cassetteitem_price--rent'));fees=amount(field('.cassetteitem_price--administration'))
                     if rent<=0: continue
                     candidates[url]=(title,address,layout,rent,fees,float(match[0]))
-                    fresh+=1
+                    page_candidates[url]=candidates[url]
                 except AppError: continue
-        if not fresh or len(candidates)>=limit*5: break
-    emit('candidate',len(candidates));accepted=0
-    for index,(url,values) in enumerate(candidates.items(),1):
-        emit('message',f'詳細確認 {index}/{len(candidates)}件');emit('detail',1)
-        if not web.permitted(url): emit('rejected',1);continue
-        try:
-            text=web.fetch(url).text;soup=BeautifulSoup(text,'html.parser')
-            age,ym=age_info(labeled(soup,('築年月','築年数')))
-            if not is_src(labeled(soup,('構造','建物構造'))) or age is None or not 0<=age<=20:
-                emit('rejected',1);continue
-            location=locate(web,soup,text,values[1],center,radius,munis)
-            row=create_unit('SUUMO',url,*values,labeled(soup,('階建','所在階')),age,ym,location) if location else None
-            if row: emit('unit',row);accepted+=1
-            else: emit('rejected',1)
-        except (AppError,ValueError,TypeError) as exc: emit('issue',str(exc));emit('rejected',1)
-        if accepted>=limit: break
+        emit('candidate',len(page_candidates));verify_page(page_candidates)
+        next_pages=[]
+        for a in soup.select('a[href]'):
+            target=urlparse(urljoin(search,a['href']))
+            if target.hostname!='suumo.jp' or target.path!=urlparse(search).path: continue
+            try: number=int(parse_qs(target.query).get('page',['0'])[0])
+            except ValueError: continue
+            if number>page: next_pages.append(number)
+        if not next_pages: break
+        page=min(next_pages)
 
 
 def search_all(db,conditions,screen):
-    center=STATIONS[conditions['station']];radius=conditions['radius'];started=time.monotonic()
+    bounds=tuple(conditions['bounds']);started=time.monotonic()
     search=dict(id=hashlib.sha256((utc_now()+str(time.time_ns())).encode()).hexdigest(),status='started',
                 started_at=utc_now(),finished_at=None,conditions=conditions,summary={})
     units={};saved=set();issues=[];logs=[]
@@ -633,20 +718,22 @@ def search_all(db,conditions,screen):
     screen['status'].info('検索実行中｜保存先の接続・新しいテーブルを確認しています')
     db.check();db.save_search(search);log('保存先確認OK。新しい検索を開始しました。')
     web=PublicWeb()
-    def region_update(done,total,count,errors):
-        screen['bar'].progress(.05+.15*done/total,text=f'地域判定 {done}/{total}地点')
-        screen['status'].info(f'検索実行中｜地域判定 {done}/{total}地点｜{count}地域｜接続失敗 {errors}地点｜経過 {int(time.monotonic()-started)}秒')
+    def region_update(stage,done,total,count,errors):
+        screen['bar'].progress(.05+.15*done/total,text=f'{stage} {done}/{total}')
+        screen['status'].info(f'検索実行中｜{stage} {done}/{total}｜{count}地域｜接続失敗 {errors}地点｜経過 {int(time.monotonic()-started)}秒')
     try:
         screen['status'].info('検索実行中｜国土地理院の地域情報を取得しています')
-        regions,munis,region_errors=regional_tasks(web,center,radius,region_update)
+        regions,munis,region_errors=regional_tasks(web,bounds,region_update)
         if region_errors: issues.append(f'地域判定で{region_errors}地点を確認できませんでした。')
+        search['conditions']['regions']=[r['label'] for r in regions]
+        st.session_state.new_regions=[r['label'] for r in regions]
         jobs=[(r,p) for r in regions for p in conditions['providers']]
         q=queue.Queue();active={};done=0;candidate=detail=rejected=0
         def work(index,region,provider):
             def emit(kind,value): q.put((index,kind,value))
             emit('message','候補検索を開始')
             collector=homes_collect if provider=='HOME’S' else suumo_collect
-            try: collector(web,region,center,radius,conditions['limit'],munis,emit)
+            try: collector(web,region,bounds,munis,emit)
             except Exception as exc: emit('issue',str(exc) if isinstance(exc,AppError) else f'取得処理エラー（{type(exc).__name__}）')
         with futures.ThreadPoolExecutor(max_workers=min(4,len(jobs))) as pool:
             pending={pool.submit(work,i,*job):i for i,job in enumerate(jobs)}
@@ -669,7 +756,8 @@ def search_all(db,conditions,screen):
                         if value['key'] not in saved: batch.append(value)
                 if batch:
                     screen['status'].info(f'検索実行中｜確認した{len(batch)}件をSupabaseへ保存しています')
-                    try: saved.update(db.save_units(batch))
+                    try:
+                        for offset in range(0,len(batch),100): saved.update(db.save_units(batch[offset:offset+100]))
                     except AppError as exc: issues.append(str(exc));log('保存エラー｜'+str(exc))
                     # Browser session holds unconfirmed rows separately; no claim of persistence.
                     st.session_state.new_units=list(units.values())
@@ -703,7 +791,7 @@ def physical_units(rows):
     return list(grouped.values())
 
 
-def mesh(rows,center,radius,interpolate):
+def mesh(rows,center,radius,interpolate,bounds=None):
     positions={}
     for r in physical_units(rows): positions.setdefault((round(r['latitude'],5),round(r['longitude'],5)),[]).append(r['rent']+r['fees'])
     buildings=[(p,statistics.median(v)) for p,v in positions.items()]
@@ -715,7 +803,9 @@ def mesh(rows,center,radius,interpolate):
     for x in range(-n,n+1):
         for y in range(-n,n+1):
             p=(center[0]+y*step/111320,center[1]+x*step/(111320*math.cos(math.radians(center[0]))))
-            if meters(center,p)>radius: continue
+            if bounds is not None:
+                if not in_rectangle(p,bounds): continue
+            elif meters(center,p)>radius: continue
             values=cells.get((x,y));estimated=False
             if values: price=statistics.median(values);count=len(values)
             elif interpolate:
@@ -730,9 +820,15 @@ def mesh(rows,center,radius,interpolate):
 
 
 def rental_map(rows,center,radius,cells,facilities):
-    m=folium.Map(location=center,zoom_start=15 if radius<=1500 else 14,tiles='OpenStreetMap',control_scale=True)
-    folium.Circle(center,radius=radius,color='#203f39',weight=2,fill=False,tooltip='検索範囲').add_to(m)
-    folium.Marker(center,tooltip='中心駅',icon=folium.Icon(color='darkgreen',icon='home')).add_to(m)
+    m=folium.Map(location=center,zoom_start=15,tiles=None,control_scale=True)
+    folium.TileLayer('https://cyberjapandata.gsi.go.jp/xyz/std/{z}/{x}/{y}.png',
+        attr='国土地理院',name='地名の地図',max_zoom=18).add_to(m)
+    rental_features(rows,cells,facilities).add_to(m)
+    return m
+
+
+def rental_features(rows,cells,facilities):
+    m=folium.FeatureGroup(name='物件・家賃・施設')
     for c in cells:
         color=COLORS[sum(c['price']>cut for cut in BANDS)]
         tip=f"{c['price']/10000:.1f}万円/月｜{'近隣から推定' if c['estimated'] else '掲載額集計'}｜根拠 {c['count']}建物位置"
@@ -807,19 +903,32 @@ def read_csv(content):
     except (UnicodeError,ValueError,KeyError,TypeError,csv.Error): raise AppError('この新しいアプリから出力したCSVを指定してください。') from None
 
 
+def capture_viewport():
+    data=st.session_state.get('new_map',{})
+    bounds=viewport_bounds(data)
+    if bounds:
+        st.session_state.new_bounds=bounds
+        st.session_state.new_view_center=bounds_center(bounds)
+        try: st.session_state.new_view_zoom=int(data.get('zoom') or 15)
+        except (TypeError,ValueError): pass
+    else:
+        st.session_state.new_bounds=None
+
+
 def remember_search():
     state=st.session_state
-    providers=list(state.new_providers)
-    if not providers:
-        state.new_search={'status':'failed','summary':{'issues':['取得元を1つ以上選択してください。'],'saved':0,'confirmed':0}}
+    providers=list(state.get('new_providers',[]))
+    bounds=state.get('new_bounds')
+    if not providers or not bounds:
+        state.new_search={'status':'failed','summary':{'issues':['地図の表示範囲と取得元を確認してください。'],'saved':0,'confirmed':0}}
         return
-    state.new_request=dict(station=state.new_station,radius=state.new_radius,
-                           limit=state.new_limit,providers=providers)
+    state.new_request=dict(bounds=list(bounds),providers=providers)
 
 
 def show_search(conditions):
-    st.subheader('物件を検索しています')
-    st.caption(f"{conditions['station']}から半径{conditions['radius']/1000:g}km｜SRC・築20年以内｜全対象間取り")
+    st.subheader('表示範囲の地名から物件を検索しています')
+    s,w,n,e=conditions['bounds']
+    st.caption(f'緯度 {s:.5f}〜{n:.5f}・経度 {w:.5f}〜{e:.5f}｜SRC・築20年以内｜件数上限なし')
     screen={'bar':st.progress(0.,text='検索を開始しました'),'status':st.empty(),'log':st.empty()}
     try: search_all(Database(),conditions,screen)
     except AppError as exc:
@@ -839,7 +948,7 @@ def main():
     request=state.pop('new_request',None)
     if request is not None:
         preferences=dict(state.get('new_preferences',{}))
-        for key in ('new_station','new_radius','new_limit','new_providers','new_group','new_budget','new_interpolate'):
+        for key in ('new_providers','new_group','new_budget','new_interpolate'):
             if key in state:
                 preferences[key]=state[key]
                 del state[key]
@@ -848,18 +957,33 @@ def main():
     preferences=state.get('new_preferences',{})
     tabs=st.tabs(['住まいを探す','保存データ','通勤・周辺施設','初期設定'])
     with tabs[0]:
-        with st.form('new_search_form'):
-            st.subheader('どの駅の近くに住みたいですか？')
-            station=st.selectbox('中心駅',list(STATIONS),index=list(STATIONS).index(preferences.get('new_station','池袋')),key='new_station')
-            a,b=st.columns(2)
-            radius=a.selectbox('駅からの範囲',[500,1000,1500,2000,3000],index=[500,1000,1500,2000,3000].index(preferences.get('new_radius',1500)),format_func=lambda n:f'{n/1000:g}km',key='new_radius')
-            limit=b.selectbox('地域・取得元ごとの上限',[10,20,40],index=[10,20,40].index(preferences.get('new_limit',20)),key='new_limit')
-            providers=st.multiselect('物件の取得元',['HOME’S','SUUMO'],default=preferences.get('new_providers',['HOME’S','SUUMO']),key='new_providers')
-            st.caption('検索時は全対象間取りを確認します。検索範囲は駅を中心とした円内です。')
-            conditions=dict(station=station,radius=radius,limit=limit,providers=providers)
-            st.form_submit_button('この条件で検索して保存',type='primary',use_container_width=True,
-                                  on_click=remember_search)
-        center=STATIONS[station]
+        st.subheader('地図を動かして、探す地域を表示してください')
+        st.caption('地図に見えている四角い範囲が検索対象です。駅名の選択や取得件数の上限はありません。')
+        group=st.radio('間取り',list(GROUPS),index=list(GROUPS).index(preferences.get('new_group','1LDK・2DK')),horizontal=True,key='new_group')
+        budget=st.number_input('月額の上限（管理費込み・万円）',min_value=1.,max_value=1000.,value=preferences.get('new_budget',50.),step=1.,key='new_budget')
+        interpolate=st.checkbox('データが十分な場所は近隣家賃も推定する',value=preferences.get('new_interpolate',False),key='new_interpolate')
+        bounds=state.get('new_bounds')
+        center=bounds_center(bounds) if bounds else state.get('new_view_center',DEFAULT_CENTER)
+        radius=bounds_radius(bounds) if bounds else 1500
+        rows=[r for r in state.new_units if valid_unit(r) and r['layout'] in GROUPS[group]
+              and (bounds is None or in_rectangle((r['latitude'],r['longitude']),bounds))]
+        pins=[r for r in rows if r['rent']+r['fees']<=budget*10000]
+        cells=mesh(rows,center,radius,interpolate,bounds) if bounds else []
+        facilities=[f for f in state.new_facilities if bounds and in_rectangle((f['lat'],f['lng']),bounds)]
+        data=st_folium(rental_map([],DEFAULT_CENTER,1500,[],[]),key='new_map',height=480,use_container_width=True,
+            returned_objects=['bounds','zoom'],center=state.get('new_view_center',DEFAULT_CENTER),
+            zoom=state.get('new_view_zoom',15),feature_group_to_add=rental_features(pins,cells,facilities),on_change=capture_viewport)
+        # Initial component defaults are not real viewport bounds. Only the browser callback makes the search ready.
+        bounds=state.get('new_bounds')
+        if bounds:
+            center=bounds_center(bounds);radius=bounds_radius(bounds)
+            south,west,north,east=bounds
+            st.caption(f'検索する表示範囲：緯度 {south:.5f}〜{north:.5f}／経度 {west:.5f}〜{east:.5f}')
+        else: st.info('地図の表示範囲を受信しています。表示後に地図を少し動かしてください。対象は東京と周辺地域です。')
+        providers=st.multiselect('物件の取得元',['HOME’S','SUUMO'],default=preferences.get('new_providers',['HOME’S','SUUMO']),key='new_providers')
+        st.button('表示中の地名から全件検索・保存',type='primary',use_container_width=True,
+                  on_click=remember_search,key='new_start',disabled=not bounds or not providers)
+        st.caption('検索開始時の表示範囲を固定し、地名・丁目ごとに取得元の掲載一覧を最後まで確認します。予算・間取りの表示設定は取得件数を制限しません。')
         result=state.new_search
         if result:
             summary=result['summary'];saved=summary.get('saved',0);confirmed=summary.get('confirmed',0)
@@ -868,15 +992,9 @@ def main():
             else: st.error('検索を完了できませんでした。以下の原因を確認してください。')
             for issue in summary.get('issues',[])[:8]: st.write('・'+issue)
             if summary.get('elapsed') is not None: st.caption(f"所要 {summary['elapsed']}秒｜詳細確認 {summary.get('detail',0)}件｜除外 {summary.get('rejected',0)}件")
-        st.subheader('地図と家賃')
-        group=st.radio('間取り',list(GROUPS),index=list(GROUPS).index(preferences.get('new_group','1LDK・2DK')),horizontal=True,key='new_group')
-        budget=st.number_input('月額の上限（管理費込み・万円）',min_value=1.,max_value=1000.,value=preferences.get('new_budget',50.),step=1.,key='new_budget')
-        interpolate=st.checkbox('データが十分な場所は近隣家賃も推定する',value=preferences.get('new_interpolate',False),key='new_interpolate')
-        rows=[r for r in state.new_units if valid_unit(r) and r['layout'] in GROUPS[group]
-              and meters(center,(r['latitude'],r['longitude']))<=radius]
-        pins=[r for r in rows if r['rent']+r['fees']<=budget*10000]
-        cells=mesh(rows,center,radius,interpolate)
-        components.html(rental_map(pins,center,radius,cells,(state.new_facilities if state.get('new_facility_center')==center else [])).get_root().render(),height=480,scrolling=False)
+            if result.get('conditions',{}).get('regions'):
+                with st.expander('今回検索した地名・丁目'):
+                    for label in result['conditions']['regions']: st.write(label)
         legend=''.join(f'<span style="display:inline-block;margin:4px 10px 4px 0;color:#203f39;font-size:12px"><b style="color:{color}">■</b> {label}</span>' for color,label in zip(COLORS,['15万円以下','15〜20万円','20〜22.5万円','22.5〜25万円','25〜27.5万円','27.5〜30万円','30〜35万円','35万円超']))
         st.markdown(legend,unsafe_allow_html=True)
         st.caption('濃い区画：掲載額の集計／薄い破線：750m以内の3建物位置以上から推定。区画は250m。家賃帯の集計は月額上限で絞る前のデータです。')
@@ -885,7 +1003,7 @@ def main():
         c2.metric('月額の中央値',f"{statistics.median([r['rent']+r['fees'] for r in pins])/10000:.1f}万円" if pins else '—')
         c3.metric('集計した区画',len(cells))
         if not pins: st.info('この範囲・間取り・予算に表示できる物件がありません。検索するか、保存データを読み込んでください。')
-        for r in sorted(physical_units(pins),key=lambda x:x['rent']+x['fees'])[:30]:
+        for r in sorted(physical_units(pins),key=lambda x:x['rent']+x['fees']):
             persisted=r['key'] in state.new_saved_keys
             st.markdown(f'<div class="unit"><h3>{html.escape(r["title"])}</h3><b>{(r["rent"]+r["fees"])/10000:g}万円 / 月</b> · {html.escape(r["layout"])} · {r["area"]:g}㎡ · 築{r["age"]}年<p>{html.escape(r["address"])}</p><a href="{html.escape(r["listing_url"],quote=True)}" target="_blank" rel="noopener">募集ページを開く ↗</a><p style="font-size:12px">{html.escape(r["provider"])} · {html.escape(r["location_method"])} · {"保存確認済み" if persisted else "画面上のみ・保存未確認"}</p></div>',unsafe_allow_html=True)
         if pins:
@@ -896,11 +1014,11 @@ def main():
                              column_config={'掲載ページ':st.column_config.LinkColumn()})
     with tabs[1]:
         st.subheader('Supabaseに保存した物件')
-        st.caption('自動読み込みは行いません。選択中の駅・範囲にある新しいアプリのデータを読み込みます。')
-        if st.button('この駅の保存物件を読み込む',key='new_load',use_container_width=True):
+        st.caption('自動読み込みは行いません。地図に表示中の範囲にある物件データを読み込みます。')
+        if st.button('表示範囲の保存物件を読み込む',key='new_load',use_container_width=True,disabled=not bounds):
             try:
                 with st.spinner('Supabaseから読み込んでいます'):
-                    rows=Database().load_units(center,radius,LAYOUTS)
+                    rows=Database().load_units(bounds,LAYOUTS)
                 state.new_units=rows;state.new_saved_keys=[r['key'] for r in rows];state.new_search=None
                 state.new_notice=f'{len(rows)}件をSupabaseから読み込みました。';st.rerun()
             except AppError as exc: st.error(str(exc))
@@ -923,7 +1041,7 @@ def main():
             try: state.new_history=Database().history()
             except AppError as exc: st.error(str(exc))
         if state.get('new_history'):
-            st.dataframe([{'開始（UTC）':r['started_at'],'結果':r['status'],'中心駅':r['conditions'].get('station'),
+            st.dataframe([{'開始（UTC）':r['started_at'],'結果':r['status'],'表示範囲':str(r['conditions'].get('bounds','')),
                            '保存確認':r['summary'].get('saved',0)} for r in state.new_history],hide_index=True)
     with tabs[2]:
         st.subheader('通勤の目安')
@@ -946,9 +1064,9 @@ def main():
                 st.link_button('混雑率の原資料',CROWD_SOURCE)
             st.caption('登録41駅・11路線による概算。時刻表・直通運転・道路の徒歩経路は使用していません。徒歩は直線距離×1.25、列車は距離から推定、乗り換えは5分です。')
         else: st.info('物件を検索するか、保存物件を読み込むと通勤を比較できます。')
-        st.subheader('駅の近くの施設')
+        st.subheader('地図の中心付近の施設')
         kind=st.selectbox('施設の種類',['スーパー','コンビニ','公園','病院'])
-        if st.button('中心駅から1kmの施設を地図に追加',key='new_facilities_fetch'):
+        if st.button('地図の中心から1kmの施設を地図に追加',key='new_facilities_fetch',disabled=not bounds):
             try:
                 state.new_facilities=fetch_facilities(center,kind);state.new_facility_center=center
                 saved=Database().save_places(state.new_facilities,kind)
@@ -959,7 +1077,7 @@ def main():
                 state.new_facilities=Database().load_places(center,kind);state.new_facility_center=center
                 state.new_notice=f'{len(state.new_facilities)}施設を読み込みました。';st.rerun()
             except AppError as exc: st.error(str(exc))
-        st.link_button('Googleマップで施設を探す','https://www.google.com/maps/search/?'+urlencode({'api':1,'query':station+' '+kind}))
+        st.link_button('Googleマップで施設を探す','https://www.google.com/maps/search/?'+urlencode({'api':1,'query':f'{center[0]},{center[1]} '+kind}))
         st.caption('OpenStreetMapに登録された施設。登録漏れや位置の誤差がある場合があります。')
     with tabs[3]:
         st.subheader('新しいアプリの初期設定')
@@ -968,7 +1086,7 @@ def main():
         st.download_button('セットアップSQLをダウンロード',SQL,'supabase_rebuild_01.sql','text/plain')
         st.write('2．StreamlitのSettings → Secretsに、接続先とサーバー用のSecret keyを設定してください。')
         st.code('SUPABASE_URL = "https://プロジェクトID.supabase.co"\nSUPABASE_SECRET_KEY = "sb_secret_から始まるキー"\nSUPABASE_NAMESPACE = "sumai-compass"',language='toml')
-        st.write('3．接続確認が成功したら、「住まいを探す」で検索してください。')
+        st.write('3．接続確認が成功したら、「住まいを探す」の地図を動かして検索してください。')
         if st.button('新しい保存先の接続を確認',key='new_check'):
             try: Database().check();st.success('物件・検索履歴の新しい保存先に接続できました。')
             except AppError as exc: st.error(str(exc))
@@ -977,7 +1095,7 @@ def main():
     with st.expander('取得・集計の範囲'):
         st.write('公開ページの掲載情報を取得し、SRC・築20年以内・対象間取り・位置を確認した物件を保存します。架空の物件や家賃は生成しません。')
         st.write('掲載地図座標を優先し、番地のある住所は一致する住所検索結果で補完します。住所と地図判定に明確な不一致がある物件は除外します。')
-        st.write('地域判定は約400m間隔・最大15×15地点。取得元ごとに候補数・ページ数の上限があり、範囲内の全物件を網羅するものではありません。')
+        st.write('地図範囲内の居住地名タイルと100m間隔の地点・範囲の端から地名・丁目を判定します。候補数・物件数・ページ数による打ち切りは行いません。通信失敗やページ送りの異常は未完了として表示します。掲載サイト側の非公開情報・取得制限や、地名データの欠落は取得できません。')
         st.write('同じ建物位置の月額募集額の中央値を求め、250m区画で集計します。近隣推定は750m以内に3建物位置以上ある場合だけ距離の逆二乗で加重平均します。')
         st.write('検索中は画面の実行で処理を進めます。検索開始に旧ジョブの再開や30秒の応答監視は使用しません。募集終了物件の自動削除は行いません。')
 
