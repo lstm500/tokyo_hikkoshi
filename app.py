@@ -1,4 +1,4 @@
-"""住まいコンパス v17 - 軽量起動 / 前景検索 / 文字進捗 / Supabase v05
+"""住まいコンパス v23 - verified red-button foreground search / progress
 
 設計方針:
 - 起動時は外部通信を行わない。
@@ -30,7 +30,7 @@ from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 import streamlit as st
 
 
-APP_VERSION = "v21-red-button-search-verified"
+APP_VERSION = "v23-red-button-search-final"
 TARGET_STRUCTURE = "SRC"
 MAX_BUILDING_AGE = 20
 
@@ -1158,6 +1158,7 @@ def main():
         unsafe_allow_html=True,
     )
     st.caption("赤い『この範囲の物件を取得・保存』を押すと、そのクリックで検索を開始します。停止・再開モードはありません。")
+    st.success("最新版確認: BUILD v23-red-button-search-final / 実行ファイル app.py")
 
     state = st.session_state
     state.setdefault("records", [])
@@ -1217,7 +1218,7 @@ def main():
     start_search = button_slot.button(
         "🔎 この範囲の物件を取得・保存",
         type="primary",
-        key="start_property_search_v21",
+        key="start_property_search_v23",
         use_container_width=True,
     )
 
@@ -1227,7 +1228,7 @@ def main():
             "🔎 検索中です…",
             type="primary",
             disabled=True,
-            key="search_running_v21",
+            key="search_running_v23",
             use_container_width=True,
         )
 
