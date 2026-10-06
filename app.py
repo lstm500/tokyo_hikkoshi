@@ -30,7 +30,7 @@ from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 import streamlit as st
 
 
-APP_VERSION = "v20-direct-search-start"
+APP_VERSION = "v21-red-button-search-verified"
 TARGET_STRUCTURE = "SRC"
 MAX_BUILDING_AGE = 20
 
@@ -1153,7 +1153,11 @@ def main():
         unsafe_allow_html=True,
     )
     st.title("住まいコンパス")
-    st.caption(f"{APP_VERSION}｜赤い取得ボタン＝検索開始")
+    st.markdown(
+        f"<div style=\"display:inline-block;background:#173a5e;color:white;padding:6px 10px;border-radius:8px;font-weight:800;margin-bottom:8px;\">BUILD {APP_VERSION}</div>",
+        unsafe_allow_html=True,
+    )
+    st.caption("赤い『この範囲の物件を取得・保存』を押すと、そのクリックで検索を開始します。停止・再開モードはありません。")
 
     state = st.session_state
     state.setdefault("records", [])
@@ -1213,7 +1217,7 @@ def main():
     start_search = button_slot.button(
         "🔎 この範囲の物件を取得・保存",
         type="primary",
-        key="start_property_search_v20",
+        key="start_property_search_v21",
         use_container_width=True,
     )
 
@@ -1223,12 +1227,13 @@ def main():
             "🔎 検索中です…",
             type="primary",
             disabled=True,
-            key="search_running_v20",
+            key="search_running_v21",
             use_container_width=True,
         )
 
         started_at = datetime.now()
         state.last_search_summary = ""
+        st.toast("検索を開始しました", icon="🔎")
 
         st.markdown(
             f"""
@@ -1252,6 +1257,9 @@ def main():
         log_box = st.empty()
         status_box.warning("🔎 検索開始済み｜現在：地域・丁目を判定しています")
         log_box.code(f"{started_at.strftime('%H:%M:%S')}  検索開始｜{station}｜半径 {radius/1000:g}km", language=None)
+
+        # UI開始表示を先にブラウザへ送るための短い描画猶予。ここより前に外部検索通信は行わない。
+        time.sleep(0.35)
 
         try:
             records = run_search(
@@ -1312,7 +1320,7 @@ def main():
         st.caption("まだ物件データはありません。赤い取得ボタンを押すと、その場で検索を開始します。")
 
     with st.expander("取得方式"):
-        st.write("赤い取得ボタンを押した実行の中で、そのまま検索を開始します。queued/paused/手動再開/自動再開は使いません。")
+        st.write("赤い取得ボタンを押した同じ実行で、そのまま検索を開始します。queued / paused / 手動再開 / 自動再開は使いません。")
         st.write("検索開始時は『検索を開始しました』を表示し、検索中は地域判定・HOME'S/SUUMO・保存件数・除外件数・エラー件数を文字で逐次更新します。")
         st.write("検索は地域×取得元の単位で並列化します。確認済み物件は各地域タスクの完了時にSupabaseへ保存します。")
 
