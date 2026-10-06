@@ -37,7 +37,7 @@ import streamlit as st
 from streamlit_folium import st_folium
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v47"
+BUILD = "REBUILD-01-v48"
 PROVIDER_OPTIONS = ("スマイティ","HOMES","SUUMO","カナリー","アットホーム","CHINTAI","Comfy","アパマンショップ")
 PROVIDER_CANONICAL = {"HOMES":"HOME’S","HOME’S":"HOME’S","スマイティ":"スマイティ","SUUMO":"SUUMO","カナリー":"カナリー",
                       "アットホーム":"アットホーム","CHINTAI":"CHINTAI","Comfy":"Comfy","アパマンショップ":"アパマンショップ"}
@@ -169,6 +169,10 @@ button:disabled{background:#e3e9e3!important;color:#607369!important;opacity:1!i
 .unit h3{font-size:18px;margin:0 0 8px}.unit a{color:#286b5d}
 @media(max-width:600px){.hero{padding:18px}.hero h1{font-size:26px}.block-container{padding-top:1rem}}
 </style>'''
+
+
+class SearchCancelled(BaseException):
+    """Cooperative stop; collector error recovery must not swallow it."""
 
 
 class AppError(Exception):
@@ -321,7 +325,7 @@ def tiles_in_bounds(bounds,zoom=15):
     return [(x,y) for x in range(x1,x2+1) for y in range(y1,y2+1)]
 
 
-def bounded_results(items,fn,workers=6):
+def bounded_results(items,fn,workers=6,stop_event=None):
     """Bound simultaneous requests, never the number of items searched."""
     iterator=iter(items)
     with futures.ThreadPoolExecutor(max_workers=workers) as pool:
@@ -333,6 +337,9 @@ def bounded_results(items,fn,workers=6):
                 pending[pool.submit(fn,item)]=item
         fill()
         while pending:
+            if stop_event is not None and stop_event.is_set():
+                for f in pending:f.cancel()
+                raise SearchCancelled()
             ready,_=futures.wait(pending,timeout=.4,return_when=futures.FIRST_COMPLETED)
             if not ready: yield None,None,None
             for f in ready:
@@ -635,7 +642,7 @@ class Database:
             offset+=len(rows)
         return out
     def history(self):
-        rows=self.call('GET',SEARCH_TABLE,{'namespace':'eq.'+self.namespace,'select':'*','order':'started_at.desc','limit':20,'status':'in.(started,completed,partial,failed)'})
+        rows=self.call('GET',SEARCH_TABLE,{'namespace':'eq.'+self.namespace,'select':'*','order':'started_at.desc','limit':20,'status':'in.(started,completed,partial,failed,cancelled)'})
         if not isinstance(rows,list): raise AppError('検索履歴を読み取れません。')
         return rows
 
@@ -652,9 +659,13 @@ class Database:
         return events
 
 
+GEO_HTTP_CACHE={}
+GEO_HTTP_LOCK=threading.Lock()
+
+
 class PublicWeb:
     def __init__(self):
-        self.local=threading.local()
+        self.local=threading.local();self.cancel_event=threading.Event();self.cache_lock=threading.RLock();self.http_flights={};self.host_slots={}
         self.headers={'User-Agent':'SumaiCompassRebuild/1.0 (personal rental research)', 'Accept-Language':'ja'}
         self.host_gates={};self.host_last_request={};self.route_cooldowns={};self.session_primed=threading.local();self.proxy_routes=[];self.route_preferred={};self.route_lock=threading.Lock();self.http_cache={};self.headers.update({'Accept':'text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8'})
         self.robots={};self.lock=threading.Lock();self.layout_form_lock=threading.Lock();self.layout_form_cache={};self.provider_cache={};self.provider_lock=threading.RLock();self.unavailable_hosts={};self.failed_detail_urls={}
@@ -666,20 +677,29 @@ class PublicWeb:
         if route is None and hasattr(self.local,'session'):return self.local.session
         if route not in self.local.sessions:self.local.sessions[route]=requests.Session()
         return self.local.sessions[route]
+    def check_cancel(self):
+        if self.cancel_event.is_set():raise SearchCancelled()
+    def pause(self,seconds):
+        if self.cancel_event.wait(max(0.,seconds)):raise SearchCancelled()
     def route_request(self,session,method,url,options):
-        host=urlparse(url).hostname
+        self.check_cancel();host=urlparse(url).hostname
+        headers=dict(self.headers);headers.update(options.get('headers',{}));options={k:v for k,v in options.items() if k!='headers'}
         if host not in RENTAL_HOSTS:
-            headers=dict(self.headers);headers.update(options.get('headers',{}));options={k:v for k,v in options.items() if k!='headers'}
             return session.request(method,url,headers=headers,timeout=(4,12),allow_redirects=False,**options)
-        with self.route_lock:gate=self.host_gates.setdefault(host,threading.Lock())
-        # All region workers share one gate for each property site.
-        with gate:
-            delay=max(0.,self.host_last_request.get(host,0.)+1.-time.monotonic())
-            if delay:
-                trace(self,'request_spacing',{'host':host,'wait_seconds':round(delay,3)},stage='transport');time.sleep(delay)
-            self.host_last_request[host]=time.monotonic()
-            headers=dict(self.headers);headers.update(options.get('headers',{}));options={k:v for k,v in options.items() if k!='headers'}
+        with self.route_lock:
+            gate=self.host_gates.setdefault(host,threading.Lock())
+            slots=self.host_slots.setdefault(host,threading.BoundedSemaphore(2))
+        while not slots.acquire(timeout=.1):self.check_cancel()
+        try:
+            while not gate.acquire(timeout=.1):self.check_cancel()
+            try:
+                delay=max(0.,self.host_last_request.get(host,0.)+1.-time.monotonic())
+                if delay:self.pause(delay)
+                self.check_cancel();self.host_last_request[host]=time.monotonic()
+            finally:gate.release()
+            # Keep one-second start spacing, but do not serialize the response wait.
             return session.request(method,url,headers=headers,timeout=(4,12),allow_redirects=False,**options)
+        finally:slots.release()
     def response_info(self,response):
         soup=BeautifulSoup(response.text[:30000],'html.parser') if 'html' in response.headers.get('Content-Type','').lower() else None
         title=soup.select_one('title') if soup else None
@@ -712,6 +732,7 @@ class PublicWeb:
         ordered=list(range(preferred,len(routes)))+list(range(preferred))
         last=None;skipped=[]
         for index in ordered:
+            self.check_cancel()
             with self.route_lock:until=max(self.route_cooldowns.get((host,index),0.),self.route_cooldowns.get((host,index,u.path),0.))
             if until>time.monotonic():
                 skipped.append(index+1);trace(self,'route_cooldown',{'host':host,'route_number':index+1,'remaining_seconds':round(until-time.monotonic())},stage='transport');continue
@@ -740,7 +761,7 @@ class PublicWeb:
                             with self.route_lock:self.route_cooldowns[(host,index)]=time.monotonic()+delay
                             trace(self,'route_cooldown',{'host':host,'route_number':index+1,'remaining_seconds':round(delay),'reason':'Retry-After'},stage='transport');break
                         if attempt<2:
-                            trace(self,'http_retry',{'url':url,'status':status,'wait_seconds':delay,'route_number':index+1 if route else None},'WARNING','transport');time.sleep(delay);continue
+                            trace(self,'http_retry',{'url':url,'status':status,'wait_seconds':delay,'route_number':index+1 if route else None},'WARNING','transport');self.pause(delay);continue
                     if blocked:
                         with self.route_lock:self.route_cooldowns[(host,index,u.path)]=time.monotonic()+60
                         if info['challenge_page'] and status<400:
@@ -752,14 +773,14 @@ class PublicWeb:
                 except (requests.Timeout,requests.ConnectionError) as exc:
                     trace(self,'proxy_error' if route else 'network',{'url':url,'route_number':index+1 if route else None,'attempt':attempt+1,'exception_type':type(exc).__name__},'WARNING','transport')
                     last=exc
-                    if attempt<2:time.sleep(2**attempt);continue
+                    if attempt<2:self.pause(2**attempt);continue
                     break
             if len(ordered)>1:trace(self,'proxy_switch',{'url':url,'failed_route_number':index+1,'remaining_routes':len(ordered)-ordered.index(index)-1},'WARNING','transport')
         if isinstance(last,Exception):raise last
         if last is None:
             error=AppError(host+'：取得経路の待機中です（直前の403・429等）。設定した全経路の待機が終わってから再検索してください。');error.diagnostic={'skipped_routes':skipped};raise error
         return last
-    def fetch(self,url,method='GET',**kwargs):
+    def _fetch_uncached(self,url,method='GET',**kwargs):
         allowed=tuple(RENTAL_HOSTS)+('mreversegeocoder.gsi.go.jp','msearch.gsi.go.jp','maps.gsi.go.jp','cyberjapandata.gsi.go.jp','japanese-addresses-v2.geoloniamaps.com','geolonia.github.io','img01.suumo.com','img02.suumo.com','maps.googleapis.com','maps.google.com')
         u=urlparse(url)
         if u.scheme!='https' or u.hostname not in allowed or u.username or u.password: raise AppError('取得先が不正です。')
@@ -794,6 +815,35 @@ class PublicWeb:
         response.encoding='utf-8' if 'gsi.go.jp' in u.hostname else response.apparent_encoding or 'utf-8'
         if method=='GET' and not kwargs.get('params') and '/chintai/' in u.path:self.http_cache[url]=response
         return response
+    def fetch(self,url,method='GET',**kwargs):
+        self.check_cancel()
+        if method!='GET':return self._fetch_uncached(url,method,**kwargs)
+        params=kwargs.get('params') or {}
+        pairs=list(params.items()) if isinstance(params,dict) else list(params)
+        key=(url,urlencode(sorted(pairs,key=lambda p:str(p[0])),doseq=True))
+        geo=urlparse(url).hostname in ('maps.gsi.go.jp','cyberjapandata.gsi.go.jp','mreversegeocoder.gsi.go.jp')
+        if geo:
+            with GEO_HTTP_LOCK:shared=GEO_HTTP_CACHE.get(key)
+            if shared and time.monotonic()-shared[0]<86400:return shared[1]
+        with self.cache_lock:
+            if key in self.http_cache:return self.http_cache[key]
+            flight=self.http_flights.get(key);owner=flight is None
+            if owner:flight=futures.Future();self.http_flights[key]=flight
+        if not owner:
+            while not flight.done():self.pause(.05)
+            return flight.result()
+        try:
+            result=self._fetch_uncached(url,method,**kwargs)
+            with self.cache_lock:self.http_cache[key]=result
+            if geo:
+                with GEO_HTTP_LOCK:
+                    if len(GEO_HTTP_CACHE)>12000:GEO_HTTP_CACHE.clear()
+                    GEO_HTTP_CACHE[key]=(time.monotonic(),result)
+            flight.set_result(result);return result
+        except BaseException as exc:
+            flight.set_exception(exc);raise
+        finally:
+            with self.cache_lock:self.http_flights.pop(key,None)
     def permitted(self,url):
         u=urlparse(url);root=u.scheme+'://'+u.netloc
         with self.lock: parser=self.robots.get(root)
@@ -934,28 +984,36 @@ def map_point_to_residential_address(web,point,munis,max_distance_m=90):
     official=reverse(web,point,munis,force=True)
     if not official:return None
     x,y=_tile_xy(point,18);candidates=[]
-    # Search the containing tile and all 8 neighbours before choosing the nearest point.
-    rings=[[(x,y)],[(x+dx,y+dy) for dx in (-1,0,1) for dy in (-1,0,1) if (dx,dy)!=(0,0)]]
-    for ring in rings:
-        for tx,ty in ring:
-            for feature in _jhj_tile(web,tx,ty,18):
-                if not isinstance(feature,dict):continue
-                geo=feature.get('geometry') or {};coords=geo.get('coordinates')
-                if geo.get('type')!='Point' or not isinstance(coords,(list,tuple)) or len(coords)<2:continue
-                try:lng2,lat2=float(coords[0]),float(coords[1])
-                except (ValueError,TypeError):continue
-                props=feature.get('properties') or {}
-                code=_property_value(props,('市区町村コード','市町村コード','municipality_code','muniCd'),('市区町村コード','市町村コード'))
-                town=_property_value(props,('町又は字の名称','町字名','町名'),('町又は字','町字'))
-                block=_property_value(props,('街区符号','街区'),('街区符号',))
-                base=_property_value(props,('基礎番号','住居番号'),('基礎番号',))
-                if code and code!=official['code']:continue
-                town=re.sub(r'[-－](\d+)$',r'\1丁目',town)
-                if town and address_key(town)!=address_key(official['town']):continue
-                if not town or not block or not base:continue
-                dist=meters(point,(lat2,lng2))
-                candidates.append((dist,town,block,base,lat2,lng2,props))
-        # Inspect neighbouring tiles too: the closest frontage may lie across a tile edge.
+    z=18;n=2**z
+    fx=(float(point[1])+180)/360*n
+    fy=(1-math.asinh(math.tan(math.radians(float(point[0]))))/math.pi)/2*n
+    tile_m=40075016.686*math.cos(math.radians(float(point[0])))/n
+    tiles=[]
+    for dx in (-1,0,1):
+        for dy in (-1,0,1):
+            tx,ty=x+dx,y+dy
+            gx=max(tx-fx,0.,fx-(tx+1));gy=max(ty-fy,0.,fy-(ty+1))
+            if math.hypot(gx,gy)*tile_m<=max_distance_m+2:tiles.append((tx,ty))
+    def read_tile(tile):return _jhj_tile(web,*tile,18)
+    for tile,features,error in bounded_results(tiles,read_tile,workers=6,stop_event=web.cancel_event):
+        if tile is None or error:continue
+        for feature in features:
+            if not isinstance(feature,dict):continue
+            geo=feature.get('geometry') or {};coords=geo.get('coordinates')
+            if geo.get('type')!='Point' or not isinstance(coords,(list,tuple)) or len(coords)<2:continue
+            try:lng2,lat2=float(coords[0]),float(coords[1])
+            except (ValueError,TypeError):continue
+            props=feature.get('properties') or {}
+            code=_property_value(props,('市区町村コード','市町村コード','municipality_code','muniCd'),('市区町村コード','市町村コード'))
+            town=_property_value(props,('町又は字の名称','町字名','町名'),('町又は字','町字'))
+            block=_property_value(props,('街区符号','街区'),('街区符号',))
+            base=_property_value(props,('基礎番号','住居番号'),('基礎番号',))
+            if code and code!=official['code']:continue
+            town=re.sub(r'[-－](\d+)$',r'\1丁目',town)
+            if town and address_key(town)!=address_key(official['town']):continue
+            if not town or not block or not base:continue
+            dist=meters(point,(lat2,lng2))
+            candidates.append((dist,town,block,base,lat2,lng2,props))
     if not candidates:
         trace(web,'map_address_unresolved',{'point':list(point),'reason':'GSI住居表示住所の候補なし','town':official.get('town')},'WARNING','location')
         return None
@@ -990,7 +1048,7 @@ def gsi_regional_tasks(web,bounds,notify):
                 if in_rectangle((lat,lng),bounds): points.append((lat,lng))
             except (KeyError,TypeError,ValueError): continue
         return points
-    for tile,points,error in bounded_results(tiles,label_tile):
+    for tile,points,error in bounded_results(tiles,label_tile,workers=12,stop_event=web.cancel_event):
         if tile is not None:
             done+=1
             if error: errors+=1
@@ -1004,7 +1062,7 @@ def gsi_regional_tasks(web,bounds,notify):
     points=itertools.chain(sorted(labels),grid)
     total=len(labels)+(nx+1)*(ny+1);done=0;regions={}
     def identify(point): return reverse(web,point,munis)
-    for point,region,error in bounded_results(points,identify):
+    for point,region,error in bounded_results(points,identify,workers=16,stop_event=web.cancel_event):
         if point is not None:
             done+=1
             if error:
@@ -1056,7 +1114,7 @@ def catalog_regions(web,bounds,notify):
     done=0;s,w,n,e=bounds
     # Broad buffer protects against town representative points outside the visible boundary.
     padded=(s-.018,w-.023,n+.018,e+.023)
-    for city,rows,error in bounded_results(cities,towns):
+    for city,rows,error in bounded_results(cities,towns,workers=12,stop_event=web.cancel_event):
         if city is not None:
             done+=1
             if error: errors.append(city[3]+'：'+str(error))
@@ -1561,36 +1619,12 @@ def _suumo_town_selector(soup,raw_html,wanted,base_url):
         if u.hostname!='suumo.jp' or not re.search(r'/chintai/[^/]+/sc_[^/]+/oz_\d+/?$',u.path):continue
         label=re.sub(r'[（(][\d,]+(?:件)?[）)]$','',normal(a.get_text(' ',strip=True)))
         if address_key(label)==wanted_key:return {'url':target,'method':'SUUMO町名URL'}
-    control=_form_control_by_label(soup,wanted)
-    if control:return {'control':control,'method':'SUUMO町名フォーム'}
-    for node in soup.find_all(string=lambda x:x and wanted in normal(x)):
-        parent=getattr(node,'parent',None)
-        for _ in range(6):
-            if parent is None:break
-            links=parent.select('a[href]') if hasattr(parent,'select') else []
-            for a in links:
-                target=urljoin(base_url,a.get('href','')).split('#')[0]
-                if re.search(r'/oz_\d+/?$',urlparse(target).path):return {'url':target,'method':'SUUMO町名DOMリンク'}
-            fields=parent.select('input[name][value],option[value]') if hasattr(parent,'select') else []
-            for field in fields:
-                name=field.get('name') or (field.parent.get('name') if field.parent else '')
-                value=str(field.get('value',''))
-                if name and value and (name in ('oz','town','town_code','townCd') or re.fullmatch(r'\d{8,}',value)):
-                    return {'control':(name,value),'method':'SUUMO町名DOM'}
-            parent=getattr(parent,'parent',None)
-    decoded=html.unescape(raw_html or '').replace('\\/','/')
-    for m in re.finditer(re.escape(wanted),decoded):
-        chunk=decoded[max(0,m.start()-2200):min(len(decoded),m.end()+2200)]
-        link=re.search(r"href=[\"']([^\"']*/chintai/[^\"']*/sc_[^\"']*/oz_\d+/?[^\"']*)[\"']",chunk,re.I)
-        if link:return {'url':urljoin(base_url,link.group(1)).split('#')[0],'method':'SUUMO町名埋込URL'}
-        link=re.search(r"(?:https://suumo\.jp)?(/chintai/[^\"'\s]+/sc_[^\"'\s]+/oz_\d+/?)(?:[?&#][^\"'\s]*)?",chunk,re.I)
-        if link:return {'url':urljoin('https://suumo.jp',link.group(1)).split('#')[0],'method':'SUUMO町名埋込URL'}
-        hit=re.search(r"name=[\"'](oz|town|town_code|townCd)[\"'][^>]{0,300}?value=[\"']([^\"']+)[\"']",chunk,re.I)
-        if hit:return {'control':(hit.group(1),hit.group(2)),'method':'SUUMO町名埋込フォーム'}
-        hit=re.search(r"value=[\"']([^\"']+)[\"'][^>]{0,300}?name=[\"'](oz|town|town_code|townCd)[\"']",chunk,re.I)
-        if hit:return {'control':(hit.group(2),hit.group(1)),'method':'SUUMO町名埋込フォーム'}
-        hit=re.search(r"[\"'](?:oz|townCode|town_code)[\"']\s*:\s*[\"'](\d{8,})[\"']",chunk,re.I)
-        if hit:return {'control':('oz',hit.group(1)),'method':'SUUMO町名埋込JSON'}
+    # Accept only explicitly labelled town controls. Listing IDs and nearby
+    # unrelated town links must never become a town search condition.
+    control=_form_control_by_label(soup,wanted,names=('oz',))
+    if control and re.fullmatch(r'\d{8}',str(control[1])):
+        return {'control':control,'method':'SUUMO町名フォーム'}
+
     return None
 
 
@@ -1681,6 +1715,20 @@ def suumo_prepare_region(web,region):
     city_reply=web.fetch(search,params=city_params);city_soup=BeautifulSoup(city_reply.text,'html.parser')
     selector=_suumo_town_selector(city_soup,city_reply.text,wanted,city_reply.url)
     canonical_url=_suumo_canonical_city_url(city_soup,city_reply.url,city_reply.text)
+    if not selector:
+        form=city_soup.find('form',id='js-machiSelectForm')
+        if form and form.get('action'):
+            target=urljoin(city_reply.url,form['action'])
+            fields=[(f['name'],f.get('value','')) for f in form.select('input[type="hidden"][name]') if f['name'] not in ('oz',)]
+            try:
+                if urlparse(target).hostname=='suumo.jp' and web.permitted(target):
+                    popup=web.fetch(target,params=fields)
+                    popup_soup=BeautifulSoup(popup.text,'html.parser')
+                    control=_form_control_by_label(popup_soup,wanted,names=('oz',))
+                    if control and re.fullmatch(r'\d{8}',str(control[1])):selector={'control':control,'method':'公開町名変更フォーム'}
+                    trace(web,'suumo_town_selector_page',{'city':region.get('city_name'),'url':target,'found':bool(control)},stage='search_conditions')
+            except AppError as exc:trace(web,'form_alternative',{'failed_url':target,'message':str(exc)},'WARNING','search_conditions')
+
 
     if not selector and canonical_url:
         try:
@@ -1700,7 +1748,7 @@ def suumo_prepare_region(web,region):
             trace(web,'suumo_town_probe_selected',{'city':region.get('city_name',''),'town':wanted,'url':probed},stage='search_conditions')
 
     if selector and selector.get('url'):
-        base_url=selector['url'].split('#')[0]
+        base_url=urlparse(selector['url'])._replace(query='',fragment='').geturl()
         base_params={'pc':'50'}
         method=selector.get('method','SUUMO町名URL')
     elif selector and selector.get('control'):
@@ -2325,6 +2373,7 @@ def search_all(db,conditions,screen,state=None):
     screen['status'].info('検索実行中｜保存先の接続・新しいテーブルを確認しています')
     db.check();db.save_search(search);log('保存先確認OK。新しい検索を開始しました。')
     web=PublicWeb();web.audit=audit
+    if hasattr(state,'cancel_event'):web.cancel_event=state.cancel_event
     if hasattr(web,'configure'):web.configure(getattr(db,'web_config',{}))
     def region_update(stage,done,total,count,errors):
         if done and done==total:audit.add('geography','region_progress','INFO',{'stage':stage,'done':done,'total':total,'regions':count,'failures':errors})
@@ -2365,39 +2414,42 @@ def search_all(db,conditions,screen,state=None):
                 continue
             available[provider]=['ALL'];generic_providers.append(provider)
             audit.add('search_conditions','provider_enabled','INFO',{'provider':provider,'layouts':list(ALL_TARGET_LAYOUTS),'filter_mode':'one public town-list crawl + explicit detail layout verification'})
-        jobs=[(r,'取得元別検索') for r in regions]
+        jobs=[];provider_targets=[]
+        for provider in conditions['providers']:
+            if provider not in available:continue
+            targets=list(suumo_groups.values()) if provider=='SUUMO' else list(homes_groups.values()) if provider=='HOME’S' else regions
+            provider_targets.append((provider,targets))
+        for number in range(max((len(targets) for _,targets in provider_targets),default=0)):
+            for provider,targets in provider_targets:
+                if number<len(targets):jobs.append((targets[number],provider))
         q=queue.Queue();active={};done=0;candidate=detail=rejected=0
-        def work(index,region,unused):
-            def run_provider(provider,search_layout,label,task_region=None):
-                target_region=task_region or region
-                DIAG_CONTEXT.audit=audit;DIAG_CONTEXT.scope={'task':index,'region':target_region['label'],'town':target_region['town'],'municipality_code':target_region['code'],'provider':provider,'search_layout':search_layout or 'ALL'}
-                def emit(kind,value):
-                    code=diagnosis_code(value) if kind=='issue' else 'accepted' if kind=='unit' else kind
-                    audit_value=compact_saved_listing(value) if kind=='unit' and isinstance(value,dict) else value
-                    audit.add('collector',code,'ERROR' if kind=='issue' else 'INFO',{'event':kind,'value':audit_value})
-                    q.put((index,kind,value))
-                emit('message',label+'｜'+provider+'｜検索を開始')
-                collector=PROVIDER_COLLECTORS[provider]
-                try:collector(web,dict(target_region,search_layout=search_layout),bounds,munis,emit)
-                except Exception as exc:
-                    trace(web,diagnosis_code(str(exc)),{'exception_type':type(exc).__name__,'traceback':traceback.format_exc()},'ERROR','collector_exception')
-                    emit('issue',label+'｜'+provider+'｜'+(str(exc) if isinstance(exc,AppError) else f'取得処理エラー（{type(exc).__name__}）'))
-                audit.add('collector','layout_loop_end','INFO',{'region':target_region['label'],'provider':provider,'layout':search_layout or 'ALL'})
-
-            # Generic portals expose mixed layouts on the town list: crawl each source once per GSI region.
-            for provider in generic_providers:
-                if available.get(provider)==['ALL']:run_provider(provider,None,'対象8間取り')
-            if available.get('SUUMO')==['GROUPED']:
-                key=(str(region['code']),address_key(town_base_name(region['town'])));group=suumo_groups.get(key)
-                if group and group.get('owner_label')==region.get('label'):run_provider('SUUMO',None,'マンション・築15年以内・指定2間取り群',group)
-            if available.get('HOME’S')==['GROUPED']:
-                key=(str(region['code']),address_key(town_base_name(region['town'])));group=homes_groups.get(key)
-                if group and group.get('owner_label')==region.get('label'):run_provider('HOME’S',None,'マンション・築15年以内・指定2間取り群',group)
-        with futures.ThreadPoolExecutor(max_workers=min(4,len(jobs))) as pool:
-            pending={pool.submit(work,i,*job):i for i,job in enumerate(jobs)}
+        def work(index,region,provider):
+            if web.cancel_event.is_set():return
+            DIAG_CONTEXT.audit=audit;DIAG_CONTEXT.scope={'task':index,'region':region['label'],'town':region['town'],'municipality_code':region['code'],'provider':provider}
+            def emit(kind,value):
+                if kind!='unit':web.check_cancel()
+                audit_value=compact_saved_listing(value) if kind=='unit' and isinstance(value,dict) else value
+                audit.add('collector','accepted' if kind=='unit' else kind,'ERROR' if kind=='issue' else 'INFO',{'event':kind,'value':audit_value})
+                q.put((index,kind,value))
+            try:
+                emit('message',provider+'｜'+region['label']+'｜検索を開始')
+                PROVIDER_COLLECTORS[provider](web,dict(region,search_layout=None),bounds,munis,emit)
+            except SearchCancelled:return
+            except Exception as exc:
+                trace(web,diagnosis_code(str(exc)),{'exception_type':type(exc).__name__,'traceback':traceback.format_exc()},'ERROR','collector_exception')
+                emit('issue',provider+'｜'+(str(exc) if isinstance(exc,AppError) else type(exc).__name__))
+        with futures.ThreadPoolExecutor(max_workers=max(1,min(8,len(jobs)))) as pool:
+            pending={};next_job=0
+            def fill_jobs():
+                nonlocal next_job
+                while next_job<len(jobs) and len(pending)<8 and not web.cancel_event.is_set():
+                    pending[pool.submit(work,next_job,*jobs[next_job])]=next_job;next_job+=1
+            fill_jobs()
             completed=set()
             while pending or not q.empty():
                 ready,_=futures.wait(pending,timeout=.35,return_when=futures.FIRST_COMPLETED) if pending else (set(),set())
+                if web.cancel_event.is_set():
+                    for f in pending:f.cancel()
                 audit.persist(db)
                 batch=[]
                 while True:
@@ -2414,6 +2466,7 @@ def search_all(db,conditions,screen,state=None):
                         units[value['key']]=merge_listing(units.get(value['key']),value)
                         batch.append(units[value['key']])
                 if batch:
+                    state.new_units=list(units.values())
                     screen['status'].info(f'検索実行中｜確認した{len(batch)}件をSupabaseへ保存しています')
                     try:
                         for offset in range(0,len(batch),100): saved.update(db.save_units(batch[offset:offset+100]))
@@ -2423,23 +2476,32 @@ def search_all(db,conditions,screen,state=None):
                     state.new_saved_keys=list(saved)
                 for f in ready:
                     index=pending.pop(f);completed.add(index);active.pop(index,None);done+=1
-                    f.result();log(f'{done}/{len(jobs)}完了｜'+jobs[index][0]['label']+'｜'+jobs[index][1])
+                    if not f.cancelled():
+                        try:f.result()
+                        except SearchCancelled:pass
+                    log(f'{done}/{len(jobs)}完了｜'+jobs[index][0]['label']+'｜'+jobs[index][1])
+                fill_jobs()
                 screen['bar'].progress(.2+.75*done/max(1,len(jobs)),text=f'物件確認 {done}/{len(jobs)}タスク｜保存確認 {len(saved)}件')
                 screen['status'].info(f'検索実行中｜{done}/{len(jobs)}タスク完了｜候補 {candidate}｜詳細 {detail}｜除外 {rejected}｜保存確認 {len(saved)}件｜経過 {int(time.monotonic()-started)}秒\n\n'+'\n\n'.join(active.values()))
-        search['status']='partial' if issues else 'completed'
+        search['status']='cancelled' if web.cancel_event.is_set() else 'partial' if issues else 'completed'
         search['summary']={'confirmed':len(units),'saved':len(saved),'candidate':candidate,'detail':detail,'rejected':rejected,
                            'retained_with_missing_fields':sum(bool(r.get('missing_fields')) for r in units.values()),'price_unknown':sum(not r.get('rent') for r in units.values()),'issues':issues[-100:],'elapsed':int(time.monotonic()-started),'tasks':len(jobs)}
+    except SearchCancelled:
+        search['status']='cancelled'
+        search['summary']={'confirmed':len(units),'saved':len(saved),'issues':issues,'elapsed':int(time.monotonic()-started)}
     except Exception as exc:
         search['status']='failed';issues.append(str(exc) if isinstance(exc,AppError) else f'検索エラー（{type(exc).__name__}）')
         search['summary']={'confirmed':len(units),'saved':len(saved),'issues':issues,'elapsed':int(time.monotonic()-started)}
-    audit.add('map','data_ready','INFO',{'confirmed_units':len(units),'colored_points':0,'render_deferred_until_saved_data_load':True})
+    audit.add('map','data_ready','INFO',{'confirmed_units':len(units),'colored_points':sum(has_point(r) for r in units.values()),'render_deferred_until_saved_data_load':False})
     screen['status'].info('検索が終了しました。詳細作業ログをSupabaseへ保存しています。')
     audit.add('search','finish','INFO',{'status':search['status'],'summary':search['summary']})
     audit.persist(db,force=True)
     search['summary']['diagnostics']={'search_id':audit.search_id,'events':audit.count,'persisted_events':audit.persisted_events}
     search['finished_at']=utc_now()
     try: db.save_search(search)
-    except AppError as exc: issues.append('検索履歴｜'+str(exc));search['summary']['issues']=issues;search['status']='partial'
+    except AppError as exc:
+        issues.append('検索履歴｜'+str(exc));search['summary']['issues']=issues
+        if search['status']!='cancelled':search['status']='partial'
     audit.persist(db,force=True)
     screen['bar'].progress(1.,text='検索処理が終了しました')
     state.new_units=list(units.values())
@@ -2469,7 +2531,7 @@ DIAG_ADVICE={
  'empty':('取得元の一覧に候補がない','地名・自治体コード・検索パラメータをログのURLで照合する。手動検索の件数と比較し、真の0件と検索条件/解析の誤りを区別する。'),
  'location_unverified':('掲載座標はあるが住所照合は未判定','地名照合サービスの失敗ログを確認する。掲載座標と実際の建物位置を手動で照合し、未判定を位置確認済みとして評価しない。'),
  'layout_assumed':('掲載間取りを単独検索の指定値で補完','検索条件・公開フォームの値と結果一覧を照合する。掲載間取りを確認できたら優先し、異なる明示間取りは除外する。補完済みを掲載確認済みとは扱わない。'),
- 'request_spacing':('取得元への同時接続と頻度を調整','物件サイトごとの同時通信は1件、通信開始は最低1秒間隔。取得件数・ページ数には上限を設けない。'),
+ 'request_spacing':('取得元への同時接続と頻度を調整','物件サイトごとの同時通信は2件、通信開始は最低1秒間隔。取得件数・ページ数には上限を設けない。'),
  'session_entry':('同じ経路で公開トップページを確認','応答状態・Cookie件数と再試行結果を比較する。Cookieの値は保存しない。'),
  'session_retry':('公開ページ閲覧後にセッション付き再試行','同じプロキシ・Cookieを使い、実際に訪れたページをRefererとして送る。改善したか後続応答で確認する。'),
  'route_cooldown':('拒否された経路またはRetry-Afterの待機','残り待機時間を確認する。403の経路とURLは60秒休止し、他の設定済み経路があれば試す。'),
@@ -2859,7 +2921,7 @@ def remember_search():
     providers=list(dict.fromkeys(canonical_provider(p) for p in selected))
     bounds=state.get('new_bounds')
     state.new_preferences={'new_providers':selected}
-    state.new_map_loaded=False
+    state.new_map_loaded=True
     if not providers or not bounds:
         state.new_search={'status':'failed','summary':{'issues':['地図の表示範囲と取得元を確認してください。'],'saved':0,'confirmed':0}}
         return
@@ -2873,7 +2935,7 @@ class WorkerState:
 
 class SearchJob:
     def __init__(self,db,conditions):
-        self.lock=threading.RLock();self.state=WorkerState();self.audit=AuditLog(conditions,(getattr(db,'key',''),));self.state.audit=self.audit;self.progress=0.;self.message='バックグラウンド検索を開始しています';self.text='';self.finished=False
+        self.lock=threading.RLock();self.state=WorkerState();self.cancel_event=threading.Event();self.state.cancel_event=self.cancel_event;self.audit=AuditLog(conditions,(getattr(db,'key',''),));self.state.audit=self.audit;self.progress=0.;self.message='バックグラウンド検索を開始しています';self.text='';self.finished=False
         self.thread=threading.Thread(target=self.run,args=(db,conditions),daemon=True,name='housing-search')
     def run(self,db,conditions):
         job=self
@@ -2891,14 +2953,17 @@ class SearchJob:
             self.state.new_search={'status':'failed','conditions':conditions,'summary':{'issues':[str(exc) if isinstance(exc,AppError) else '検索処理エラー（'+type(exc).__name__+'）'],'saved':len(self.state.new_saved_keys),'confirmed':len(self.state.new_units)}}
         finally:
             with self.lock: self.finished=True
+    def request_stop(self):
+        self.cancel_event.set()
+        with self.lock:self.message='中断要求を受け付けました。通信終了後、取得済みデータを保持して終了します。'
     def snapshot(self):
         with self.lock:
-            return dict(progress=self.progress,message=self.message,log=self.text,finished=self.finished,
+            return dict(progress=self.progress,message=self.message,log=self.text,finished=self.finished,stopping=getattr(self,'cancel_event',threading.Event()).is_set(),
                         units=list(self.state.new_units),saved=list(self.state.new_saved_keys),result=self.state.new_search)
 
 class PositionRepairJob(SearchJob):
     def __init__(self,db,rows,bounds,saved):
-        self.lock=threading.RLock();self.state=WorkerState();self.state.new_units=[dict(r) for r in rows];self.state.new_saved_keys=list(saved)
+        self.lock=threading.RLock();self.cancel_event=threading.Event();self.state=WorkerState();self.state.cancel_event=self.cancel_event;self.state.new_units=[dict(r) for r in rows];self.state.new_saved_keys=list(saved)
         self.conditions={'bounds':list(bounds),'mode':'published_map_position_repair','providers':list({r['provider'] for r in rows})}
         self.audit=AuditLog(self.conditions,(getattr(db,'key',''),));self.state.audit=self.audit
         self.progress=0.;self.message='掲載物件の地図から位置と住所を再取得しています';self.text='';self.finished=False;self.updated=0
@@ -2906,7 +2971,7 @@ class PositionRepairJob(SearchJob):
     def run(self,db,conditions):
         rows=[dict(r) for r in self.state.new_units];saved=set(self.state.new_saved_keys);issues=[];updated=0;attempted=0
         history={'id':self.audit.search_id,'status':'started','conditions':conditions,'summary':{},'started_at':utc_now(),'finished_at':None}
-        web=PublicWeb();web.audit=self.audit
+        web=PublicWeb();web.audit=self.audit;web.cancel_event=self.cancel_event
         if hasattr(web,'configure'):web.configure(getattr(db,'web_config',{}))
         try:
             try:db.save_search(history)
@@ -2915,6 +2980,7 @@ class PositionRepairJob(SearchJob):
             except Exception as exc:munis={};self.audit.add('location','reverse_address_pending','WARNING',{'reason':'市区町村コード表を取得できない','exception_type':type(exc).__name__})
             targets=[i for i,r in enumerate(rows) if needs_position_repair(r)]
             for done,i in enumerate(targets,1):
+                web.check_cancel()
                 old=rows[i];attempted+=1;point=None
                 with self.lock:self.message=f'物件地図の位置確認 {done}/{len(targets)}件｜改善 {updated}件'
                 self.audit.add('location','position_repair_start','INFO',{'listing_url':old['listing_url'],'old_point':[old.get('latitude'),old.get('longitude')],'old_precision':old.get('coordinate_precision')})
@@ -2943,6 +3009,10 @@ class PositionRepairJob(SearchJob):
                     'position_pending':sum(needs_position_repair(r) for r in rows),'issues':list(dict.fromkeys(issues)),'individual_positions':len({(r.get('latitude'),r.get('longitude')) for r in rows if has_point(r)})})
             self.audit.add('location','position_repair_finish','INFO',history['summary']);self.audit.persist(db,force=True)
             db.save_search(history)
+        except SearchCancelled:
+            history.update(status='cancelled',finished_at=utc_now(),summary={'confirmed':len(rows),'saved':len(saved),'position_attempted':attempted,'position_updated':updated,'issues':issues})
+            try:db.save_search(history)
+            except Exception:pass
         except Exception as exc:
             history.update(status='partial',finished_at=utc_now(),summary={**history.get('summary',{}),'confirmed':len(rows),'saved':len(saved),'issues':[str(exc) if isinstance(exc,AppError) else '位置更新の保存・ログ処理に失敗しました']})
             self.audit.add('location','position_pending','ERROR',{'exception_type':type(exc).__name__,'retained':len(rows)})
@@ -2980,8 +3050,8 @@ def start_search(conditions):
     with lock:
         old=jobs.get(token)
         if old and not old.snapshot()['finished']: return
-        # A new search only saves data. Previously loaded map colors must not remain active.
-        st.session_state.new_map_loaded=False
+        # Start with an empty map and reflect this search as rows arrive.
+        st.session_state.new_map_loaded=True
         st.session_state.new_units=[]
         st.session_state.new_saved_keys=[]
         # Secrets are read on the Streamlit thread, before launching a pure Python worker.
@@ -3007,11 +3077,13 @@ def background_progress(anchor=None):
         if not st.session_state.get('new_job_rendered')==id(job):
             st.session_state.new_job_rendered=id(job);st.rerun()
         return
-    if (job.updated if isinstance(job,PositionRepairJob) else len(snap['units']))!=st.session_state.get('position_rendered_count') and time.monotonic()-st.session_state.get('position_rendered_at',0)>3:
+    if (job.updated if isinstance(job,PositionRepairJob) else len(snap['units']))!=st.session_state.get('position_rendered_count') and time.monotonic()-st.session_state.get('position_rendered_at',0)>2:
         st.session_state.position_rendered_count=job.updated if isinstance(job,PositionRepairJob) else len(snap['units']);st.session_state.position_rendered_at=time.monotonic();st.rerun()
     def render():
         st.progress(min(.99,snap['progress']),text='バックグラウンドで地図位置・住所を確認しています' if isinstance(job,PositionRepairJob) else 'バックグラウンドで検索・保存しています')
-        st.caption(snap['message'])
+        st.caption('中断処理中｜'+snap['message'] if snap.get('stopping') else snap['message'])
+        if st.button('検索を中断（取得済みデータは保持）',key='stop_background_job',disabled=bool(snap.get('stopping'))):
+            job.request_stop();st.rerun()
     if anchor is None:
         render()
     else:
@@ -3052,7 +3124,7 @@ def main():
     with tabs[0]:
         st.subheader('地図を動かして、探す地域を表示してください')
         st.caption('地図に見えている四角い範囲が検索対象です。駅名の選択や取得件数の上限はありません。')
-        st.caption('検索中はデータベースへの保存だけを行い、地図には色を付けません。「保存データ」で読み込んだ時だけ家賃帯を色付けします。')
+        st.caption('検索中も取得済みの物件を地図へ反映します。進捗と中断ボタンは地図のすぐ下に表示します。')
         st.caption('保存する募集データは家賃・間取り・詳細住所（推定）・データ取得日時です。地図画像や緯度経度は保存しません。')
         selected_group=state.get('layout_display_group','group1')
         if selected_group not in DISPLAY_LAYOUT_GROUPS:selected_group='group1';state.layout_display_group='group1'
@@ -3106,6 +3178,7 @@ def main():
             summary=result['summary'];saved=summary.get('saved',0);confirmed=summary.get('confirmed',0)
             if result.get('conditions',{}).get('mode')=='published_map_position_repair':st.info(f"位置の再確認：{summary.get('position_attempted',0)}件｜位置改善 {summary.get('position_updated',0)}件｜未確認 {summary.get('position_pending',0)}件｜全募集を保持")
             if result['status']=='completed': st.success(f'検索完了｜取得 {confirmed}件・保存確認 {saved}件')
+            elif result['status']=='cancelled': st.info(f'検索を中断しました｜取得 {confirmed}件・保存確認 {saved}件を保持しています。')
             elif result['status']=='partial': st.error(f'検索終了｜取得 {confirmed}件・保存確認 {saved}件。一部の取得・保存に失敗しました。')
             else: st.error('検索を完了できませんでした。以下の原因を確認してください。')
             for issue in summary.get('issues',[])[:8]: st.write('・'+issue)
@@ -3121,7 +3194,7 @@ def main():
         c1.metric('現在の範囲の募集',len(rows))
         c2.metric('家賃帯で色付けした募集',display_report['map']['colored_points'])
         c3.metric('位置未確認の募集',display_report['map']['unconfirmed_positions'])
-        if not state.get('new_map_loaded'):st.info('検索結果は保存のみです。地図に色を付けるには「保存データ」から読み込んでください。')
+        if not state.get('new_map_loaded'):st.info('取得済みデータは検索中も地図へ反映します。保存データは「保存データ」から読み込めます。')
         elif not rows:st.info('この表示範囲に配置できる保存データがありません。')
         if rows:
             with st.expander('募集を1件ずつ確認'):
@@ -3236,7 +3309,7 @@ def main():
         st.code('RENTAL_HTTP_PROXIES = ["http://ユーザー:パスワード@ホスト:ポート", "http://別のユーザー:パスワード@別のホスト:ポート"]',language='toml')
         try:st.caption('設定済みプロキシ：'+str(len(rental_network_settings()['proxies']))+'経路')
         except AppError as exc:st.error(str(exc))
-        st.caption('追加対策：同じ経路で公開トップページを確認してCookieを引き継ぎ、物件サイトごとに同時通信1件・最低1秒間隔で取得します。403の経路とURLは60秒休止し、別の公開条件ページも確認します。')
+        st.caption('追加対策：同じ経路で公開トップページを確認してCookieを引き継ぎ、物件サイトごとに同時通信2件・通信開始は最低1秒間隔で取得します。403の経路とURLは60秒休止し、別の公開条件ページも確認します。')
         st.caption('利用するプロキシサービスの接続URLを設定してください。設定済みの経路で403・空応答・通信失敗が出た場合は別の経路へ切り替えます。認証情報は作業ログへ出力しません。')
         st.write('3．接続確認が成功したら、「住まいを探す」の地図を動かして検索してください。')
         if st.button('新しい保存先の接続を確認',key='new_check'):
@@ -3250,7 +3323,7 @@ def main():
         st.write('募集情報は既存SupabaseのJSON保存領域へ保存するため、追加SQLは不要です。schema 4・5の保存データを読み込みます。旧データの取得日時は未記録と表示します。')
         st.write('SUUMOは物件マーカー座標、HOMESは画像ピン座標を起点にし、国土地理院の住居表示住所データから街区符号・基礎番号を最近傍推定します。一覧・詳細ページの所在地文字列から住所や位置を補完しません。')
         st.write('地図範囲内の居住地名タイルと100m間隔の地点・範囲の端から地名・丁目を判定します。候補数・物件数・ページ数による打ち切りは行いません。通信失敗やページ送りの異常は未完了として表示します。掲載サイト側の非公開情報・取得制限や、地名データの欠落は取得できません。')
-        st.write('検索時は地図を色付けしません。保存データを読み込んだ時に住所から一時的に座標を生成し、家賃帯をCanvasで色付けします。生成座標はDBへ保存しません。')
+        st.write('検索中は取得した物件の座標を使って地図へ逐次反映します。保存データ読込時は住所から座標を一時生成します。座標はDBへ保存しません。')
         st.write('検索と保存はサーバーのバックグラウンドで実行し、画面は1秒ごとに進捗を表示します。サーバーの休止・再起動を越えて実行することはできません。募集終了物件の自動削除は行いません。')
         st.caption('地名取得の代替経路：Geolonia Japanese Addresses v2（デジタル庁アドレス・ベース・レジストリ由来、CC BY 4.0）。町代表点を使って近隣自治体の全町丁目を検索します。地名データの欠落や境界の完全な網羅は保証できません。')
         st.link_button('町丁目データの出典・ライセンス','https://github.com/geolonia/japanese-addresses-v2')
