@@ -2,7 +2,8 @@
 Run: streamlit run app.py
 Dependencies: streamlit>=1.50,<2, requests>=2.32,<3, beautifulsoup4>=4.13,<5, folium>=0.18,<1, streamlit-folium==0.24.0.
 Persistent storage: Supabase housing_units_v1, housing_searches_v1, housing_places_v1.
-Search and verified storage run on server worker threads; UI polls snapshots.
+Search and available-field storage run on server worker threads; UI polls snapshots.
+New flexible listings are JSON records in housing_searches_v1; old housing_units_v1 records remain readable.
 """
 from __future__ import annotations
 
@@ -36,7 +37,7 @@ import streamlit as st
 from streamlit_folium import st_folium
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v34"
+BUILD = "REBUILD-01-v35"
 DEFAULT_CENTER = (35.7303,139.711)
 UNIT_TABLE = "housing_units_v1"
 SEARCH_TABLE = "housing_searches_v1"
@@ -189,10 +190,10 @@ def town_matches(town,address):
     return bool(re.search(r'(?:^|[都道府県市区郡町村])'+re.escape(wanted),actual))
 
 
-def parsed_layout(raw):
+def parsed_layout(raw,rough=True):
     value=normal(raw).upper().replace('　',' ').strip()
     match=re.match(r'^(\d+(?:LDK|SLDK|SDK|DK|SK|LK|K|L|R))(?=$|[\s(（+/])',value)
-    return match[1] if match else '1R' if value=='ワンルーム' else None
+    return (re.sub(r'^(\d+)S(LDK|DK|K)$',r'\1\2',match[1]) if rough else match[1]) if match else '1R' if value=='ワンルーム' else None
 
 
 def resolve_layout(web,raw,requested=None,url=''):
@@ -220,7 +221,7 @@ def discover_layout_inputs(soup,provider):
         if field.name=='option':options.append(field.get_text(' ',strip=True))
         options.extend([field.get('aria-label',''),field.get('data-label','')])
         for text in options:
-            layout=parsed_layout(text)
+            layout=parsed_layout(text,rough=False)
             if layout in LAYOUTS and str(field.get('value','')):
                 result[layout]=(name,str(field['value']));break
     return result
@@ -349,14 +350,58 @@ def is_src(value):
     return "鉄骨鉄筋" in value or bool(re.search(r"(?<![A-Z])SRC(?![A-Z])",value))
 
 
+def monthly_price(row):
+    return float(row.get('rent') or 0)+float(row.get('fees') or 0)
+
+
+def has_point(row):
+    try:return math.isfinite(float(row['latitude'])) and math.isfinite(float(row['longitude'])) and 34<=float(row['latitude'])<=37 and 138<=float(row['longitude'])<=141
+    except (ValueError,TypeError,KeyError):return False
+
+
+def listing_in_bounds(row,bounds):
+    if bounds is None:return True
+    if has_point(row):return in_rectangle((row['latitude'],row['longitude']),bounds)
+    old=row.get('search_bounds')
+    return isinstance(old,(list,tuple)) and len(old)==4 and old[0]<=bounds[2] and old[2]>=bounds[0] and old[1]<=bounds[3] and old[3]>=bounds[1]
+
+
 def valid_unit(row):
     try:
-        return (row['layout'] in LAYOUTS and row['structure']=='SRC' and 0<=int(row['age'])<=20
-                and 34<=float(row['latitude'])<=37 and 138<=float(row['longitude'])<=141
-                and math.isfinite(float(row['area'])) and 0<float(row['area'])<=1000
-                and 0<int(row['rent'])<=10000000 and 0<=int(row['fees'])<=10000000
-                and bool(row['key']) and safe_url(row['listing_url'],row['provider']))
-    except (KeyError,ValueError,TypeError): return False
+        rent=row.get('rent')
+        return (bool(row.get('key')) and safe_url(row['listing_url'],row['provider'])
+                and (row.get('layout') in LAYOUTS or isinstance(rent,(int,float)) and math.isfinite(rent) and rent>0)
+                and (rent is None or isinstance(rent,(int,float)) and math.isfinite(rent) and 0<rent<=10000000))
+    except (KeyError,ValueError,TypeError):return False
+
+
+def optional_amount(value):
+    if value is None or not str(value).strip():return None
+    try:return amount(value)
+    except (AppError,ValueError,TypeError):return None
+
+
+def partial_listing(provider,url,title,address,layout,rent,fees,area,region,bounds,location=None,structure=None,age=None,built_ym=None,floor=''):
+    def number(value,minimum,maximum):
+        try:return value if value is not None and math.isfinite(float(value)) and minimum<=float(value)<=maximum else None
+        except (ValueError,TypeError):return None
+    rent=number(rent,1,10000000);fees=number(fees,0,10000000);area=number(area,.01,10000);age=number(age,0,150)
+    point=region.get('point') if region else None
+    precise=bool(location and has_point(location))
+    location=dict(location or {})
+    if not precise:
+        okay=isinstance(point,(list,tuple)) and len(point)==2 and in_rectangle(point,bounds)
+        location=dict(latitude=point[0] if okay else None,longitude=point[1] if okay else None,
+                      location_method='町丁目の検索地点（建物位置未確認）' if okay else '地域のみ確認・地図位置未確認',
+                      map_address=region.get('label','') if region else '',address_match='町丁目単位')
+    row=dict(key=hashlib.sha256(url.encode()).hexdigest(),title=str(title or '掲載募集'),address=str(address or ''),layout=layout,
+             rent=rent if rent and rent>0 else None,fees=fees,area=area,floor=floor,structure=structure,age=age,built_ym=built_ym,
+             provider=provider,listing_url=url,fetched_at=utc_now(),coordinate_precision='building' if precise else 'town',
+             region_label=region.get('label','') if region else '',search_bounds=list(bounds),**location)
+    row['price_basis']='管理費込み' if fees is not None else '家賃のみ・管理費未確認'
+    row['missing_fields']=[k for k in ('rent','fees','area','structure','age') if row.get(k) is None]
+    if not precise:row['missing_fields'].append('building_location')
+    return row if valid_unit(row) else None
 
 
 def rental_network_settings():
@@ -434,13 +479,13 @@ class Database:
             if not isinstance(rows,list): raise AppError('保存テーブルの応答形式が不正です。')
     def save_units(self,rows):
         unique={r['key']:r for r in rows if valid_unit(r)}
-        if len(unique)!=len({r.get('key') for r in rows}): raise AppError('保存対象の物件情報を確認できません。')
-        if not unique: return set()
-        payload=[dict(r,namespace=self.namespace) for r in unique.values()]
-        result=self.call('POST',UNIT_TABLE,{'on_conflict':'namespace,key','select':'key'},payload,
-                         'resolution=merge-duplicates,return=representation')
-        saved={r.get('key') for r in result if isinstance(r,dict)} if isinstance(result,list) else set()
-        if not set(unique)<=saved: raise AppError('Supabaseから保存完了の確認が得られません。')
+        if len(unique)!=len({r.get('key') for r in rows}):raise AppError('募集URL・家賃・間取りの保存形式を確認してください。')
+        if not unique:return set()
+        payload=[dict(namespace=self.namespace,id='listing.'+key,status='rental_listing',started_at=row.get('fetched_at') or utc_now(),
+                      finished_at=None,conditions={'record_type':'rental_listing','schema':2},summary={'listing':row}) for key,row in unique.items()]
+        result=self.call('POST',SEARCH_TABLE,{'on_conflict':'namespace,id','select':'id'},payload,'resolution=merge-duplicates,return=representation')
+        saved={r.get('id') for r in result if isinstance(r,dict)} if isinstance(result,list) else set()
+        if not {'listing.'+k for k in unique}<=saved:raise AppError('Supabaseから募集情報の保存確認が得られません。')
         return set(unique)
     def save_search(self,search):
         result=self.call('POST',SEARCH_TABLE,{'on_conflict':'namespace,id','select':'id'},
@@ -448,26 +493,26 @@ class Database:
         if not isinstance(result,list) or not any(x.get('id')==search['id'] for x in result if isinstance(x,dict)):
             raise AppError('検索履歴の保存を確認できません。')
     def load_units(self,bounds,layouts):
-        s,w,n,e=bounds;out=[];offset=0
+        out=[];offset=0
         while True:
-            params={'namespace':'eq.'+self.namespace,'select':'*','order':'key.asc','limit':300,'offset':offset,
-                    'and':f'(latitude.gte.{s},latitude.lte.{n},longitude.gte.{w},longitude.lte.{e})',
-                    'layout':'in.('+','.join(layouts)+')','structure':'eq.SRC'}
-            rows=self.call('GET',UNIT_TABLE,params)
-            if not isinstance(rows,list): raise AppError('保存物件を読み取れません。')
-            if not rows: break
-            for row in rows:
-                if row.get('built_ym'):
-                    row=dict(row);row['age'],_=age_info(row['built_ym'].replace('-', '年')+'月')
-                elif row.get('fetched_at'):
-                    try:
-                        stamp=datetime.fromisoformat(row['fetched_at'].replace('Z','+00:00'))
-                        row=dict(row);row['age']=int(row['age'])+max(0,datetime.now(timezone.utc).year-stamp.year)
-                    except (ValueError,TypeError):
-                        continue
-                if valid_unit(row) and in_rectangle((row['latitude'],row['longitude']),bounds): out.append(row)
+            rows=self.call('GET',SEARCH_TABLE,{'namespace':'eq.'+self.namespace,'select':'summary','status':'eq.rental_listing','order':'id.asc','limit':300,'offset':offset})
+            if not isinstance(rows,list):raise AppError('保存した募集情報を読み取れません。')
+            if not rows:break
+            for item in rows:
+                row=(item.get('summary') or {}).get('listing')
+                if isinstance(row,dict) and valid_unit(row) and row.get('layout') in layouts and listing_in_bounds(row,bounds):out.append(row)
             offset+=len(rows)
-        return list({r['key']:r for r in out}.values())
+        offset=0;s,w,n,e=bounds
+        while True:
+            rows=self.call('GET',UNIT_TABLE,{'namespace':'eq.'+self.namespace,'select':'*','order':'key.asc','limit':300,'offset':offset,
+                  'and':f'(latitude.gte.{s},latitude.lte.{n},longitude.gte.{w},longitude.lte.{e})','layout':'in.('+','.join(layouts)+')'})
+            if not isinstance(rows,list):raise AppError('以前の保存物件を読み取れません。')
+            if not rows:break
+            for row in rows:
+                if valid_unit(row) and listing_in_bounds(row,bounds):out.append(row)
+            offset+=len(rows)
+        # Current flexible records take precedence over old strictly filtered records.
+        return list({r['key']:r for r in reversed(out)}.values())
     def save_places(self,rows,kind):
         if not rows: return set()
         payload=[dict(namespace=self.namespace,key=hashlib.sha256((kind+r['name']+str(r['lat'])+str(r['lng'])).encode()).hexdigest(),
@@ -491,7 +536,7 @@ class Database:
             offset+=len(rows)
         return out
     def history(self):
-        rows=self.call('GET',SEARCH_TABLE,{'namespace':'eq.'+self.namespace,'select':'*','order':'started_at.desc','limit':20,'status':'neq.diagnostic_log'})
+        rows=self.call('GET',SEARCH_TABLE,{'namespace':'eq.'+self.namespace,'select':'*','order':'started_at.desc','limit':20,'status':'in.(started,completed,partial,failed)'})
         if not isinstance(rows,list): raise AppError('検索履歴を読み取れません。')
         return rows
 
@@ -969,55 +1014,32 @@ def create_unit(provider,url,title,address,layout,rent,fees,area,floor,age,built
 
 
 def homes_detail(web,url,bounds,munis,hint,search_layout=None):
-    text=web.fetch(url).text;soup=BeautifulSoup(text,'html.parser');recognized=False
+    text=web.fetch(url).text;soup=BeautifulSoup(text,'html.parser')
+    entity={};offer={};listing={}
     for script in soup.select('script[type="application/ld+json"]'):
-        try: data=json.loads(script.get_text())
-        except ValueError: continue
-        for listing in json_nodes(data):
-            if listing.get('@type')!='RealEstateListing': continue
-            entity=listing.get('mainEntity') or {};offer=listing.get('offers') or {}
-            if not isinstance(entity,dict) or not isinstance(offer,dict): continue
-            if offer.get('priceCurrency') not in (None,'JPY'): continue
-            if offer.get('availability') not in (None,'https://schema.org/InStock','http://schema.org/InStock'): continue
-            attrs={x.get('name'):x.get('value') for x in entity.get('additionalProperty',[]) if isinstance(x,dict)}
-            if attrs.get('建物構造') or attrs.get('構造'): recognized=True
-            layout=resolve_layout(web,attrs.get('間取り'),search_layout,url)
-            costs={x.get('name'):x.get('value') for x in offer.get('additionalProperty',[]) if isinstance(x,dict)}
-            structure=attrs.get('建物構造') or attrs.get('構造') or labeled(soup,('建物構造','構造'))
-            if not is_src(structure):
-                trace(web,'structure',{'url':url,'structure':structure});continue
-            age,ym=age_info(attrs.get('築年月') or attrs.get('築年数') or labeled(soup,('築年月','築年数')))
-            if age is None or not 0<=age<=20 or layout is None:
-                trace(web,'layout' if layout is None else 'age',{'url':url,'layout':attrs.get('間取り'),'age':age,'raw_age':attrs.get('築年月') or attrs.get('築年数')});continue
-            fees=costs.get('管理費等',costs.get('管理費'))
-            if fees is None: raise AppError('HOME’S詳細ページの管理費を読み取れません。保存額を確認できません。')
-            addr=entity.get('address') or {}
-            address=''.join(str(addr.get(x,'')) for x in ('addressRegion','addressLocality','streetAddress')) if isinstance(addr,dict) else ''
-            location=locate(web,soup,text,address,bounds,munis,hint)
-            if not location: continue
-            try:
-                return create_unit('HOME’S',url,entity.get('name') or listing.get('name'),address,layout,
-                                   amount(offer.get('price')),amount(fees),float((entity.get('floorSize') or {}).get('value',0)),
-                                   entity.get('floorLevel'),age,ym,location)
-            except (AppError,TypeError,ValueError): continue
-    if recognized: return None
-    # Published HTML tables remain usable when the page has no RealEstateListing JSON-LD.
-    structure=labeled(soup,('建物構造','構造'))
-    layout=resolve_layout(web,labeled(soup,('間取り',)),search_layout,url)
-    if not structure:
-        raise AppError('HOME’S詳細ページの構造を読み取れません。募集終了またはページ形式の変更を確認してください。')
-    age,ym=age_info(labeled(soup,('築年月','築年数')))
-    if not is_src(structure) or layout not in LAYOUTS or age is None or not 0<=age<=20:
-        trace(web,'structure' if not is_src(structure) else 'layout' if layout not in LAYOUTS else 'age',{'url':url,'structure':structure,'layout':layout,'age':age});return None
-    rent=labeled(soup,('賃料','家賃'));fees=labeled(soup,('管理費等','管理費','管理費・共益費'))
-    address=labeled(soup,('所在地','住所'));area=labeled(soup,('専有面積','面積'))
-    if not rent or not fees or not area: raise AppError('HOME’S詳細の賃料・管理費・面積を読み取れません。')
-    match=re.search(r'\d+(?:\.\d+)?',normal(area))
-    location=locate(web,soup,text,address,bounds,munis,hint)
-    if not location or not match: return None
-    title=soup.select_one('h1')
-    return create_unit('HOME’S',url,title.get_text(' ',strip=True) if title else 'HOME’S掲載物件',address,layout,
-                       amount(rent),amount(fees),float(match[0]),labeled(soup,('所在階','階数')),age,ym,location)
+        try:data=json.loads(script.get_text())
+        except ValueError:continue
+        found=next((n for n in json_nodes(data) if n.get('@type')=='RealEstateListing'),None)
+        if found:
+            listing=found;entity=found.get('mainEntity') or {};offer=found.get('offers') or {};break
+    entity=entity if isinstance(entity,dict) else {};offer=offer if isinstance(offer,dict) else {}
+    attrs={x.get('name'):x.get('value') for x in entity.get('additionalProperty',[]) if isinstance(x,dict)}
+    costs={x.get('name'):x.get('value') for x in offer.get('additionalProperty',[]) if isinstance(x,dict)}
+    layout=resolve_layout(web,attrs.get('間取り') or labeled(soup,('間取り',)),search_layout,url)
+    if layout is None:return None
+    addr=entity.get('address') or {}
+    address=''.join(str(addr.get(k,'')) for k in ('addressRegion','addressLocality','streetAddress')) if isinstance(addr,dict) else str(addr)
+    address=address or labeled(soup,('所在地','住所'))
+    title=entity.get('name') or listing.get('name') or (soup.select_one('h1').get_text(' ',strip=True) if soup.select_one('h1') else 'HOME’S掲載募集')
+    rent=optional_amount(offer.get('price') or labeled(soup,('賃料','家賃')))
+    fees=optional_amount(costs.get('管理費等',costs.get('管理費')) or labeled(soup,('管理費等','管理費','管理費・共益費')))
+    size=entity.get('floorSize');raw_area=str(size.get('value','') if isinstance(size,dict) else size or '') or labeled(soup,('専有面積','面積'))
+    match=re.search(r'\d+(?:\.\d+)?',normal(raw_area));area=float(match[0]) if match else None
+    structure=attrs.get('建物構造') or attrs.get('構造') or labeled(soup,('建物構造','構造')) or None
+    age,ym=age_info(attrs.get('築年月') or attrs.get('築年数') or labeled(soup,('築年月','築年数')))
+    try:location=locate(web,soup,text,address,bounds,munis,hint,source_url=url)
+    except AppError as exc:location=None;trace(web,'location',{'url':url,'message':str(exc)},'WARNING','location')
+    return partial_listing('HOME’S',url,title,address,layout,rent,fees,area,{},bounds,location,structure,age,ym,labeled(soup,('所在階','階数')))
 
 
 def homes_collect(web,region,bounds,munis,emit):
@@ -1029,8 +1051,8 @@ def homes_collect(web,region,bounds,munis,emit):
     if not requested:raise AppError('HOME’Sは間取りを1種類ずつ指定して検索してください。')
     layout_params=single_layout_parameters(web,'HOME’S',requested)
     tiles=tiles_in_bounds(bounds)
-    base={'cond[houseageh]':'20','cond[freeword]':region['town'],'cond[fwtype]':'1','zoom':'15',
-          'cond[mbg][3001]':'3001','cond[mbg][3002]':'3002','cond[mbg][3003]':'3003',
+    base={'cond[houseageh]':'0','cond[freeword]':region['town'],'cond[fwtype]':'1','zoom':'15',
+          
           'cond[monthmoneyroom]':'0','cond[monthmoneyroomh]':'0','cond[housearea]':'0','cond[houseareah]':'0',
           'cond[walkminutesh]':'0','cond[newdate]':'0','cond[exfreeword]':''}
     base.update(layout_params)
@@ -1068,8 +1090,13 @@ def homes_collect(web,region,bounds,munis,emit):
         emit('message',f'詳細確認 {index}/{len(links)}件');emit('detail',1)
         if not web.permitted(url): emit('issue','詳細ページの自動取得が許可されていません。');continue
         try: row=homes_detail(web,url,bounds,munis,hint,requested)
-        except AppError as exc: emit('issue',str(exc));row=None
-        if row: emit('unit',row);accepted+=1
+        except Exception as exc:
+            trace(web,'detail_optional_error',{'url':url,'exception_type':type(exc).__name__,'message':str(exc) if isinstance(exc,AppError) else '詳細追加確認失敗','retained':True},'WARNING','collector')
+            emit('message','詳細を確認できないため、取得済みの地域・間取り・募集URLを保持します。');row=partial_listing('HOME’S',url,'HOME’S掲載募集',region['label'],requested,None,None,None,region,bounds)
+        if row:
+            row['region_label']=region['label']
+            if not has_point(row):row.update(latitude=region['point'][0],longitude=region['point'][1],coordinate_precision='town',location_method='町丁目の検索地点（建物位置未確認）')
+            emit('unit',row);accepted+=1
         else: emit('rejected',1)
 
 
@@ -1082,22 +1109,22 @@ def suumo_collect(web,region,bounds,munis,emit):
     candidates={};page=1;seen_pages=set()
     def verify_page(page_candidates):
         for index,(url,values) in enumerate(page_candidates.items(),1):
-            emit('message',f'詳細確認 {index}/{len(page_candidates)}件');emit('detail',1)
-            if not web.permitted(url): emit('issue','詳細ページの自動取得が許可されていません。');continue
+            row=partial_listing('SUUMO',url,*values,region,bounds)
+            if not row:emit('rejected',1);continue
+            trace(web,'partial_retained',{'url':url,'missing_fields':row['missing_fields'],'listing':row},stage='collector');emit('unit',row)
+            emit('message',f'掲載項目の追加確認 {index}/{len(page_candidates)}件');emit('detail',1)
             try:
+                if not web.permitted(url):raise AppError('詳細ページの自動取得が許可されていません。一覧の募集情報は保持します。')
                 text=web.fetch(url).text;soup=BeautifulSoup(text,'html.parser')
-                structure=labeled(soup,('構造','建物構造'))
+                structure=labeled(soup,('構造','建物構造')) or None
                 age,ym=age_info(labeled(soup,('築年月','築年数')))
-                trace(web,'detail_fields',{'url':url,'structure':structure,'raw_built':labeled(soup,('築年月','築年数')),'age':age,'built_ym':ym,'listing_address':values[1],'layout':values[2]},stage='parser')
-                if not structure or age is None: raise AppError('SUUMO詳細ページの構造・築年月を読み取れません。募集終了またはページ形式の変更を確認してください。')
-                if not is_src(structure) or not 0<=age<=20:
-                    trace(web,'structure' if not is_src(structure) else 'age',{'url':url,'structure':structure,'age':age,'built_ym':ym});emit('rejected',1);continue
-                location=locate(web,soup,text,values[1],bounds,munis,source_url=url)
-                if not location:trace(web,'location_pending',{'url':url,'listing_fields':{'title':values[0],'address':values[1],'layout':values[2],'rent':values[3],'fees':values[4],'area':values[5]},'structure':structure,'age':age,'built_ym':ym,'reason':'建物位置未確認。掲載項目を保持して位置読取改善後に再照合する。'},'WARNING','location')
-                row=create_unit('SUUMO',url,*values,labeled(soup,('階建','所在階')),age,ym,location) if location else None
-                if row: emit('unit',row)
-                else: emit('rejected',1)
-            except (AppError,ValueError,TypeError) as exc: emit('issue',str(exc));emit('rejected',1)
+                try:location=locate(web,soup,text,values[1],bounds,munis,source_url=url)
+                except AppError as exc:location=None;trace(web,'location',{'url':url,'message':str(exc)},'WARNING','location')
+                enriched=partial_listing('SUUMO',url,*values,region,bounds,location,structure,age,ym,labeled(soup,('階建','所在階')))
+                if enriched:emit('unit',enriched)
+                trace(web,'detail_fields',{'url':url,'structure':structure,'age':age,'built_ym':ym,'retained':True,'missing_fields':enriched['missing_fields'] if enriched else row['missing_fields']},stage='parser')
+            except (AppError,ValueError,TypeError) as exc:
+                trace(web,'detail_optional_error',{'url':url,'message':str(exc),'retained':True},'WARNING','collector');emit('message','追加項目の確認に失敗。一覧で取得した情報は保存対象として保持しました。')
     while True:
         emit('message',f'検索一覧 {page}ページ目（件数上限なし）')
         params={'ar':'030','bs':'040','pc':'50','sc':region['code'],'ta':region['pref'],'fw2':region['town'],'page':page}
@@ -1127,19 +1154,15 @@ def suumo_collect(web,region,bounds,munis,emit):
                 link=room.select_one('a[href*="/chintai/"]')
                 if layout not in LAYOUTS:
                     trace(web,'layout',{'layout':layout,'address':address,'page':page});continue
-                if not link or room.select_one('.cassetteitem_price--administration') is None:
+                if not link:
                     trace(web,'parse',{'missing':'detail_link_or_management_fee','address':address,'page':page},'WARNING');continue
                 url=urljoin('https://suumo.jp',link['href']).split('#')[0]
                 if not safe_url(url,'SUUMO') or url in candidates:
                     trace(web,'duplicate' if url in candidates else 'parse',{'url':url,'page':page});continue
                 try:
                     match=re.search(r'\d+(?:\.\d+)?',normal(field('.cassetteitem_menseki')))
-                    if not match:
-                        trace(web,'parse',{'url':url,'missing':'area','raw':field('.cassetteitem_menseki')},'WARNING');continue
-                    rent=amount(field('.cassetteitem_price--rent'));fees=amount(field('.cassetteitem_price--administration'))
-                    if rent<=0:
-                        trace(web,'parse',{'url':url,'invalid_rent':rent},'WARNING');continue
-                    candidates[url]=(title,address,layout,rent,fees,float(match[0]))
+                    rent=optional_amount(field('.cassetteitem_price--rent'));fees=optional_amount(field('.cassetteitem_price--administration'))
+                    candidates[url]=(title,address,layout,rent,fees,float(match[0]) if match else None)
                     page_candidates[url]=candidates[url]
                 except AppError as exc:
                     trace(web,'parse',{'url':url,'message':str(exc)},'WARNING');continue
@@ -1238,7 +1261,7 @@ def search_all(db,conditions,screen,state=None):
                         issues.append(label+'｜'+str(value));log(issues[-1])
                     elif kind=='unit':
                         units[value['key']]=value
-                        if value['key'] not in saved: batch.append(value)
+                        batch.append(value) # Save enrichment even if basic fields were already persisted.
                 if batch:
                     screen['status'].info(f'検索実行中｜確認した{len(batch)}件をSupabaseへ保存しています')
                     try:
@@ -1254,14 +1277,14 @@ def search_all(db,conditions,screen,state=None):
                 screen['status'].info(f'検索実行中｜{done}/{len(jobs)}タスク完了｜候補 {candidate}｜詳細 {detail}｜除外 {rejected}｜保存確認 {len(saved)}件｜経過 {int(time.monotonic()-started)}秒\n\n'+'\n\n'.join(active.values()))
         search['status']='partial' if issues else 'completed'
         search['summary']={'confirmed':len(units),'saved':len(saved),'candidate':candidate,'detail':detail,'rejected':rejected,
-                           'issues':issues[-100:],'elapsed':int(time.monotonic()-started),'tasks':len(jobs)}
+                           'retained_with_missing_fields':sum(bool(r.get('missing_fields')) for r in units.values()),'price_unknown':sum(not r.get('rent') for r in units.values()),'issues':issues[-100:],'elapsed':int(time.monotonic()-started),'tasks':len(jobs)}
     except Exception as exc:
         search['status']='failed';issues.append(str(exc) if isinstance(exc,AppError) else f'検索エラー（{type(exc).__name__}）')
         search['summary']={'confirmed':len(units),'saved':len(saved),'issues':issues,'elapsed':int(time.monotonic()-started)}
     display=conditions.get('display',{});display_group=display.get('group','1LDK・2DK');display_budget=display.get('budget',50.)
     map_rows=[r for r in units.values() if r['layout'] in GROUPS.get(display_group,LAYOUTS)]
     map_cells=mesh(map_rows,bounds_center(bounds),bounds_radius(bounds),False,bounds)
-    audit.add('map','data_ready','INFO',{'display_at_search_start':display,'confirmed_units':len(units),'group_units':len(map_rows),'within_budget_units':sum(r['rent']+r['fees']<=display_budget*10000 for r in map_rows),'colored_cells':len(map_cells),'bands':[sum(rent_color(v['price'])==color for v in map_cells) for color in COLORS],'background_tile':'GSI standard map, grayscale base pane; rent overlay retains band colors','no_data_color':False,'monotone_base':True})
+    audit.add('map','data_ready','INFO',{'display_at_search_start':display,'confirmed_units':len(units),'group_units':len(map_rows),'within_budget_units':sum(monthly_price(r)<=display_budget*10000 for r in map_rows),'town_markers':len({(r.get('region_label'),r['layout']) for r in map_rows if r.get('coordinate_precision')=='town' and has_point(r) and r.get('rent')}),'colored_cells':len(map_cells),'bands':[sum(rent_color(v['price'])==color for v in map_cells) for color in COLORS],'background_tile':'GSI standard map, grayscale base pane; rent overlay retains band colors','no_data_color':False,'monotone_base':True})
     screen['status'].info('検索が終了しました。詳細作業ログをSupabaseへ保存しています。')
     audit.add('search','finish','INFO',{'status':search['status'],'summary':search['summary']})
     audit.persist(db,force=True)
@@ -1288,8 +1311,8 @@ DIAG_ADVICE={
  'http_5xx':('取得先のサーバーエラー','発生時刻とURLを確認して障害を切り分け、復旧後に失敗したタスクだけを再検証する。'),
  'network':('接続・DNS・TLSの問題の可能性','同一ホストの複数URLと別ホストの結果を比較する。StreamlitログでDNS/TLS・外向き通信を確認する。'),
  'parse':('掲載情報の形式を読み取れない','HTTP成功時のページタイトル・ハッシュ・検出件数と現行HTML/JSONを照合し、項目名・セレクタ・ページ送りを修正して同じ例で再検証する。'),
- 'structure':('SRC条件による除外','実際の構造表記とSRC判定を照合する。RC等の正しい除外と表記ゆれの誤判定を分ける。'),
- 'age':('築年数条件または築年月の読取','築年月の元表記・解析値・実行日を照合する。築20年超は仕様上の除外であり取得失敗とは扱わない。'),
+ 'structure':('構造の掲載情報','実際の構造表記とSRC判定を照合する。RC等の正しい除外と表記ゆれの誤判定を分ける。'),
+ 'age':('築年数の掲載情報','築年月の元表記・解析値・実行日を照合する。築20年超は仕様上の除外であり取得失敗とは扱わない。'),
  'layout':('間取り条件または表記の不一致','間取りの元表記を確認し、空白・全角・括弧等を正規化する。対象外間取りは仕様上の除外とする。'),
  'address':('地名・住所の照合で不一致','丁目の漢数字・数字、町名表記、市区名の変換を照合する。実際の掲載座標との比較で誤除外がないか確認する。'),
  'location':('掲載座標・住所の位置を確認できない','掲載地図・JSON-LD・住所検索の各候補と表示範囲を比較する。番地や掲載座標がない物件を架空座標で補完しない。'),
@@ -1311,6 +1334,8 @@ DIAG_ADVICE={
  'http_retry':('一時的なHTTPエラーを再試行','Retry-Afterと再試行後の状態を確認する。繰り返す場合は取得元またはプロキシの接続状況を調べる。'),
  'provider_unavailable':('取得元の検索条件を取得できない','通信試行ログを確認する。403が全経路で続く場合はプロキシ接続先と取得元へのアクセス可否を確認する。'),
  'layout_unsupported':('取得元に単独検索条件がない','この間取りは検索未実施。取得元の公開フォームに対応する間取りがあるか確認する。'),
+ 'partial_retained':('取得できた募集情報を保存対象に保持','未確認項目があっても取得済みの家賃・間取り・地域を反映する。建物座標と町丁目の概算を区別する。'),
+ 'detail_optional_error':('詳細の追加確認でエラー・一覧情報は保持','一覧から取得できた募集項目とSupabase保存確認を見る。詳細エラーを募集全体の除外理由にしない。'),
  'location_pending':('条件に合う募集だが建物位置が未確認','記録したURLと掲載項目を用いて掲載地図・正確な番地を確認する。地図の250m区画へ町丁目代表点を入れない。位置を確認した後に再取得・保存する。'),
  'map_link_result':('掲載ページから地図ページを追加確認','座標の出所と掲載住所を照合する。町丁目の代表点を建物座標として扱わない。'),
  'http_empty':('HTTP 202の空応答で掲載データが未到着','公開ページを手動で確認し、取得元のアクセス条件と公開API/データ提供を確認する。空本文をHTML解析失敗や間取り欠落と扱わない。'),
@@ -1335,7 +1360,7 @@ class AuditLog:
         fd,self.path=tempfile.mkstemp(prefix='sumai-log-',suffix='.jsonl');os.close(fd)
         self.lock=threading.RLock();self.count=0;self.offset=0;self.chunk=0;self.last_save=0.;self.persisted_events=0
         self.storage_error=None;self.search_id=hashlib.sha256(os.urandom(32)).hexdigest();self.secrets=tuple(str(v) for v in secrets if v)
-        self.add('search','start','INFO',{'build':BUILD,'bounds':conditions.get('bounds'),'providers':conditions.get('providers'),'filters':{'structure':'SRC','max_age':20,'layouts':list(LAYOUTS)},'property_limit':None})
+        self.add('search','start','INFO',{'build':BUILD,'bounds':conditions.get('bounds'),'providers':conditions.get('providers'),'filters':{'structure':None,'max_age':None,'layouts':list(LAYOUTS)},'property_limit':None})
     def clean(self,value):
         if isinstance(value,dict):return {str(k):('[REDACTED]' if re.search(r'^(?:key|apikey|api_key|token|access_token|authorization|cookie|password|secret|SUPABASE_.*KEY)$',str(k),re.I) else self.clean(v)) for k,v in value.items()}
         if isinstance(value,(list,tuple)):return [self.clean(x) for x in value]
@@ -1439,8 +1464,10 @@ def diagnostic_downloads(events,prefix='current'):
 def physical_units(rows):
     grouped={}
     for r in rows:
+        if r.get('coordinate_precision')=='town' or not has_point(r):
+            grouped.setdefault(r['key'],r);continue
         fingerprint=(round(r['latitude'],5),round(r['longitude'],5),r['layout'],r.get('floor',''),
-                     round(r['area'],1),r['rent'],r['fees'])
+                     round(r.get('area') or 0,1),r['rent'],r['fees'])
         grouped.setdefault(fingerprint,r)
     return list(grouped.values())
 
@@ -1454,10 +1481,11 @@ def mesh(rows,center,radius,interpolate=False,bounds=None):
     """Color only occupied 250 m cells. Missing data is never interpolated."""
     positions={}
     for r in physical_units(rows):
+        if r.get('coordinate_precision')=='town' or not has_point(r) or not r.get('rent'):continue
         point=(float(r['latitude']),float(r['longitude']))
         if bounds is not None and not in_rectangle(point,bounds): continue
         if bounds is None and meters(center,point)>radius: continue
-        positions.setdefault((round(point[0],5),round(point[1],5)),[]).append(r['rent']+r['fees'])
+        positions.setdefault((round(point[0],5),round(point[1],5)),[]).append(monthly_price(r))
     cells={};step=250;scale=111320*math.cos(math.radians(center[0]))
     for point,values in positions.items():
         y=math.floor((point[0]-center[0])*111320/step+.5)
@@ -1502,6 +1530,13 @@ def rental_map(rows,center,radius,cells,facilities):
     return m
 
 
+def listing_card(r,persisted):
+    price=f'{monthly_price(r)/10000:g}万円 / 月' if r.get('rent') else '家賃未確認'
+    area=f"{r['area']:g}㎡" if r.get('area') else '面積未確認'
+    age=f"築{r['age']}年" if r.get('age') is not None else '築年数未確認'
+    return '<div class="unit"><h3>'+html.escape(r['title'])+'</h3><b>'+price+'</b> · '+html.escape(r.get('layout') or '間取り未確認')+' · '+area+' · '+age+'<p>'+html.escape(r.get('address') or '')+'</p><p>'+html.escape(r.get('price_basis','管理費込み'))+' · '+html.escape(r.get('location_method') or '位置未確認')+'</p><a href="'+html.escape(r['listing_url'],quote=True)+'" target="_blank" rel="noopener">募集ページを開く ↗</a><p>'+('保存確認済み' if persisted else '保存未確認')+'</p></div>'
+
+
 def rental_features(rows,cells,facilities):
     m=folium.FeatureGroup(name='物件・家賃・施設')
     for c in cells:
@@ -1511,14 +1546,20 @@ def rental_features(rows,cells,facilities):
         area=folium.Rectangle(c['bounds'],color=color,weight=.6,opacity=.5,fill=True,fill_color=color,fill_opacity=.30,tooltip=tip)
         area.options['pane']='rentAreas'
         area.add_to(m)
+    towns={}
     for r in physical_units(rows):
-        tip=html.escape(r['title'])+f"｜{(r['rent']+r['fees'])/10000:g}万円"
-        popup=(f"<b>{html.escape(r['title'])}</b><br>{html.escape(r['layout'])} / {r['area']:g}㎡<br>"
-               f"総額 {(r['rent']+r['fees'])/10000:g}万円<br>{html.escape(r['address'])}<br>"
-               f"{html.escape(r['location_method'])}<br><a href='{html.escape(r['listing_url'],quote=True)}' target='_blank' rel='noopener'>募集ページ</a>")
+        if not has_point(r) or not r.get('rent'):continue
+        if r.get('coordinate_precision')=='town':
+            towns.setdefault((r.get('region_label') or r['address'],r['layout']),[]).append(r);continue
+        tip=html.escape(r['title'])+f"｜{monthly_price(r)/10000:g}万円｜{r.get('price_basis','管理費込み')}"
         folium.CircleMarker((r['latitude'],r['longitude']),radius=5,color='#fff',weight=1,fill=True,
-                            fill_color=rent_color(r['rent']+r['fees']),fill_opacity=1,
-                            tooltip=tip,popup=folium.Popup(popup,max_width=280)).add_to(m)
+                            fill_color=rent_color(monthly_price(r)),fill_opacity=1,tooltip=tip,
+                            popup=folium.Popup(listing_card(r,False),max_width=280)).add_to(m)
+    for (town,layout),items in towns.items():
+        price=statistics.median(monthly_price(r) for r in items);point=(items[0]['latitude'],items[0]['longitude'])
+        label=f'{town}｜{layout}｜約{price/10000:g}万円｜{len(items)}募集｜町丁目単位・建物位置未確認'
+        folium.CircleMarker(point,radius=16,color=rent_color(price),weight=2,fill=True,fill_color=rent_color(price),fill_opacity=.45,
+                            tooltip=html.escape(label),popup=html.escape(label)).add_to(m)
     for f in facilities:
         folium.CircleMarker((f['lat'],f['lng']),radius=6,color='#fff',fill=True,fill_color='#555555',fill_opacity=1,tooltip=html.escape(f['name'])).add_to(m)
     return m
@@ -1558,8 +1599,8 @@ def fetch_facilities(center,kind):
 
 def csv_bytes(rows):
     keys=['key','title','address','latitude','longitude','layout','rent','fees','area','floor','structure','age','built_ym',
-          'location_method','map_address','address_match','provider','listing_url','fetched_at']
-    file=io.StringIO();writer=csv.DictWriter(file,fieldnames=keys,extrasaction='ignore');writer.writeheader();writer.writerows(rows)
+          'location_method','map_address','address_match','provider','listing_url','fetched_at','coordinate_precision','region_label','price_basis','search_bounds']
+    file=io.StringIO();writer=csv.DictWriter(file,fieldnames=keys,extrasaction='ignore');writer.writeheader();writer.writerows([{**r,'search_bounds':json.dumps(r.get('search_bounds'))} for r in rows])
     return file.getvalue().encode('utf-8-sig')
 
 
@@ -1568,8 +1609,9 @@ def read_csv(content):
     try:
         rows=[]
         for row in csv.DictReader(io.StringIO(content.decode('utf-8-sig'))):
-            for key in ('latitude','longitude','area'): row[key]=float(row[key])
-            for key in ('rent','fees','age'): row[key]=int(row[key])
+            for key in ('latitude','longitude','area'): row[key]=float(row[key]) if row.get(key) else None
+            for key in ('rent','fees','age'): row[key]=int(row[key]) if row.get(key) else None
+            row['search_bounds']=json.loads(row.get('search_bounds') or 'null')
             row['built_ym']=row.get('built_ym') or None
             if not valid_unit(row): raise ValueError()
             row['key']=hashlib.sha256(row['listing_url'].encode()).hexdigest()
@@ -1679,7 +1721,7 @@ def background_status():
 def main():
     st.set_page_config(page_title='住まいコンパス｜新しい住まいを探す',page_icon='🏡',layout='wide',initial_sidebar_state='collapsed')
     st.markdown(CSS,unsafe_allow_html=True)
-    st.markdown(f'<div class="hero"><span class="badge">SUMAI COMPASS · {BUILD}</span><h1>次の住まいを、地図から。</h1><p>掲載物件を確認し、家賃と暮らしやすさを比べます。<br>SRC・築20年以内の賃貸物件を対象にしています。</p></div>',unsafe_allow_html=True)
+    st.markdown(f'<div class="hero"><span class="badge">SUMAI COMPASS · {BUILD}</span><h1>次の住まいを、地図から。</h1><p>掲載物件を確認し、家賃と暮らしやすさを比べます。<br>間取りと家賃帯を、取得できた情報で比較します。</p></div>',unsafe_allow_html=True)
     state=st.session_state
     state.setdefault('new_units',[]);state.setdefault('new_search',None);state.setdefault('new_saved_keys',[])
     state.setdefault('new_facilities',[])
@@ -1694,20 +1736,22 @@ def main():
         st.caption('地図に見えている四角い範囲が検索対象です。駅名の選択や取得件数の上限はありません。')
         group=st.radio('間取り',list(GROUPS),index=list(GROUPS).index(preferences.get('new_group','1LDK・2DK')),horizontal=True,key='new_group')
         budget=st.number_input('月額の上限（管理費込み・万円）',min_value=1.,max_value=1000.,value=preferences.get('new_budget',50.),step=1.,key='new_budget')
-        st.caption('家賃帯は管理費込みの月額で色分けします。家賃データのない場所はモノトーンです。駅名・地名は地図を拡大して確認できます。')
+        verified_only=st.checkbox('表示だけをSRC・築20年以内に絞る',value=False,key='new_verified_only')
+        st.caption('取得・保存は構造や築年数の未確認で除外しません。町丁目の丸は概算の家賃帯で、建物位置を示しません。管理費未確認なら家賃のみで集計します。')
+        st.caption('家賃帯は、管理費が読み取れた場合は加算し、未確認の場合は家賃のみで色分けします。家賃データのない場所はモノトーンです。駅名・地名は地図を拡大して確認できます。')
         bounds=state.get('new_bounds')
         center=bounds_center(bounds) if bounds else state.get('new_view_center',DEFAULT_CENTER)
         radius=bounds_radius(bounds) if bounds else 1500
         rows=[r for r in state.new_units if valid_unit(r) and r['layout'] in GROUPS[group]
-              and (bounds is None or in_rectangle((r['latitude'],r['longitude']),bounds))]
-        pins=[r for r in rows if r['rent']+r['fees']<=budget*10000]
+              and listing_in_bounds(r,bounds) and (not verified_only or is_src(r.get('structure') or '') and r.get('age') is not None and 0<=r['age']<=20)]
+        pins=[r for r in rows if r.get('rent') and monthly_price(r)<=budget*10000]
         cells=mesh(rows,center,radius,False,bounds) if bounds else []
         job=active_job()
         if job:
             map_signature=(tuple(bounds) if bounds else None,group,budget,len(state.new_units),len(cells))
             if state.get('diagnostic_map_signature')!=map_signature:
                 state.diagnostic_map_signature=map_signature
-                job.audit.add('map','render','INFO',{'bounds':bounds,'group':group,'budget':budget,'loaded_units':len(state.new_units),'visible_units':len(pins),'colored_cells':len(cells),'bands':[sum(rent_color(v['price'])==color for v in cells) for color in COLORS],'no_data_color':False,'monotone_base':True})
+                job.audit.add('map','render','INFO',{'bounds':bounds,'group':group,'budget':budget,'loaded_units':len(state.new_units),'visible_units':len(pins),'town_markers':len({(r.get('region_label'),r['layout']) for r in pins if r.get('coordinate_precision')=='town' and has_point(r)}),'colored_cells':len(cells),'bands':[sum(rent_color(v['price'])==color for v in cells) for color in COLORS],'no_data_color':False,'monotone_base':True})
         facilities=[f for f in state.new_facilities if bounds and in_rectangle((f['lat'],f['lng']),bounds)]
         data=st_folium(rental_map([],DEFAULT_CENTER,1500,[],[]),key='new_map',height=480,use_container_width=True,
             returned_objects=['bounds','zoom'],center=state.get('new_view_center',DEFAULT_CENTER),
@@ -1727,8 +1771,8 @@ def main():
         result=state.new_search
         if result:
             summary=result['summary'];saved=summary.get('saved',0);confirmed=summary.get('confirmed',0)
-            if result['status']=='completed': st.success(f'検索完了｜確認 {confirmed}件・保存確認 {saved}件')
-            elif result['status']=='partial': st.error(f'検索終了｜確認 {confirmed}件・保存確認 {saved}件。一部の取得・保存に失敗しました。')
+            if result['status']=='completed': st.success(f'検索完了｜取得 {confirmed}件・保存確認 {saved}件')
+            elif result['status']=='partial': st.error(f'検索終了｜取得 {confirmed}件・保存確認 {saved}件。一部の取得・保存に失敗しました。')
             else: st.error('検索を完了できませんでした。以下の原因を確認してください。')
             for issue in summary.get('issues',[])[:8]: st.write('・'+issue)
             if summary.get('elapsed') is not None: st.caption(f"所要 {summary['elapsed']}秒｜詳細確認 {summary.get('detail',0)}件｜除外 {summary.get('rejected',0)}件")
@@ -1737,20 +1781,21 @@ def main():
                     for label in result['conditions']['regions']: st.write(label)
         legend=''.join(f'<span style="display:inline-block;margin:4px 10px 4px 0;color:#203f39;font-size:12px"><b style="color:{color}">■</b> {label}</span>' for color,label in zip(COLORS,['15万円以下','15〜20万円','20〜22.5万円','22.5〜25万円','25〜27.5万円','27.5〜30万円','30〜35万円','35万円超']))
         st.markdown(legend,unsafe_allow_html=True)
-        st.caption('色付き区画：掲載額の中央値（管理費込み）。区画は250m。掲載額のない区画はモノトーンのままです。駅名・地名が読めるよう家賃帯の色を半透明で表示します。家賃帯の集計は月額上限で絞る前のデータです。')
+        st.caption('町丁目の丸：募集の家賃中央値・建物位置未確認。正確な座標がある区画：250mごとの掲載額中央値。管理費未確認なら家賃のみ。掲載額のない区画はモノトーンのままです。駅名・地名が読めるよう家賃帯の色を半透明で表示します。家賃帯の集計は月額上限で絞る前のデータです。')
         c1,c2,c3=st.columns(3)
+        st.caption(f'取得した募集：{len(state.new_units)}件｜表示中の間取り：{len(rows)}件｜家賃未確認：{sum(not r.get("rent") for r in rows)}件')
         c1.metric('条件内の募集',len(physical_units(pins)))
-        c2.metric('月額の中央値',f"{statistics.median([r['rent']+r['fees'] for r in pins])/10000:.1f}万円" if pins else '—')
-        c3.metric('集計した区画',len(cells))
+        c2.metric('月額の中央値',f"{statistics.median([monthly_price(r) for r in pins])/10000:.1f}万円" if pins else '—')
+        c3.metric('色分けした地域・区画',len(cells)+len({(r.get('region_label'),r['layout']) for r in pins if r.get('coordinate_precision')=='town' and has_point(r)}))
         if not pins: st.info('この範囲・間取り・予算に表示できる物件がありません。検索するか、保存データを読み込んでください。')
-        for r in sorted(physical_units(pins),key=lambda x:x['rent']+x['fees']):
+        for r in sorted(physical_units(pins),key=lambda x:monthly_price(x)):
             persisted=r['key'] in state.new_saved_keys
-            st.markdown(f'<div class="unit"><h3>{html.escape(r["title"])}</h3><b>{(r["rent"]+r["fees"])/10000:g}万円 / 月</b> · {html.escape(r["layout"])} · {r["area"]:g}㎡ · 築{r["age"]}年<p>{html.escape(r["address"])}</p><a href="{html.escape(r["listing_url"],quote=True)}" target="_blank" rel="noopener">募集ページを開く ↗</a><p style="font-size:12px">{html.escape(r["provider"])} · {html.escape(r["location_method"])} · {"保存確認済み" if persisted else "画面上のみ・保存未確認"}</p></div>',unsafe_allow_html=True)
-        if pins:
-            with st.expander('すべての物件を表で見る'):
-                st.dataframe([{'物件名':r['title'],'間取り':r['layout'],'総額（万円）':(r['rent']+r['fees'])/10000,'面積':r['area'],
+            st.markdown(listing_card(r,persisted),unsafe_allow_html=True)
+        if rows:
+            with st.expander('取得できた情報をすべて表で見る（未確認も保持）'):
+                st.dataframe([{'物件名':r['title'],'間取り':r['layout'],'月額（万円）':monthly_price(r)/10000 if r.get('rent') else None,'面積':r['area'],
                                '築年数':r['age'],'掲載住所':r['address'],'地図判定住所':r['map_address'],'住所照合':r['address_match'],
-                               '取得元':r['provider'],'掲載ページ':r['listing_url']} for r in physical_units(pins)],hide_index=True,
+                               '取得元':r['provider'],'掲載ページ':r['listing_url']} for r in physical_units(rows)],hide_index=True,
                              column_config={'掲載ページ':st.column_config.LinkColumn()})
     with tabs[1]:
         st.subheader('Supabaseに保存した物件')
@@ -1809,7 +1854,7 @@ def main():
                 except (ValueError,UnicodeError,AttributeError):st.error('このアプリからダウンロードした解析用JSONログを選択してください。')
     with tabs[2]:
         st.subheader('通勤の目安')
-        options=physical_units(state.new_units)
+        options=physical_units([r for r in state.new_units if has_point(r) and r.get('coordinate_precision')!='town'])
         if options:
             i=st.selectbox('出発する物件',range(len(options)),format_func=lambda i:options[i]['title'])
             destination=st.selectbox('勤務先の最寄り駅',list(STATIONS),key='new_destination')
@@ -1864,10 +1909,11 @@ def main():
         st.caption(f'実行中の版：{BUILD}')
     with st.expander('取得・集計の範囲'):
         st.write('間取りを読み取れない場合は単独検索で指定した間取りを採用し、補完したことを詳細ログへ記録します。掲載間取りが指定と異なる場合は除外します。構造・築年月・位置は間取りから推測しません。')
-        st.write('公開ページの掲載情報を取得し、SRC・築20年以内・対象間取り・位置を確認した物件を保存します。架空の物件や家賃は生成しません。')
+        st.write('間取り・家賃・地域の取得済み項目を保存します。構造・築年数・管理費・面積・建物位置の未確認で募集全体を除外しません。未確認項目は空欄として保持します。')
+        st.write('募集情報は既存SupabaseのJSON保存領域へ保存するため、追加SQLは不要です。以前に保存した物件も読み込みます。')
         st.write('掲載地図座標を優先し、番地のある住所は一致する住所検索結果で補完します。住所と地図判定に明確な不一致がある物件は除外します。')
         st.write('地図範囲内の居住地名タイルと100m間隔の地点・範囲の端から地名・丁目を判定します。候補数・物件数・ページ数による打ち切りは行いません。通信失敗やページ送りの異常は未完了として表示します。掲載サイト側の非公開情報・取得制限や、地名データの欠落は取得できません。')
-        st.write('同じ建物位置の月額募集額の中央値を求め、250m区画で集計します。掲載額のある区画だけを家賃帯で色分けします。家賃データのない区画へ推定の色を広げません。')
+        st.write('町丁目まで確認できた募集は、その町丁目の丸で家賃中央値を表示します。建物位置ではありません。正確な座標のある募集は250m区画で集計します。掲載額のある区画だけを家賃帯で色分けします。家賃データのない区画へ推定の色を広げません。')
         st.write('検索と保存はサーバーのバックグラウンドで実行し、画面は1秒ごとに進捗を表示します。サーバーの休止・再起動を越えて実行することはできません。募集終了物件の自動削除は行いません。')
         st.caption('地名取得の代替経路：Geolonia Japanese Addresses v2（デジタル庁アドレス・ベース・レジストリ由来、CC BY 4.0）。町代表点を使って近隣自治体の全町丁目を検索します。地名データの欠落や境界の完全な網羅は保証できません。')
         st.link_button('町丁目データの出典・ライセンス','https://github.com/geolonia/japanese-addresses-v2')
