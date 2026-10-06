@@ -32,7 +32,7 @@ import streamlit as st
 from streamlit_folium import st_folium
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v28"
+BUILD = "REBUILD-01-v29"
 DEFAULT_CENTER = (35.7303,139.711)
 UNIT_TABLE = "housing_units_v1"
 SEARCH_TABLE = "housing_searches_v1"
@@ -899,31 +899,32 @@ def physical_units(rows):
     return list(grouped.values())
 
 
-def mesh(rows,center,radius,interpolate,bounds=None):
+def rent_color(price):
+    """Monthly rent plus management fees; each threshold belongs to the lower band."""
+    return COLORS[sum(price>cut for cut in BANDS)]
+
+
+def mesh(rows,center,radius,interpolate=False,bounds=None):
+    """Color only occupied 250 m cells. Missing data is never interpolated."""
     positions={}
-    for r in physical_units(rows): positions.setdefault((round(r['latitude'],5),round(r['longitude'],5)),[]).append(r['rent']+r['fees'])
-    buildings=[(p,statistics.median(v)) for p,v in positions.items()]
-    cells={};step=250
-    for point,price in buildings:
-        y=round((point[0]-center[0])*111320/step);x=round((point[1]-center[1])*111320*math.cos(math.radians(center[0]))/step)
-        cells.setdefault((x,y),[]).append(price)
-    out=[];n=math.ceil(radius/step)
-    for x in range(-n,n+1):
-        for y in range(-n,n+1):
-            p=(center[0]+y*step/111320,center[1]+x*step/(111320*math.cos(math.radians(center[0]))))
-            if bounds is not None:
-                if not in_rectangle(p,bounds): continue
-            elif meters(center,p)>radius: continue
-            values=cells.get((x,y));estimated=False
-            if values: price=statistics.median(values);count=len(values)
-            elif interpolate:
-                nearby=[(meters(p,b),v) for b,v in buildings if meters(p,b)<=750]
-                if len(nearby)<3: continue
-                weighted=[(1/max(30,d)**2,v) for d,v in nearby]
-                price=sum(w*v for w,v in weighted)/sum(w for w,_ in weighted);count=len(nearby);estimated=True
-            else: continue
-            cell_bounds=rectangle(p,step/2)
-            out.append(dict(bounds=[[cell_bounds[0],cell_bounds[1]],[cell_bounds[2],cell_bounds[3]]],price=price,count=count,estimated=estimated))
+    for r in physical_units(rows):
+        point=(float(r['latitude']),float(r['longitude']))
+        if bounds is not None and not in_rectangle(point,bounds): continue
+        if bounds is None and meters(center,point)>radius: continue
+        positions.setdefault((round(point[0],5),round(point[1],5)),[]).append(r['rent']+r['fees'])
+    cells={};step=250;scale=111320*math.cos(math.radians(center[0]))
+    for point,values in positions.items():
+        y=math.floor((point[0]-center[0])*111320/step+.5)
+        x=math.floor((point[1]-center[1])*scale/step+.5)
+        cells.setdefault((x,y),[]).append(statistics.median(values))
+    out=[]
+    for (x,y),values in sorted(cells.items()):
+        point=(center[0]+y*step/111320,center[1]+x*step/scale)
+        cell=rectangle(point,step/2)
+        if bounds is not None:
+            cell=(max(cell[0],bounds[0]),max(cell[1],bounds[1]),min(cell[2],bounds[2]),min(cell[3],bounds[3]))
+            if cell[0]>=cell[2] or cell[1]>=cell[3]: continue
+        out.append(dict(bounds=[[cell[0],cell[1]],[cell[2],cell[3]]],price=statistics.median(values),count=len(values),estimated=False))
     return out
 
 
@@ -931,6 +932,13 @@ def rental_map(rows,center,radius,cells,facilities):
     m=folium.Map(location=center,zoom_start=15,tiles=None,control_scale=True)
     folium.TileLayer('https://cyberjapandata.gsi.go.jp/xyz/std/{z}/{x}/{y}.png',
         attr='国土地理院',name='地名の地図',max_zoom=18).add_to(m)
+    folium.map.CustomPane('rentAreas',z_index=390,pointer_events=True).add_to(m)
+    # Base-map station and town labels stay visible through translucent rent areas.
+    # Major station names also have persistent white-backed labels above the colors.
+    for name,point in STATIONS.items():
+        folium.CircleMarker(point,radius=2,color='#173a5e',weight=1,fill=True,fill_color='#ffffff',fill_opacity=1,
+            tooltip=folium.Tooltip(html.escape(name)+'駅',permanent=True,direction='top',
+                style='background:rgba(255,255,255,.94);color:#173a5e;border:0;font-size:12px;font-weight:700;box-shadow:none;padding:2px 4px;')).add_to(m)
     rental_features(rows,cells,facilities).add_to(m)
     return m
 
@@ -938,17 +946,18 @@ def rental_map(rows,center,radius,cells,facilities):
 def rental_features(rows,cells,facilities):
     m=folium.FeatureGroup(name='物件・家賃・施設')
     for c in cells:
-        color=COLORS[sum(c['price']>cut for cut in BANDS)]
-        tip=f"{c['price']/10000:.1f}万円/月｜{'近隣から推定' if c['estimated'] else '掲載額集計'}｜根拠 {c['count']}建物位置"
-        folium.Rectangle(c['bounds'],color=color,weight=.4,fill=True,fill_color=color,
-                         fill_opacity=.24 if c['estimated'] else .55,dash_array='4,3' if c['estimated'] else None,tooltip=tip).add_to(m)
+        if c.get('estimated') or c.get('count',0)<=0 or not isinstance(c.get('price'),(int,float)) or not math.isfinite(c['price']): continue
+        color=rent_color(c['price'])
+        tip=f"{c['price']/10000:.1f}万円/月（管理費込み）｜掲載額の中央値｜{c['count']}建物位置"
+        folium.Rectangle(c['bounds'],color=color,weight=.6,opacity=.5,fill=True,fill_color=color,
+                         fill_opacity=.30,pane='rentAreas',tooltip=tip).add_to(m)
     for r in physical_units(rows):
         tip=html.escape(r['title'])+f"｜{(r['rent']+r['fees'])/10000:g}万円"
         popup=(f"<b>{html.escape(r['title'])}</b><br>{html.escape(r['layout'])} / {r['area']:g}㎡<br>"
                f"総額 {(r['rent']+r['fees'])/10000:g}万円<br>{html.escape(r['address'])}<br>"
                f"{html.escape(r['location_method'])}<br><a href='{html.escape(r['listing_url'],quote=True)}' target='_blank' rel='noopener'>募集ページ</a>")
         folium.CircleMarker((r['latitude'],r['longitude']),radius=5,color='#fff',weight=1,fill=True,
-                            fill_color=COLORS[sum(r['rent']+r['fees']>cut for cut in BANDS)],fill_opacity=1,
+                            fill_color=rent_color(r['rent']+r['fees']),fill_opacity=1,
                             tooltip=tip,popup=folium.Popup(popup,max_width=280)).add_to(m)
     for f in facilities:
         folium.CircleMarker((f['lat'],f['lng']),radius=6,color='#fff',fill=True,fill_color='#203f39',fill_opacity=1,tooltip=html.escape(f['name'])).add_to(m)
@@ -1117,14 +1126,14 @@ def main():
         st.caption('地図に見えている四角い範囲が検索対象です。駅名の選択や取得件数の上限はありません。')
         group=st.radio('間取り',list(GROUPS),index=list(GROUPS).index(preferences.get('new_group','1LDK・2DK')),horizontal=True,key='new_group')
         budget=st.number_input('月額の上限（管理費込み・万円）',min_value=1.,max_value=1000.,value=preferences.get('new_budget',50.),step=1.,key='new_budget')
-        interpolate=st.checkbox('データが十分な場所は近隣家賃も推定する',value=preferences.get('new_interpolate',False),key='new_interpolate')
+        st.caption('家賃帯は管理費込みの月額で色分けします。掲載額のない区画は着色しません。駅名・地名は地図を拡大して確認できます。')
         bounds=state.get('new_bounds')
         center=bounds_center(bounds) if bounds else state.get('new_view_center',DEFAULT_CENTER)
         radius=bounds_radius(bounds) if bounds else 1500
         rows=[r for r in state.new_units if valid_unit(r) and r['layout'] in GROUPS[group]
               and (bounds is None or in_rectangle((r['latitude'],r['longitude']),bounds))]
         pins=[r for r in rows if r['rent']+r['fees']<=budget*10000]
-        cells=mesh(rows,center,radius,interpolate,bounds) if bounds else []
+        cells=mesh(rows,center,radius,False,bounds) if bounds else []
         facilities=[f for f in state.new_facilities if bounds and in_rectangle((f['lat'],f['lng']),bounds)]
         data=st_folium(rental_map([],DEFAULT_CENTER,1500,[],[]),key='new_map',height=480,use_container_width=True,
             returned_objects=['bounds','zoom'],center=state.get('new_view_center',DEFAULT_CENTER),
@@ -1154,7 +1163,7 @@ def main():
                     for label in result['conditions']['regions']: st.write(label)
         legend=''.join(f'<span style="display:inline-block;margin:4px 10px 4px 0;color:#203f39;font-size:12px"><b style="color:{color}">■</b> {label}</span>' for color,label in zip(COLORS,['15万円以下','15〜20万円','20〜22.5万円','22.5〜25万円','25〜27.5万円','27.5〜30万円','30〜35万円','35万円超']))
         st.markdown(legend,unsafe_allow_html=True)
-        st.caption('濃い区画：掲載額の集計／薄い破線：750m以内の3建物位置以上から推定。区画は250m。家賃帯の集計は月額上限で絞る前のデータです。')
+        st.caption('色付き区画：掲載額の中央値（管理費込み）。区画は250m。掲載額のない区画は無着色です。駅名・地名が読めるよう半透明で表示します。家賃帯の集計は月額上限で絞る前のデータです。')
         c1,c2,c3=st.columns(3)
         c1.metric('条件内の募集',len(physical_units(pins)))
         c2.metric('月額の中央値',f"{statistics.median([r['rent']+r['fees'] for r in pins])/10000:.1f}万円" if pins else '—')
@@ -1253,7 +1262,7 @@ def main():
         st.write('公開ページの掲載情報を取得し、SRC・築20年以内・対象間取り・位置を確認した物件を保存します。架空の物件や家賃は生成しません。')
         st.write('掲載地図座標を優先し、番地のある住所は一致する住所検索結果で補完します。住所と地図判定に明確な不一致がある物件は除外します。')
         st.write('地図範囲内の居住地名タイルと100m間隔の地点・範囲の端から地名・丁目を判定します。候補数・物件数・ページ数による打ち切りは行いません。通信失敗やページ送りの異常は未完了として表示します。掲載サイト側の非公開情報・取得制限や、地名データの欠落は取得できません。')
-        st.write('同じ建物位置の月額募集額の中央値を求め、250m区画で集計します。近隣推定は750m以内に3建物位置以上ある場合だけ距離の逆二乗で加重平均します。')
+        st.write('同じ建物位置の月額募集額の中央値を求め、250m区画で集計します。掲載額のある区画だけを家賃帯で色分けします。家賃データのない区画へ推定の色を広げません。')
         st.write('検索と保存はサーバーのバックグラウンドで実行し、画面は1秒ごとに進捗を表示します。サーバーの休止・再起動を越えて実行することはできません。募集終了物件の自動削除は行いません。')
         st.caption('地名取得の代替経路：Geolonia Japanese Addresses v2（デジタル庁アドレス・ベース・レジストリ由来、CC BY 4.0）。町代表点を使って近隣自治体の全町丁目を検索します。地名データの欠落や境界の完全な網羅は保証できません。')
         st.link_button('町丁目データの出典・ライセンス','https://github.com/geolonia/japanese-addresses-v2')
