@@ -30,7 +30,7 @@ from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 import streamlit as st
 
 
-APP_VERSION = "v18-visible-search-start"
+APP_VERSION = "v19-click-ack-before-search"
 TARGET_STRUCTURE = "SRC"
 MAX_BUILDING_AGE = 20
 
@@ -1161,6 +1161,7 @@ def main():
     state.setdefault("search_request", None)
     state.setdefault("search_message", "")
     state.setdefault("search_started_at", None)
+    state.setdefault("search_acknowledged_at", None)
 
     with st.expander("地域・物件取得の設定", expanded=True):
         station = st.selectbox("中心駅", list(STATIONS), index=list(STATIONS).index("池袋"))
@@ -1186,7 +1187,7 @@ def main():
         st.map([{"lat": center_lat, "lon": center_lng}], latitude="lat", longitude="lon", use_container_width=True)
 
     phase = state.get("search_phase", "idle")
-    if phase in ("queued", "running"):
+    if phase in ("queued", "acknowledged", "running"):
         elapsed = 0
         if state.get("search_started_at"):
             elapsed = max(0, int(time.time() - float(state.search_started_at)))
@@ -1224,13 +1225,12 @@ def main():
         except StorageError as exc:
             st.error(str(exc))
 
-    search_busy = phase in ("queued", "running")
-    search_label = "🔎 検索中です…" if search_busy else "🔎 この範囲の物件を取得・保存"
-    start_search = c3.button(search_label, type="primary", disabled=search_busy)
-
-    if start_search:
+    def queue_search_request():
+        # on_click callback is executed before Streamlit performs the next full rerun.
+        # This guarantees that the next render already knows the click was accepted.
         state.search_phase = "queued"
         state.search_started_at = time.time()
+        state.search_acknowledged_at = None
         state.search_message = f"検索ボタン受付完了｜{station}を中心に半径{radius/1000:g}kmを検索準備中"
         state.search_request = {
             "center_lat": center_lat,
@@ -1240,38 +1240,90 @@ def main():
             "worker_count": worker_count,
             "station": station,
         }
-        st.rerun()
 
-    if state.get("search_phase") == "queued" and state.get("search_request"):
-        req = dict(state.search_request)
-        state.search_phase = "running"
-        state.search_message = "検索実行中｜ステップ1/3：検索範囲の地域・丁目を判定しています"
-        progress_bar = st.progress(0.01, text="検索開始：地域・丁目を判定中")
-        status_box = st.empty()
-        log_box = st.empty()
-        status_box.warning("🔎 検索ボタンを受け付けました。現在、地域・丁目を判定しています。")
-        try:
-            records = run_search(
-                req["center_lat"],
-                req["center_lng"],
-                req["radius"],
-                req["per_region_limit"],
-                req["worker_count"],
-                progress_bar,
-                status_box,
-                log_box,
-            )
-            state.last_search_records = records
-            state.records = deduplicate(records)
-            state.search_phase = "completed"
-            state.search_message = f"検索完了｜今回確認できた物件 {len(state.records)}件"
-        except Exception as exc:
-            state.search_phase = "failed"
-            state.search_message = f"物件取得を停止しました：{type(exc).__name__}: {exc}"
-            status_box.error(state.search_message)
-        finally:
-            state.search_request = None
-        # 完了ログを残すため自動rerunはしない。次の操作時にも完了状態を表示する。
+    search_busy = phase in ("queued", "acknowledged", "running")
+    search_label = "🔎 検索中です…" if search_busy else "🔎 この範囲の物件を取得・保存"
+    c3.button(
+        search_label,
+        type="primary",
+        disabled=search_busy,
+        on_click=queue_search_request,
+        key="start_property_search",
+    )
+
+    # Two-stage start: first render a visible acknowledgement, then start the heavy
+    # network work on the fragment's next tick. This prevents the first fetch from
+    # blocking the browser before the user sees that the button press was accepted.
+    if state.get("search_phase") in ("queued", "acknowledged", "running"):
+        @st.fragment(run_every=1)
+        def search_controller():
+            current_phase = state.get("search_phase", "idle")
+
+            if current_phase == "queued":
+                state.search_phase = "acknowledged"
+                state.search_acknowledged_at = time.time()
+                state.search_message = "検索ボタンを受け付けました｜1秒後に地域・丁目の判定を開始します"
+                st.markdown(
+                    "<div style='border:3px solid #ff4b4b;background:#fff3f3;padding:16px;border-radius:12px;'>"
+                    "<div style='font-size:22px;font-weight:800;color:#b42318;'>✅ 検索ボタンを受け付けました</div>"
+                    "<div style='margin-top:6px;font-weight:700;color:#173a5e;'>この表示が出てから検索処理を開始します。</div>"
+                    "</div>",
+                    unsafe_allow_html=True,
+                )
+                st.info("現在の状態：受付完了 → 検索開始待ち（約1秒）")
+                return
+
+            if current_phase == "acknowledged":
+                req = dict(state.get("search_request") or {})
+                if not req:
+                    state.search_phase = "failed"
+                    state.search_message = "検索条件を保持できなかったため開始できませんでした。"
+                    st.error(state.search_message)
+                    return
+
+                state.search_phase = "running"
+                state.search_message = "検索実行中｜ステップ1/3：検索範囲の地域・丁目を判定しています"
+                st.markdown(
+                    "<div style='border:3px solid #ff4b4b;background:#fff3f3;padding:16px;border-radius:12px;'>"
+                    "<div style='font-size:22px;font-weight:800;color:#b42318;'>🔎 物件検索を実行中です</div>"
+                    "<div style='margin-top:6px;font-weight:700;color:#173a5e;'>HOME'S・SUUMOの確認を開始しました。</div>"
+                    "</div>",
+                    unsafe_allow_html=True,
+                )
+                progress_bar = st.progress(0.01, text="検索開始：地域・丁目を判定中")
+                status_box = st.empty()
+                log_box = st.empty()
+                status_box.warning("ステップ1/3｜地域・丁目を判定しています。")
+                try:
+                    records = run_search(
+                        req["center_lat"],
+                        req["center_lng"],
+                        req["radius"],
+                        req["per_region_limit"],
+                        req["worker_count"],
+                        progress_bar,
+                        status_box,
+                        log_box,
+                    )
+                    state.last_search_records = records
+                    state.records = deduplicate(records)
+                    state.search_phase = "completed"
+                    state.search_message = f"検索完了｜今回確認できた物件 {len(state.records)}件"
+                    status_box.success(state.search_message)
+                except Exception as exc:
+                    state.search_phase = "failed"
+                    state.search_message = f"物件取得を停止しました：{type(exc).__name__}: {exc}"
+                    status_box.error(state.search_message)
+                finally:
+                    state.search_request = None
+                # Return to a normal full render so the button is enabled again and
+                # the final status remains visible outside the fragment.
+                st.rerun()
+
+            if current_phase == "running":
+                st.info("検索処理を実行中です。進捗表示を更新しています。")
+
+        search_controller()
 
     if state.records:
         selected = [p for p in state.records if p.get("layout") in LAYOUT_GROUPS[layout_group] and target_property(p)]
