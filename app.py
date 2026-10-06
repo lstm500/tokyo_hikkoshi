@@ -37,7 +37,7 @@ import streamlit as st
 from streamlit_folium import st_folium
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v35"
+BUILD = "REBUILD-01-v37"
 DEFAULT_CENTER = (35.7303,139.711)
 UNIT_TABLE = "housing_units_v1"
 SEARCH_TABLE = "housing_searches_v1"
@@ -371,7 +371,7 @@ def valid_unit(row):
         rent=row.get('rent')
         return (bool(row.get('key')) and safe_url(row['listing_url'],row['provider'])
                 and (row.get('layout') in LAYOUTS or isinstance(rent,(int,float)) and math.isfinite(rent) and rent>0)
-                and (rent is None or isinstance(rent,(int,float)) and math.isfinite(rent) and 0<rent<=10000000))
+                and (rent is None or isinstance(rent,(int,float)) and math.isfinite(rent) and rent>0))
     except (KeyError,ValueError,TypeError):return False
 
 
@@ -385,7 +385,7 @@ def partial_listing(provider,url,title,address,layout,rent,fees,area,region,boun
     def number(value,minimum,maximum):
         try:return value if value is not None and math.isfinite(float(value)) and minimum<=float(value)<=maximum else None
         except (ValueError,TypeError):return None
-    rent=number(rent,1,10000000);fees=number(fees,0,10000000);area=number(area,.01,10000);age=number(age,0,150)
+    rent=number(rent,1,float('inf'));fees=number(fees,0,float('inf'));area=number(area,.01,10000);age=number(age,0,150)
     point=region.get('point') if region else None
     precise=bool(location and has_point(location))
     location=dict(location or {})
@@ -492,27 +492,39 @@ class Database:
                          [dict(search,namespace=self.namespace)],'resolution=merge-duplicates,return=representation')
         if not isinstance(result,list) or not any(x.get('id')==search['id'] for x in result if isinstance(x,dict)):
             raise AppError('検索履歴の保存を確認できません。')
-    def load_units(self,bounds,layouts):
+    def load_units(self,bounds,layouts=None):
         out=[];offset=0
+        self.last_load_diagnostic={'time':utc_now(),'bounds':list(bounds),'layouts':list(layouts) if layouts is not None else None,'pages':[],'excluded':{'invalid':0,'layout':0,'bounds':0},'raw_records':0}
         while True:
             rows=self.call('GET',SEARCH_TABLE,{'namespace':'eq.'+self.namespace,'select':'summary','status':'eq.rental_listing','order':'id.asc','limit':300,'offset':offset})
             if not isinstance(rows,list):raise AppError('保存した募集情報を読み取れません。')
+            self.last_load_diagnostic['pages'].append({'table':SEARCH_TABLE,'offset':offset,'returned':len(rows),'server_filters':['namespace','rental_listing']})
+            self.last_load_diagnostic['raw_records']+=len(rows)
             if not rows:break
             for item in rows:
                 row=(item.get('summary') or {}).get('listing')
-                if isinstance(row,dict) and valid_unit(row) and row.get('layout') in layouts and listing_in_bounds(row,bounds):out.append(row)
+                if not isinstance(row,dict) or not valid_unit(row):self.last_load_diagnostic['excluded']['invalid']+=1
+                elif layouts is not None and row.get('layout') not in layouts:self.last_load_diagnostic['excluded']['layout']+=1
+                elif not listing_in_bounds(row,bounds):self.last_load_diagnostic['excluded']['bounds']+=1
+                else:out.append(row)
             offset+=len(rows)
         offset=0;s,w,n,e=bounds
         while True:
             rows=self.call('GET',UNIT_TABLE,{'namespace':'eq.'+self.namespace,'select':'*','order':'key.asc','limit':300,'offset':offset,
-                  'and':f'(latitude.gte.{s},latitude.lte.{n},longitude.gte.{w},longitude.lte.{e})','layout':'in.('+','.join(layouts)+')'})
+                  'and':f'(latitude.gte.{s},latitude.lte.{n},longitude.gte.{w},longitude.lte.{e})',**({'layout':'in.('+','.join(layouts)+')'} if layouts is not None else {})})
             if not isinstance(rows,list):raise AppError('以前の保存物件を読み取れません。')
+            self.last_load_diagnostic['pages'].append({'table':UNIT_TABLE,'offset':offset,'returned':len(rows),'server_filters':['namespace','bounds']+(['layouts'] if layouts is not None else []),'outside_server_filters_not_counted':True})
+            self.last_load_diagnostic['raw_records']+=len(rows)
             if not rows:break
             for row in rows:
-                if valid_unit(row) and listing_in_bounds(row,bounds):out.append(row)
+                if not valid_unit(row):self.last_load_diagnostic['excluded']['invalid']+=1
+                elif not listing_in_bounds(row,bounds):self.last_load_diagnostic['excluded']['bounds']+=1
+                else:out.append(row)
             offset+=len(rows)
         # Current flexible records take precedence over old strictly filtered records.
-        return list({r['key']:r for r in reversed(out)}.values())
+        unique=list({r['key']:r for r in reversed(out)}.values())
+        self.last_load_diagnostic.update(before_key_merge=len(out),key_duplicates=len(out)-len(unique),returned=len(unique))
+        return unique
     def save_places(self,rows,kind):
         if not rows: return set()
         payload=[dict(namespace=self.namespace,key=hashlib.sha256((kind+r['name']+str(r['lat'])+str(r['lng'])).encode()).hexdigest(),
@@ -692,7 +704,6 @@ class PublicWeb:
         except requests.ConnectionError as exc:
             error=AppError(f'{u.hostname}：接続できません（DNS・ネットワーク・接続先を確認）。');error.diagnostic={'exception_type':type(exc).__name__,'reason':'接続経路の通信失敗'};raise error from None
         except requests.RequestException: raise AppError(f'{u.hostname}：通信処理に失敗しました。') from None
-        if len(response.content)>8000000: raise AppError('公開ページの容量が上限を超えました。')
         response.encoding='utf-8' if 'gsi.go.jp' in u.hostname else response.apparent_encoding or 'utf-8'
         if method=='GET' and not kwargs.get('params') and '/chintai/' in u.path:self.http_cache[url]=response
         return response
@@ -1281,10 +1292,9 @@ def search_all(db,conditions,screen,state=None):
     except Exception as exc:
         search['status']='failed';issues.append(str(exc) if isinstance(exc,AppError) else f'検索エラー（{type(exc).__name__}）')
         search['summary']={'confirmed':len(units),'saved':len(saved),'issues':issues,'elapsed':int(time.monotonic()-started)}
-    display=conditions.get('display',{});display_group=display.get('group','1LDK・2DK');display_budget=display.get('budget',50.)
-    map_rows=[r for r in units.values() if r['layout'] in GROUPS.get(display_group,LAYOUTS)]
-    map_cells=mesh(map_rows,bounds_center(bounds),bounds_radius(bounds),False,bounds)
-    audit.add('map','data_ready','INFO',{'display_at_search_start':display,'confirmed_units':len(units),'group_units':len(map_rows),'within_budget_units':sum(monthly_price(r)<=display_budget*10000 for r in map_rows),'town_markers':len({(r.get('region_label'),r['layout']) for r in map_rows if r.get('coordinate_precision')=='town' and has_point(r) and r.get('rent')}),'colored_cells':len(map_cells),'bands':[sum(rent_color(v['price'])==color for v in map_cells) for color in COLORS],'background_tile':'GSI standard map, grayscale base pane; rent overlay retains band colors','no_data_color':False,'monotone_base':True})
+    audit.add('map','data_ready','INFO',{'confirmed_units':len(units),'individual_points':sum(has_point(r) for r in units.values()),
+        'colored_points':sum(has_point(r) and bool(r.get('rent')) for r in units.values()),
+        'position_pending':sum(not has_point(r) for r in units.values()),'monthly_limit':None,'aggregation':False,'layout_filter':None,'renderer':'Canvas'})
     screen['status'].info('検索が終了しました。詳細作業ログをSupabaseへ保存しています。')
     audit.add('search','finish','INFO',{'status':search['status'],'summary':search['summary']})
     audit.persist(db,force=True)
@@ -1462,14 +1472,61 @@ def diagnostic_downloads(events,prefix='current'):
                        '詳細':str(e.get('details',{})),'改善案':e.get('improvement','')} for e in events[-20:]],hide_index=True)
 
 def physical_units(rows):
-    grouped={}
-    for r in rows:
-        if r.get('coordinate_precision')=='town' or not has_point(r):
-            grouped.setdefault(r['key'],r);continue
-        fingerprint=(round(r['latitude'],5),round(r['longitude'],5),r['layout'],r.get('floor',''),
-                     round(r.get('area') or 0,1),r['rent'],r['fees'])
-        grouped.setdefault(fingerprint,r)
-    return list(grouped.values())
+    """Keep each acquired listing; do not merge by address, price, room size or location."""
+    return list(rows)
+
+
+DISPLAY_REASONS={
+ 'invalid':'保存レコードのURL・家賃等が不正',
+ 'bounds':'現在の地図範囲外（位置不明なら検索範囲の重なりで判定）',
+ 'location_missing':'位置未確認：取得情報は保持・地図配置は保留',
+ 'unpriced':'家賃未確認：1募集の灰色の点として表示',
+ 'town':'1募集を1点として表示（町丁目の位置・建物位置未確認）',
+ 'building':'1募集を建物座標の1点として表示'}
+
+
+def display_pipeline(units,bounds,load=None):
+    """All layouts and all prices, one point per listing; no spatial or price aggregation."""
+    rows=[];records=[];points=[];counts={k:0 for k in DISPLAY_REASONS}
+    for r in units:
+        if not valid_unit(r):reason='invalid'
+        elif not listing_in_bounds(r,bounds):reason='bounds'
+        else:
+            rows.append(r)
+            if not has_point(r):reason='location_missing'
+            else:
+                points.append((r['latitude'],r['longitude']))
+                reason='unpriced' if not r.get('rent') else 'town' if r.get('coordinate_precision')=='town' else 'building'
+        counts[reason]+=1
+        records.append({'key':r.get('key'),'title':r.get('title'),'provider':r.get('provider'),'listing_url':r.get('listing_url'),
+            'layout':r.get('layout'),'rent':r.get('rent'),'fees':r.get('fees'),'monthly':monthly_price(r) if r.get('rent') else None,
+            'region':r.get('region_label') or r.get('address'),'latitude':r.get('latitude'),'longitude':r.get('longitude'),
+            'coordinate_precision':r.get('coordinate_precision'),'location_method':r.get('location_method'),
+            'reason_code':reason,'reason':DISPLAY_REASONS[reason],'merged_into':None})
+    report={'schema':2,'build':BUILD,'time':utc_now(),'filters':{'bounds':bounds,'layouts':None,'monthly_limit':None,'structure':None,'age':None},
+        'aggregation':False,'load':load,'stages':{'loaded':len(units),'in_bounds':len(rows),'individual_points':len(points)},
+        'reason_counts':counts,'map':{'markers_total':len(points),'colored_points':counts['town']+counts['building'],
+        'gray_points':counts['unpriced'],'unique_positions':len(set(points)), 'overlapping_points':len(points)-len(set(points)),
+        'renderer':'Canvas','aggregation':False}, 'records':records,
+        'improvements':['位置未確認の場合は掲載URL・住所・掲載地図の読取結果を確認して座標取得を改善する。取得済み募集は捨てない。',
+            '町丁目しか分からない募集はその位置を明記する。同じ座標の点は重なるが、件数をまとめたり実在しない位置へ散らしたりしない。',
+            '家賃未確認の場合は一覧・詳細の金額の読取箇所を確認する。管理費未確認なら読み取れた家賃で色分けする。']}
+    return rows,rows,[],report
+
+
+def display_diagnostic_downloads(report):
+    stages=report['stages'];mapping=report['map']
+    st.caption(f"読み込んだ募集 {stages['loaded']}件｜現在の範囲 {stages['in_bounds']}件｜1件ずつ地図へ描画 {mapping['markers_total']}件｜位置未確認 {report['reason_counts']['location_missing']}件")
+    st.caption(f"家賃帯で色付け {mapping['colored_points']}点｜家賃未確認の灰色 {mapping['gray_points']}点｜同じ座標への重なり {mapping['overlapping_points']}点。月額上限・間取りによる除外、募集の集約は行いません。")
+    with st.expander('表示が少ない原因・全募集の診断ログ'):
+        st.dataframe([{'理由':DISPLAY_REASONS[k],'募集件数':v} for k,v in report['reason_counts'].items()],hide_index=True)
+        text=['住まいコンパス 1募集1点の表示診断',json.dumps({k:v for k,v in report.items() if k!='records'},ensure_ascii=False,indent=2),'募集ごとの判定：']
+        text.extend(json.dumps(r,ensure_ascii=False) for r in report['records'])
+        st.download_button('表示原因ログをTXTでダウンロード','\n'.join(text).encode('utf-8-sig'),'sumai_display_log.txt','text/plain',key='display_txt',on_click='ignore')
+        st.download_button('表示原因ログをJSONでダウンロード',json.dumps(report,ensure_ascii=False,indent=2).encode('utf-8'),'sumai_display_log.json','application/json',key='display_json',on_click='ignore')
+        output=io.StringIO();writer=csv.DictWriter(output,fieldnames=list(report['records'][0]) if report['records'] else ['key','reason']);writer.writeheader();writer.writerows(report['records'])
+        st.download_button('全募集の表示判定をCSVでダウンロード',output.getvalue().encode('utf-8-sig'),'sumai_display_decisions.csv','text/csv',key='display_csv',on_click='ignore')
+        for advice in report['improvements']:st.write('・'+advice)
 
 
 def rent_color(price):
@@ -1478,28 +1535,8 @@ def rent_color(price):
 
 
 def mesh(rows,center,radius,interpolate=False,bounds=None):
-    """Color only occupied 250 m cells. Missing data is never interpolated."""
-    positions={}
-    for r in physical_units(rows):
-        if r.get('coordinate_precision')=='town' or not has_point(r) or not r.get('rent'):continue
-        point=(float(r['latitude']),float(r['longitude']))
-        if bounds is not None and not in_rectangle(point,bounds): continue
-        if bounds is None and meters(center,point)>radius: continue
-        positions.setdefault((round(point[0],5),round(point[1],5)),[]).append(monthly_price(r))
-    cells={};step=250;scale=111320*math.cos(math.radians(center[0]))
-    for point,values in positions.items():
-        y=math.floor((point[0]-center[0])*111320/step+.5)
-        x=math.floor((point[1]-center[1])*scale/step+.5)
-        cells.setdefault((x,y),[]).append(statistics.median(values))
-    out=[]
-    for (x,y),values in sorted(cells.items()):
-        point=(center[0]+y*step/111320,center[1]+x*step/scale)
-        cell=rectangle(point,step/2)
-        if bounds is not None:
-            cell=(max(cell[0],bounds[0]),max(cell[1],bounds[1]),min(cell[2],bounds[2]),min(cell[3],bounds[3]))
-            if cell[0]>=cell[2] or cell[1]>=cell[3]: continue
-        out.append(dict(bounds=[[cell[0],cell[1]],[cell[2],cell[3]]],price=statistics.median(values),count=len(values),estimated=False))
-    return out
+    """No cell averages or town aggregation: each listing has its own point."""
+    return []
 
 
 
@@ -1514,12 +1551,12 @@ class MonotoneBase(MacroElement):
         super().__init__();self._name='MonotoneBase'
 
 def rental_map(rows,center,radius,cells,facilities):
-    m=folium.Map(location=center,zoom_start=15,tiles=None,control_scale=True)
+    m=folium.Map(location=center,zoom_start=15,tiles=None,control_scale=True,prefer_canvas=True)
     folium.map.CustomPane('monotoneBase',z_index=200,pointer_events=False).add_to(m)
     MonotoneBase().add_to(m)
     folium.TileLayer('https://cyberjapandata.gsi.go.jp/xyz/std/{z}/{x}/{y}.png',
         attr='国土地理院',name='駅名・地名のモノトーン地図',max_zoom=18,pane='monotoneBase').add_to(m)
-    folium.map.CustomPane('rentAreas',z_index=390,pointer_events=True).add_to(m)
+    folium.map.CustomPane('rentIndividualPane',z_index=410,pointer_events=False).add_to(m)
     # Base-map station and town labels stay visible through translucent rent areas.
     # Major station names also have persistent white-backed labels above the colors.
     for name,point in STATIONS.items():
@@ -1537,29 +1574,36 @@ def listing_card(r,persisted):
     return '<div class="unit"><h3>'+html.escape(r['title'])+'</h3><b>'+price+'</b> · '+html.escape(r.get('layout') or '間取り未確認')+' · '+area+' · '+age+'<p>'+html.escape(r.get('address') or '')+'</p><p>'+html.escape(r.get('price_basis','管理費込み'))+' · '+html.escape(r.get('location_method') or '位置未確認')+'</p><a href="'+html.escape(r['listing_url'],quote=True)+'" target="_blank" rel="noopener">募集ページを開く ↗</a><p>'+('保存確認済み' if persisted else '保存未確認')+'</p></div>'
 
 
+class IndividualRentPoints(MacroElement):
+    """One Canvas renderer; one noninteractive colored point per acquired listing."""
+    _template=Template("""{% macro script(this, kwargs) %}
+    var {{ this.get_name() }}_data = {{ this.payload }};
+    var {{ this.get_name() }}_map = {{ this._parent._parent.get_name() }};
+    var {{ this.get_name() }}_renderer = {{ this.get_name() }}_map._individualRentCanvas;
+    if (!{{ this.get_name() }}_renderer) {
+        {{ this.get_name() }}_renderer = L.canvas({padding:0.3,pane:'rentIndividualPane'});
+        {{ this.get_name() }}_map._individualRentCanvas = {{ this.get_name() }}_renderer;
+    }
+    {{ this.get_name() }}_data.forEach(function(item) {
+        L.circleMarker([item.lat,item.lng],{renderer:{{ this.get_name() }}_renderer,
+            radius:6,color:item.color,weight:item.approx?1.5:0.6,interactive:false,
+            dashArray:item.approx?'2,2':null,fill:true,fillColor:item.color,fillOpacity:0.9})
+        .addTo({{ this._parent.get_name() }});
+    });
+    {% endmacro %}""")
+    def __init__(self,rows):
+        super().__init__();self._name='IndividualRentPoints';self.items=[]
+        for r in rows:
+            if not has_point(r):continue
+            self.items.append({'key':r['key'],'lat':r['latitude'],'lng':r['longitude'],
+                'color':rent_color(monthly_price(r)) if r.get('rent') else '#777777',
+                'approx':r.get('coordinate_precision')=='town'})
+        self.payload=json.dumps(self.items,ensure_ascii=False,separators=(',',':')).replace('<','\\u003c').replace('>','\\u003e').replace('&','\\u0026')
+
+
 def rental_features(rows,cells,facilities):
-    m=folium.FeatureGroup(name='物件・家賃・施設')
-    for c in cells:
-        if c.get('estimated') or c.get('count',0)<=0 or not isinstance(c.get('price'),(int,float)) or not math.isfinite(c['price']): continue
-        color=rent_color(c['price'])
-        tip=f"{c['price']/10000:.1f}万円/月（管理費込み）｜掲載額の中央値｜{c['count']}建物位置"
-        area=folium.Rectangle(c['bounds'],color=color,weight=.6,opacity=.5,fill=True,fill_color=color,fill_opacity=.30,tooltip=tip)
-        area.options['pane']='rentAreas'
-        area.add_to(m)
-    towns={}
-    for r in physical_units(rows):
-        if not has_point(r) or not r.get('rent'):continue
-        if r.get('coordinate_precision')=='town':
-            towns.setdefault((r.get('region_label') or r['address'],r['layout']),[]).append(r);continue
-        tip=html.escape(r['title'])+f"｜{monthly_price(r)/10000:g}万円｜{r.get('price_basis','管理費込み')}"
-        folium.CircleMarker((r['latitude'],r['longitude']),radius=5,color='#fff',weight=1,fill=True,
-                            fill_color=rent_color(monthly_price(r)),fill_opacity=1,tooltip=tip,
-                            popup=folium.Popup(listing_card(r,False),max_width=280)).add_to(m)
-    for (town,layout),items in towns.items():
-        price=statistics.median(monthly_price(r) for r in items);point=(items[0]['latitude'],items[0]['longitude'])
-        label=f'{town}｜{layout}｜約{price/10000:g}万円｜{len(items)}募集｜町丁目単位・建物位置未確認'
-        folium.CircleMarker(point,radius=16,color=rent_color(price),weight=2,fill=True,fill_color=rent_color(price),fill_opacity=.45,
-                            tooltip=html.escape(label),popup=html.escape(label)).add_to(m)
+    m=folium.FeatureGroup(name='1募集1点・家賃帯')
+    IndividualRentPoints(rows).add_to(m)
     for f in facilities:
         folium.CircleMarker((f['lat'],f['lng']),radius=6,color='#fff',fill=True,fill_color='#555555',fill_opacity=1,tooltip=html.escape(f['name'])).add_to(m)
     return m
@@ -1605,7 +1649,6 @@ def csv_bytes(rows):
 
 
 def read_csv(content):
-    if len(content)>10000000: raise AppError('CSVは10MB以下にしてください。')
     try:
         rows=[]
         for row in csv.DictReader(io.StringIO(content.decode('utf-8-sig'))):
@@ -1640,7 +1683,7 @@ def remember_search():
     if not providers or not bounds:
         state.new_search={'status':'failed','summary':{'issues':['地図の表示範囲と取得元を確認してください。'],'saved':0,'confirmed':0}}
         return
-    state.new_request=dict(bounds=list(bounds),providers=providers,display={'group':state.get('new_group','1LDK・2DK'),'budget':state.get('new_budget',50.)})
+    state.new_request=dict(bounds=list(bounds),providers=providers,display={'layouts':'all','monthly_limit':None,'aggregation':False})
 
 
 
@@ -1734,24 +1777,18 @@ def main():
     with tabs[0]:
         st.subheader('地図を動かして、探す地域を表示してください')
         st.caption('地図に見えている四角い範囲が検索対象です。駅名の選択や取得件数の上限はありません。')
-        group=st.radio('間取り',list(GROUPS),index=list(GROUPS).index(preferences.get('new_group','1LDK・2DK')),horizontal=True,key='new_group')
-        budget=st.number_input('月額の上限（管理費込み・万円）',min_value=1.,max_value=1000.,value=preferences.get('new_budget',50.),step=1.,key='new_budget')
-        verified_only=st.checkbox('表示だけをSRC・築20年以内に絞る',value=False,key='new_verified_only')
-        st.caption('取得・保存は構造や築年数の未確認で除外しません。町丁目の丸は概算の家賃帯で、建物位置を示しません。管理費未確認なら家賃のみで集計します。')
-        st.caption('家賃帯は、管理費が読み取れた場合は加算し、未確認の場合は家賃のみで色分けします。家賃データのない場所はモノトーンです。駅名・地名は地図を拡大して確認できます。')
+        st.caption('全間取り・全家賃の募集を1件ずつ表示します。町丁目の位置しか分からない募集も1件ずつ保持し、破線の点として表示します。')
+        st.caption('家賃帯は読み取れた家賃と管理費で色分けします。管理費が不明なら家賃のみ。家賃未確認の点と背景はモノトーンです。')
         bounds=state.get('new_bounds')
         center=bounds_center(bounds) if bounds else state.get('new_view_center',DEFAULT_CENTER)
         radius=bounds_radius(bounds) if bounds else 1500
-        rows=[r for r in state.new_units if valid_unit(r) and r['layout'] in GROUPS[group]
-              and listing_in_bounds(r,bounds) and (not verified_only or is_src(r.get('structure') or '') and r.get('age') is not None and 0<=r['age']<=20)]
-        pins=[r for r in rows if r.get('rent') and monthly_price(r)<=budget*10000]
-        cells=mesh(rows,center,radius,False,bounds) if bounds else []
+        rows,pins,cells,display_report=display_pipeline(state.new_units,bounds,state.get('new_load_diagnostic'))
         job=active_job()
         if job:
-            map_signature=(tuple(bounds) if bounds else None,group,budget,len(state.new_units),len(cells))
+            map_signature=(tuple(bounds) if bounds else None,len(state.new_units),tuple(display_report['stages'].values()),tuple(display_report['map'].values()))
             if state.get('diagnostic_map_signature')!=map_signature:
                 state.diagnostic_map_signature=map_signature
-                job.audit.add('map','render','INFO',{'bounds':bounds,'group':group,'budget':budget,'loaded_units':len(state.new_units),'visible_units':len(pins),'town_markers':len({(r.get('region_label'),r['layout']) for r in pins if r.get('coordinate_precision')=='town' and has_point(r)}),'colored_cells':len(cells),'bands':[sum(rent_color(v['price'])==color for v in cells) for color in COLORS],'no_data_color':False,'monotone_base':True})
+                job.audit.add('map','render','INFO',{'bounds':bounds,'loaded_units':len(state.new_units),'aggregation':False,'monthly_limit':None,'renderer':'Canvas','display_stages':display_report['stages'],'display_reasons':display_report['reason_counts'],'display_map':display_report['map']})
         facilities=[f for f in state.new_facilities if bounds and in_rectangle((f['lat'],f['lng']),bounds)]
         data=st_folium(rental_map([],DEFAULT_CENTER,1500,[],[]),key='new_map',height=480,use_container_width=True,
             returned_objects=['bounds','zoom'],center=state.get('new_view_center',DEFAULT_CENTER),
@@ -1766,7 +1803,7 @@ def main():
         providers=st.multiselect('物件の取得元',['HOME’S','SUUMO'],default=preferences.get('new_providers',['HOME’S','SUUMO']),key='new_providers')
         st.button('表示中の地名から全件検索・保存',type='primary',use_container_width=True,
                   on_click=remember_search,key='new_start',disabled=not bounds or not providers or bool(active_job() and not active_job().snapshot()['finished']))
-        st.caption('検索開始時の表示範囲を固定し、同じ地名・丁目で1K→1L→1DK→1LDK→2DK→2LDK→3DK→3LDKを1種類ずつ検索し、それぞれ掲載一覧を最後まで確認します。予算・間取りの表示設定は取得件数を制限しません。')
+        st.caption('検索開始時の表示範囲を固定し、同じ地名・丁目で1K→1L→1DK→1LDK→2DK→2LDK→3DK→3LDKを1種類ずつ検索し、それぞれ掲載一覧を最後まで確認します。取得・保存・表示に件数上限や月額上限はありません。')
         background_status()
         result=state.new_search
         if result:
@@ -1781,16 +1818,17 @@ def main():
                     for label in result['conditions']['regions']: st.write(label)
         legend=''.join(f'<span style="display:inline-block;margin:4px 10px 4px 0;color:#203f39;font-size:12px"><b style="color:{color}">■</b> {label}</span>' for color,label in zip(COLORS,['15万円以下','15〜20万円','20〜22.5万円','22.5〜25万円','25〜27.5万円','27.5〜30万円','30〜35万円','35万円超']))
         st.markdown(legend,unsafe_allow_html=True)
-        st.caption('町丁目の丸：募集の家賃中央値・建物位置未確認。正確な座標がある区画：250mごとの掲載額中央値。管理費未確認なら家賃のみ。掲載額のない区画はモノトーンのままです。駅名・地名が読めるよう家賃帯の色を半透明で表示します。家賃帯の集計は月額上限で絞る前のデータです。')
+        st.caption('1募集につき1点を、その募集の家賃帯で表示します。町丁目や区画の平均・中央値へまとめません。町丁目の位置しか分からない点は破線で表示します。同じ位置の募集は重なります。')
+        display_diagnostic_downloads(display_report)
         c1,c2,c3=st.columns(3)
-        st.caption(f'取得した募集：{len(state.new_units)}件｜表示中の間取り：{len(rows)}件｜家賃未確認：{sum(not r.get("rent") for r in rows)}件')
-        c1.metric('条件内の募集',len(physical_units(pins)))
-        c2.metric('月額の中央値',f"{statistics.median([monthly_price(r) for r in pins])/10000:.1f}万円" if pins else '—')
-        c3.metric('色分けした地域・区画',len(cells)+len({(r.get('region_label'),r['layout']) for r in pins if r.get('coordinate_precision')=='town' and has_point(r)}))
-        if not pins: st.info('この範囲・間取り・予算に表示できる物件がありません。検索するか、保存データを読み込んでください。')
-        for r in sorted(physical_units(pins),key=lambda x:monthly_price(x)):
-            persisted=r['key'] in state.new_saved_keys
-            st.markdown(listing_card(r,persisted),unsafe_allow_html=True)
+        c1.metric('現在の範囲の募集',len(rows))
+        c2.metric('家賃帯で色付けした募集',display_report['map']['colored_points'])
+        c3.metric('位置未確認の募集',display_report['reason_counts']['location_missing'])
+        if not rows:st.info('この範囲の募集データがありません。検索するか、保存データを読み込んでください。')
+        if rows:
+            with st.expander('募集を1件ずつ確認'):
+                chosen=st.selectbox('確認する募集',rows,format_func=lambda r:(r.get('title') or '')+'｜'+str(r.get('layout') or '間取り未確認')+'｜'+(f"{monthly_price(r)/10000:g}万円" if r.get('rent') else '家賃未確認')+'｜'+r['key'][:8],key='individual_listing')
+                st.markdown(listing_card(chosen,chosen['key'] in state.new_saved_keys),unsafe_allow_html=True)
         if rows:
             with st.expander('取得できた情報をすべて表で見る（未確認も保持）'):
                 st.dataframe([{'物件名':r['title'],'間取り':r['layout'],'月額（万円）':monthly_price(r)/10000 if r.get('rent') else None,'面積':r['area'],
@@ -1803,11 +1841,13 @@ def main():
         if st.button('表示範囲の保存物件を読み込む',key='new_load',use_container_width=True,disabled=not bounds):
             try:
                 with st.spinner('Supabaseから読み込んでいます'):
-                    rows=Database().load_units(bounds,LAYOUTS)
+                    db=Database();rows=db.load_units(bounds)
+                    state.new_load_diagnostic=getattr(db,'last_load_diagnostic',{'returned':len(rows),'bounds':bounds,'time':utc_now()})
                 state.new_units=rows;state.new_saved_keys=[r['key'] for r in rows];state.new_search=None
                 state.new_notice=f'{len(rows)}件をSupabaseから読み込みました。';st.rerun()
             except AppError as exc: st.error(str(exc))
         if state.get('new_notice'): st.success(state.new_notice)
+        st.caption('読み込んだ募集は1件ずつ地図に表示します。位置未確認や同じ座標への重なりは「住まいを探す」の表示原因ログで確認できます。')
         st.download_button('現在の物件データをCSVで保存',csv_bytes(state.new_units),'sumai_rebuild_units.csv','text/csv',use_container_width=True)
         upload=st.file_uploader('このアプリのCSVを追加する',type=['csv'])
         if st.button('CSVの物件をSupabaseへ保存',disabled=upload is None,key='new_import'):
@@ -1913,7 +1953,7 @@ def main():
         st.write('募集情報は既存SupabaseのJSON保存領域へ保存するため、追加SQLは不要です。以前に保存した物件も読み込みます。')
         st.write('掲載地図座標を優先し、番地のある住所は一致する住所検索結果で補完します。住所と地図判定に明確な不一致がある物件は除外します。')
         st.write('地図範囲内の居住地名タイルと100m間隔の地点・範囲の端から地名・丁目を判定します。候補数・物件数・ページ数による打ち切りは行いません。通信失敗やページ送りの異常は未完了として表示します。掲載サイト側の非公開情報・取得制限や、地名データの欠落は取得できません。')
-        st.write('町丁目まで確認できた募集は、その町丁目の丸で家賃中央値を表示します。建物位置ではありません。正確な座標のある募集は250m区画で集計します。掲載額のある区画だけを家賃帯で色分けします。家賃データのない区画へ推定の色を広げません。')
+        st.write('全間取り・全家賃の募集を1件につき1点としてCanvasで表示します。位置未確認の募集も保持します。町丁目の座標は建物位置として扱わず明記します。募集や家賃を平均・中央値へ集約しません。')
         st.write('検索と保存はサーバーのバックグラウンドで実行し、画面は1秒ごとに進捗を表示します。サーバーの休止・再起動を越えて実行することはできません。募集終了物件の自動削除は行いません。')
         st.caption('地名取得の代替経路：Geolonia Japanese Addresses v2（デジタル庁アドレス・ベース・レジストリ由来、CC BY 4.0）。町代表点を使って近隣自治体の全町丁目を検索します。地名データの欠落や境界の完全な網羅は保証できません。')
         st.link_button('町丁目データの出典・ライセンス','https://github.com/geolonia/japanese-addresses-v2')
