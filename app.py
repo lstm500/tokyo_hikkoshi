@@ -37,7 +37,7 @@ import streamlit as st
 from streamlit_folium import st_folium
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v48"
+BUILD = "REBUILD-01-v49"
 PROVIDER_OPTIONS = ("スマイティ","HOMES","SUUMO","カナリー","アットホーム","CHINTAI","Comfy","アパマンショップ")
 PROVIDER_CANONICAL = {"HOMES":"HOME’S","HOME’S":"HOME’S","スマイティ":"スマイティ","SUUMO":"SUUMO","カナリー":"カナリー",
                       "アットホーム":"アットホーム","CHINTAI":"CHINTAI","Comfy":"Comfy","アパマンショップ":"アパマンショップ"}
@@ -932,7 +932,7 @@ def reverse(web,point,munis,force=False):
     data=web.fetch('https://mreversegeocoder.gsi.go.jp/reverse-geocoder/LonLatToAddress',
                    params={'lat':point[0],'lon':point[1]}).json().get('results',{})
     code=str(data.get('muniCd',''));town=str(data.get('lv01Nm',''))
-    trace(web,'reverse_result' if code and town and code in munis else 'parse',{'point':point,'municipality_code':code,'town':town,'known_municipality':code in munis},stage='geography')
+    trace(web,'reverse_result' if code and town and code in munis else 'parse',{'point':point,'municipality_code':code,'town':town,'known_municipality':code in munis},level='INFO' if code and town and code in munis else 'WARNING',stage='geography')
     if not code or not town or code not in munis: return None
     pref,prefecture,city=munis[code]
     return dict(code=code,pref=pref,town=town,label=prefecture+city+town,point=point)
@@ -968,8 +968,9 @@ def _jhj_tile(web,x,y,z=18):
         data=web.fetch(url).json()
         features=data.get('features',[]) if isinstance(data,dict) else []
         if not isinstance(features,list):features=[]
-    except (AppError,ValueError,TypeError):
-        features=[]
+    except (AppError,ValueError,TypeError) as exc:
+        trace(web,'address_tile_failed',{'url':url,'exception_type':type(exc).__name__,'reason':str(exc),'diagnostic':getattr(exc,'diagnostic',{})},'WARNING','address.tiles')
+        raise
     cache[key]=features
     return features
 
@@ -982,8 +983,9 @@ def map_point_to_residential_address(web,point,munis,max_distance_m=90):
     information at zoom 18; the nearest same-town point is used as an address estimate.
     """
     official=reverse(web,point,munis,force=True)
-    if not official:return None
-    x,y=_tile_xy(point,18);candidates=[]
+    if not official:
+        trace(web,'map_address_unresolved',{'point':list(point),'failed_stage':'address.reverse_geocode','reason':'逆ジオコーディングで有効な市区町村・町丁目を取得できない'},'WARNING','location');return None
+    x,y=_tile_xy(point,18);candidates=[];tile_errors=[];feature_count=0
     z=18;n=2**z
     fx=(float(point[1])+180)/360*n
     fy=(1-math.asinh(math.tan(math.radians(float(point[0]))))/math.pi)/2*n
@@ -996,7 +998,10 @@ def map_point_to_residential_address(web,point,munis,max_distance_m=90):
             if math.hypot(gx,gy)*tile_m<=max_distance_m+2:tiles.append((tx,ty))
     def read_tile(tile):return _jhj_tile(web,*tile,18)
     for tile,features,error in bounded_results(tiles,read_tile,workers=6,stop_event=web.cancel_event):
-        if tile is None or error:continue
+        if tile is None:continue
+        if error:
+            tile_errors.append({'tile':list(tile),'error':str(error),'exception_type':type(error).__name__});continue
+        feature_count+=len(features)
         for feature in features:
             if not isinstance(feature,dict):continue
             geo=feature.get('geometry') or {};coords=geo.get('coordinates')
@@ -1014,12 +1019,15 @@ def map_point_to_residential_address(web,point,munis,max_distance_m=90):
             if not town or not block or not base:continue
             dist=meters(point,(lat2,lng2))
             candidates.append((dist,town,block,base,lat2,lng2,props))
+    if tile_errors:
+        trace(web,'map_address_unresolved',{'point':list(point),'failed_stage':'address.tiles','reason':'必要な住所タイルの取得に失敗し、最近傍住所を比較できない','tile_errors':tile_errors,'feature_count':feature_count,'requested_tiles':tiles,'candidate_count':len(candidates)},'WARNING','location')
+        return None
     if not candidates:
-        trace(web,'map_address_unresolved',{'point':list(point),'reason':'GSI住居表示住所の候補なし','town':official.get('town')},'WARNING','location')
+        trace(web,'map_address_unresolved',{'point':list(point),'reason':'GSI住居表示住所の候補なし','town':official.get('town'),'tile_errors':tile_errors,'feature_count':feature_count,'requested_tiles':tiles,'maximum_distance_m':max_distance_m},'WARNING','location')
         return None
     best=min(candidates,key=lambda c:c[0])
     if best[0]>max_distance_m:
-        trace(web,'map_address_unresolved',{'point':list(point),'reason':'最近傍の住居表示住所が遠すぎる','distance_m':round(best[0],1),'town':official.get('town')},'WARNING','location')
+        trace(web,'map_address_unresolved',{'point':list(point),'reason':'最近傍の住居表示住所が遠すぎる','distance_m':round(best[0],1),'town':official.get('town'),'tile_errors':tile_errors,'feature_count':feature_count,'requested_tiles':tiles,'maximum_distance_m':max_distance_m},'WARNING','location')
         return None
     _,town,block,base,lat2,lng2,_=best
     pref_code,prefecture,city=munis[official['code']]
@@ -1062,7 +1070,7 @@ def gsi_regional_tasks(web,bounds,notify):
     points=itertools.chain(sorted(labels),grid)
     total=len(labels)+(nx+1)*(ny+1);done=0;regions={}
     def identify(point): return reverse(web,point,munis)
-    for point,region,error in bounded_results(points,identify,workers=16,stop_event=web.cancel_event):
+    for point,region,error in bounded_results(points,identify,workers=8,stop_event=web.cancel_event):
         if point is not None:
             done+=1
             if error:
@@ -1479,8 +1487,9 @@ def homes_location_from_map_image(web,detail_soup,detail_url,bounds,munis,expect
     if not target:raise AppError('HOMES詳細ページの「地図を見る」を確認できません。')
     if not web.permitted(target):raise AppError('HOMESの地図ページの自動取得が許可されていません。')
     reply=web.fetch(target);soup=BeautifulSoup(reply.text,'html.parser')
-    candidates=[p for p in map_image_candidates(web,soup,target) if p[3]>=5 and in_rectangle(p[:2],bounds)]
-    trace(web,'homes_map_image_candidates',{'detail_url':detail_url,'map_url':target,'candidates':candidates},stage='image_location')
+    all_candidates=map_image_candidates(web,soup,target)
+    candidates=[p for p in all_candidates if p[3]>=5 and in_rectangle(p[:2],bounds)]
+    trace(web,'homes_map_image_candidates',{'detail_url':detail_url,'map_url':target,'all_candidates':all_candidates,'in_bounds_candidates':candidates,'bounds':list(bounds)},stage='image_location')
     if not candidates:return None
     priority=max(p[3] for p in candidates);best=[p for p in candidates if p[3]==priority]
     distinct={(round(p[0],6),round(p[1],6)) for p in best}
@@ -1500,27 +1509,31 @@ def homes_location_from_map_image(web,detail_soup,detail_url,bounds,munis,expect
 
 
 def homes_detail(web,url,region,bounds,munis,layouts):
+    begin_listing(web,'HOME’S',url)
     text=web.fetch(url).text;soup=BeautifulSoup(text,'html.parser')
     raw_layout=labeled(soup,('間取り','間取'))
     if not raw_layout:
         m=re.search(r'間取り\s*((?:\d+)(?:LDK|DK|K))',normal(soup.get_text(' ',strip=True)),re.I);raw_layout=m.group(1) if m else ''
     layout=parsed_layout(raw_layout)
-    if layout not in layouts:return None
+    if layout not in layouts:return reject_listing(web,'HOME’S',url,'detail.layout','condition' if layout else 'missing_data','間取りが検索条件外、または読み取れない',{'raw':raw_layout,'parsed':layout},list(layouts))
     page_text=normal(soup.get_text(' ',strip=True));kind=labeled(soup,('建物種別','建物の種類','種別'))
     heading=normal(soup.select_one('h1').get_text(' ',strip=True)) if soup.select_one('h1') else ''
-    if 'マンション' not in normal(kind+' '+heading+' '+page_text[:600]):return None
+    if 'マンション' not in normal(kind+' '+heading+' '+page_text[:600]):return reject_listing(web,'HOME’S',url,'detail.building_type','condition' if kind else 'missing_data','マンションであることを確認できない',{'raw':kind,'heading':heading,'page_excerpt':page_text[:600]},'マンション')
     raw_age=labeled(soup,('築年数','築年月','築年'));age,_=age_info(raw_age)
-    if age is not None and age>15:return None
+    if age is not None and age>15:return reject_listing(web,'HOME’S',url,'detail.age','condition','築年数が15年を超える',{'raw':raw_age,'years':age},'15年以内')
     rent=optional_amount(labeled(soup,('賃料','家賃')))
-    if not rent:return None
+    if not rent:return reject_listing(web,'HOME’S',url,'detail.rent','missing_data','家賃を正の数値として読み取れない',{'raw':labeled(soup,('賃料','家賃')),'parsed':rent},'家賃（円）>0')
     expected_towns=region.get('visible_towns') or [region.get('town','')]
     try:location=homes_location_from_map_image(web,soup,url,bounds,munis,expected_towns)
     except AppError as exc:
         trace(web,'location_pending',{'url':url,'message':str(exc),'source':'HOMES地図画像'},'WARNING','location');location=None
     if not location or not location.get('inferred_address'):
-        trace(web,'location_pending',{'url':url,'reason':'地図画像から住所を確定できないため保存しない','source':'HOMES地図画像'},'WARNING','location');return None
+        trace(web,'location_pending',{'url':url,'reason':'地図画像から住所を確定できないため保存しない','source':'HOMES地図画像'},'WARNING','location');return reject_listing(web,'HOME’S',url,'map.address_inference','location_failure','地図の物件位置から詳細住所を推定できない',location,'番地までの推定住所')
     address=location['inferred_address']
-    return partial_listing('HOME’S',url,'HOMES掲載募集',address,layout,rent,None,None,region,bounds,location,None,age,None,'')
+    row=partial_listing('HOME’S',url,'HOMES掲載募集',address,layout,rent,None,None,region,bounds,location,None,age,None,'')
+
+    if not row:return reject_listing(web,'HOME’S',url,'listing.validation','invalid_data','保存必須項目の検証を通らない',{'rent':rent,'layout':layout,'address':address,'location':location},'有効な家賃・間取り・詳細住所・物件URL')
+    return row
 
 
 def homes_collect(web,region,bounds,munis,emit):
@@ -1542,15 +1555,16 @@ def homes_collect(web,region,bounds,munis,emit):
             for index,url in enumerate(detail_urls,1):
                 emit('message',f'HOMES条件{group_number} 詳細ページ {index}/{len(detail_urls)}件');emit('detail',1)
                 try:
+                    begin_listing(web,'HOME’S',url)
                     if not web.permitted(url):raise AppError('HOMES詳細ページの自動取得が許可されていません。')
                     row=homes_detail(web,url,region,bounds,munis,layouts)
                     if row:
                         if visible_towns and row.get('address') and not any(town_matches(t,row['address']) for t in visible_towns):
-                            emit('rejected',1);continue
+                            reject_listing(web,'HOME’S',url,'address.town_match','condition','推定住所が対象町域と一致しない',row['address'],list(visible_towns));emit('rejected',1);continue
                         emit('unit',row)
                     else:emit('rejected',1)
                 except (AppError,ValueError,TypeError) as exc:
-                    emit('issue','HOMES詳細確認｜'+str(exc));trace(web,'detail_optional_error',{'url':url,'message':str(exc)},'WARNING','collector')
+                    trace(web,'listing_failed',{'provider':'HOME’S','url':url,'decision':'failed','failed_stage':'detail.request_or_parse','category':'acquisition_failure','reason':str(exc),'exception_type':type(exc).__name__,'observed':getattr(exc,'diagnostic',{}),'expected':'物件詳細と必要項目を取得','evidence':list(getattr(web.local,'listing_evidence',[]))},'ERROR','rejection');emit('issue','HOMES詳細確認｜'+str(exc));trace(web,'detail_optional_error',{'url':url,'message':str(exc)},'WARNING','collector')
             next_url=generic_next_page(soup,reply.url,'HOME’S')
             current_url=next_url
         if not found:trace(web,'empty',{'provider':'HOME’S','region':region.get('label'),'group':list(layouts),'reason':'条件一覧に候補なし'},stage='collector')
@@ -1843,7 +1857,7 @@ def suumo_location_from_kankyo_image(web,detail_soup,detail_url,bounds,munis,exp
     node=soup.find('script',id='js-gmapData');points=[]
     if node:
         try:
-            data=json.loads(node.get_text());markers=data.get('markers',[])
+            markers=[];data=json.loads(node.get_text());markers=data.get('markers',[])
             for marker in markers if isinstance(markers,list) else []:
                 if not isinstance(marker,dict) or marker.get('type')!='room':continue
                 lat,lng=float(marker['lat']),float(marker['lng'])
@@ -1854,15 +1868,16 @@ def suumo_location_from_kankyo_image(web,detail_soup,detail_url,bounds,munis,exp
     if node:
         distinct=set(points)
         if len(distinct)!=1:
-            trace(web,'suumo_marker_unresolved',{'map_url':target,'room_markers':len(distinct)},'WARNING','location');return None
+            trace(web,'suumo_marker_unresolved',{'map_url':target,'room_markers':len(distinct),'marker_types':[x.get('type') for x in markers if isinstance(x,dict)] if isinstance(markers,list) else [],'valid_room_points':list(distinct),'expected':'type=roomの有効座標が一意'},'WARNING','location');return None
         lat,lng=next(iter(distinct));method='SUUMO地図・周辺環境の物件マーカー座標→GSI住居表示住所推定'
     else:
         candidates=map_image_candidates(web,soup,target)
         distinct={p[:2] for p in candidates if p[3]>=5}
-        if len(distinct)!=1:return None
+        if len(distinct)!=1:
+            trace(web,'suumo_marker_unresolved',{'map_url':target,'script_found':False,'image_candidates':candidates,'reason':'物件地図スクリプトがなく、画像ピン候補も一意に取得できない'},'WARNING','location');return None
         lat,lng=next(iter(distinct));method='SUUMO地図画像ピン認識→GSI住居表示住所推定'
     if not in_rectangle((lat,lng),bounds):
-        trace(web,'outside',{'map_url':target,'point':[lat,lng]},'INFO','location');return None
+        trace(web,'outside',{'map_url':target,'point':[lat,lng],'bounds':list(bounds)},'WARNING','location');return None
     inferred=map_point_to_residential_address(web,(lat,lng),munis)
     if not inferred:return None
     address=inferred['address']
@@ -1917,36 +1932,37 @@ def suumo_collect(web,region,bounds,munis,emit):
             for index,url in enumerate(page_candidates,1):
                 emit('message',f'条件{group_number} 詳細を見る {index}/{len(page_candidates)}件');emit('detail',1)
                 try:
+                    begin_listing(web,'SUUMO',url)
                     if not web.permitted(url):raise AppError('SUUMO詳細ページの自動取得が許可されていません。')
                     detail_reply=web.fetch(url);detail=BeautifulSoup(detail_reply.text,'html.parser');fields=suumo_detail_fields(detail)
                     # The detail-page address is intentionally not used for location/address acquisition.
                     # Only rent/layout/building type/age are read here; address comes from the property map below.
                     layout=parsed_layout(fields['raw_layout'],rough=False)
                     if parsed_layout(fields['raw_layout']) not in layouts:
-                        emit('rejected',1);trace(web,'layout',{'url':url,'observed':fields['raw_layout'],'parsed':layout,'requested_group':list(layouts),'reason':'detail_layout_not_in_group'},'WARNING');continue
+                        reject_listing(web,'SUUMO',url,'detail.layout','condition' if layout else 'missing_data','間取りが検索条件外、または読み取れない',{'raw':fields['raw_layout'],'parsed':layout},list(layouts));emit('rejected',1);trace(web,'layout',{'url':url,'observed':fields['raw_layout'],'parsed':layout,'requested_group':list(layouts),'reason':'detail_layout_not_in_group'},'WARNING');continue
                     if 'マンション' not in fields['building_type']:
-                        emit('rejected',1);trace(web,'structure',{'url':url,'building_type':fields['building_type'],'reason':'not_mansion'},'WARNING');continue
+                        reject_listing(web,'SUUMO',url,'detail.building_type','condition' if fields['building_type'] else 'missing_data','建物種別がマンションと確認できない',fields['building_type'],'マンション');emit('rejected',1);trace(web,'structure',{'url':url,'building_type':fields['building_type'],'reason':'not_mansion'},'WARNING');continue
                     age,ym=age_info(fields['raw_age'])
                     if age is None or age>15:
-                        emit('rejected',1);trace(web,'age',{'url':url,'raw_age':fields['raw_age'],'age':age,'reason':'detail_age_not_confirmed_within_15'},'WARNING');continue
+                        reject_listing(web,'SUUMO',url,'detail.age','missing_data' if age is None else 'condition','築年数が15年以内と確認できない',{'raw':fields['raw_age'],'years':age},'15年以内');emit('rejected',1);trace(web,'age',{'url':url,'raw_age':fields['raw_age'],'age':age,'reason':'detail_age_not_confirmed_within_15'},'WARNING');continue
                     rent=optional_amount(fields['raw_rent'])
                     if not rent:
-                        emit('rejected',1);trace(web,'parse',{'url':url,'missing':'detail_rent','visible_head':fields['visible'][:400]},'WARNING');continue
+                        reject_listing(web,'SUUMO',url,'detail.rent','missing_data','家賃を読み取れない',{'raw':fields['raw_rent'],'parsed':rent},'家賃（円）>0');emit('rejected',1);trace(web,'parse',{'url':url,'missing':'detail_rent','visible_head':fields['visible'][:400]},'WARNING');continue
 
                     try:location=suumo_location_from_kankyo_image(web,detail,url,bounds,munis,visible_towns)
                     except AppError as exc:
                         location=None;trace(web,'location_pending',{'url':url,'message':str(exc),'source':'SUUMO地図・周辺環境の物件マーカー'},'WARNING','location')
                     address=location.get('inferred_address','') if location else ''
                     if not address:
-                        emit('rejected',1);trace(web,'location_pending',{'url':url,'reason':'物件地図から詳細住所を推定できないため保存しない','source':'SUUMO地図・周辺環境の物件マーカー'},'WARNING','location');continue
+                        reject_listing(web,'SUUMO',url,'map.address_inference','location_failure','物件位置から詳細住所を推定できない',location,'同一町丁目の90m以内に番地を持つ住所候補');emit('rejected',1);trace(web,'location_pending',{'url':url,'reason':'物件地図から詳細住所を推定できないため保存しない','source':'SUUMO地図・周辺環境の物件マーカー'},'WARNING','location');continue
 
                     # Rent, layout, inferred address and acquisition time survive Database.save_units().
                     row=partial_listing('SUUMO',url,'SUUMO掲載募集',address,layout,rent,None,None,region,bounds,location,None,age,ym,'')
-                    if not row:emit('rejected',1);continue
+                    if not row:reject_listing(web,'SUUMO',url,'listing.validation','invalid_data','保存必須項目の検証を通らない',{'rent':rent,'layout':layout,'address':address,'location':location},'有効な家賃・間取り・詳細住所・物件URL');emit('rejected',1);continue
                     row['address_source']=location['location_method']
                     emit('unit',row)
                 except (AppError,ValueError,TypeError) as exc:
-                    emit('issue','SUUMO詳細確認｜'+str(exc));trace(web,'detail_optional_error',{'url':url,'message':str(exc)},'WARNING','collector')
+                    trace(web,'listing_failed',{'provider':'SUUMO','url':url,'decision':'failed','failed_stage':'detail.request_or_parse','category':'acquisition_failure','reason':str(exc),'exception_type':type(exc).__name__,'observed':getattr(exc,'diagnostic',{}),'expected':'物件詳細と必要項目を取得','evidence':list(getattr(web.local,'listing_evidence',[]))},'ERROR','rejection');emit('issue','SUUMO詳細確認｜'+str(exc));trace(web,'detail_optional_error',{'url':url,'message':str(exc)},'WARNING','collector')
 
             next_url=_suumo_next_url(soup,reply.url,filter_params)
             trace(web,'page_end',{'provider':'SUUMO','group':list(layouts),'page':page_number,'buildings':len(buildings),'new_candidates':len(page_candidates),'next_url':next_url or ''},stage='pagination')
@@ -2255,17 +2271,18 @@ def regex_after_label(text,labels,value_pattern):
 
 
 def generic_detail(web,provider,url,region,bounds,munis,requested):
+    begin_listing(web,provider,url)
     if not web.permitted(url):raise AppError(provider+'の詳細ページの自動取得が許可されていません。')
     reply=web.fetch(url);soup=BeautifulSoup(reply.text,'html.parser');visible=' '.join(soup.stripped_strings);structured=json_listing_fields(soup)
     raw_layout=structured.get('layout') or generic_labeled(soup,('間取り','間取')) or regex_after_label(visible,('間取り','間取'),r'(?:ワンルーム|\d+(?:S?LDK|S?DK|SK|LK|K|L|R))')
     layout=resolve_layout(web,raw_layout,requested,url)
-    if layout is None:return None
+    if layout is None:return reject_listing(web,provider,url,'detail.layout','condition' if parsed_layout(raw_layout) else 'missing_data','間取りが検索条件外、または読み取れない',raw_layout,requested or list(LAYOUTS))
     address=structured.get('address') or generic_labeled(soup,('所在地','住所','物件所在地','所在地住所'))
     if not address:
         m=re.search(r'(東京都|神奈川県|千葉県|埼玉県)[^|｜\n]{2,80}?(?=(?:交通|最寄|駅徒歩|間取り|賃料|家賃|築|$))',visible)
         if m:address=m.group(0).strip()
     if address and not town_matches(region['town'],address):
-        trace(web,'address',{'provider':provider,'town':region['town'],'listing_address':address,'url':url},'WARNING','parser');return None
+        trace(web,'address',{'provider':provider,'town':region['town'],'listing_address':address,'url':url},'WARNING','parser');return reject_listing(web,provider,url,'address.town_match','condition','掲載住所が対象町域と一致しない',address,region['town'])
     title=structured.get('title') or (soup.select_one('h1').get_text(' ',strip=True) if soup.select_one('h1') else provider+'掲載募集')
     raw_rent=structured.get('rent') or generic_labeled(soup,('賃料','家賃'))
     if not raw_rent:raw_rent=regex_after_label(visible,('賃料','家賃'),r'\d+(?:\.\d+)?\s*万円|\d[\d,]*\s*円')
@@ -2286,6 +2303,7 @@ def generic_detail(web,provider,url,region,bounds,munis,requested):
     except AppError as exc:location=None;trace(web,'location',{'provider':provider,'url':url,'message':str(exc)},'WARNING','location')
     row=partial_listing(provider,url,title,address or region['label'],layout,rent,fees,area,region,bounds,location,structure or None,age,ym,floor)
     if row:trace(web,'detail_fields',{'provider':provider,'url':url,'layout':layout,'rent':rent,'fees':fees,'area':area,'address':address,'missing_fields':row.get('missing_fields',[])},stage='parser')
+    if not row:return reject_listing(web,provider,url,'listing.validation','invalid_data','保存必須項目の検証を通らない',{'rent':rent,'raw_rent':raw_rent,'layout':layout,'address':address,'location':location},'有効な家賃・間取り・住所・物件URL')
     return row
 
 
@@ -2321,7 +2339,7 @@ def public_portal_collect(web,region,bounds,munis,emit,provider):
         try:row=generic_detail(web,provider,url,region,bounds,munis,requested)
         except Exception as exc:
             trace(web,'detail_optional_error',{'provider':provider,'url':url,'exception_type':type(exc).__name__,'message':str(exc) if isinstance(exc,AppError) else '詳細追加確認失敗'},'WARNING','collector')
-            emit('issue',provider+'｜'+(str(exc) if isinstance(exc,AppError) else '詳細ページを確認できません。'));continue
+            trace(web,'listing_failed',{'provider':provider,'url':url,'decision':'failed','failed_stage':'detail.request_or_parse','category':'acquisition_failure','reason':str(exc),'exception_type':type(exc).__name__,'observed':getattr(exc,'diagnostic',{}),'expected':'物件詳細と必要項目を取得','evidence':list(getattr(web.local,'listing_evidence',[]))},'ERROR','rejection');emit('issue',provider+'｜'+(str(exc) if isinstance(exc,AppError) else '詳細ページを確認できません。'));continue
         if row:emit('unit',row);accepted+=1
         else:emit('rejected',1)
     trace(web,'provider_collect_finish',{'provider':provider,'region':region['label'],'layout':requested,'detail_links':len(links),'accepted':accepted},stage='collector')
@@ -2438,11 +2456,11 @@ def search_all(db,conditions,screen,state=None):
             except Exception as exc:
                 trace(web,diagnosis_code(str(exc)),{'exception_type':type(exc).__name__,'traceback':traceback.format_exc()},'ERROR','collector_exception')
                 emit('issue',provider+'｜'+(str(exc) if isinstance(exc,AppError) else type(exc).__name__))
-        with futures.ThreadPoolExecutor(max_workers=max(1,min(8,len(jobs)))) as pool:
+        with futures.ThreadPoolExecutor(max_workers=max(1,min(4,len(jobs)))) as pool:
             pending={};next_job=0
             def fill_jobs():
                 nonlocal next_job
-                while next_job<len(jobs) and len(pending)<8 and not web.cancel_event.is_set():
+                while next_job<len(jobs) and len(pending)<4 and not web.cancel_event.is_set():
                     pending[pool.submit(work,next_job,*jobs[next_job])]=next_job;next_job+=1
             fill_jobs()
             completed=set()
@@ -2558,6 +2576,8 @@ DIAG_ADVICE={
  'map_address_difference':('掲載住所と逆算町字が異なる','掲載地図の座標と逆算住所を別項目で確認する。番地の一致とは扱わない。'),
  'unknown':('現時点で理由を特定できない','前後の通信・解析・除外イベントを照合する。再現URLと読取項目を追加してから修正する。原因を断定しない。')}
 
+DIAG_ADVICE.update({'listing_rejected':('物件の除外理由と工程・取得値・期待値','failed_stage/observed/expected/evidenceで条件不一致と読取・住所推定失敗を区別する。'),'listing_failed':('物件の通信・解析処理に失敗','HTTP状態・例外型・直前の工程を確認する。原因未確定を確定扱いしない。')})
+
 def diagnosis_code(message):
     text=str(message)
     if '取得経路の待機中' in text:return 'route_cooldown'
@@ -2627,7 +2647,47 @@ class AuditLog:
                 self.storage_error=None;return
 
 
+def begin_listing(web,provider,url):
+    if not hasattr(web,'local'):web.local=threading.local()
+    web.local.listing_evidence=[]
+    DIAG_CONTEXT.scope={**getattr(DIAG_CONTEXT,'scope',{}),'provider':provider,'listing_url':url}
+
+def reject_listing(web,provider,url,stage,category,reason,observed=None,expected=None):
+    evidence=list(getattr(getattr(web,'local',None),'listing_evidence',[]))
+    if stage=='map.address_inference':
+        stages={'suumo_marker_invalid':'map.marker_json','suumo_marker_unresolved':'map.room_marker',
+                'map_multiple_candidates':'map.image_candidates','image_georef_missing':'map.image_metadata',
+                'image_pin_error':'map.image_decode','image_pin_result':'map.image_pin',
+                'outside':'map.bounds','map_address_difference':'address.town_match',
+                'homes_map_image_candidates':'map.image_candidates','map_address_unresolved':'address.residential_candidates'}
+        for item in reversed(evidence):
+            code=item['code'];detail=item['details']
+            if code not in stages:continue
+            if code=='image_pin_result' and detail.get('point'):continue
+            if code=='homes_map_image_candidates' and detail.get('in_bounds_candidates'):continue
+            stage=detail.get('failed_stage') or stages[code];observed=detail
+            if code=='map_address_unresolved' and detail.get('tile_errors'):stage='address.tiles';category='acquisition_failure'
+            reason=detail.get('reason') or {'suumo_marker_unresolved':'物件マーカーを一意に取得できない','homes_map_image_candidates':'範囲内の地図画像ピン候補を取得できない','outside':'物件マーカーが検索範囲外','map_multiple_candidates':'物件ピン候補が複数ある','map_address_difference':'推定住所が対象町域と一致しない'}.get(code,reason)
+            if code in ('outside','map_address_difference'):category='condition'
+            break
+    trace(web,'listing_rejected',{'provider':provider,'url':url,'decision':'excluded','failed_stage':stage,
+          'category':category,'reason':reason,'observed':observed,'expected':expected,'evidence':evidence},'WARNING','rejection')
+    return None
+
+def exclusion_rows(events):
+    return [{'時刻UTC':e.get('time'),'取得元':e.get('details',{}).get('provider'),'物件URL':e.get('details',{}).get('url'),
+             '判定':e.get('details',{}).get('decision'),'工程':e.get('details',{}).get('failed_stage'),
+             '分類':e.get('details',{}).get('category'),'理由':e.get('details',{}).get('reason'),
+             '取得値':json.dumps(e.get('details',{}).get('observed'),ensure_ascii=False),
+             '期待値':json.dumps(e.get('details',{}).get('expected'),ensure_ascii=False)}
+            for e in events if e.get('code') in ('listing_rejected','listing_failed')]
+
+
 def trace(web,code,details=None,level='INFO',stage='parser'):
+    local=getattr(web,'local',None)
+    if local is not None and hasattr(local,'listing_evidence') and code not in ('listing_rejected','listing_failed') and (level in ('WARNING','ERROR') or code in ('reverse_result','image_pin_result','homes_map_image_candidates')):
+        local.listing_evidence.append({'code':code,'stage':stage,'details':details or {}})
+        local.listing_evidence=local.listing_evidence[-20:]
     audit=getattr(web,'audit',None) or getattr(DIAG_CONTEXT,'audit',None)
     if audit:audit.add(stage,code,level,details)
 
@@ -2668,12 +2728,20 @@ def diagnostic_downloads(events,prefix='current'):
     export_key=(events[0].get('search_id'),len(events),events[-1].get('seq'))
     export=st.session_state.get(prefix+'_log_export')
     if not export or export['key']!=export_key:
-        export={'key':export_key,'txt':diagnostic_report(events),'json':json.dumps({'schema':1,'events':events},ensure_ascii=False,indent=2).encode('utf-8')};st.session_state[prefix+'_log_export']=export
+        export={'key':export_key,'txt':diagnostic_report(events),'json':json.dumps({'schema':1,'events':events},ensure_ascii=False,separators=(',',':')).encode('utf-8')};export['decisions']=exclusion_rows(events)
+        reason_output=io.StringIO()
+        if export['decisions']:
+            reason_writer=csv.DictWriter(reason_output,fieldnames=list(export['decisions'][0]));reason_writer.writeheader();reason_writer.writerows(export['decisions'])
+        export['reasons_csv']=reason_output.getvalue().encode('utf-8-sig');export['preview']=export['txt'].decode('utf-8-sig').split('詳細イベント')[0];st.session_state[prefix+'_log_export']=export
     st.download_button('詳細作業ログ・改善案をTXTでダウンロード',export['txt'],'sumai_work_log.txt','text/plain',key=prefix+'_txt',on_click='ignore')
     st.download_button('解析用の詳細ログをJSONでダウンロード',export['json'],
                        'sumai_work_log.json','application/json',key=prefix+'_json',on_click='ignore')
+    decisions=export['decisions']
+    if decisions:
+        st.download_button('物件ごとの除外・取得失敗理由をCSVでダウンロード',export['reasons_csv'],'sumai_exclusion_reasons.csv','text/csv',key=prefix+'_reasons',on_click='ignore')
     with st.expander('作業ログの原因別集計と改善案'):
-        st.text(export['txt'].decode('utf-8-sig').split('詳細イベント')[0])
+        if decisions:st.dataframe(decisions[-100:],hide_index=True)
+        st.text(export['preview'])
         st.caption('全イベントはダウンロードに含まれます。画面には最新20イベントを表示します。')
         st.dataframe([{'時刻UTC':e['time'],'工程':e['stage'],'理由':e['code'],'取得元・地名':str(e.get('context',{})),
                        '詳細':str(e.get('details',{})),'改善案':e.get('improvement','')} for e in events[-20:]],hide_index=True)
@@ -3063,7 +3131,7 @@ def start_search(conditions):
         job.created=time.monotonic();job.thread.start()
     st.session_state.new_search=None
 
-@st.fragment(run_every='1s')
+@st.fragment(run_every='2s')
 def background_progress(anchor=None):
     """Render live worker progress at an explicit anchor directly below the map."""
     job=active_job()
@@ -3074,16 +3142,21 @@ def background_progress(anchor=None):
         if snap['finished']:st.session_state.finished_snapshot_applied=job.audit.search_id
     if snap['finished']:
         st.session_state.new_search=snap['result']
-        if not st.session_state.get('new_job_rendered')==id(job):
-            st.session_state.new_job_rendered=id(job);st.rerun()
-        return
-    if (job.updated if isinstance(job,PositionRepairJob) else len(snap['units']))!=st.session_state.get('position_rendered_count') and time.monotonic()-st.session_state.get('position_rendered_at',0)>2:
-        st.session_state.position_rendered_count=job.updated if isinstance(job,PositionRepairJob) else len(snap['units']);st.session_state.position_rendered_at=time.monotonic();st.rerun()
+    def refresh_map():
+        st.session_state.new_units=snap['units'];st.session_state.new_saved_keys=snap['saved']
+        st.rerun()
     def render():
+        if snap['finished']:
+            result=snap.get('result') or {};summary=result.get('summary',{})
+            st.info(f"検索終了｜状態 {result.get('status','不明')}｜取得 {len(snap['units'])}件｜保存確認 {len(snap['saved'])}件")
+            if st.button('取得済みデータを地図へ反映',key='refresh_finished_map'):refresh_map()
+            return
         st.progress(min(.99,snap['progress']),text='バックグラウンドで地図位置・住所を確認しています' if isinstance(job,PositionRepairJob) else 'バックグラウンドで検索・保存しています')
         st.caption('中断処理中｜'+snap['message'] if snap.get('stopping') else snap['message'])
+        st.caption(f"地図操作優先：自動再描画を停止中｜取得済み {len(snap['units'])}件。検索・保存は継続します。")
+        if st.button('取得済みデータを地図へ反映',key='refresh_live_map'):refresh_map()
         if st.button('検索を中断（取得済みデータは保持）',key='stop_background_job',disabled=bool(snap.get('stopping'))):
-            job.request_stop();st.rerun()
+            job.request_stop()
     if anchor is None:
         render()
     else:
@@ -3096,15 +3169,39 @@ def background_status():
     job=active_job()
     if job is None:return
     snap=job.snapshot()
+    st.caption(f"作業ログ {job.audit.count}イベント｜Supabase保存確認 {job.audit.persisted_events}イベント")
+    # Keep polling cheap: build a complete export only when explicitly requested.
+    if st.button('作業ログを準備・更新（検索中も利用できます）',key='current_log_prepare'):
+        try:
+            with st.spinner('現在までの作業ログを準備しています'):
+                events=job.audit.records()
+                st.session_state.diagnostic_export_cache={'id':job.audit.search_id,'events':events,'count':len(events),'prepared_at':utc_now()}
+        except Exception as exc:
+            st.error('作業ログを準備できませんでした：'+type(exc).__name__)
     audit_cache=st.session_state.get('diagnostic_export_cache')
-    if not audit_cache or audit_cache['id']!=job.audit.search_id or time.monotonic()-audit_cache['at']>=10 or snap['finished'] and audit_cache['count']!=job.audit.count:
-        audit_cache={'id':job.audit.search_id,'at':time.monotonic(),'count':job.audit.count,'events':job.audit.records()};st.session_state.diagnostic_export_cache=audit_cache
-    diagnostic_downloads(audit_cache['events'])
-    if job.audit.storage_error:st.error('作業ログのSupabase保存を確認できません。TXTまたはJSONでダウンロードしてください。'+job.audit.storage_error)
-    st.caption(f"ログ {job.audit.count}イベント｜Supabase保存確認 {job.audit.persisted_events}イベント｜実行中のダウンロードは最大10秒前の内容です。")
+    if audit_cache and audit_cache['id']==job.audit.search_id:
+        diagnostic_downloads(audit_cache['events'])
+        st.caption(f"ダウンロード対象：{audit_cache['count']}イベント｜準備日時：{acquisition_time_jst(audit_cache['prepared_at'])}｜最新分を含めるには「準備・更新」を押してください。")
+    else:
+        st.caption('「作業ログを準備・更新」を押すとJSON・TXTのダウンロードボタンが表示されます。')
+    if job.audit.storage_error:st.error('作業ログのSupabase保存を確認できません。準備・更新ボタンから、このサーバーに残るログをダウンロードできます。'+job.audit.storage_error)
+
     if not snap['finished']:
         if snap['log']:st.code(snap['log'],language=None)
         st.caption('画面を操作しても検索と保存は継続します。サーバーの休止・再起動では実行が終了します。')
+
+def capture_map_fragment():
+    had_bounds=bool(st.session_state.get('new_bounds'))
+    capture_viewport()
+    if not had_bounds and st.session_state.get('new_bounds'):st.rerun()
+
+@st.fragment
+def interactive_rental_map(pins,cells,facilities):
+    state=st.session_state
+    st_folium(rental_map([],DEFAULT_CENTER,1500,[],[]),key='new_map',height=480,use_container_width=True,
+        returned_objects=['bounds','zoom'],center=state.get('new_view_center',DEFAULT_CENTER),
+        zoom=state.get('new_view_zoom',15),feature_group_to_add=rental_features(pins,cells,facilities),on_change=capture_map_fragment)
+
 
 def main():
     st.set_page_config(page_title='住まいコンパス｜新しい住まいを探す',page_icon='🏡',layout='wide',initial_sidebar_state='collapsed')
@@ -3147,9 +3244,7 @@ def main():
                 state.diagnostic_map_signature=map_signature
                 job.audit.add('map','render','INFO',{'bounds':bounds,'loaded_units':len(map_units),'aggregation':False,'monthly_limit':None,'renderer':'Canvas','display_stages':display_report['stages'],'display_reasons':display_report['reason_counts'],'display_map':display_report['map']})
         facilities=[f for f in state.new_facilities if bounds and in_rectangle((f['lat'],f['lng']),bounds)]
-        data=st_folium(rental_map([],DEFAULT_CENTER,1500,[],[]),key='new_map',height=480,use_container_width=True,
-            returned_objects=['bounds','zoom'],center=state.get('new_view_center',DEFAULT_CENTER),
-            zoom=state.get('new_view_zoom',15),feature_group_to_add=rental_features(pins,cells,facilities),on_change=capture_viewport)
+        interactive_rental_map(pins,cells,facilities)
         # Fixed DOM position: live progress is rendered into this placeholder and nowhere else.
         progress_anchor=st.empty()
         background_progress(progress_anchor)
@@ -3194,7 +3289,7 @@ def main():
         c1.metric('現在の範囲の募集',len(rows))
         c2.metric('家賃帯で色付けした募集',display_report['map']['colored_points'])
         c3.metric('位置未確認の募集',display_report['map']['unconfirmed_positions'])
-        if not state.get('new_map_loaded'):st.info('取得済みデータは検索中も地図へ反映します。保存データは「保存データ」から読み込めます。')
+        if not state.get('new_map_loaded'):st.info('取得済みデータは「地図へ反映」で表示します。保存データは「保存データ」から読み込めます。')
         elif not rows:st.info('この表示範囲に配置できる保存データがありません。')
         if rows:
             with st.expander('募集を1件ずつ確認'):
