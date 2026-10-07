@@ -37,7 +37,7 @@ import streamlit as st
 from streamlit_folium import st_folium
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v51"
+BUILD = "REBUILD-01-v52"
 PROVIDER_OPTIONS = ("スマイティ","HOMES","SUUMO","カナリー","アットホーム","CHINTAI","Comfy","アパマンショップ")
 PROVIDER_CANONICAL = {"HOMES":"HOME’S","HOME’S":"HOME’S","スマイティ":"スマイティ","SUUMO":"SUUMO","カナリー":"カナリー",
                       "アットホーム":"アットホーム","CHINTAI":"CHINTAI","Comfy":"Comfy","アパマンショップ":"アパマンショップ"}
@@ -208,7 +208,7 @@ def town_matches(town,address):
     if match:
         base,number=match.groups()
         return bool(re.search(r'(?:^|[都道府県市区郡町村])'+re.escape(base+number)+r'(?:丁目|[-ー−－番号]|$)',actual))
-    return bool(re.search(r'(?:^|[都道府県市区郡町村])'+re.escape(wanted),actual))
+    return bool(re.search(r'(?:^|[都道府県市区郡町村])'+re.escape(wanted)+r'(?=\d|[-ー−－番号]|$)',actual))
 
 
 def parsed_layout(raw,rough=True):
@@ -1890,7 +1890,8 @@ def suumo_location_from_kankyo_image(web,detail_soup,detail_url,bounds,munis,exp
             trace(web,'suumo_marker_unresolved',{'map_url':target,'script_found':False,'image_candidates':candidates,'reason':'物件地図スクリプトがなく、画像ピン候補も一意に取得できない'},'WARNING','location');return None
         lat,lng=next(iter(distinct));method='SUUMO地図画像ピン認識→GSI住居表示住所推定'
     if not in_rectangle((lat,lng),bounds):
-        trace(web,'outside',{'map_url':target,'point':[lat,lng],'bounds':list(bounds)},'WARNING','location');return None
+        trace(web,'published_point_outside_bounds',{'map_url':target,'point':[lat,lng],'bounds':list(bounds),
+              'retained':True,'reason':'検索範囲外でも住所推定・保存を継続'},stage='location')
     inferred=map_point_to_residential_address(web,(lat,lng),munis)
     if not inferred:return None
     address=inferred['address']
@@ -1908,7 +1909,8 @@ def suumo_location_from_kankyo_image(web,detail_soup,detail_url,bounds,munis,exp
 def suumo_collect(web,region,bounds,munis,emit):
     """SUUMO: map towns -> town page/filter -> detail -> kankyo map -> compact save."""
     prepared=suumo_prepare_region(web,region);seen_urls=set()
-    visible_towns=region.get('visible_towns') or [region.get('town','')]
+    # The town search returns every chome. Save the full town, including off-screen properties.
+    collection_towns=[town_base_name(region.get('town',''))]
     for group_number,layouts in enumerate(SUUMO_LAYOUT_GROUPS,1):
         filter_params=suumo_group_params(prepared,layouts,1)
         current_url=prepared['url'];current_params=filter_params;seen_pages=set();group_candidates=0;page_number=1
@@ -1962,7 +1964,7 @@ def suumo_collect(web,region,bounds,munis,emit):
                     if not rent:
                         reject_listing(web,'SUUMO',url,'detail.rent','missing_data','家賃を読み取れない',{'raw':fields['raw_rent'],'parsed':rent},'家賃（円）>0');emit('rejected',1);trace(web,'parse',{'url':url,'missing':'detail_rent','visible_head':fields['visible'][:400]},'WARNING');continue
 
-                    try:location=suumo_location_from_kankyo_image(web,detail,url,bounds,munis,visible_towns)
+                    try:location=suumo_location_from_kankyo_image(web,detail,url,bounds,munis,collection_towns)
                     except AppError as exc:
                         location=None;trace(web,'location_pending',{'url':url,'message':str(exc),'source':'SUUMO地図・周辺環境の物件マーカー'},'WARNING','location')
                     address=location.get('inferred_address','') if location else ''
@@ -2978,7 +2980,7 @@ def hydrate_saved_units(rows,bounds,cache=None):
         point=cache.get(row.get('address'))
         if not point:continue
         lat,lng,title=point
-        if bounds and not in_rectangle((lat,lng),bounds):continue
+        # Keep off-screen saved records in memory so panning can reveal their points.
         item=dict(row,latitude=lat,longitude=lng,coordinate_precision='address',location_method='保存済み地図由来住所を読み込み時に住所検索',map_address=title,address_match='保存住所から再配置')
         hydrated.append(item)
     return hydrated,cache
@@ -3257,7 +3259,12 @@ def main():
                 state.diagnostic_map_signature=map_signature
                 job.audit.add('map','render','INFO',{'bounds':bounds,'loaded_units':len(map_units),'aggregation':False,'monthly_limit':None,'renderer':'Canvas','display_stages':display_report['stages'],'display_reasons':display_report['reason_counts'],'display_map':display_report['map']})
         facilities=[f for f in state.new_facilities if bounds and in_rectangle((f['lat'],f['lng']),bounds)]
-        interactive_rental_map(pins,cells,facilities)
+        # Leaflet clips points to its viewport. Keeping every loaded point in the layer
+        # lets a pan reveal previously off-screen properties without a full app rerun.
+        interactive_rental_map(map_units,cells,facilities)
+        if st.button('現在の範囲の件数・一覧を更新',key='refresh_viewport_summary'):
+            st.rerun()
+        st.caption('地図を動かすと読み込み済みの物件を表示します。下の件数・一覧は「現在の範囲の件数・一覧を更新」で更新できます。')
         # Fragment owns its widget container directly, including partial reruns.
         background_progress()
         # Initial component defaults are not real viewport bounds. Only the browser callback makes the search ready.
@@ -3278,7 +3285,7 @@ def main():
         st.caption('スマイティ・HOMES・SUUMO・カナリー・アットホーム・CHINTAI・Comfy・アパマンショップから、使う取得元を1つ以上選択できます。')
         st.button('表示中の地名から全件検索・保存',type='primary',use_container_width=True,
                   on_click=remember_search,key='new_start',disabled=not bounds or not providers or bool(active_job() and not active_job().snapshot()['finished']))
-        st.caption('検索開始時の表示範囲を固定します。HOMESは区名→町域→マンション・築15年以内→①1LDK/2K/2DK→②2LDK/3K/3DK→詳細→「地図を見る」の画像認識、SUUMOは市区郡→町名→同じ2間取り群→詳細→「地図・周辺環境」の物件マーカー座標取得です。SUUMOは地図ページの物件マーカー座標、HOMESは地図画像のピンから詳細住所を推定できた場合だけ保存します。住所は実所在地未確認の推定値です。保存は家賃・間取り・詳細住所（推定）・データ取得日時です。')
+        st.caption('検索開始時の表示範囲から検索する町名を決めます。SUUMOはその町の全丁目を対象に、範囲外でも詳細住所を推定して保存します。HOMESは区名→町域→マンション・築15年以内→①1LDK/2K/2DK→②2LDK/3K/3DK→詳細→「地図を見る」の画像認識、SUUMOは市区郡→町名→同じ2間取り群→詳細→「地図・周辺環境」の物件マーカー座標取得です。住所は実所在地未確認の推定値です。保存は家賃・間取り・詳細住所（推定）・データ取得日時です。')
         background_status()
         result=state.new_search
         if result:
@@ -3312,17 +3319,17 @@ def main():
                 st.dataframe([{'家賃（万円）':float(r['rent'])/10000 if r.get('rent') else None,'間取り':r.get('layout'),'住所（推定）':r.get('address'),'データ取得日時':acquisition_time_jst(r.get('fetched_at'))} for r in physical_units(rows)],hide_index=True)
     with tabs[1]:
         st.subheader('Supabaseに保存した物件')
-        st.caption('自動読み込みは行いません。地図に表示中の範囲にある物件データを読み込みます。')
-        if st.button('表示範囲の保存物件を読み込む',key='new_load',use_container_width=True,disabled=not bounds or bool(active_job() and not active_job().snapshot()['finished'])):
+        st.caption('保存物件をまとめて読み込みます。範囲外の物件も保持し、地図を動かすと表示できます。地図操作中の自動読み込みは行いません。')
+        if st.button('保存物件をすべて読み込む',key='new_load',use_container_width=True,disabled=bool(active_job() and not active_job().snapshot()['finished'])):
             try:
                 with st.spinner('家賃・間取り・住所を読み込み、住所から地図表示位置を一時生成しています'):
-                    db=Database();stored=db.load_units(bounds)
+                    db=Database();stored=db.load_units(None)
                     rows,cache=hydrate_saved_units(stored,bounds,state.get('address_point_cache'))
                     state.address_point_cache=cache
-                    diag=getattr(db,'last_load_diagnostic',{'returned':len(stored),'bounds':bounds,'time':utc_now()});diag['in_bounds_after_address_geocode']=len(rows);state.new_load_diagnostic=diag
+                    diag=getattr(db,'last_load_diagnostic',{'returned':len(stored),'bounds':bounds,'time':utc_now()});diag['geocoded_total']=len(rows);diag['in_bounds_after_address_geocode']=sum(listing_in_bounds(r,bounds) for r in rows);state.new_load_diagnostic=diag
                 state.new_units=rows;state.new_saved_keys=[r['key'] for r in rows];state.new_search=None;state.new_map_loaded=True
                 state.pop('new_job_token',None)
-                state.new_notice=f'{len(rows)}件を表示範囲へ読み込み、家賃帯の色を地図上に生成しました。座標はデータベースへ保存していません。';st.rerun()
+                state.new_notice=f'{len(rows)}件を読み込みました。範囲外の物件も地図を動かすと表示できます。座標はデータベースへ保存していません。';st.rerun()
             except AppError as exc: st.error(str(exc))
         if state.get('new_notice'): st.success(state.new_notice)
         st.caption('DBには家賃・間取り・詳細住所（推定）・データ取得日時を保存します。読み込み時に住所を一時的に座標化して地図へ色付けし、その座標は保存しません。')
