@@ -38,7 +38,7 @@ import streamlit as st
 from streamlit_folium import st_folium
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v55"
+BUILD = "REBUILD-01-v56"
 PROVIDER_OPTIONS = ("スマイティ","HOMES","SUUMO","カナリー","アットホーム","CHINTAI","Comfy","アパマンショップ")
 PROVIDER_CANONICAL = {"HOMES":"HOME’S","HOME’S":"HOME’S","スマイティ":"スマイティ","SUUMO":"SUUMO","カナリー":"カナリー",
                       "アットホーム":"アットホーム","CHINTAI":"CHINTAI","Comfy":"Comfy","アパマンショップ":"アパマンショップ"}
@@ -2542,6 +2542,7 @@ def search_all(db,conditions,screen,state=None):
     screen['status'].info('検索実行中｜保存先の接続・新しいテーブルを確認しています')
     db.check();db.save_search(search);log('保存先確認OK。新しい検索を開始しました。')
     web=PublicWeb();web.audit=audit
+    if hasattr(state,'request_starts'):web.host_last_request=state.request_starts
     if hasattr(state,'cancel_event'):web.cancel_event=state.cancel_event
     if hasattr(web,'configure'):web.configure(getattr(db,'web_config',{}))
     def region_update(stage,done,total,count,errors):
@@ -2607,7 +2608,7 @@ def search_all(db,conditions,screen,state=None):
             conditions['auto_total_tasks']=len(jobs);conditions['auto_task_index']=index
             conditions['auto_task_label']=jobs[index][0]['label']+'｜'+jobs[index][1]
             jobs=[jobs[index]]
-        q=queue.Queue();active={};done=0;candidate=detail=rejected=skipped=0
+        q=queue.Queue();active={};done=0;candidate=detail=rejected=skipped=incomplete=0
         def work(index,region,provider):
             if web.cancel_event.is_set():return
             DIAG_CONTEXT.audit=audit;DIAG_CONTEXT.scope={'task':index,'region':region['label'],'town':region['town'],'municipality_code':region['code'],'provider':provider}
@@ -2624,6 +2625,7 @@ def search_all(db,conditions,screen,state=None):
             except Exception as exc:
                 trace(web,diagnosis_code(str(exc)),{'exception_type':type(exc).__name__,'traceback':traceback.format_exc()},'ERROR','collector_exception')
                 emit('issue',provider+'｜'+(str(exc) if isinstance(exc,AppError) else type(exc).__name__))
+                emit('incomplete',1)
         with futures.ThreadPoolExecutor(max_workers=max(1,min(4,len(jobs)))) as pool:
             pending={};next_job=0
             def fill_jobs():
@@ -2647,6 +2649,7 @@ def search_all(db,conditions,screen,state=None):
                     elif kind=='detail': detail+=int(value)
                     elif kind=='rejected': rejected+=int(value)
                     elif kind=='skipped': skipped+=int(value)
+                    elif kind=='incomplete': incomplete+=int(value)
                     elif kind=='issue':
                         issues.append(label+'｜'+str(value));log(issues[-1])
                     elif kind=='unit':
@@ -2678,7 +2681,7 @@ def search_all(db,conditions,screen,state=None):
                 screen['bar'].progress(.2+.75*done/max(1,len(jobs)),text=f'物件確認 {done}/{len(jobs)}タスク｜保存確認 {len(saved)}件')
                 screen['status'].info(f'検索実行中｜{done}/{len(jobs)}タスク完了｜候補 {candidate}｜詳細 {detail}｜除外 {rejected}｜取得済みスキップ {skipped}｜保存確認 {len(saved)}件｜経過 {int(time.monotonic()-started)}秒\n\n'+'\n\n'.join(active.values()))
         search['status']='cancelled' if web.cancel_event.is_set() else 'partial' if issues else 'completed'
-        search['summary']={'confirmed':len(units),'saved':len(saved),'candidate':candidate,'detail':detail,'rejected':rejected,'already_acquired':skipped,
+        search['summary']={'confirmed':len(units),'saved':len(saved),'candidate':candidate,'detail':detail,'rejected':rejected,'already_acquired':skipped,'incomplete_tasks':incomplete,
                            'retained_with_missing_fields':sum(bool(r.get('missing_fields')) for r in units.values()),'price_unknown':sum(not r.get('rent') for r in units.values()),'issues':issues[-100:],'elapsed':int(time.monotonic()-started),'tasks':len(jobs)}
     except SearchCancelled:
         search['status']='cancelled'
@@ -3465,9 +3468,9 @@ class AutomaticCollection:
     """One low-concurrency collection loop per saved namespace; no Streamlit UI in its thread."""
     def __init__(self,db,settings,summary=None):
         validate_automatic_settings(settings);validate_automatic_summary(summary or {})
-        self.db=db;self.settings=dict(settings);self.summary=dict(summary or {})
+        self.db=db;self.settings=dict(settings);self.settings['interval_minutes']=0;self.summary=dict(summary or {});self.summary.pop('next_run_at',None)
         self.lock=threading.RLock();self.io_lock=threading.Lock();self.stop_event=threading.Event()
-        self.current=None;self.message='自動収集を準備しています';self.progress=0.;self.error=''
+        self.request_starts={};self.current=None;self.message='自動収集を準備しています';self.progress=0.;self.error=''
         self.thread=threading.Thread(target=self.run,daemon=True,name='housing-automatic-collection')
     def persist(self):
         with self.io_lock:
@@ -3494,16 +3497,6 @@ class AutomaticCollection:
         try:
             while not self.stop_event.is_set():
                 with self.lock:
-                    next_run=self.summary.get('next_run_at')
-                delay=0.
-                if next_run:
-                    try:delay=max(0.,(datetime.fromisoformat(next_run)-datetime.now(timezone.utc)).total_seconds())
-                    except (ValueError,TypeError):pass
-                if delay:
-                    with self.lock:self.message='次の町の収集を待機しています'
-                    if self.stop_event.wait(delay):break
-                if self.stop_event.is_set():break
-                with self.lock:
                     if self.stop_event.is_set():break
                     conditions={'bounds':[34,138,37,141],'ward_code':self.settings['ward_code'],'providers':list(self.settings['providers']),
                                 'mode':'automatic_collection','auto_task_index':int(self.summary.get('next_task_index',0)),
@@ -3511,33 +3504,37 @@ class AutomaticCollection:
                     for key in ('auto_regions','auto_munis'):
                         if self.settings.get(key):conditions[key]=self.settings[key]
                     self.summary['last_started_at']=utc_now();self.summary['last_status']='running'
-                    job=SearchJob(self.db,conditions);self.current=job
+                    job=SearchJob(self.db,conditions)
+                    if hasattr(job,'state'):job.state.request_starts=self.request_starts
+                    self.current=job
                 self.persist()
                 # Run synchronously on this daemon. The normal search persists each acquired batch.
                 job.run(self.db,conditions)
-                snap=job.snapshot();result=snap.get('result') or {};status=result.get('status','failed')
+                snap=job.snapshot();result=snap.get('result') or {};status=result.get('status','failed');incomplete=bool(result.get('summary',{}).get('incomplete_tasks'))
                 with self.lock:
                     self.current=None;self.progress=1.;self.summary['last_finished_at']=utc_now();self.summary['last_status']=status
                     self.summary['last_task']=conditions.get('auto_task_label','地域判定')
                     self.summary['last_summary']=result.get('summary',{})
                     self.summary['saved_observations']=int(self.summary.get('saved_observations',0))+len(snap['saved'])
                     self.summary['confirmed_observations']=int(self.summary.get('confirmed_observations',0))+len(snap['units'])
-                    if status in ('completed','partial'):
+                    if status in ('completed','partial') and not incomplete:
                         total=max(1,int(conditions.get('auto_total_tasks',1)))
                         self.summary['next_task_index']=(int(conditions.get('auto_task_index',0))+1)%total
                         self.summary['total_tasks']=total
                         self.summary['completed_runs']=int(self.summary.get('completed_runs',0))+1
                         for key in ('auto_regions','auto_munis'):
                             if conditions.get(key):self.settings[key]=conditions[key]
-                    interval=max(5,int(self.settings.get('interval_minutes',30)))
-                    self.summary['next_run_at']=(datetime.now(timezone.utc)+timedelta(minutes=interval)).isoformat(timespec='seconds')
-                    self.message='今回の収集を保存しました。次の町へ順番に進みます。'
+                    self.summary.pop('next_run_at',None)
+                    if status=='failed' or incomplete:
+                        self.settings['enabled']=False;self.stop_event.set()
+                        self.error='今回の町の全ページ確認を完了できませんでした。原因を確認して同じ町から再開してください。'
+                    self.message='取得に失敗したため自動収集を中止しました。' if status=='failed' or incomplete else '取得・保存処理を中止しました。' if status=='cancelled' else '今回の収集を保存しました。待機せず次の町へ進みます。'
                 self.persist()
         except Exception as exc:
             with self.lock:
                 self.error=str(exc) if isinstance(exc,AppError) else '自動収集エラー（'+type(exc).__name__+'）'
                 self.message='自動収集が停止しました。設定画面から再開してください。'
-                self.summary['last_status']='failed'
+                self.summary['last_status']='failed';self.settings['enabled']=False
             try:self.persist()
             except Exception:pass
         finally:
@@ -3589,9 +3586,6 @@ def validate_automatic_settings(settings):
     codes=settings.get('town_codes',[])
     if not isinstance(codes,list) or any(not isinstance(c,str) or not re.fullmatch(re.escape(settings['ward_code'])+r'\d{3}',c) for c in codes):raise AppError('対象町名の設定が不正です。')
     if settings.get('providers')!=['SUUMO']:raise AppError('自動収集はSUUMOを指定してください。')
-    try:interval=int(settings.get('interval_minutes',30))
-    except (ValueError,TypeError):raise AppError('実行間隔は5〜1440分を指定してください。') from None
-    if not 5<=interval<=1440:raise AppError('実行間隔は5〜1440分を指定してください。')
 
 def validate_automatic_summary(summary):
     if not isinstance(summary,dict):raise AppError('自動収集の進捗形式が不正です。')
@@ -3601,8 +3595,8 @@ def validate_automatic_summary(summary):
         except (ValueError,TypeError):raise AppError('自動収集の進捗が不正です：'+key) from None
     if not isinstance(summary.get('last_summary',{}),dict):raise AppError('自動収集の前回結果が不正です。')
 
-def start_automatic_collection(ward_code,interval_minutes,town_codes=None):
-    settings={'enabled':True,'ward_code':ward_code,'providers':['SUUMO'],'interval_minutes':int(interval_minutes),'created_at':utc_now(),'town_codes':sorted(set(town_codes or []))}
+def start_automatic_collection(ward_code,interval_minutes=0,town_codes=None):
+    settings={'enabled':True,'ward_code':ward_code,'providers':['SUUMO'],'interval_minutes':0,'created_at':utc_now(),'town_codes':sorted(set(town_codes or []))}
     validate_automatic_settings(settings)
     db=Database();db.web_config=rental_network_settings();registry,lock=automatic_registry();key=automatic_registry_key(db)
     with lock:
@@ -3630,12 +3624,12 @@ def automatic_collection_panel():
     saved=snap['settings'] if snap else st.session_state.get('automatic_saved_settings',{})
     ward_code=st.selectbox('自動収集する区',list(TOKYO_WARDS),index=list(TOKYO_WARDS).index(saved.get('ward_code','13116')),format_func=lambda code:TOKYO_WARDS[code],key='automatic_ward')
     town_codes=ward_town_selector(ward_code,'automatic',saved.get('town_codes',[]),disabled=busy)
-    interval=st.number_input('町ごとの実行間隔（分）',min_value=5,max_value=1440,value=int(saved.get('interval_minutes',30)),step=5,key='automatic_interval')
+    st.caption('町ごとの待機時間はありません。件数・ページ数の取得上限は設けず、各町を最後のページまで確認してから次の町へ進みます。')
     st.caption('選択した町を順番に検索します。町名未選択なら区の全町が対象です。築15年以内・マンション・1LDK/2K/2DK・2LDK/3K/3DKが対象です。過去3か月以内の取得済みIDは詳細取得前にスキップします。設定は停止後に変更できます。')
     manual=active_job();manual_busy=bool(manual and not manual.snapshot()['finished'])
     if st.button('選択した区で自動収集を開始・再開',key='automatic_start',disabled=busy or manual_busy):
         try:
-            controller=start_automatic_collection(ward_code,interval,town_codes);snap=controller.snapshot();busy=True
+            controller=start_automatic_collection(ward_code,town_codes=town_codes);snap=controller.snapshot();busy=True
         except AppError as exc:st.error(str(exc))
     if st.button('自動収集を中止（取得済みデータを保存）',key='automatic_stop',disabled=not busy or bool(snap and snap['stopping'])):
         try:
@@ -3647,7 +3641,7 @@ def automatic_collection_panel():
         summary=snap['summary'];st.write(snap['message']);st.progress(min(1.,max(0.,snap['progress'])))
         st.caption('対象区：'+TOKYO_WARDS[snap['settings']['ward_code']]+'｜町名指定：'+str(len(snap['settings'].get('town_codes',[])))+'町（0なら区全体）')
         st.caption(f"完了した収集 {summary.get('completed_runs',0)}回｜延べ保存確認 {summary.get('saved_observations',0)}件｜次の町 {int(summary.get('next_task_index',0))+1}/{summary.get('total_tasks','未判定')}")
-        st.caption('最終終了：'+acquisition_time_jst(summary.get('last_finished_at'))+'｜次回予定：'+acquisition_time_jst(summary.get('next_run_at')))
+        st.caption('最終終了：'+acquisition_time_jst(summary.get('last_finished_at')))
         st.caption('前回の取得済みIDスキップ：'+str(summary.get('last_summary',{}).get('already_acquired',0))+'件')
         if summary.get('last_task'):st.caption('前回の町：'+summary['last_task']+'｜結果：'+str(summary.get('last_status','')))
         for issue in summary.get('last_summary',{}).get('issues',[])[:4]:st.error(issue)
