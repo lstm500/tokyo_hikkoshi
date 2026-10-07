@@ -38,7 +38,7 @@ import streamlit as st
 from streamlit_folium import st_folium
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v57"
+BUILD = "REBUILD-01-v58"
 PROVIDER_OPTIONS = ("スマイティ","HOMES","SUUMO","カナリー","アットホーム","CHINTAI","Comfy","アパマンショップ")
 PROVIDER_CANONICAL = {"HOMES":"HOME’S","HOME’S":"HOME’S","スマイティ":"スマイティ","SUUMO":"SUUMO","カナリー":"カナリー",
                       "アットホーム":"アットホーム","CHINTAI":"CHINTAI","Comfy":"Comfy","アパマンショップ":"アパマンショップ"}
@@ -413,14 +413,27 @@ def compact_saved_listing(row):
             parsed=datetime.fromisoformat(str(stamp).replace('Z','+00:00'))
             if parsed.tzinfo is None:return None
             stamp=parsed.astimezone(timezone.utc).isoformat(timespec='seconds')
-        return {'rent':int(round(float(rent))),'layout':layout,'address':address[:220],'fetched_at':stamp or None}
+        result={'rent':int(round(float(rent))),'layout':layout,'address':address[:220],'fetched_at':stamp or None}
+        property_id=row.get('property_id')
+        if isinstance(property_id,str) and re.fullmatch(r'SUUMO:(?:bc|jnc):\d+',property_id):result['property_id']=property_id
+        return result
     except (ValueError,TypeError,AttributeError):return None
+
+
+def newest_observation(old,new):
+    if not old:return new
+    try:
+        a=datetime.fromisoformat(str(old.get('fetched_at')).replace('Z','+00:00'))
+        b=datetime.fromisoformat(str(new.get('fetched_at')).replace('Z','+00:00'))
+        if a.tzinfo and b.tzinfo and a>b:return old
+    except (ValueError,TypeError):pass
+    return new
 
 
 def compact_listing_key(row):
     compact=compact_saved_listing(row)
     if not compact:return None
-    identity={k:compact[k] for k in ('rent','layout','address')}
+    identity={'property_id':compact['property_id']} if compact.get('property_id') else {k:compact[k] for k in ('rent','layout','address')}
     return hashlib.sha256(json.dumps(identity,ensure_ascii=False,sort_keys=True,separators=(',',':')).encode()).hexdigest()
 
 
@@ -470,6 +483,7 @@ def partial_listing(provider,url,title,address,layout,rent,fees,area,region,boun
 def merge_listing(old,new):
     """Incomplete new observations must not erase previously acquired fields or map points."""
     if not old:return dict(new)
+    if newest_observation(old,new) is old:return dict(old)
     out=dict(old);retained=[]
     for k,v in new.items():
         if v is not None and v!='' and k!='missing_fields':out[k]=v
@@ -563,39 +577,7 @@ class Database:
                              (SEARCH_TABLE,'id,status,conditions,summary'), (PLACE_TABLE,'key,title,kind,latitude,longitude')):
             rows=self.call('GET',table,{'namespace':'eq.'+self.namespace,'select':select,'limit':1})
             if not isinstance(rows,list): raise AppError('保存テーブルの応答形式が不正です。')
-    def save_units(self,rows):
-        # Persistent fields: rent, layout, inferred address and acquisition time.
-        unique={}
-        for row in rows:
-            compact=compact_saved_listing(row)
-            if compact:
-                key=compact_listing_key(compact);unique[key]=compact
-        if not unique:return set()
-        saved=set();items=list(unique.items())
-        for offset in range(0,len(items),200):
-            batch=items[offset:offset+200]
-            unknown=[key for key,compact in batch if not compact.get('fetched_at')]
-            if unknown:
-                previous=self.call('GET',SEARCH_TABLE,{'namespace':'eq.'+self.namespace,'status':'eq.rental_listing',
-                    'select':'id,summary','id':'in.('+','.join('listing.'+key for key in unknown)+')','limit':200})
-                if not isinstance(previous,list):raise AppError('以前の取得日時を確認できません。')
-                stamps={str(r.get('id','')).removeprefix('listing.'):((r.get('summary') or {}).get('listing') or {}).get('fetched_at') for r in previous}
-                for key,compact in batch:
-                    if not compact.get('fetched_at') and stamps.get(key):compact['fetched_at']=stamps[key]
-            payload=[dict(namespace=self.namespace,id='listing.'+key,status='rental_listing',started_at=utc_now(),finished_at=None,
-                          conditions={'record_type':'rental_listing','schema':5,'fields':['rent','layout','address','fetched_at'],'address_origin':'suumo_room_marker_to_gsi_residential_address;homes_map_image'},
-                          summary={'listing':compact}) for key,compact in batch]
-            result=self.call('POST',SEARCH_TABLE,{'on_conflict':'namespace,id','select':'id'},payload,'resolution=merge-duplicates,return=representation')
-            if isinstance(result,list):
-                saved.update(str(r.get('id','')).removeprefix('listing.') for r in result if isinstance(r,dict) and r.get('id'))
-        if not set(unique)<=saved:raise AppError('Supabaseから募集情報の保存確認が得られません。')
-        return set(unique)
-    def save_search(self,search):
-        result=self.call('POST',SEARCH_TABLE,{'on_conflict':'namespace,id','select':'id'},
-                         [dict(search,namespace=self.namespace)],'resolution=merge-duplicates,return=representation')
-        if not isinstance(result,list) or not any(x.get('id')==search['id'] for x in result if isinstance(x,dict)):
-            raise AppError('検索履歴の保存を確認できません。')
-    def save_acquisition_ids(self,rows):
+    def acquisition_payload(self,rows):
         unique={}
         for row in rows:
             property_id=row.get('property_id')
@@ -608,33 +590,96 @@ class Database:
             except (ValueError,TypeError,AttributeError):raise AppError('物件IDの取得日時を確認できません。') from None
             if property_id in unique and unique[property_id]['finished_at']>=stamp:continue
             unique[property_id]={'namespace':self.namespace,'id':'acquired.'+hashlib.sha256(property_id.encode()).hexdigest(),
-                            'status':'rental_acquisition','started_at':stamp,'finished_at':stamp,
-                            'conditions':{'provider':'SUUMO','property_id':property_id,'schema':1},
-                            'summary':{'last_success_at':stamp,'listing_key':compact_listing_key(row)}}
-        payload=list(unique.values())
+                'status':'rental_acquisition','started_at':stamp,'finished_at':stamp,
+                'conditions':{'provider':'SUUMO','property_id':property_id,'schema':2},
+                'summary':{'last_success_at':stamp,'listing_key':compact_listing_key(row)}}
+        return list(unique.values())
+
+    def save_units(self,rows):
+        unique={}
+        for r in rows:
+            compact=compact_saved_listing(r)
+            if compact:
+                key=compact_listing_key(compact);unique[key]=newest_observation(unique.get(key),compact)
+        saved=set();items=list(unique.items());self.last_save_stats={'new':0,'updated':0,'failed':0}
+        if not hasattr(self,'job_new_keys'):self.job_new_keys=set()
+        if not hasattr(self,'covered_acquisitions'):self.covered_acquisitions={}
+        for offset in range(0,len(items),200):
+            batch=items[offset:offset+200]
+            unknown=[key for key,compact in batch if not compact.get('fetched_at')]
+            if unknown:
+                previous=self.call('GET',SEARCH_TABLE,{'namespace':'eq.'+self.namespace,'status':'eq.rental_listing',
+                    'select':'id,summary','id':'in.('+','.join('listing.'+key for key in unknown)+')','limit':200})
+                if not isinstance(previous,list):raise AppError('以前の取得日時を確認できません。')
+                stamps={str(r.get('id','')).removeprefix('listing.'):((r.get('summary') or {}).get('listing') or {}).get('fetched_at') for r in previous}
+                for key,compact in batch:
+                    if not compact.get('fetched_at') and stamps.get(key):compact['fetched_at']=stamps[key]
+            payload=[dict(namespace=self.namespace,id='listing.'+key,status='rental_listing',started_at=utc_now(),finished_at=None,
+                conditions={'record_type':'rental_listing','schema':6,'fields':['property_id','rent','layout','address','fetched_at'],
+                            'address_origin':'suumo_room_marker_to_gsi_residential_address;homes_map_image'},summary={'listing':compact}) for key,compact in batch]
+            result=self.call('POST',SEARCH_TABLE,{'on_conflict':'namespace,id','select':'id'},payload,'resolution=ignore-duplicates,return=representation')
+            if not isinstance(result,list):raise AppError('Supabaseから新規保存の確認が得られません。')
+            inserted={str(r.get('id','')).removeprefix('listing.') for r in result if isinstance(r,dict) and r.get('id')}
+            self.job_new_keys.update(inserted)
+            updates=[r for r in payload if r['id'].removeprefix('listing.') not in inserted]
+            ledger=self.acquisition_payload([compact for _,compact in batch])
+            rest=updates+ledger
+            if rest:
+                response=self.call('POST',SEARCH_TABLE,{'on_conflict':'namespace,id','select':'id'},rest,'resolution=merge-duplicates,return=representation')
+                returned={r.get('id') for r in response if isinstance(r,dict)} if isinstance(response,list) else set()
+                if not {r['id'] for r in rest}<=returned:raise AppError('募集情報の更新・取得済みIDの保存を確認できません。')
+            for row in ledger:self.covered_acquisitions[row['conditions']['property_id']]=(row['finished_at'],row['summary']['listing_key'])
+            saved.update(key for key,_ in batch)
+            self.last_save_stats['new']+=len(inserted);self.last_save_stats['updated']+=len(updates)
+        if not set(unique)<=saved:raise AppError('Supabaseから募集情報の保存確認が得られません。')
+        return saved
+    def save_search(self,search):
+        result=self.call('POST',SEARCH_TABLE,{'on_conflict':'namespace,id','select':'id'},
+                         [dict(search,namespace=self.namespace)],'resolution=merge-duplicates,return=representation')
+        if not isinstance(result,list) or not any(x.get('id')==search['id'] for x in result if isinstance(x,dict)):
+            raise AppError('検索履歴の保存を確認できません。')
+    def save_acquisition_ids(self,rows):
+        payload=self.acquisition_payload(rows)
+        covered=getattr(self,'covered_acquisitions',{})
+        payload=[r for r in payload if covered.get(r['conditions']['property_id'])!=(r['finished_at'],r['summary']['listing_key'])]
         if not payload:return
         result=self.call('POST',SEARCH_TABLE,{'on_conflict':'namespace,id','select':'id'},payload,'resolution=merge-duplicates,return=representation')
         returned={r.get('id') for r in result if isinstance(r,dict)} if isinstance(result,list) else set()
         if not {r['id'] for r in payload}<=returned:raise AppError('物件IDの取得済み管理情報を保存できません。')
 
     def load_recent_acquisition_ids(self):
-        out={};offset=0;cutoff=acquisition_cutoff().isoformat(timespec='seconds')
+        cached=getattr(self,'acquisition_cache',None)
+        if cached is not None and time.monotonic()-getattr(self,'acquisition_cache_at',0)<900:return cached
+        out={};offset=0;cutoff=acquisition_cutoff().isoformat(timespec='seconds');ledgers=[]
         while True:
             rows=self.call('GET',SEARCH_TABLE,{'namespace':'eq.'+self.namespace,'status':'eq.rental_acquisition',
-                           'finished_at':'gte.'+cutoff,'select':'conditions,summary','order':'id.asc','limit':500,'offset':offset})
+                'finished_at':'gte.'+cutoff,'select':'conditions,summary','order':'id.asc','limit':500,'offset':offset})
             if not isinstance(rows,list):raise AppError('過去3か月の取得済み物件IDを確認できません。')
-            for row in rows:
-                property_id=(row.get('conditions') or {}).get('property_id')
-                stamp=(row.get('summary') or {}).get('last_success_at')
-                if property_id and recent_acquisition(stamp):out[property_id]=stamp
+            ledgers.extend(rows)
             if len(rows)<500:break
             offset+=len(rows)
+        # Old acquisition records link to compact records without IDs. Preserve that
+        # confirmed observation per ID, using the ledger's own success timestamp.
+        stored=self.load_units();by_key={hashlib.sha256(json.dumps({k:r[k] for k in ('rent','layout','address')},ensure_ascii=False,sort_keys=True,separators=(',',':')).encode()).hexdigest():r for r in stored};by_id={r['property_id']:r for r in stored if r.get('property_id')}
+        by_key.update({compact_listing_key(r):r for r in stored})
+        migration=[]
+        for row in ledgers:
+            property_id=(row.get('conditions') or {}).get('property_id');meta=row.get('summary') or {};stamp=meta.get('last_success_at')
+            if not property_id or not recent_acquisition(stamp):continue
+            current=by_id.get(property_id)
+            if not current:
+                previous=by_key.get(meta.get('listing_key'))
+                if previous:
+                    current=dict(previous,property_id=property_id,fetched_at=stamp);migration.append(current);by_id[property_id]=current
+            if current:out[property_id]=stamp
+        if migration:self.save_units(migration)
+        self.acquisition_cache=out;self.acquisition_cache_at=time.monotonic()
         return out
 
     def load_units(self,bounds=None,layouts=None):
         out=[];offset=0
         self.last_load_diagnostic={'time':utc_now(),'bounds':list(bounds) if bounds else None,'layouts':list(layouts) if layouts is not None else None,
-                                   'pages':[],'excluded':{'invalid':0,'layout':0,'legacy_schema':0},'raw_records':0,'storage_schema':5,'geocode_on_load':True}
+                                   'pages':[],'excluded':{'invalid':0,'layout':0,'legacy_schema':0},'raw_records':0,'storage_schema':6,'geocode_on_load':True}
         while True:
             rows=self.call('GET',SEARCH_TABLE,{'namespace':'eq.'+self.namespace,'select':'summary,conditions','status':'eq.rental_listing','order':'id.asc','limit':500,'offset':offset})
             if not isinstance(rows,list):raise AppError('保存した募集情報を読み取れません。')
@@ -643,16 +688,19 @@ class Database:
             if not rows:break
             for item in rows:
                 meta=item.get('conditions') or {}
-                if int(meta.get('schema') or 0) not in (4,5):
+                if int(meta.get('schema') or 0) not in (4,5,6):
                     self.last_load_diagnostic['excluded']['legacy_schema']+=1;continue
                 raw=(item.get('summary') or {}).get('listing')
                 compact=compact_saved_listing(raw if isinstance(raw,dict) else {})
                 if not compact:self.last_load_diagnostic['excluded']['invalid']+=1;continue
                 if layouts is not None and compact['layout'] not in layouts:self.last_load_diagnostic['excluded']['layout']+=1;continue
                 key=compact_listing_key(compact)
-                out.append({'key':key,'title':compact['address'],'rent':compact['rent'],'layout':compact['layout'],'address':compact['address'],
+                out.append({**compact,'key':key,'title':compact['address'],'rent':compact['rent'],'layout':compact['layout'],'address':compact['address'],
                             'fetched_at':compact.get('fetched_at'),'fees':0,'loaded_from_compact_storage':True})
             offset+=len(rows)
+        # Do not count legacy copies again when an ID record covers that observation.
+        represented={hashlib.sha256(json.dumps({k:r[k] for k in ('rent','layout','address')},ensure_ascii=False,sort_keys=True,separators=(',',':')).encode()).hexdigest() for r in out if r.get('property_id')}
+        out=[r for r in out if r.get('property_id') or r['key'] not in represented]
         unique=list({r['key']:r for r in out}.values())
         self.last_load_diagnostic.update(before_key_merge=len(out),key_duplicates=len(out)-len(unique),returned=len(unique))
         return unique
@@ -719,9 +767,9 @@ def response_encoding(response):
 
 class PublicWeb:
     def __init__(self):
-        self.local=threading.local();self.cancel_event=threading.Event();self.cache_lock=threading.RLock();self.http_flights={};self.host_slots={}
+        self.local=threading.local();self.cancel_event=threading.Event();self.cache_lock=threading.RLock();self.http_flights={};self.host_slots={};self.detail_slots=threading.BoundedSemaphore(4);self.jhj_tile_cache={};self.jhj_tile_cached_at={};self.address_result_cache={}
         self.headers={'User-Agent':'SumaiCompassRebuild/1.0 (personal rental research)', 'Accept-Language':'ja'}
-        self.host_gates={};self.host_last_request={};self.route_cooldowns={};self.session_primed=threading.local();self.proxy_routes=[];self.route_preferred={};self.route_lock=threading.Lock();self.http_cache={};self.headers.update({'Accept':'text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8'})
+        self.host_gates={};self.host_last_request={};self.host_backoff={};self.route_cooldowns={};self.session_primed=threading.local();self.proxy_routes=[];self.route_preferred={};self.route_lock=threading.Lock();self.http_cache={};self.headers.update({'Accept':'text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8'})
         self.robots={};self.lock=threading.Lock();self.layout_form_lock=threading.Lock();self.layout_form_cache={};self.provider_cache={};self.provider_lock=threading.RLock();self.unavailable_hosts={};self.failed_detail_urls={}
     def configure(self,config):
         self.proxy_routes=list((config or {}).get('proxies',[]))
@@ -738,8 +786,6 @@ class PublicWeb:
     def route_request(self,session,method,url,options):
         self.check_cancel();host=urlparse(url).hostname
         headers=dict(self.headers);headers.update(options.get('headers',{}));options={k:v for k,v in options.items() if k!='headers'}
-        if host not in RENTAL_HOSTS:
-            return session.request(method,url,headers=headers,timeout=(4,12),allow_redirects=False,**options)
         with self.route_lock:
             gate=self.host_gates.setdefault(host,threading.Lock())
             slots=self.host_slots.setdefault(host,threading.BoundedSemaphore(2))
@@ -747,8 +793,15 @@ class PublicWeb:
         try:
             while not gate.acquire(timeout=.1):self.check_cancel()
             try:
-                delay=max(0.,self.host_last_request.get(host,0.)+1.-time.monotonic())
-                if delay:self.pause(delay)
+                interval=1.;parser=self.robots.get(urlparse(url).scheme+'://'+urlparse(url).netloc)
+                if parser:
+                    crawl=parser.crawl_delay(self.headers['User-Agent']);rate=parser.request_rate(self.headers['User-Agent'])
+                    if crawl:interval=max(interval,float(crawl))
+                    if rate and rate.requests:interval=max(interval,float(rate.seconds)/rate.requests)
+                while True:
+                    delay=max(0.,self.host_last_request.get(host,0.)+interval-time.monotonic(),self.host_backoff.get(host,0.)-time.monotonic())
+                    if delay<=0:break
+                    self.pause(delay)
                 self.check_cancel();self.host_last_request[host]=time.monotonic()
             finally:gate.release()
             # Keep one-second start spacing, but do not serialize the response wait.
@@ -809,6 +862,7 @@ class PublicWeb:
                         except (ValueError,TypeError):
                             try:delay=max(0.,(parsedate_to_datetime(raw)-datetime.now(timezone.utc)).total_seconds())
                             except (ValueError,TypeError,OverflowError):delay=2**attempt
+                        with self.route_lock:self.host_backoff[host]=max(self.host_backoff.get(host,0.),time.monotonic()+delay)
                         if delay>30:
                             with self.route_lock:self.route_cooldowns[(host,index)]=time.monotonic()+delay
                             trace(self,'route_cooldown',{'host':host,'route_number':index+1,'remaining_seconds':round(delay),'reason':'Retry-After'},stage='transport');break
@@ -1013,15 +1067,26 @@ def _property_value(props,exact=(),contains=()):
     return ''
 
 
+def _cache_jhj_features(web,key,features,cached_at=None):
+    with web.cache_lock:
+        cache=web.jhj_tile_cache;times=web.jhj_tile_cached_at
+        if key not in cache and len(cache)>=512:
+            oldest=next(iter(cache));cache.pop(oldest,None);times.pop(oldest,None)
+        cache[key]=features;times[key]=time.monotonic() if cached_at is None else cached_at
+
+
 def _jhj_tile(web,x,y,z=18):
     """Fetch GSI residential-address points once per tile. Images are never persisted."""
     cache=getattr(web,'jhj_tile_cache',None)
     if cache is None:cache={};web.jhj_tile_cache=cache
     key=(z,x,y)
-    if key in cache:return cache[key]
+    with web.cache_lock:
+        at=getattr(web,'jhj_tile_cached_at',{}).get(key,0)
+        if key in cache and time.monotonic()-at<(3600 if not cache[key] else 86400):return cache[key]
+        cache.pop(key,None)
     with GEO_HTTP_LOCK:empty_at=GEO_EMPTY_ADDRESS_TILES.get(key)
     if empty_at is not None and time.monotonic()-empty_at<3600:
-        cache[key]=[];trace(web,'address_tile_empty',{'tile':list(key),'source':'cached_NoSuchKey_404'},stage='address.tiles');return []
+        _cache_jhj_features(web,key,[],empty_at);trace(web,'address_tile_empty',{'tile':list(key),'source':'cached_NoSuchKey_404'},stage='address.tiles');return []
     url=f'https://cyberjapandata.gsi.go.jp/xyz/experimental_jhj/{z}/{x}/{y}.geojson'
     try:
         data=web.fetch(url).json()
@@ -1030,7 +1095,7 @@ def _jhj_tile(web,x,y,z=18):
     except (AppError,ValueError,TypeError) as exc:
         diagnostic=getattr(exc,'diagnostic',{})
         if diagnostic.get('status')==404 and diagnostic.get('server_error_code')=='NoSuchKey':
-            cache[key]=[]
+            _cache_jhj_features(web,key,[])
             with GEO_HTTP_LOCK:
                 if len(GEO_EMPTY_ADDRESS_TILES)>12000:GEO_EMPTY_ADDRESS_TILES.clear()
                 GEO_EMPTY_ADDRESS_TILES[key]=time.monotonic()
@@ -1038,11 +1103,27 @@ def _jhj_tile(web,x,y,z=18):
             return []
         trace(web,'address_tile_failed',{'url':url,'exception_type':type(exc).__name__,'reason':str(exc),'diagnostic':getattr(exc,'diagnostic',{})},'WARNING','address.tiles')
         raise
-    cache[key]=features
+    _cache_jhj_features(web,key,features)
     return features
 
 
 def map_point_to_residential_address(web,point,munis,max_distance_m=90):
+    key=(tuple(map(float,point)),max_distance_m,id(munis))
+    with web.cache_lock:
+        cached=web.address_result_cache.get(key)
+    if cached and time.monotonic()-cached[0]<86400:
+        trace(web,'address_cached',{'point':list(point),'address':cached[1]['address']},stage='location')
+        return dict(cached[1])
+    result=_map_point_to_residential_address(web,point,munis,max_distance_m)
+    if result:
+        with web.cache_lock:
+            cache=web.address_result_cache
+            if len(cache)>=12000:cache.pop(next(iter(cache)))
+            cache[key]=(time.monotonic(),dict(result))
+    return result
+
+
+def _map_point_to_residential_address(web,point,munis,max_distance_m=90):
     """Map pin -> nearest GSI residential-address frontage point.
 
     This is deliberately coordinate-first. It never receives or uses a listing-page
@@ -1064,7 +1145,11 @@ def map_point_to_residential_address(web,point,munis,max_distance_m=90):
             gx=max(tx-fx,0.,fx-(tx+1));gy=max(ty-fy,0.,fy-(ty+1))
             if math.hypot(gx,gy)*tile_m<=max_distance_m+2:tiles.append((tx,ty))
     def read_tile(tile):return _jhj_tile(web,*tile,18)
-    for tile,features,error in bounded_results(tiles,read_tile,workers=6,stop_event=web.cancel_event):
+    with web.cache_lock:
+        tile_cache=web.jhj_tile_cache;tile_times=web.jhj_tile_cached_at;now=time.monotonic()
+        cached_tiles=[(t,tile_cache[(18,*t)],None) for t in tiles if (18,*t) in tile_cache and now-tile_times.get((18,*t),0)<(3600 if not tile_cache[(18,*t)] else 86400)]
+    tile_results=cached_tiles if len(cached_tiles)==len(tiles) else bounded_results(tiles,read_tile,workers=2,stop_event=web.cancel_event)
+    for tile,features,error in tile_results:
         if tile is None:continue
         if error:
             tile_errors.append({'tile':list(tile),'error':str(error),'exception_type':type(error).__name__});continue
@@ -2052,7 +2137,7 @@ def suumo_location_from_kankyo_image(web,detail_soup,detail_url,bounds,munis,exp
 
 def suumo_collect(web,region,bounds,munis,emit):
     """SUUMO: map towns -> town page/filter -> detail -> kankyo map -> compact save."""
-    prepared=suumo_prepare_region(web,region);seen_urls=set()
+    prepared=suumo_prepare_region(web,region);seen_urls=set();seen_ids=set()
     # The town search returns every chome. Save the full town, including off-screen properties.
     collection_towns=[town_base_name(region.get('town',''))]
     for group_number,layouts in enumerate(SUUMO_LAYOUT_GROUPS,1):
@@ -2088,6 +2173,13 @@ def suumo_collect(web,region,bounds,munis,emit):
                     seen_urls.add(url)
                     group_candidates+=1
                     property_id=suumo_property_id(url)
+                    if property_id and property_id in seen_ids:continue
+                    if property_id:seen_ids.add(property_id)
+                    with web.cache_lock:
+                        claimed=getattr(web,'claimed_ids',None)
+                        if claimed is None:claimed=set();web.claimed_ids=claimed
+                        if property_id and property_id in claimed:continue
+                        if property_id:claimed.add(property_id)
                     obtained=getattr(web,'acquired_ids',{}).get(property_id)
                     if obtained and recent_acquisition(obtained):
                         begin_listing(web,'SUUMO',url)
@@ -2096,7 +2188,14 @@ def suumo_collect(web,region,bounds,munis,emit):
                     page_candidates.append(url)
             emit('candidate',len(page_candidates))
 
-            for index,url in enumerate(page_candidates,1):
+            scope=dict(getattr(DIAG_CONTEXT,'scope',{}))
+            def detail_work(item):
+                while not web.detail_slots.acquire(timeout=.1):web.check_cancel()
+                try:return detail_work_unbounded(item)
+                finally:web.detail_slots.release()
+            def detail_work_unbounded(item):
+                web.check_cancel()
+                index,url=item;DIAG_CONTEXT.audit=getattr(web,'audit',None);DIAG_CONTEXT.scope=dict(scope)
                 emit('message',f'条件{group_number} 詳細を見る {index}/{len(page_candidates)}件');emit('detail',1)
                 try:
                     begin_listing(web,'SUUMO',url)
@@ -2106,31 +2205,34 @@ def suumo_collect(web,region,bounds,munis,emit):
                     # Only rent/layout/building type/age are read here; address comes from the property map below.
                     layout=parsed_layout(fields['raw_layout'],rough=False)
                     if parsed_layout(fields['raw_layout']) not in layouts:
-                        reject_listing(web,'SUUMO',url,'detail.layout','condition' if layout else 'missing_data','間取りが検索条件外、または読み取れない',{'raw':fields['raw_layout'],'parsed':layout},list(layouts));emit('rejected',1);trace(web,'layout',{'url':url,'observed':fields['raw_layout'],'parsed':layout,'requested_group':list(layouts),'reason':'detail_layout_not_in_group'},'WARNING');continue
+                        reject_listing(web,'SUUMO',url,'detail.layout','condition' if layout else 'missing_data','間取りが検索条件外、または読み取れない',{'raw':fields['raw_layout'],'parsed':layout},list(layouts));emit('rejected',1);trace(web,'layout',{'url':url,'observed':fields['raw_layout'],'parsed':layout,'requested_group':list(layouts),'reason':'detail_layout_not_in_group'},'WARNING');return
                     if 'マンション' not in fields['building_type']:
-                        reject_listing(web,'SUUMO',url,'detail.building_type','condition' if fields['building_type'] else 'missing_data','建物種別がマンションと確認できない',fields['building_type'],'マンション');emit('rejected',1);trace(web,'structure',{'url':url,'building_type':fields['building_type'],'reason':'not_mansion'},'WARNING');continue
+                        reject_listing(web,'SUUMO',url,'detail.building_type','condition' if fields['building_type'] else 'missing_data','建物種別がマンションと確認できない',fields['building_type'],'マンション');emit('rejected',1);trace(web,'structure',{'url':url,'building_type':fields['building_type'],'reason':'not_mansion'},'WARNING');return
                     age,ym=age_info(fields['raw_age'])
                     if age is None or age>15:
-                        reject_listing(web,'SUUMO',url,'detail.age','missing_data' if age is None else 'condition','築年数が15年以内と確認できない',{'raw':fields['raw_age'],'years':age},'15年以内');emit('rejected',1);trace(web,'age',{'url':url,'raw_age':fields['raw_age'],'age':age,'reason':'detail_age_not_confirmed_within_15'},'WARNING');continue
+                        reject_listing(web,'SUUMO',url,'detail.age','missing_data' if age is None else 'condition','築年数が15年以内と確認できない',{'raw':fields['raw_age'],'years':age},'15年以内');emit('rejected',1);trace(web,'age',{'url':url,'raw_age':fields['raw_age'],'age':age,'reason':'detail_age_not_confirmed_within_15'},'WARNING');return
                     rent=optional_amount(fields['raw_rent'])
                     if not rent:
-                        reject_listing(web,'SUUMO',url,'detail.rent','missing_data','家賃を読み取れない',{'raw':fields['raw_rent'],'parsed':rent},'家賃（円）>0');emit('rejected',1);trace(web,'parse',{'url':url,'missing':'detail_rent','visible_head':fields['visible'][:400]},'WARNING');continue
+                        reject_listing(web,'SUUMO',url,'detail.rent','missing_data','家賃を読み取れない',{'raw':fields['raw_rent'],'parsed':rent},'家賃（円）>0');emit('rejected',1);trace(web,'parse',{'url':url,'missing':'detail_rent','visible_head':fields['visible'][:400]},'WARNING');return
 
                     try:location=suumo_location_from_kankyo_image(web,detail,url,bounds,munis,collection_towns)
                     except AppError as exc:
                         location=None;trace(web,'location_pending',{'url':url,'message':str(exc),'source':'SUUMO地図・周辺環境の物件マーカー'},'WARNING','location')
                     address=location.get('inferred_address','') if location else ''
                     if not address:
-                        reject_listing(web,'SUUMO',url,'map.address_inference','location_failure','物件位置から詳細住所を推定できない',location,'同一町丁目の90m以内に番地を持つ住所候補');emit('rejected',1);trace(web,'location_pending',{'url':url,'reason':'物件地図から詳細住所を推定できないため保存しない','source':'SUUMO地図・周辺環境の物件マーカー'},'WARNING','location');continue
+                        reject_listing(web,'SUUMO',url,'map.address_inference','location_failure','物件位置から詳細住所を推定できない',location,'同一町丁目の90m以内に番地を持つ住所候補');emit('rejected',1);trace(web,'location_pending',{'url':url,'reason':'物件地図から詳細住所を推定できないため保存しない','source':'SUUMO地図・周辺環境の物件マーカー'},'WARNING','location');return
 
                     # Rent, layout, inferred address and acquisition time survive Database.save_units().
                     row=partial_listing('SUUMO',url,'SUUMO掲載募集',address,layout,rent,None,None,region,bounds,location,None,age,ym,'')
-                    if not row:reject_listing(web,'SUUMO',url,'listing.validation','invalid_data','保存必須項目の検証を通らない',{'rent':rent,'layout':layout,'address':address,'location':location},'有効な家賃・間取り・詳細住所・物件URL');emit('rejected',1);continue
+                    if not row:reject_listing(web,'SUUMO',url,'listing.validation','invalid_data','保存必須項目の検証を通らない',{'rent':rent,'layout':layout,'address':address,'location':location},'有効な家賃・間取り・詳細住所・物件URL');emit('rejected',1);return
                     row['property_id']=suumo_property_id(url)
                     row['address_source']=location['location_method']
                     emit('unit',row)
                 except (AppError,ValueError,TypeError) as exc:
                     trace(web,'listing_failed',{'provider':'SUUMO','url':url,'decision':'failed','failed_stage':'detail.request_or_parse','category':'acquisition_failure','reason':str(exc),'exception_type':type(exc).__name__,'observed':getattr(exc,'diagnostic',{}),'expected':'物件詳細と必要項目を取得','evidence':list(getattr(web.local,'listing_evidence',[]))},'ERROR','rejection');emit('issue','SUUMO詳細確認｜'+str(exc));trace(web,'detail_optional_error',{'url':url,'message':str(exc)},'WARNING','collector')
+
+            for _,_,error in bounded_results(list(enumerate(page_candidates,1)),detail_work,workers=4,stop_event=web.cancel_event):
+                if error:raise error
 
             next_url=_suumo_next_url(soup,reply.url,filter_params)
             trace(web,'page_end',{'provider':'SUUMO','group':list(layouts),'page':page_number,'buildings':len(buildings),'new_candidates':len(page_candidates),'next_url':next_url or ''},stage='pagination')
@@ -2551,14 +2653,16 @@ def search_all(db,conditions,screen,state=None):
     DIAG_CONTEXT.audit=audit;DIAG_CONTEXT.scope={}
     search=dict(id=audit.search_id,status='started',
                 started_at=utc_now(),finished_at=None,conditions=conditions,summary={})
-    units={};saved=set();issues=[];logs=[];acquisition_pending={}
+    units={};saved=set();issues=[];logs=[];acquisition_pending={};q=None
     def log(message):
         audit.add('progress',diagnosis_code(message) if 'エラー' in message or '失敗' in message else 'progress','INFO',{'message':message})
         logs.append(f"{datetime.now().strftime('%H:%M:%S')}  {message}")
         screen['log'].code('\n'.join(logs[-15:]),language=None)
     screen['status'].info('検索実行中｜保存先の接続・新しいテーブルを確認しています')
-    db.check();db.save_search(search);log('保存先確認OK。新しい検索を開始しました。')
-    web=PublicWeb();web.audit=audit
+    if not getattr(db,'collection_checked',False):db.check();db.collection_checked=True
+    db.save_search(search);log('保存先確認OK。新しい検索を開始しました。')
+    web=getattr(state,'shared_web',None) or PublicWeb();web.audit=audit
+    web.http_cache.clear();web.failed_detail_urls.clear();web.unavailable_hosts.clear();web.claimed_ids=set()
     if hasattr(state,'request_starts'):web.host_last_request=state.request_starts
     if hasattr(state,'cancel_event'):web.cancel_event=state.cancel_event
     if hasattr(web,'configure'):web.configure(getattr(db,'web_config',{}))
@@ -2625,7 +2729,8 @@ def search_all(db,conditions,screen,state=None):
             conditions['auto_total_tasks']=len(jobs);conditions['auto_task_index']=index
             conditions['auto_task_label']=jobs[index][0]['label']+'｜'+jobs[index][1]
             jobs=[jobs[index]]
-        q=queue.Queue();active={};done=0;candidate=detail=rejected=skipped=incomplete=0
+        db.job_new_keys=set()
+        q=queue.Queue();active={};done=0;candidate=detail=rejected=skipped=incomplete=0;save_buffer={};last_flush=time.monotonic()
         def work(index,region,provider):
             if web.cancel_event.is_set():return
             DIAG_CONTEXT.audit=audit;DIAG_CONTEXT.scope={'task':index,'region':region['label'],'town':region['town'],'municipality_code':region['code'],'provider':provider}
@@ -2651,7 +2756,7 @@ def search_all(db,conditions,screen,state=None):
                     pending[pool.submit(work,next_job,*jobs[next_job])]=next_job;next_job+=1
             fill_jobs()
             completed=set()
-            while pending or not q.empty():
+            while pending or not q.empty() or save_buffer:
                 ready,_=futures.wait(pending,timeout=.35,return_when=futures.FIRST_COMPLETED) if pending else (set(),set())
                 if web.cancel_event.is_set():
                     for f in pending:f.cancel()
@@ -2670,9 +2775,14 @@ def search_all(db,conditions,screen,state=None):
                     elif kind=='issue':
                         issues.append(label+'｜'+str(value));log(issues[-1])
                     elif kind=='unit':
-                        units[value['key']]=merge_listing(units.get(value['key']),value)
-                        batch.append(units[value['key']])
+                        identity=compact_listing_key(value) or value['key'];value=dict(value,key=identity)
+                        units[identity]=merge_listing(units.get(identity),value)
+                        batch.append(units[identity])
+                for row in batch:
+                    key=compact_listing_key(row);save_buffer[key]=newest_observation(save_buffer.get(key),row)
+                batch=list(save_buffer.values()) if save_buffer and (len(save_buffer)>=50 or time.monotonic()-last_flush>=2 or web.cancel_event.is_set() or (len(ready)==len(pending) and next_job==len(jobs))) else []
                 if batch:
+                    save_buffer.clear();last_flush=time.monotonic()
                     state.new_units=list(units.values())
                     screen['status'].info(f'検索実行中｜確認した{len(batch)}件をSupabaseへ保存しています')
                     try:
@@ -2684,7 +2794,7 @@ def search_all(db,conditions,screen,state=None):
                             for row in chunk:acquisition_pending.pop(row.get('property_id'),None)
                             for row in chunk:
                                 if row.get('property_id'):web.acquired_ids[row['property_id']]=row['fetched_at']
-                    except AppError as exc: issues.append(str(exc));log('保存エラー｜'+str(exc))
+                    except Exception as exc: issues.append(str(exc) if isinstance(exc,AppError) else type(exc).__name__);log('保存エラー｜'+(str(exc) if isinstance(exc,AppError) else type(exc).__name__))
                     # Browser session holds unconfirmed rows separately; no claim of persistence.
                     state.new_units=list(units.values())
                     state.new_saved_keys=list(saved)
@@ -2699,34 +2809,42 @@ def search_all(db,conditions,screen,state=None):
                 screen['status'].info(f'検索実行中｜{done}/{len(jobs)}タスク完了｜候補 {candidate}｜詳細 {detail}｜除外 {rejected}｜取得済みスキップ {skipped}｜保存確認 {len(saved)}件｜経過 {int(time.monotonic()-started)}秒\n\n'+'\n\n'.join(active.values()))
         search['status']='cancelled' if web.cancel_event.is_set() else 'partial' if issues else 'completed'
         search['summary']={'confirmed':len(units),'saved':len(saved),'candidate':candidate,'detail':detail,'rejected':rejected,'already_acquired':skipped,'incomplete_tasks':incomplete,
-                           'retained_with_missing_fields':sum(bool(r.get('missing_fields')) for r in units.values()),'price_unknown':sum(not r.get('rent') for r in units.values()),'issues':issues[-100:],'elapsed':int(time.monotonic()-started),'tasks':len(jobs)}
+                           'retained_with_missing_fields':sum(bool(r.get('missing_fields')) for r in units.values()),'price_unknown':sum(not r.get('rent') for r in units.values()),'issues':issues[-100:],'elapsed':round(time.monotonic()-started,3),'tasks':len(jobs)}
     except SearchCancelled:
         search['status']='cancelled'
-        search['summary']={'confirmed':len(units),'saved':len(saved),'issues':issues,'elapsed':int(time.monotonic()-started)}
+        search['summary']={'confirmed':len(units),'saved':len(saved),'issues':issues,'elapsed':round(time.monotonic()-started,3)}
     except Exception as exc:
         search['status']='failed';issues.append(str(exc) if isinstance(exc,AppError) else f'検索エラー（{type(exc).__name__}）')
-        search['summary']={'confirmed':len(units),'saved':len(saved),'issues':issues,'elapsed':int(time.monotonic()-started)}
+        search['summary']={'confirmed':len(units),'saved':len(saved),'issues':issues,'elapsed':round(time.monotonic()-started,3)}
+    # On a consumer exception the executor has joined its workers. Preserve all
+    # accepted rows still in the queue before final persistence, including stop.
+    if q is not None:
+        while True:
+            try:_,kind,value=q.get_nowait()
+            except queue.Empty:break
+            if kind=='unit':
+                identity=compact_listing_key(value) or value['key'];value=dict(value,key=identity)
+                units[identity]=merge_listing(units.get(identity),value)
     # Workers have finished and the event queue is drained before this final save.
     # Cancellation only stops acquisition; database writes remain enabled.
-    if web.cancel_event.is_set():
-        remaining=[r for r in units.values() if compact_listing_key(r) not in saved]
-        if remaining or acquisition_pending:
-            screen['status'].info('中止処理中｜取得済みデータの保存を確認しています')
-        for offset in range(0,len(remaining),100):
-            chunk=remaining[offset:offset+100]
-            try:
-                saved.update(db.save_units(chunk));state.new_last_saved_at=utc_now()
-                for row in chunk:
-                    if row.get('property_id'):acquisition_pending[row['property_id']]=row
-            except Exception as exc:
-                audit.add('database','stop_save_failed','ERROR',{'stage':'stop.final_save','exception_type':type(exc).__name__,'rows':len(chunk)})
-                issues.append('中止時の物件保存失敗：'+(str(exc) if isinstance(exc,AppError) else type(exc).__name__))
-        if acquisition_pending:
-            try:
-                db.save_acquisition_ids(list(acquisition_pending.values()));acquisition_pending.clear()
-            except Exception as exc:issues.append('中止時の取得済みID保存失敗：'+(str(exc) if isinstance(exc,AppError) else type(exc).__name__))
+    remaining=[r for r in units.values() if compact_listing_key(r) not in saved]
+    if remaining or acquisition_pending:
+        screen['status'].info('最終保存中｜取得済みデータの保存を確認しています')
+    for offset in range(0,len(remaining),100):
+        chunk=remaining[offset:offset+100]
+        try:
+            saved.update(db.save_units(chunk));state.new_last_saved_at=utc_now()
+            for row in chunk:
+                if row.get('property_id'):acquisition_pending[row['property_id']]=row
+        except Exception as exc:
+            audit.add('database','stop_save_failed','ERROR',{'stage':'stop.final_save' if web.cancel_event.is_set() else 'search.final_save','exception_type':type(exc).__name__,'rows':len(chunk)})
+            issues.append('最終保存での物件保存失敗：'+(str(exc) if isinstance(exc,AppError) else type(exc).__name__))
+    if acquisition_pending:
+        try:
+            db.save_acquisition_ids(list(acquisition_pending.values()));acquisition_pending.clear()
+        except Exception as exc:issues.append('最終保存での取得済みID保存失敗：'+(str(exc) if isinstance(exc,AppError) else type(exc).__name__))
     unsaved=sum(compact_listing_key(r) not in saved for r in units.values())
-    search['summary'].update(last_saved_at=getattr(state,'new_last_saved_at',None),saved=len(saved),unsaved=unsaved,acquisition_ids_pending=len(acquisition_pending),issues=issues[-100:])
+    search['summary'].update(confirmed=len(units),elapsed=round(time.monotonic()-started,3),new_saved=len(saved & getattr(db,'job_new_keys',set())),updated_saved=len(saved-getattr(db,'job_new_keys',set())),processed=search['summary'].get('detail',0)+search['summary'].get('already_acquired',0),last_saved_at=getattr(state,'new_last_saved_at',None),saved=len(saved),unsaved=unsaved,acquisition_ids_pending=len(acquisition_pending),issues=issues[-100:])
     if unsaved:
         audit.add('database','unsaved_listings','ERROR',{'stage':'stop.final_save' if web.cancel_event.is_set() else 'search.final_save','unsaved':unsaved,'retained_in_server_memory':True})
     audit.add('map','data_ready','INFO',{'confirmed_units':len(units),'colored_points':sum(has_point(r) for r in units.values()),'render_deferred_until_saved_data_load':False})
@@ -2739,7 +2857,6 @@ def search_all(db,conditions,screen,state=None):
     except AppError as exc:
         issues.append('検索履歴｜'+str(exc));search['summary']['issues']=issues
         if search['status']!='cancelled':search['status']='partial'
-    audit.persist(db,force=True)
     screen['bar'].progress(1.,text='検索処理が終了しました')
     state.new_units=list(units.values())
     state.new_search=search
@@ -3135,7 +3252,7 @@ def fetch_facilities(center,kind):
 
 
 def csv_bytes(rows):
-    keys=['rent','layout','address','fetched_at'];file=io.StringIO();writer=csv.DictWriter(file,fieldnames=keys);writer.writeheader()
+    keys=['property_id','rent','layout','address','fetched_at'];file=io.StringIO();writer=csv.DictWriter(file,fieldnames=keys);writer.writeheader()
     for row in rows:
         compact=compact_saved_listing(row)
         if compact:writer.writerow(compact)
@@ -3146,7 +3263,7 @@ def read_csv(content):
     try:
         rows=[]
         for raw in csv.DictReader(io.StringIO(content.decode('utf-8-sig'))):
-            row={'rent':int(raw['rent']),'layout':normal(raw['layout']),'address':normal(raw['address']),'fetched_at':normal(raw.get('fetched_at')) or None}
+            row={'property_id':normal(raw.get('property_id')) or None,'rent':int(raw['rent']),'layout':normal(raw['layout']),'address':normal(raw['address']),'fetched_at':normal(raw.get('fetched_at')) or None}
             compact=compact_saved_listing(row)
             if not compact:raise ValueError()
             key=compact_listing_key(compact);rows.append({'key':key,'title':compact['address'],**compact,'fetched_at':compact.get('fetched_at'),'fees':0,'loaded_from_compact_storage':True})
@@ -3182,7 +3299,8 @@ def hydrate_saved_units(rows,bounds,cache=None):
     hydrated=[]
     for row in rows:
         point=cache.get(row.get('address'))
-        if not point:continue
+        if not point:
+            hydrated.append(dict(row,coordinate_precision='unknown',location_method='保存住所の地図配置を確認できない'));continue
         lat,lng,title=point
         # Keep off-screen saved records in memory so panning can reveal their points.
         item=dict(row,latitude=lat,longitude=lng,coordinate_precision='address',location_method='保存済み地図由来住所を読み込み時に住所検索',map_address=title,address_match='保存住所から再配置')
@@ -3487,7 +3605,7 @@ class AutomaticCollection:
         validate_automatic_settings(settings);validate_automatic_summary(summary or {})
         self.db=db;self.settings=dict(settings);self.settings['interval_minutes']=0;self.summary=dict(summary or {});self.summary.pop('next_run_at',None)
         self.lock=threading.RLock();self.io_lock=threading.Lock();self.stop_event=threading.Event()
-        self.request_starts={};self.last_job=None;self.current=None;self.message='自動収集を準備しています';self.progress=0.;self.error=''
+        self.request_starts={};self.shared_web=PublicWeb();self.last_job=None;self.current=None;self.message='自動収集を準備しています';self.progress=0.;self.error=''
         self.thread=threading.Thread(target=self.run,daemon=True,name='housing-automatic-collection')
     def persist(self):
         with self.io_lock:
@@ -3522,7 +3640,7 @@ class AutomaticCollection:
                         if self.settings.get(key):conditions[key]=self.settings[key]
                     self.summary['last_started_at']=utc_now();self.summary['current_status']='running'
                     job=SearchJob(self.db,conditions)
-                    if hasattr(job,'state'):job.state.request_starts=self.request_starts
+                    if hasattr(job,'state'):job.state.request_starts=self.request_starts;job.state.shared_web=self.shared_web
                     self.current=job
                 self.persist()
                 # Run synchronously on this daemon. The normal search persists each acquired batch.
@@ -3533,6 +3651,11 @@ class AutomaticCollection:
                     self.summary['current_status']='stopped';self.summary['last_task']=conditions.get('auto_task_label','地域判定')
                     self.summary['last_summary']=result.get('summary',{})
                     self.summary['saved_observations']=int(self.summary.get('saved_observations',0))+len(snap['saved'])
+                    stats=result.get('summary',{})
+                    for name,source in (('new_saved_observations','new_saved'),('updated_saved_observations','updated_saved'),('failed_save_observations','unsaved'),('processed_observations','processed'),('detail_observations','detail'),('skipped_observations','already_acquired'),('rejected_observations','rejected')):
+                        self.summary[name]=int(self.summary.get(name,0))+int(stats.get(source,0))
+                    self.summary['statistics_started_at']=self.summary.get('statistics_started_at') or self.summary['last_started_at']
+                    self.summary['collection_seconds']=float(self.summary.get('collection_seconds',0))+float(stats.get('elapsed',0))
                     self.summary['confirmed_observations']=int(self.summary.get('confirmed_observations',0))+len(snap['units'])
                     if status in ('completed','partial') and not incomplete:
                         total=max(1,int(conditions.get('auto_total_tasks',1)))
@@ -3658,6 +3781,10 @@ def automatic_collection_panel():
         summary=snap['summary'];st.write(snap['message']);st.progress(min(1.,max(0.,snap['progress'])))
         st.caption('対象区：'+TOKYO_WARDS[snap['settings']['ward_code']]+'｜町名指定：'+str(len(snap['settings'].get('town_codes',[])))+'町（0なら区全体）')
         st.caption(f"完了した収集 {summary.get('completed_runs',0)}回｜延べ保存確認 {summary.get('saved_observations',0)}件｜次の町 {int(summary.get('next_task_index',0))+1}/{summary.get('total_tasks','未判定')}")
+        if summary.get('statistics_started_at'):
+            seconds=max(1,float(summary.get('collection_seconds',0)));processed=int(summary.get('processed_observations',0));rate=processed*3600/seconds
+            st.caption(f"v58集計：新規保存 {summary.get('new_saved_observations',0)}件｜更新 {summary.get('updated_saved_observations',0)}件｜未保存 {summary.get('failed_save_observations',0)}件｜詳細確認 {summary.get('detail_observations',0)}件｜取得済みスキップ {summary.get('skipped_observations',0)}件｜除外 {summary.get('rejected_observations',0)}件")
+            st.caption(f"集計開始 {acquisition_time_jst(summary['statistics_started_at'])}｜処理速度 {rate:.0f}件/時（取得済みスキップを含む）｜8時間換算 {rate*8:.0f}件・達成保証ではありません")
         st.caption('最終終了：'+acquisition_time_jst(summary.get('last_finished_at')))
         st.caption('前回の取得済みIDスキップ：'+str(summary.get('last_summary',{}).get('already_acquired',0))+'件')
         if summary.get('last_task'):st.caption('前回の町：'+summary['last_task']+'｜結果：'+str(summary.get('last_status','')))
@@ -3783,7 +3910,7 @@ def main():
                 st.markdown(listing_card(chosen,chosen['key'] in state.new_saved_keys),unsafe_allow_html=True)
         if rows:
             with st.expander('取得できた情報をすべて表で見る（未確認も保持）'):
-                st.dataframe([{'家賃（万円）':float(r['rent'])/10000 if r.get('rent') else None,'間取り':r.get('layout'),'住所（推定）':r.get('address'),'データ取得日時':acquisition_time_jst(r.get('fetched_at'))} for r in physical_units(rows)],hide_index=True)
+                st.dataframe([{'物件ID':r.get('property_id','未記録'),'家賃（万円）':float(r['rent'])/10000 if r.get('rent') else None,'間取り':r.get('layout'),'住所（推定）':r.get('address'),'データ取得日時':acquisition_time_jst(r.get('fetched_at'))} for r in physical_units(rows)],hide_index=True)
     with tabs[1]:
         automatic_collection_panel()
         st.subheader('Supabaseに保存した物件')
@@ -3794,10 +3921,10 @@ def main():
                     db=Database();stored=db.load_units(None)
                     rows,cache=hydrate_saved_units(stored,bounds,state.get('address_point_cache'))
                     state.address_point_cache=cache
-                    diag=getattr(db,'last_load_diagnostic',{'returned':len(stored),'bounds':bounds,'time':utc_now()});diag['geocoded_total']=len(rows);diag['in_bounds_after_address_geocode']=sum(listing_in_bounds(r,bounds) for r in rows);state.new_load_diagnostic=diag
+                    diag=getattr(db,'last_load_diagnostic',{'returned':len(stored),'bounds':bounds,'time':utc_now()});diag['geocoded_total']=sum(has_point(r) for r in rows);diag['in_bounds_after_address_geocode']=sum(listing_in_bounds(r,bounds) for r in rows);state.new_load_diagnostic=diag
                 state.new_units=rows;state.new_saved_keys=[r['key'] for r in rows];state.new_search=None;state.new_map_loaded=True
                 state.pop('new_job_token',None)
-                state.new_notice=f'{len(rows)}件を読み込みました。範囲外の物件も地図を動かすと表示できます。座標はデータベースへ保存していません。';st.rerun()
+                state.new_notice=f'{len(rows)}件を読み込みました。地図配置 {sum(has_point(r) for r in rows)}件・配置未確認 {sum(not has_point(r) for r in rows)}件。配置未確認のデータも一覧・CSVに保持しています。';st.rerun()
             except AppError as exc: st.error(str(exc))
         if state.get('new_notice'): st.success(state.new_notice)
         st.caption('DBには家賃・間取り・詳細住所（推定）・データ取得日時を保存します。読み込み時に住所を一時的に座標化して地図へ色付けし、その座標は保存しません。')
