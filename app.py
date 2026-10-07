@@ -38,7 +38,7 @@ import streamlit as st
 from streamlit_folium import st_folium
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v56"
+BUILD = "REBUILD-01-v57"
 PROVIDER_OPTIONS = ("スマイティ","HOMES","SUUMO","カナリー","アットホーム","CHINTAI","Comfy","アパマンショップ")
 PROVIDER_CANONICAL = {"HOMES":"HOME’S","HOME’S":"HOME’S","スマイティ":"スマイティ","SUUMO":"SUUMO","カナリー":"カナリー",
                       "アットホーム":"アットホーム","CHINTAI":"CHINTAI","Comfy":"Comfy","アパマンショップ":"アパマンショップ"}
@@ -697,6 +697,7 @@ class Database:
 
 
 GEO_HTTP_CACHE={}
+GEO_EMPTY_ADDRESS_TILES={}
 GEO_HTTP_LOCK=threading.Lock()
 
 
@@ -857,7 +858,11 @@ class PublicWeb:
         except requests.HTTPError as exc:
             message=f'{u.hostname}：HTTP {exc.response.status_code}（公開ページの取得失敗）。'
             if method=='GET' and not kwargs.get('params'):self.failed_detail_urls[url]=message
-            error=AppError(message);error.diagnostic=self.response_info(exc.response);raise error from None
+            error=AppError(message);error.diagnostic={**self.response_info(exc.response),'status':exc.response.status_code}
+            if u.hostname=='cyberjapandata.gsi.go.jp' and u.path.startswith('/xyz/experimental_jhj/') and exc.response.status_code==404:
+                code=re.search(r'<Code>([^<]+)</Code>',exc.response.text[:4096])
+                if code:error.diagnostic['server_error_code']=code.group(1)
+            raise error from None
         except requests.exceptions.ProxyError:
             raise AppError('プロキシ接続失敗。接続先・ポート・認証情報・HTTPS CONNECT対応を確認してください。') from None
         except requests.ConnectionError as exc:
@@ -928,7 +933,8 @@ def audited_public_fetch(self,url,method='GET',**kwargs):
     except Exception as exc:
         details.update(elapsed_ms=round((time.monotonic()-started)*1000),exception_type=type(exc).__name__,technical_exception=getattr(exc,'diagnostic',{}),message=str(exc) if isinstance(exc,AppError) else '応答処理失敗')
         match=re.search(r'HTTP (\d{3})',details['message']);details['status']=int(match[1]) if match else None
-        trace(self,diagnosis_code(details['message']),details,'ERROR','http');raise
+        empty_tile=(urlparse(url).hostname=='cyberjapandata.gsi.go.jp' and urlparse(url).path.startswith('/xyz/experimental_jhj/') and details['technical_exception'].get('status')==404 and details['technical_exception'].get('server_error_code')=='NoSuchKey')
+        trace(self,'address_tile_empty_response' if empty_tile else diagnosis_code(details['message']),details,'INFO' if empty_tile else 'ERROR','http');raise
 PublicWeb.fetch=audited_public_fetch
 
 _original_db_call=Database.call
@@ -1013,12 +1019,23 @@ def _jhj_tile(web,x,y,z=18):
     if cache is None:cache={};web.jhj_tile_cache=cache
     key=(z,x,y)
     if key in cache:return cache[key]
+    with GEO_HTTP_LOCK:empty_at=GEO_EMPTY_ADDRESS_TILES.get(key)
+    if empty_at is not None and time.monotonic()-empty_at<3600:
+        cache[key]=[];trace(web,'address_tile_empty',{'tile':list(key),'source':'cached_NoSuchKey_404'},stage='address.tiles');return []
     url=f'https://cyberjapandata.gsi.go.jp/xyz/experimental_jhj/{z}/{x}/{y}.geojson'
     try:
         data=web.fetch(url).json()
-        features=data.get('features',[]) if isinstance(data,dict) else []
-        if not isinstance(features,list):features=[]
+        if not isinstance(data,dict) or data.get('type')!='FeatureCollection' or not isinstance(data.get('features'),list):raise AppError('住所タイルが有効なGeoJSON FeatureCollectionではありません。')
+        features=data['features']
     except (AppError,ValueError,TypeError) as exc:
+        diagnostic=getattr(exc,'diagnostic',{})
+        if diagnostic.get('status')==404 and diagnostic.get('server_error_code')=='NoSuchKey':
+            cache[key]=[]
+            with GEO_HTTP_LOCK:
+                if len(GEO_EMPTY_ADDRESS_TILES)>12000:GEO_EMPTY_ADDRESS_TILES.clear()
+                GEO_EMPTY_ADDRESS_TILES[key]=time.monotonic()
+            trace(web,'address_tile_empty',{'url':url,'tile':list(key),'status':404,'server_error_code':'NoSuchKey','reason':'この住所タイルのオブジェクトが存在しないため空タイルとして扱う'},stage='address.tiles')
+            return []
         trace(web,'address_tile_failed',{'url':url,'exception_type':type(exc).__name__,'reason':str(exc),'diagnostic':getattr(exc,'diagnostic',{})},'WARNING','address.tiles')
         raise
     cache[key]=features
@@ -2778,7 +2795,7 @@ DIAG_ADVICE={
  'map_address_difference':('掲載住所と逆算町字が異なる','掲載地図の座標と逆算住所を別項目で確認する。番地の一致とは扱わない。'),
  'unknown':('現時点で理由を特定できない','前後の通信・解析・除外イベントを照合する。再現URLと読取項目を追加してから修正する。原因を断定しない。')}
 
-DIAG_ADVICE.update({'listing_rejected':('物件の除外理由と工程・取得値・期待値','failed_stage/observed/expected/evidenceで条件不一致と読取・住所推定失敗を区別する。'),'listing_failed':('物件の通信・解析処理に失敗','HTTP状態・例外型・直前の工程を確認する。原因未確定を確定扱いしない。')})
+DIAG_ADVICE.update({'address_tile_empty':('GSIの住所タイルにデータがない','HTTP 404とNoSuchKeyが両方確認された空タイル。取得できた周辺タイルの同一町丁目の住所候補を比較する。その他の通信失敗と区別する。'),'listing_rejected':('物件の除外理由と工程・取得値・期待値','failed_stage/observed/expected/evidenceで条件不一致と読取・住所推定失敗を区別する。'),'listing_failed':('物件の通信・解析処理に失敗','HTTP状態・例外型・直前の工程を確認する。原因未確定を確定扱いしない。')})
 
 def diagnosis_code(message):
     text=str(message)
@@ -3470,7 +3487,7 @@ class AutomaticCollection:
         validate_automatic_settings(settings);validate_automatic_summary(summary or {})
         self.db=db;self.settings=dict(settings);self.settings['interval_minutes']=0;self.summary=dict(summary or {});self.summary.pop('next_run_at',None)
         self.lock=threading.RLock();self.io_lock=threading.Lock();self.stop_event=threading.Event()
-        self.request_starts={};self.current=None;self.message='自動収集を準備しています';self.progress=0.;self.error=''
+        self.request_starts={};self.last_job=None;self.current=None;self.message='自動収集を準備しています';self.progress=0.;self.error=''
         self.thread=threading.Thread(target=self.run,daemon=True,name='housing-automatic-collection')
     def persist(self):
         with self.io_lock:
@@ -3503,7 +3520,7 @@ class AutomaticCollection:
                                 'town_codes':list(self.settings.get('town_codes',[]))}
                     for key in ('auto_regions','auto_munis'):
                         if self.settings.get(key):conditions[key]=self.settings[key]
-                    self.summary['last_started_at']=utc_now();self.summary['last_status']='running'
+                    self.summary['last_started_at']=utc_now();self.summary['current_status']='running'
                     job=SearchJob(self.db,conditions)
                     if hasattr(job,'state'):job.state.request_starts=self.request_starts
                     self.current=job
@@ -3512,8 +3529,8 @@ class AutomaticCollection:
                 job.run(self.db,conditions)
                 snap=job.snapshot();result=snap.get('result') or {};status=result.get('status','failed');incomplete=bool(result.get('summary',{}).get('incomplete_tasks'))
                 with self.lock:
-                    self.current=None;self.progress=1.;self.summary['last_finished_at']=utc_now();self.summary['last_status']=status
-                    self.summary['last_task']=conditions.get('auto_task_label','地域判定')
+                    self.last_job=job;self.current=None;self.progress=1.;self.summary['last_finished_at']=utc_now();self.summary['last_status']=status
+                    self.summary['current_status']='stopped';self.summary['last_task']=conditions.get('auto_task_label','地域判定')
                     self.summary['last_summary']=result.get('summary',{})
                     self.summary['saved_observations']=int(self.summary.get('saved_observations',0))+len(snap['saved'])
                     self.summary['confirmed_observations']=int(self.summary.get('confirmed_observations',0))+len(snap['units'])
@@ -3647,6 +3664,14 @@ def automatic_collection_panel():
         for issue in summary.get('last_summary',{}).get('issues',[])[:4]:st.error(issue)
         if snap['error']:st.error(snap['error'])
     if st.session_state.get('automatic_settings_error'):st.error(st.session_state.automatic_settings_error)
+    if controller and st.button('自動収集のログを準備・更新',key='automatic_log_prepare'):
+        with controller.lock:log_job=controller.current or controller.last_job
+        if log_job:
+            events=log_job.audit.records();st.session_state.automatic_log_events=events
+            st.session_state.automatic_log_search_id=log_job.audit.search_id
+    if st.session_state.get('automatic_log_events'):
+        diagnostic_downloads(st.session_state.automatic_log_events,'automatic')
+        st.caption('ログは準備した時点の町・処理の記録です。更新するにはもう一度「準備・更新」を押してください。')
     st.caption('物件ID・取得成功日時は再取得の管理情報として保存します。詳細住所と募集データの保存に成功した物件だけが取得済みになります。')
     st.caption('蓄積した物件は「保存物件をすべて読み込む」で地図へ表示できます。収集中も地図の自動再描画は行いません。')
 
