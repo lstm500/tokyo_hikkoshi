@@ -17,6 +17,7 @@ import io
 import json
 import math
 import os
+import calendar
 import queue
 import re
 import statistics
@@ -37,7 +38,7 @@ import streamlit as st
 from streamlit_folium import st_folium
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v52"
+BUILD = "REBUILD-01-v54"
 PROVIDER_OPTIONS = ("スマイティ","HOMES","SUUMO","カナリー","アットホーム","CHINTAI","Comfy","アパマンショップ")
 PROVIDER_CANONICAL = {"HOMES":"HOME’S","HOME’S":"HOME’S","スマイティ":"スマイティ","SUUMO":"SUUMO","カナリー":"カナリー",
                       "アットホーム":"アットホーム","CHINTAI":"CHINTAI","Comfy":"Comfy","アパマンショップ":"アパマンショップ"}
@@ -594,6 +595,42 @@ class Database:
                          [dict(search,namespace=self.namespace)],'resolution=merge-duplicates,return=representation')
         if not isinstance(result,list) or not any(x.get('id')==search['id'] for x in result if isinstance(x,dict)):
             raise AppError('検索履歴の保存を確認できません。')
+    def save_acquisition_ids(self,rows):
+        unique={}
+        for row in rows:
+            property_id=row.get('property_id')
+            if not property_id:continue
+            stamp=row.get('fetched_at') or utc_now()
+            try:
+                parsed=datetime.fromisoformat(stamp.replace('Z','+00:00'))
+                if parsed.tzinfo is None:raise ValueError()
+                stamp=parsed.astimezone(timezone.utc).isoformat()
+            except (ValueError,TypeError,AttributeError):raise AppError('物件IDの取得日時を確認できません。') from None
+            if property_id in unique and unique[property_id]['finished_at']>=stamp:continue
+            unique[property_id]={'namespace':self.namespace,'id':'acquired.'+hashlib.sha256(property_id.encode()).hexdigest(),
+                            'status':'rental_acquisition','started_at':stamp,'finished_at':stamp,
+                            'conditions':{'provider':'SUUMO','property_id':property_id,'schema':1},
+                            'summary':{'last_success_at':stamp,'listing_key':compact_listing_key(row)}}
+        payload=list(unique.values())
+        if not payload:return
+        result=self.call('POST',SEARCH_TABLE,{'on_conflict':'namespace,id','select':'id'},payload,'resolution=merge-duplicates,return=representation')
+        returned={r.get('id') for r in result if isinstance(r,dict)} if isinstance(result,list) else set()
+        if not {r['id'] for r in payload}<=returned:raise AppError('物件IDの取得済み管理情報を保存できません。')
+
+    def load_recent_acquisition_ids(self):
+        out={};offset=0;cutoff=acquisition_cutoff().isoformat(timespec='seconds')
+        while True:
+            rows=self.call('GET',SEARCH_TABLE,{'namespace':'eq.'+self.namespace,'status':'eq.rental_acquisition',
+                           'finished_at':'gte.'+cutoff,'select':'conditions,summary','order':'id.asc','limit':500,'offset':offset})
+            if not isinstance(rows,list):raise AppError('過去3か月の取得済み物件IDを確認できません。')
+            for row in rows:
+                property_id=(row.get('conditions') or {}).get('property_id')
+                stamp=(row.get('summary') or {}).get('last_success_at')
+                if property_id and recent_acquisition(stamp):out[property_id]=stamp
+            if len(rows)<500:break
+            offset+=len(rows)
+        return out
+
     def load_units(self,bounds=None,layouts=None):
         out=[];offset=0
         self.last_load_diagnostic={'time':utc_now(),'bounds':list(bounds) if bounds else None,'layouts':list(layouts) if layouts is not None else None,
@@ -1721,6 +1758,95 @@ def _suumo_probe_town_url(web,canonical_url,municipality_code,city_name,wanted,m
     return state['towns'].get(wanted_key)
 
 
+TOKYO_WARDS={str(13101+i):name for i,name in enumerate(('千代田区','中央区','港区','新宿区','文京区','台東区','墨田区','江東区','品川区','目黒区','大田区','世田谷区','渋谷区','中野区','杉並区','豊島区','北区','荒川区','板橋区','練馬区','足立区','葛飾区','江戸川区'))}
+
+def acquisition_cutoff(now=None):
+    now=now or datetime.now(timezone.utc);month_index=now.year*12+now.month-1-3
+    year,month=divmod(month_index,12);month+=1
+    return now.replace(year=year,month=month,day=min(now.day,calendar.monthrange(year,month)[1]))
+
+def suumo_property_id(url):
+    u=urlparse(url);bc=parse_qs(u.query).get('bc',[''])[0]
+    if re.fullmatch(r'\d+',bc):return 'SUUMO:bc:'+bc
+    match=re.search(r'/bc_(\d+)',u.path)
+    if match:return 'SUUMO:bc:'+match[1]
+    match=re.search(r'/jnc_(\d+)',u.path)
+    return 'SUUMO:jnc:'+match[1] if match else None
+
+def recent_acquisition(value,now=None):
+    try:
+        dt=datetime.fromisoformat(str(value).replace('Z','+00:00'))
+        if dt.tzinfo is None:return False
+        now=now or datetime.now(timezone.utc)
+        return acquisition_cutoff(now)<=dt<=now
+    except (ValueError,TypeError):return False
+
+def suumo_ward_regions(web,code):
+    if code not in TOKYO_WARDS:raise AppError('東京23区から対象区を選択してください。')
+    url='https://suumo.jp/jj/chintai/ichiran/FR301FC001/'
+    params={'ar':'030','bs':'040','ta':'13','sc':code,'pc':'50','srch_navi':'1'}
+    if not web.permitted(url):raise AppError('SUUMOの区選択ページの自動取得が許可されていません。')
+    reply=web.fetch(url,params=params);soup=BeautifulSoup(reply.text,'html.parser')
+    documents=[soup];form=soup.find('form',id='js-machiSelectForm')
+    if form and form.get('action'):
+        target=urljoin(reply.url,form['action'])
+        if urlparse(target).hostname!='suumo.jp' or not web.permitted(target):raise AppError('SUUMOの町名選択ページを確認できません。')
+        fields=[(f['name'],f.get('value','')) for f in form.select('input[type="hidden"][name]') if f['name']!='oz']
+        popup=web.fetch(target,params=fields);documents.append(BeautifulSoup(popup.text,'html.parser'))
+    regions={}
+    for document in documents:
+        for field in document.select('input[name="oz"][value]'):
+            oz=str(field['value'])
+            if not re.fullmatch(re.escape(code)+r'\d{3}',oz):continue
+            label=document.find('label',attrs={'for':field.get('id')})
+            if label is None:label=field.find_parent('label')
+            if label is None:continue
+            link=label.find('a');name=normal((link or label).get_text(' ',strip=True))
+            name=re.sub(r'\s*[（(][\d,]+(?:件)?[）)]\s*$','',name)
+            if not name:continue
+            prepared={'url':url,'base_params':{**params,'oz':oz},'town':name,'selection_method':'区の公開町名選択フォーム',
+                      'mansion':('ts','1'),'age15':('cn','15'),'layout_filters':{layout:('md',value) for layout,value in SUUMO_LAYOUT_CODES.items()}}
+            regions[oz]={'code':code,'pref':'13','town':name,'suumo_town':name,'city_name':TOKYO_WARDS[code],
+                         'label':'東京都'+TOKYO_WARDS[code]+name,'suumo_prepared':prepared}
+    if not regions:raise AppError('選択した区のSUUMO町名リストを取得できません。')
+    trace(web,'suumo_ward_towns',{'ward':TOKYO_WARDS[code],'municipality_code':code,'town_count':len(regions)},stage='search_conditions')
+    return list(regions.values()),municipalities(web),0
+
+
+def select_ward_towns(regions,town_codes):
+    if not town_codes:return regions
+    selected=set(town_codes)
+    result=[r for r in regions if r.get('suumo_prepared',{}).get('base_params',{}).get('oz') in selected]
+    found={r['suumo_prepared']['base_params']['oz'] for r in result}
+    if selected-found:raise AppError('選択した町名をSUUMOの町名一覧で確認できません。町名を読み込み直してください。')
+    return result
+
+def ward_town_selector(ward_code,prefix,saved_codes=None,disabled=False):
+    cache=st.session_state.setdefault('ward_town_cache',{})
+    cached=cache.get(ward_code)
+    if st.button('町名を読み込む・更新',key=prefix+'_load_towns',disabled=disabled):
+        try:
+            with st.spinner('SUUMOの町名一覧を読み込んでいます'):
+                web=PublicWeb();web.configure(rental_network_settings())
+                regions,munis,_=suumo_ward_regions(web,ward_code)
+                cache[ward_code]={'regions':regions,'munis':munis}
+                cached=cache[ward_code]
+        except Exception as exc:st.error('町名一覧の取得に失敗しました：'+(str(exc) if isinstance(exc,AppError) else type(exc).__name__))
+    if not cached:
+        st.caption('町名を絞る場合は「町名を読み込む・更新」を押してください。読み込まなくても区全体を検索できます。')
+        retained=[c for c in (saved_codes or []) if isinstance(c,str) and re.fullmatch(re.escape(ward_code)+r'\d{3}',c)]
+        if retained:st.caption('保存済みの町名指定 '+str(len(retained))+'町を保持しています。変更する場合は町名一覧を読み込んでください。')
+        return retained
+    options={r['suumo_prepared']['base_params']['oz']:r['town'] for r in cached['regions']}
+    widget_key=prefix+'_towns_'+ward_code;stored_key=prefix+'_selected_'+ward_code
+    defaults=st.session_state.get(stored_key,saved_codes or [])
+    def keep_selection():st.session_state[stored_key]=list(st.session_state.get(widget_key,[]))
+    selected=st.multiselect('対象の町名（未選択なら区全体）',list(options),default=[c for c in defaults if c in options],
+                          format_func=lambda code:options[code],key=widget_key,disabled=disabled,on_change=keep_selection)
+    st.session_state[stored_key]=list(selected)
+    return selected
+
+
 def suumo_prepare_region(web,region):
     """Resolve the visible-map municipality/town to a SUUMO search target.
 
@@ -1728,6 +1854,7 @@ def suumo_prepare_region(web,region):
     selecting 市区郡 -> 町名. Municipality-wide or free-word address search is
     never substituted when the town selector cannot be confirmed.
     """
+    if region.get('suumo_prepared'):return dict(region['suumo_prepared'])
     cache=getattr(web,'suumo_region_cache',None)
     if cache is None:cache={};web.suumo_region_cache=cache
     wanted=normal(region.get('suumo_town') or town_base_name(region.get('town','')))
@@ -1941,7 +2068,15 @@ def suumo_collect(web,region,bounds,munis,emit):
                     if not links:continue
                     url=min(links,key=lambda x:x[0])[1]
                     if url in seen_urls:continue
-                    seen_urls.add(url);page_candidates.append(url);group_candidates+=1
+                    seen_urls.add(url)
+                    group_candidates+=1
+                    property_id=suumo_property_id(url)
+                    obtained=getattr(web,'acquired_ids',{}).get(property_id)
+                    if obtained and recent_acquisition(obtained):
+                        begin_listing(web,'SUUMO',url)
+                        trace(web,'listing_already_acquired',{'url':url,'property_id':property_id,'last_success_at':obtained,'reason':'過去3か月以内に取得・保存済み'},stage='collector')
+                        emit('skipped',1);continue
+                    page_candidates.append(url)
             emit('candidate',len(page_candidates))
 
             for index,url in enumerate(page_candidates,1):
@@ -1974,6 +2109,7 @@ def suumo_collect(web,region,bounds,munis,emit):
                     # Rent, layout, inferred address and acquisition time survive Database.save_units().
                     row=partial_listing('SUUMO',url,'SUUMO掲載募集',address,layout,rent,None,None,region,bounds,location,None,age,ym,'')
                     if not row:reject_listing(web,'SUUMO',url,'listing.validation','invalid_data','保存必須項目の検証を通らない',{'rent':rent,'layout':layout,'address':address,'location':location},'有効な家賃・間取り・詳細住所・物件URL');emit('rejected',1);continue
+                    row['property_id']=suumo_property_id(url)
                     row['address_source']=location['location_method']
                     emit('unit',row)
                 except (AppError,ValueError,TypeError) as exc:
@@ -2415,10 +2551,20 @@ def search_all(db,conditions,screen,state=None):
         screen['bar'].progress(.05+.15*done/max(1,total),text=f'{stage} {done}/{total}')
         screen['status'].info(f'検索実行中｜{stage} {done}/{total}｜{count}地域｜取得失敗 {errors}件｜経過 {int(time.monotonic()-started)}秒')
     try:
-        screen['status'].info('検索実行中｜国土地理院の地域情報を取得しています')
-        regions,munis,region_errors=regional_tasks(web,bounds,region_update)
+        if 'SUUMO' in conditions['providers']:web.acquired_ids=db.load_recent_acquisition_ids()
+        screen['status'].info('検索実行中｜地域の町名リストを取得しています')
+        if conditions.get('auto_regions') and conditions.get('auto_munis'):
+            regions,munis,region_errors=conditions['auto_regions'],conditions['auto_munis'],0
+        elif conditions.get('ward_code'):
+            regions,munis,region_errors=suumo_ward_regions(web,conditions['ward_code'])
+        else:
+            regions,munis,region_errors=regional_tasks(web,bounds,region_update)
+        if conditions.get('ward_code'):
+            regions=select_ward_towns(regions,conditions.get('town_codes',[]))
+        if conditions.get('mode')=='automatic_collection':
+            conditions['auto_regions']=regions;conditions['auto_munis']=munis
         if region_errors: issues.append(f'地域判定で{region_errors}地点を確認できませんでした。')
-        search['conditions']['region_source']='Geolonia町丁目一覧' if getattr(web,'reverse_unavailable',False) else '国土地理院地名判定'
+        search['conditions']['region_source']='SUUMO区の公開町名選択フォーム' if conditions.get('ward_code') else 'Geolonia町丁目一覧' if getattr(web,'reverse_unavailable',False) else '国土地理院地名判定'
         log('地名取得完了｜'+search['conditions']['region_source']+'｜'+str(len(regions))+'地域')
         search['conditions']['regions']=[r['label'] for r in regions]
         state.new_regions=[r['label'] for r in regions]
@@ -2455,13 +2601,20 @@ def search_all(db,conditions,screen,state=None):
         for number in range(max((len(targets) for _,targets in provider_targets),default=0)):
             for provider,targets in provider_targets:
                 if number<len(targets):jobs.append((targets[number],provider))
-        q=queue.Queue();active={};done=0;candidate=detail=rejected=0
+        if conditions.get('mode')=='automatic_collection':
+            if not jobs:raise AppError('自動収集する町が見つかりません。対象範囲を変更してください。')
+            index=int(conditions.get('auto_task_index',0))%len(jobs)
+            conditions['auto_total_tasks']=len(jobs);conditions['auto_task_index']=index
+            conditions['auto_task_label']=jobs[index][0]['label']+'｜'+jobs[index][1]
+            jobs=[jobs[index]]
+        q=queue.Queue();active={};done=0;candidate=detail=rejected=skipped=0
         def work(index,region,provider):
             if web.cancel_event.is_set():return
             DIAG_CONTEXT.audit=audit;DIAG_CONTEXT.scope={'task':index,'region':region['label'],'town':region['town'],'municipality_code':region['code'],'provider':provider}
             def emit(kind,value):
                 if kind!='unit':web.check_cancel()
                 audit_value=compact_saved_listing(value) if kind=='unit' and isinstance(value,dict) else value
+                if kind=='unit' and isinstance(audit_value,dict) and value.get('property_id'):audit_value={**audit_value,'property_id':value['property_id']}
                 audit.add('collector','accepted' if kind=='unit' else kind,'ERROR' if kind=='issue' else 'INFO',{'event':kind,'value':audit_value})
                 q.put((index,kind,value))
             try:
@@ -2493,6 +2646,7 @@ def search_all(db,conditions,screen,state=None):
                     elif kind=='candidate': candidate+=int(value)
                     elif kind=='detail': detail+=int(value)
                     elif kind=='rejected': rejected+=int(value)
+                    elif kind=='skipped': skipped+=int(value)
                     elif kind=='issue':
                         issues.append(label+'｜'+str(value));log(issues[-1])
                     elif kind=='unit':
@@ -2502,7 +2656,11 @@ def search_all(db,conditions,screen,state=None):
                     state.new_units=list(units.values())
                     screen['status'].info(f'検索実行中｜確認した{len(batch)}件をSupabaseへ保存しています')
                     try:
-                        for offset in range(0,len(batch),100): saved.update(db.save_units(batch[offset:offset+100]))
+                        for offset in range(0,len(batch),100):
+                            chunk=batch[offset:offset+100];saved.update(db.save_units(chunk))
+                            db.save_acquisition_ids(chunk)
+                            for row in chunk:
+                                if row.get('property_id'):web.acquired_ids[row['property_id']]=row['fetched_at']
                     except AppError as exc: issues.append(str(exc));log('保存エラー｜'+str(exc))
                     # Browser session holds unconfirmed rows separately; no claim of persistence.
                     state.new_units=list(units.values())
@@ -2515,9 +2673,9 @@ def search_all(db,conditions,screen,state=None):
                     log(f'{done}/{len(jobs)}完了｜'+jobs[index][0]['label']+'｜'+jobs[index][1])
                 fill_jobs()
                 screen['bar'].progress(.2+.75*done/max(1,len(jobs)),text=f'物件確認 {done}/{len(jobs)}タスク｜保存確認 {len(saved)}件')
-                screen['status'].info(f'検索実行中｜{done}/{len(jobs)}タスク完了｜候補 {candidate}｜詳細 {detail}｜除外 {rejected}｜保存確認 {len(saved)}件｜経過 {int(time.monotonic()-started)}秒\n\n'+'\n\n'.join(active.values()))
+                screen['status'].info(f'検索実行中｜{done}/{len(jobs)}タスク完了｜候補 {candidate}｜詳細 {detail}｜除外 {rejected}｜取得済みスキップ {skipped}｜保存確認 {len(saved)}件｜経過 {int(time.monotonic()-started)}秒\n\n'+'\n\n'.join(active.values()))
         search['status']='cancelled' if web.cancel_event.is_set() else 'partial' if issues else 'completed'
-        search['summary']={'confirmed':len(units),'saved':len(saved),'candidate':candidate,'detail':detail,'rejected':rejected,
+        search['summary']={'confirmed':len(units),'saved':len(saved),'candidate':candidate,'detail':detail,'rejected':rejected,'already_acquired':skipped,
                            'retained_with_missing_fields':sum(bool(r.get('missing_fields')) for r in units.values()),'price_unknown':sum(not r.get('rent') for r in units.values()),'issues':issues[-100:],'elapsed':int(time.monotonic()-started),'tasks':len(jobs)}
     except SearchCancelled:
         search['status']='cancelled'
@@ -3000,6 +3158,16 @@ def capture_viewport():
 
 def remember_search():
     state=st.session_state
+    if automatic_busy():
+        state.new_search={'status':'failed','summary':{'issues':['自動収集を停止してから手動検索を開始してください。'],'saved':0,'confirmed':0}}
+        return
+    if state.get('manual_search_scope','地図の表示範囲')=='区・町名を選択':
+        code=state.get('manual_ward','13116')
+        state.new_request={'bounds':[34,138,37,141],'providers':['SUUMO'],'ward_code':code,
+                           'town_codes':list(state.get('manual_selected_'+code,[])), 'mode':'ward_search',
+                           'display':{'layouts':'all','monthly_limit':None,'aggregation':False}}
+        state.new_map_loaded=True
+        return
     selected=list(state.get('new_providers',[]))
     providers=list(dict.fromkeys(canonical_provider(p) for p in selected))
     bounds=state.get('new_bounds')
@@ -3128,6 +3296,7 @@ def active_job():
     with lock: return jobs.get(st.session_state.get('new_job_token'))
 
 def start_search(conditions):
+    if automatic_busy():raise AppError('自動収集を停止してから手動検索を開始してください。')
     jobs,lock=job_registry()
     token=st.session_state.setdefault('new_job_token',hashlib.sha256(os.urandom(32)).hexdigest())
     with lock:
@@ -3218,6 +3387,204 @@ def interactive_rental_map(pins,cells,facilities):
         st.rerun()
 
 
+AUTO_COLLECTION_ID='automatic.collection.settings'
+
+class AutomaticCollection:
+    """One low-concurrency collection loop per saved namespace; no Streamlit UI in its thread."""
+    def __init__(self,db,settings,summary=None):
+        validate_automatic_settings(settings);validate_automatic_summary(summary or {})
+        self.db=db;self.settings=dict(settings);self.summary=dict(summary or {})
+        self.lock=threading.RLock();self.io_lock=threading.Lock();self.stop_event=threading.Event()
+        self.current=None;self.message='自動収集を準備しています';self.progress=0.;self.error=''
+        self.thread=threading.Thread(target=self.run,daemon=True,name='housing-automatic-collection')
+    def persist(self):
+        with self.io_lock:
+            with self.lock:
+                record={'id':AUTO_COLLECTION_ID,'status':'automatic_collection_settings','started_at':self.settings.get('created_at',utc_now()),
+                        'finished_at':None,'conditions':json.loads(json.dumps(self.settings)), 'summary':json.loads(json.dumps(self.summary))}
+            self.db.save_search(record)
+    def snapshot(self):
+        with self.lock:
+            job=self.current
+            result=dict(settings=dict(self.settings),summary=dict(self.summary),message=self.message,error=self.error,
+                        running=self.thread.is_alive(),stopping=self.stop_event.is_set(),progress=self.progress)
+        if job:
+            snap=job.snapshot();result.update(message=snap['message'],progress=snap['progress'],current=snap)
+        return result
+    def request_stop(self):
+        with self.lock:
+            self.stop_event.set()
+            self.settings['enabled']=False;self.message='停止要求を受け付けました。取得済みデータを保存して終了します。'
+            job=self.current
+        if job:job.request_stop()
+        self.persist()
+    def run(self):
+        try:
+            while not self.stop_event.is_set():
+                with self.lock:
+                    next_run=self.summary.get('next_run_at')
+                delay=0.
+                if next_run:
+                    try:delay=max(0.,(datetime.fromisoformat(next_run)-datetime.now(timezone.utc)).total_seconds())
+                    except (ValueError,TypeError):pass
+                if delay:
+                    with self.lock:self.message='次の町の収集を待機しています'
+                    if self.stop_event.wait(delay):break
+                if self.stop_event.is_set():break
+                with self.lock:
+                    if self.stop_event.is_set():break
+                    conditions={'bounds':[34,138,37,141],'ward_code':self.settings['ward_code'],'providers':list(self.settings['providers']),
+                                'mode':'automatic_collection','auto_task_index':int(self.summary.get('next_task_index',0)),
+                                'town_codes':list(self.settings.get('town_codes',[]))}
+                    for key in ('auto_regions','auto_munis'):
+                        if self.settings.get(key):conditions[key]=self.settings[key]
+                    self.summary['last_started_at']=utc_now();self.summary['last_status']='running'
+                    job=SearchJob(self.db,conditions);self.current=job
+                self.persist()
+                # Run synchronously on this daemon. The normal search persists each acquired batch.
+                job.run(self.db,conditions)
+                snap=job.snapshot();result=snap.get('result') or {};status=result.get('status','failed')
+                with self.lock:
+                    self.current=None;self.progress=1.;self.summary['last_finished_at']=utc_now();self.summary['last_status']=status
+                    self.summary['last_task']=conditions.get('auto_task_label','地域判定')
+                    self.summary['last_summary']=result.get('summary',{})
+                    self.summary['saved_observations']=int(self.summary.get('saved_observations',0))+len(snap['saved'])
+                    self.summary['confirmed_observations']=int(self.summary.get('confirmed_observations',0))+len(snap['units'])
+                    if status in ('completed','partial'):
+                        total=max(1,int(conditions.get('auto_total_tasks',1)))
+                        self.summary['next_task_index']=(int(conditions.get('auto_task_index',0))+1)%total
+                        self.summary['total_tasks']=total
+                        self.summary['completed_runs']=int(self.summary.get('completed_runs',0))+1
+                        for key in ('auto_regions','auto_munis'):
+                            if conditions.get(key):self.settings[key]=conditions[key]
+                    interval=max(5,int(self.settings.get('interval_minutes',30)))
+                    self.summary['next_run_at']=(datetime.now(timezone.utc)+timedelta(minutes=interval)).isoformat(timespec='seconds')
+                    self.message='今回の収集を保存しました。次の町へ順番に進みます。'
+                self.persist()
+        except Exception as exc:
+            with self.lock:
+                self.error=str(exc) if isinstance(exc,AppError) else '自動収集エラー（'+type(exc).__name__+'）'
+                self.message='自動収集が停止しました。設定画面から再開してください。'
+                self.summary['last_status']='failed'
+            try:self.persist()
+            except Exception:pass
+        finally:
+            with self.lock:self.current=None
+
+@st.cache_resource
+def automatic_registry():
+    return {},threading.RLock()
+
+def automatic_registry_key(db):
+    return hashlib.sha256((db.url+'|'+db.namespace).encode()).hexdigest()
+
+def get_automatic_collection():
+    controller=st.session_state.get('automatic_collection_controller')
+    if controller:
+        registry,lock=automatic_registry()
+        with lock:controller=registry.get(automatic_registry_key(controller.db),controller)
+        st.session_state.automatic_collection_controller=controller
+    return controller
+
+def automatic_busy():
+    controller=get_automatic_collection()
+    return bool(controller and controller.snapshot()['running'])
+
+def restore_automatic_collection():
+    # One lookup when a browser session starts. It never runs on map pan or progress polls.
+    if st.session_state.get('automatic_settings_checked'):return
+    st.session_state.automatic_settings_checked=True
+    try:
+        db=Database();db.web_config=rental_network_settings();registry,lock=automatic_registry();key=automatic_registry_key(db)
+        with lock:
+            controller=registry.get(key)
+            if controller and controller.thread.is_alive():
+                st.session_state.automatic_collection_controller=controller;return
+            rows=db.call('GET',SEARCH_TABLE,{'namespace':'eq.'+db.namespace,'id':'eq.'+AUTO_COLLECTION_ID,'select':'conditions,summary','limit':1})
+            if not isinstance(rows,list):raise AppError('自動収集設定を読み取れません。')
+            if not rows:return
+            settings=rows[0].get('conditions') or {};summary=rows[0].get('summary') or {}
+            validate_automatic_settings(settings);validate_automatic_summary(summary)
+            st.session_state.automatic_saved_settings=settings;st.session_state.automatic_saved_summary=summary
+            if not settings.get('enabled'):return
+            controller=AutomaticCollection(db,settings,summary);registry[key]=controller
+            st.session_state.automatic_collection_controller=controller;controller.thread.start()
+    except Exception as exc:st.session_state.automatic_settings_error=str(exc) if isinstance(exc,AppError) else '自動収集設定の復元に失敗しました（'+type(exc).__name__+'）'
+
+def validate_automatic_settings(settings):
+    if not isinstance(settings,dict):raise AppError('自動収集設定の形式が不正です。')
+    if settings.get('ward_code') not in TOKYO_WARDS:raise AppError('東京23区から対象区を選択してください。')
+    codes=settings.get('town_codes',[])
+    if not isinstance(codes,list) or any(not isinstance(c,str) or not re.fullmatch(re.escape(settings['ward_code'])+r'\d{3}',c) for c in codes):raise AppError('対象町名の設定が不正です。')
+    if settings.get('providers')!=['SUUMO']:raise AppError('自動収集はSUUMOを指定してください。')
+    try:interval=int(settings.get('interval_minutes',30))
+    except (ValueError,TypeError):raise AppError('実行間隔は5〜1440分を指定してください。') from None
+    if not 5<=interval<=1440:raise AppError('実行間隔は5〜1440分を指定してください。')
+
+def validate_automatic_summary(summary):
+    if not isinstance(summary,dict):raise AppError('自動収集の進捗形式が不正です。')
+    for key in ('next_task_index','total_tasks','completed_runs','saved_observations','confirmed_observations'):
+        try:
+            if key in summary and int(summary[key])<0:raise ValueError()
+        except (ValueError,TypeError):raise AppError('自動収集の進捗が不正です：'+key) from None
+    if not isinstance(summary.get('last_summary',{}),dict):raise AppError('自動収集の前回結果が不正です。')
+
+def start_automatic_collection(ward_code,interval_minutes,town_codes=None):
+    settings={'enabled':True,'ward_code':ward_code,'providers':['SUUMO'],'interval_minutes':int(interval_minutes),'created_at':utc_now(),'town_codes':sorted(set(town_codes or []))}
+    validate_automatic_settings(settings)
+    db=Database();db.web_config=rental_network_settings();registry,lock=automatic_registry();key=automatic_registry_key(db)
+    with lock:
+        old=registry.get(key)
+        if old and old.thread.is_alive():raise AppError('自動収集が稼働中です。停止してから範囲を変更してください。')
+        old_snapshot=old.snapshot() if old else {}
+        prior=old_snapshot.get('settings',st.session_state.get('automatic_saved_settings',{}))
+        previous_summary=old_snapshot.get('summary',st.session_state.get('automatic_saved_summary',{}))
+        same_scope=prior.get('ward_code')==settings['ward_code'] and sorted(prior.get('town_codes',[]))==settings['town_codes']
+        summary=previous_summary if same_scope else {}
+        for item in ('auto_regions','auto_munis'):
+            if same_scope and prior.get(item):settings[item]=prior[item]
+        controller=AutomaticCollection(db,settings,summary);controller.persist()
+        registry[key]=controller;st.session_state.automatic_collection_controller=controller
+        st.session_state.automatic_settings_error='';controller.thread.start()
+    return controller
+
+@st.fragment(run_every='5s')
+def automatic_collection_panel():
+    st.subheader('アプリ内の自動収集（SUUMO）')
+    st.caption('画面を閉じてもサーバー稼働中は収集します。休止・再起動では止まり、次にアプリを開くと保存した設定・町の順番から再開します。')
+    controller=get_automatic_collection();snap=controller.snapshot() if controller else None
+    busy=bool(snap and snap['running'])
+    bounds=st.session_state.get('new_bounds')
+    saved=snap['settings'] if snap else st.session_state.get('automatic_saved_settings',{})
+    ward_code=st.selectbox('自動収集する区',list(TOKYO_WARDS),index=list(TOKYO_WARDS).index(saved.get('ward_code','13116')),format_func=lambda code:TOKYO_WARDS[code],key='automatic_ward')
+    town_codes=ward_town_selector(ward_code,'automatic',saved.get('town_codes',[]),disabled=busy)
+    interval=st.number_input('町ごとの実行間隔（分）',min_value=5,max_value=1440,value=int(saved.get('interval_minutes',30)),step=5,key='automatic_interval')
+    st.caption('選択した町を順番に検索します。町名未選択なら区の全町が対象です。築15年以内・マンション・1LDK/2K/2DK・2LDK/3K/3DKが対象です。過去3か月以内の取得済みIDは詳細取得前にスキップします。設定は停止後に変更できます。')
+    manual=active_job();manual_busy=bool(manual and not manual.snapshot()['finished'])
+    if st.button('選択した区で自動収集を開始・再開',key='automatic_start',disabled=busy or manual_busy):
+        try:
+            controller=start_automatic_collection(ward_code,interval,town_codes);snap=controller.snapshot();busy=True
+        except AppError as exc:st.error(str(exc))
+    if st.button('自動収集を停止',key='automatic_stop',disabled=not busy or bool(snap and snap['stopping'])):
+        try:
+            controller.request_stop();snap=controller.snapshot()
+            st.session_state.automatic_saved_settings=snap['settings'];st.session_state.automatic_saved_summary=snap['summary']
+            st.success('停止を要求しました。保存済みデータは保持します。')
+        except AppError as exc:st.error('実行の停止は要求しましたが、停止設定の保存に失敗しました：'+str(exc))
+    if snap:
+        summary=snap['summary'];st.write(snap['message']);st.progress(min(1.,max(0.,snap['progress'])))
+        st.caption('対象区：'+TOKYO_WARDS[snap['settings']['ward_code']]+'｜町名指定：'+str(len(snap['settings'].get('town_codes',[])))+'町（0なら区全体）')
+        st.caption(f"完了した収集 {summary.get('completed_runs',0)}回｜延べ保存確認 {summary.get('saved_observations',0)}件｜次の町 {int(summary.get('next_task_index',0))+1}/{summary.get('total_tasks','未判定')}")
+        st.caption('最終終了：'+acquisition_time_jst(summary.get('last_finished_at'))+'｜次回予定：'+acquisition_time_jst(summary.get('next_run_at')))
+        st.caption('前回の取得済みIDスキップ：'+str(summary.get('last_summary',{}).get('already_acquired',0))+'件')
+        if summary.get('last_task'):st.caption('前回の町：'+summary['last_task']+'｜結果：'+str(summary.get('last_status','')))
+        for issue in summary.get('last_summary',{}).get('issues',[])[:4]:st.error(issue)
+        if snap['error']:st.error(snap['error'])
+    if st.session_state.get('automatic_settings_error'):st.error(st.session_state.automatic_settings_error)
+    st.caption('物件ID・取得成功日時は再取得の管理情報として保存します。詳細住所と募集データの保存に成功した物件だけが取得済みになります。')
+    st.caption('蓄積した物件は「保存物件をすべて読み込む」で地図へ表示できます。収集中も地図の自動再描画は行いません。')
+
+
 def main():
     st.set_page_config(page_title='住まいコンパス｜新しい住まいを探す',page_icon='🏡',layout='wide',initial_sidebar_state='collapsed')
     st.markdown(CSS,unsafe_allow_html=True)
@@ -3227,6 +3594,7 @@ def main():
     state.setdefault('new_facilities',[])
     state.setdefault('new_map_loaded',False);state.setdefault('address_point_cache',{})
     state.setdefault('layout_display_group','group1')
+    restore_automatic_collection()
     request=state.pop('new_request',None)
     if request is not None:
         try: start_search(request)
@@ -3283,8 +3651,15 @@ def main():
             if list(state.get('new_providers',[]))!=current_provider_state:state.new_providers=current_provider_state
         providers=st.multiselect('物件の取得元（複数選択可）',list(PROVIDER_OPTIONS),default=provider_defaults,key='new_providers')
         st.caption('スマイティ・HOMES・SUUMO・カナリー・アットホーム・CHINTAI・Comfy・アパマンショップから、使う取得元を1つ以上選択できます。')
-        st.button('表示中の地名から全件検索・保存',type='primary',use_container_width=True,
-                  on_click=remember_search,key='new_start',disabled=not bounds or not providers or bool(active_job() and not active_job().snapshot()['finished']))
+        scope=st.radio('検索方法',['地図の表示範囲','区・町名を選択'],horizontal=True,key='manual_search_scope')
+        searching=automatic_busy() or bool(active_job() and not active_job().snapshot()['finished'])
+        if scope=='区・町名を選択':
+            ward_code=st.selectbox('検索する区',list(TOKYO_WARDS),index=list(TOKYO_WARDS).index(state.get('manual_selected_ward','13116')),format_func=lambda code:TOKYO_WARDS[code],key='manual_ward',disabled=searching)
+            state.manual_selected_ward=ward_code
+            ward_town_selector(ward_code,'manual',disabled=searching)
+            st.caption('区・町名指定はSUUMOを対象に、築15年以内・マンション・1LDK/2K/2DK/2LDK/3K/3DKを検索・保存します。地図の表示範囲では絞りません。')
+        st.button('表示中の地名から全件検索・保存' if scope=='地図の表示範囲' else '選択した区・町名を検索・保存',type='primary',use_container_width=True,
+                  on_click=remember_search,key='new_start',disabled=searching or (scope=='地図の表示範囲' and (not bounds or not providers)))
         st.caption('検索開始時の表示範囲から検索する町名を決めます。SUUMOはその町の全丁目を対象に、範囲外でも詳細住所を推定して保存します。HOMESは区名→町域→マンション・築15年以内→①1LDK/2K/2DK→②2LDK/3K/3DK→詳細→「地図を見る」の画像認識、SUUMOは市区郡→町名→同じ2間取り群→詳細→「地図・周辺環境」の物件マーカー座標取得です。住所は実所在地未確認の推定値です。保存は家賃・間取り・詳細住所（推定）・データ取得日時です。')
         background_status()
         result=state.new_search
@@ -3296,7 +3671,7 @@ def main():
             elif result['status']=='partial': st.error(f'検索終了｜取得 {confirmed}件・保存確認 {saved}件。一部の取得・保存に失敗しました。')
             else: st.error('検索を完了できませんでした。以下の原因を確認してください。')
             for issue in summary.get('issues',[])[:8]: st.write('・'+issue)
-            if summary.get('elapsed') is not None: st.caption(f"所要 {summary['elapsed']}秒｜詳細確認 {summary.get('detail',0)}件｜除外 {summary.get('rejected',0)}件")
+            if summary.get('elapsed') is not None: st.caption(f"所要 {summary['elapsed']}秒｜詳細確認 {summary.get('detail',0)}件｜除外 {summary.get('rejected',0)}件｜取得済みスキップ {summary.get('already_acquired',0)}件")
             if result.get('conditions',{}).get('regions'):
                 with st.expander('今回検索した地名・丁目'):
                     for label in result['conditions']['regions']: st.write(label)
@@ -3318,6 +3693,7 @@ def main():
             with st.expander('取得できた情報をすべて表で見る（未確認も保持）'):
                 st.dataframe([{'家賃（万円）':float(r['rent'])/10000 if r.get('rent') else None,'間取り':r.get('layout'),'住所（推定）':r.get('address'),'データ取得日時':acquisition_time_jst(r.get('fetched_at'))} for r in physical_units(rows)],hide_index=True)
     with tabs[1]:
+        automatic_collection_panel()
         st.subheader('Supabaseに保存した物件')
         st.caption('保存物件をまとめて読み込みます。範囲外の物件も保持し、地図を動かすと表示できます。地図操作中の自動読み込みは行いません。')
         if st.button('保存物件をすべて読み込む',key='new_load',use_container_width=True,disabled=bool(active_job() and not active_job().snapshot()['finished'])):
