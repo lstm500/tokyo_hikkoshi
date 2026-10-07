@@ -38,7 +38,7 @@ import streamlit as st
 from streamlit_folium import st_folium
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v54"
+BUILD = "REBUILD-01-v55"
 PROVIDER_OPTIONS = ("スマイティ","HOMES","SUUMO","カナリー","アットホーム","CHINTAI","Comfy","アパマンショップ")
 PROVIDER_CANONICAL = {"HOMES":"HOME’S","HOME’S":"HOME’S","スマイティ":"スマイティ","SUUMO":"SUUMO","カナリー":"カナリー",
                       "アットホーム":"アットホーム","CHINTAI":"CHINTAI","Comfy":"Comfy","アパマンショップ":"アパマンショップ"}
@@ -2534,7 +2534,7 @@ def search_all(db,conditions,screen,state=None):
     DIAG_CONTEXT.audit=audit;DIAG_CONTEXT.scope={}
     search=dict(id=audit.search_id,status='started',
                 started_at=utc_now(),finished_at=None,conditions=conditions,summary={})
-    units={};saved=set();issues=[];logs=[]
+    units={};saved=set();issues=[];logs=[];acquisition_pending={}
     def log(message):
         audit.add('progress',diagnosis_code(message) if 'エラー' in message or '失敗' in message else 'progress','INFO',{'message':message})
         logs.append(f"{datetime.now().strftime('%H:%M:%S')}  {message}")
@@ -2657,8 +2657,11 @@ def search_all(db,conditions,screen,state=None):
                     screen['status'].info(f'検索実行中｜確認した{len(batch)}件をSupabaseへ保存しています')
                     try:
                         for offset in range(0,len(batch),100):
-                            chunk=batch[offset:offset+100];saved.update(db.save_units(chunk))
+                            chunk=batch[offset:offset+100];saved.update(db.save_units(chunk));state.new_last_saved_at=utc_now()
+                            for row in chunk:
+                                if row.get('property_id'):acquisition_pending[row['property_id']]=row
                             db.save_acquisition_ids(chunk)
+                            for row in chunk:acquisition_pending.pop(row.get('property_id'),None)
                             for row in chunk:
                                 if row.get('property_id'):web.acquired_ids[row['property_id']]=row['fetched_at']
                     except AppError as exc: issues.append(str(exc));log('保存エラー｜'+str(exc))
@@ -2683,6 +2686,29 @@ def search_all(db,conditions,screen,state=None):
     except Exception as exc:
         search['status']='failed';issues.append(str(exc) if isinstance(exc,AppError) else f'検索エラー（{type(exc).__name__}）')
         search['summary']={'confirmed':len(units),'saved':len(saved),'issues':issues,'elapsed':int(time.monotonic()-started)}
+    # Workers have finished and the event queue is drained before this final save.
+    # Cancellation only stops acquisition; database writes remain enabled.
+    if web.cancel_event.is_set():
+        remaining=[r for r in units.values() if compact_listing_key(r) not in saved]
+        if remaining or acquisition_pending:
+            screen['status'].info('中止処理中｜取得済みデータの保存を確認しています')
+        for offset in range(0,len(remaining),100):
+            chunk=remaining[offset:offset+100]
+            try:
+                saved.update(db.save_units(chunk));state.new_last_saved_at=utc_now()
+                for row in chunk:
+                    if row.get('property_id'):acquisition_pending[row['property_id']]=row
+            except Exception as exc:
+                audit.add('database','stop_save_failed','ERROR',{'stage':'stop.final_save','exception_type':type(exc).__name__,'rows':len(chunk)})
+                issues.append('中止時の物件保存失敗：'+(str(exc) if isinstance(exc,AppError) else type(exc).__name__))
+        if acquisition_pending:
+            try:
+                db.save_acquisition_ids(list(acquisition_pending.values()));acquisition_pending.clear()
+            except Exception as exc:issues.append('中止時の取得済みID保存失敗：'+(str(exc) if isinstance(exc,AppError) else type(exc).__name__))
+    unsaved=sum(compact_listing_key(r) not in saved for r in units.values())
+    search['summary'].update(last_saved_at=getattr(state,'new_last_saved_at',None),saved=len(saved),unsaved=unsaved,acquisition_ids_pending=len(acquisition_pending),issues=issues[-100:])
+    if unsaved:
+        audit.add('database','unsaved_listings','ERROR',{'stage':'stop.final_save' if web.cancel_event.is_set() else 'search.final_save','unsaved':unsaved,'retained_in_server_memory':True})
     audit.add('map','data_ready','INFO',{'confirmed_units':len(units),'colored_points':sum(has_point(r) for r in units.values()),'render_deferred_until_saved_data_load':False})
     screen['status'].info('検索が終了しました。詳細作業ログをSupabaseへ保存しています。')
     audit.add('search','finish','INFO',{'status':search['status'],'summary':search['summary']})
@@ -3186,7 +3212,7 @@ class WorkerState:
 
 class SearchJob:
     def __init__(self,db,conditions):
-        self.lock=threading.RLock();self.state=WorkerState();self.cancel_event=threading.Event();self.state.cancel_event=self.cancel_event;self.audit=AuditLog(conditions,(getattr(db,'key',''),));self.state.audit=self.audit;self.progress=0.;self.message='バックグラウンド検索を開始しています';self.text='';self.finished=False
+        self.lock=threading.RLock();self.state=WorkerState();self.cancel_event=threading.Event();self.state.cancel_event=self.cancel_event;self.audit=AuditLog(conditions,(getattr(db,'key',''),));self.state.audit=self.audit;self.started_at=utc_now();self.updated_at=self.started_at;self.progress=0.;self.message='バックグラウンド検索を開始しています';self.text='';self.finished=False
         self.thread=threading.Thread(target=self.run,args=(db,conditions),daemon=True,name='housing-search')
     def run(self,db,conditions):
         job=self
@@ -3194,7 +3220,7 @@ class SearchJob:
             def progress(self,value,text=''):
                 with job.lock: job.progress=value
             def info(self,value):
-                with job.lock: job.message=value
+                with job.lock: job.message=value;job.updated_at=utc_now()
             def code(self,value,language=None):
                 with job.lock: job.text=value
         screen={k:Display() for k in ('bar','status','log')}
@@ -3206,11 +3232,11 @@ class SearchJob:
             with self.lock: self.finished=True
     def request_stop(self):
         self.cancel_event.set()
-        with self.lock:self.message='中断要求を受け付けました。通信終了後、取得済みデータを保持して終了します。'
+        with self.lock:self.message='中止要求を受け付けました。新しい取得を止め、通信終了後に取得済みデータを保存・確認して終了します。'
     def snapshot(self):
         with self.lock:
             return dict(progress=self.progress,message=self.message,log=self.text,finished=self.finished,stopping=getattr(self,'cancel_event',threading.Event()).is_set(),
-                        units=list(self.state.new_units),saved=list(self.state.new_saved_keys),result=self.state.new_search)
+                        updated_at=getattr(self,'updated_at',None),last_saved_at=getattr(self.state,'new_last_saved_at',None),units=list(self.state.new_units),saved=list(self.state.new_saved_keys),result=self.state.new_search)
 
 class PositionRepairJob(SearchJob):
     def __init__(self,db,rows,bounds,saved):
@@ -3293,7 +3319,33 @@ def job_registry():
 
 def active_job():
     jobs,lock=job_registry()
-    with lock: return jobs.get(st.session_state.get('new_job_token'))
+    with lock:
+        old=jobs.get(st.session_state.get('new_job_token'))
+        if old and not old.snapshot()['finished']:return old
+        server_key=st.session_state.get('manual_server_key')
+        if server_key:
+            for token,job in jobs.items():
+                if getattr(job,'server_key',None)==server_key and not job.snapshot()['finished']:
+                    st.session_state.new_job_token=token;return job
+        return old
+
+def manual_registry_key(db):
+    return hashlib.sha256((str(getattr(db,'url',''))+'|'+str(db.namespace)).encode()).hexdigest()
+
+def restore_manual_search():
+    if st.session_state.get('manual_job_checked'):return
+    st.session_state.manual_job_checked=True
+    if active_job():return
+    try:
+        key=manual_registry_key(Database());st.session_state.manual_server_key=key
+    except Exception:return
+    jobs,lock=job_registry()
+    with lock:
+        for token,job in jobs.items():
+            if getattr(job,'server_key',None)==key and not job.snapshot()['finished']:
+                st.session_state.new_job_token=token;st.session_state.new_map_loaded=True
+                snap=job.snapshot();st.session_state.new_units=snap['units'];st.session_state.new_saved_keys=snap['saved']
+                return
 
 def start_search(conditions):
     if automatic_busy():raise AppError('自動収集を停止してから手動検索を開始してください。')
@@ -3308,7 +3360,11 @@ def start_search(conditions):
         st.session_state.new_saved_keys=[]
         # Secrets are read on the Streamlit thread, before launching a pure Python worker.
         db=Database();db.web_config=rental_network_settings()
-        job=SearchJob(db,conditions);jobs[token]=job
+        server_key=manual_registry_key(db);st.session_state.manual_server_key=server_key
+        for running_token,running in jobs.items():
+            if getattr(running,'server_key',None)==server_key and not running.snapshot()['finished']:
+                st.session_state.new_job_token=running_token;return
+        job=SearchJob(db,conditions);job.server_key=server_key;jobs[token]=job
         # Release finished jobs from other sessions after two hours.
         for key,value in list(jobs.items()):
             if key!=token and value.finished and time.monotonic()-getattr(value,'created',time.monotonic())>7200: jobs.pop(key,None)
@@ -3319,7 +3375,19 @@ def start_search(conditions):
 def background_progress():
     """Render live worker progress and buttons inside the fragment-owned container."""
     job=active_job()
-    if job is None:return
+    if job is None or job.snapshot()['finished']:
+        controller=get_automatic_collection()
+        auto=controller.snapshot() if controller else None
+        if auto and auto['running']:
+            st.progress(min(.99,max(0.,auto['progress'])),text='サーバー側で自動収集しています')
+            st.caption(auto['message'])
+            current=auto.get('current',{})
+            if current:st.caption('処理更新：'+acquisition_time_jst(current.get('updated_at'))+'｜最終物件保存：'+acquisition_time_jst(current.get('last_saved_at')))
+            if st.button('自動収集を中止（取得済みデータを保存）',key='auto_stop_map',disabled=auto['stopping']):
+                try:controller.request_stop()
+                except AppError as exc:st.error('中止は要求しましたが、停止設定の保存に失敗しました：'+str(exc))
+            return
+        if job is None:return
     snap=job.snapshot()
     if not snap['finished'] or st.session_state.get('finished_snapshot_applied')!=job.audit.search_id:
         st.session_state.new_units=snap['units'];st.session_state.new_saved_keys=snap['saved']
@@ -3330,16 +3398,20 @@ def background_progress():
         st.session_state.new_units=snap['units'];st.session_state.new_saved_keys=snap['saved']
         st.rerun()
     def render():
+        st.caption('処理更新：'+acquisition_time_jst(snap.get('updated_at'))+'｜最終物件保存：'+acquisition_time_jst(snap.get('last_saved_at')))
         if snap['finished']:
             result=snap.get('result') or {};summary=result.get('summary',{})
             st.info(f"検索終了｜状態 {result.get('status','不明')}｜取得 {len(snap['units'])}件｜保存確認 {len(snap['saved'])}件")
+            if summary.get('unsaved'):st.error('未保存 '+str(summary['unsaved'])+'件。保存に失敗したデータはサーバーのメモリに保持しています。作業ログを確認してください。')
+            if summary.get('acquisition_ids_pending'):st.error('取得済みIDの保存未確認 '+str(summary['acquisition_ids_pending'])+'件。次回は再取得対象になります。')
             if st.button('取得済みデータを地図へ反映',key='refresh_finished_map'):refresh_map()
             return
         st.progress(min(.99,snap['progress']),text='バックグラウンドで地図位置・住所を確認しています' if isinstance(job,PositionRepairJob) else 'バックグラウンドで検索・保存しています')
         st.caption('中断処理中｜'+snap['message'] if snap.get('stopping') else snap['message'])
+        st.caption('画面を閉じたり他のアプリへ移っても、サーバー稼働中は取得・保存を継続します。')
         st.caption(f"地図操作優先：自動再描画を停止中｜取得済み {len(snap['units'])}件。検索・保存は継続します。")
         if st.button('取得済みデータを地図へ反映',key='refresh_live_map'):refresh_map()
-        if st.button('検索を中断（取得済みデータは保持）',key='stop_background_job',disabled=bool(snap.get('stopping'))):
+        if st.button('取得を中止（取得済みデータを保存）',key='stop_background_job',disabled=bool(snap.get('stopping'))):
             job.request_stop()
     render()
 
@@ -3565,7 +3637,7 @@ def automatic_collection_panel():
         try:
             controller=start_automatic_collection(ward_code,interval,town_codes);snap=controller.snapshot();busy=True
         except AppError as exc:st.error(str(exc))
-    if st.button('自動収集を停止',key='automatic_stop',disabled=not busy or bool(snap and snap['stopping'])):
+    if st.button('自動収集を中止（取得済みデータを保存）',key='automatic_stop',disabled=not busy or bool(snap and snap['stopping'])):
         try:
             controller.request_stop();snap=controller.snapshot()
             st.session_state.automatic_saved_settings=snap['settings'];st.session_state.automatic_saved_summary=snap['summary']
@@ -3594,6 +3666,7 @@ def main():
     state.setdefault('new_facilities',[])
     state.setdefault('new_map_loaded',False);state.setdefault('address_point_cache',{})
     state.setdefault('layout_display_group','group1')
+    restore_manual_search()
     restore_automatic_collection()
     request=state.pop('new_request',None)
     if request is not None:
