@@ -38,7 +38,7 @@ import streamlit as st
 from streamlit_folium import st_folium
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v64"
+BUILD = "REBUILD-01-v65"
 PROVIDER_OPTIONS = ("スマイティ","HOMES","SUUMO","カナリー","アットホーム","CHINTAI","Comfy","アパマンショップ")
 PROVIDER_CANONICAL = {"HOMES":"HOME’S","HOME’S":"HOME’S","スマイティ":"スマイティ","SUUMO":"SUUMO","カナリー":"カナリー",
                       "アットホーム":"アットホーム","CHINTAI":"CHINTAI","Comfy":"Comfy","アパマンショップ":"アパマンショップ"}
@@ -107,11 +107,12 @@ CROWD = {
     '田園都市線':(138,'池尻大橋 → 渋谷','7:50〜8:50'),
 }
 BANDS = (100000,125000,150000,175000,200000,225000,250000,275000,300000,350000,400000)
-# High-contrast cool-to-warm rent scale: lower rents are blue, middle rents move through
-# cyan/green/yellow, and higher rents become orange/red. Each adjacent band deliberately
-# changes hue enough to stay distinguishable on the grayscale base map.
-COLORS = ("#173B8F","#1565C0","#1588D0","#12B8C4","#008E78","#2FA84F",
-          "#7CB342","#B7C62B","#E1B51E","#F28C28","#E84A2F","#A9152A")
+# Perceptual rent scale. The five bands up to 200,000 yen deliberately use clearly
+# separated hues (navy -> blue -> cyan -> green -> yellow). Above 200,000 yen the
+# scale stays in a warm orange-to-burgundy family so the lower-price differences remain
+# immediately readable on the grayscale base map.
+COLORS = ("#17357A","#0067D9","#00A9D6","#00A870","#E8B900","#F39A1F",
+          "#F06B24","#E94A35","#D9342B","#BC2733","#941D3B","#65102F")
 RENT_BAND_LABELS = (f'{BANDS[0]/10000:g}万円以下',) + tuple(
     f'{lower/10000:g}〜{upper/10000:g}万円' for lower,upper in zip(BANDS,BANDS[1:])
 ) + (f'{BANDS[-1]/10000:g}万円超',)
@@ -3300,8 +3301,8 @@ class IndividualRentPoints(MacroElement):
     }
     {{ this.get_name() }}_data.forEach(function(item) {
         L.circleMarker([item.lat,item.lng],{renderer:{{ this.get_name() }}_renderer,
-            radius:6,color:item.color,weight:item.approx?1.5:0.6,interactive:false,
-            dashArray:item.approx?'2,2':null,fill:true,fillColor:item.color,fillOpacity:0.9})
+            radius:6.5,color:'#ffffff',weight:item.approx?1.8:1.0,interactive:false,
+            dashArray:item.approx?'2,2':null,fill:true,fillColor:item.color,fillOpacity:0.96})
         .addTo({{ this._parent.get_name() }});
     });
     {% endmacro %}""")
@@ -4144,7 +4145,18 @@ def main():
         facilities=[f for f in state.new_facilities if bounds and in_rectangle((f['lat'],f['lng']),bounds)]
         # Leaflet clips points to its viewport. Keeping every loaded point in the layer
         # lets a pan reveal previously off-screen properties without a full app rerun.
-        legend=''.join(f'<span style="display:inline-block;margin:4px 10px 4px 0;color:#203f39;font-size:12px"><b style="color:{color}">■</b> {label}</span>' for color,label in zip(COLORS,RENT_BAND_LABELS))
+        def legend_chip(color,label,emphasis=False):
+            return (f'<span style="display:inline-flex;align-items:center;gap:5px;padding:3px 7px;'
+                    f'border-radius:999px;border:{"1.5px" if emphasis else "1px"} solid #c7cec9;'
+                    f'background:#ffffff;color:#203b38;font-size:12px;font-weight:{700 if emphasis else 500}">'
+                    f'<i style="display:inline-block;width:11px;height:11px;border-radius:50%;background:{color};'
+                    f'border:1px solid #ffffff;box-shadow:0 0 0 1px #6f7773"></i>{label}</span>')
+        legend=(
+            '<div style="display:flex;flex-wrap:wrap;gap:5px 7px;margin:2px 0 5px">'+
+            ''.join(legend_chip(color,label,True) for color,label in zip(COLORS[:5],RENT_BAND_LABELS[:5]))+
+            '</div><div style="display:flex;flex-wrap:wrap;gap:5px 7px;margin:0 0 8px">'+
+            ''.join(legend_chip(color,label,False) for color,label in zip(COLORS[5:],RENT_BAND_LABELS[5:]))+
+            '</div>')
         st.markdown(legend,unsafe_allow_html=True)
         interactive_rental_map(map_units,cells,facilities)
         if st.button('現在の範囲の件数・一覧を更新',key='refresh_viewport_summary'):
