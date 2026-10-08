@@ -38,7 +38,7 @@ import streamlit as st
 from streamlit_folium import st_folium
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v91"
+BUILD = "REBUILD-01-v92"
 
 # ============================================================================
 # NON-NEGOTIABLE SUUMO ADDRESS POLICY -- DO NOT DELETE OR WEAKEN
@@ -130,6 +130,64 @@ def homes_direct_city_list_url(region, category='mansion'):
     if alias=='tokyo' and slug and category in ('mansion','kodate'):
         return f'https://www.homes.co.jp/chintai/{category}/tokyo/{slug}/list/'
     return None
+
+# HOME'S availability policy:
+# - A server-side HTTP 403 from HOME'S is treated as provider unavailability, not
+#   as a reason to stop the whole collection.
+# - We do not try to defeat the access control.  HOME'S is disabled for the current
+#   run/controller and collection continues with SUUMO.
+# - A new user-initiated collection may test HOME'S again, because the site's policy
+#   or CloudFront routing may have changed meanwhile.
+def is_homes_http403_error(exc):
+    if not isinstance(exc,AppError):return False
+    diagnostic=getattr(exc,'diagnostic',{}) or {}
+    try:status=int(diagnostic.get('status')) if diagnostic.get('status') is not None else None
+    except (TypeError,ValueError):status=None
+    return status==403 or bool(re.search(r'(?:^|\D)HTTP\s*403(?:\D|$)',str(exc),re.I))
+
+
+def homes_runtime_disabled(web):
+    state=getattr(web,'provider_runtime_disabled',{}) or {}
+    item=state.get('HOME’S') or state.get('HOMES')
+    return dict(item) if isinstance(item,dict) else None
+
+
+def disable_homes_for_runtime(web,exc,url=''):
+    """Open a per-runtime circuit breaker after a genuine HOME'S HTTP 403."""
+    if not is_homes_http403_error(exc):return None
+    diagnostic=getattr(exc,'diagnostic',{}) or {}
+    item={'provider':'HOME’S','reason':'HTTP 403','message':'HOME’SがHTTP 403を返したため、この実行ではHOME’Sを停止しSUUMOのみで続行します。',
+          'url':url or normal(diagnostic.get('url')),'status':403,'detected_at':utc_now()}
+    lock=getattr(web,'cache_lock',None)
+    if lock:
+        with lock:
+            state=getattr(web,'provider_runtime_disabled',None)
+            if not isinstance(state,dict):state={};web.provider_runtime_disabled=state
+            state['HOME’S']=dict(item)
+    else:
+        state=getattr(web,'provider_runtime_disabled',None)
+        if not isinstance(state,dict):state={};web.provider_runtime_disabled=state
+        state['HOME’S']=dict(item)
+    trace(web,'homes_http403_fallback',item,'WARNING','provider_fallback')
+    return item
+
+
+def homes_preflight_or_fallback(web,regions):
+    """Probe one direct ward URL once; HTTP 403 opens the HOME'S circuit breaker."""
+    disabled=homes_runtime_disabled(web)
+    if disabled:return False,disabled
+    probe_region=next((r for r in (regions or []) if homes_direct_city_list_url(r,'mansion')),None)
+    if not probe_region:return True,None
+    url=homes_direct_city_list_url(probe_region,'mansion')
+    try:
+        if not web.permitted(url):raise AppError('HOMESの区別一覧ページの自動取得が許可されていません。')
+        web.fetch(url)
+        trace(web,'homes_preflight_ok',{'url':url,'decision':'HOME’Sを利用'},stage='provider_fallback')
+        return True,None
+    except AppError as exc:
+        if is_homes_http403_error(exc):
+            return False,disable_homes_for_runtime(web,exc,url)
+        raise
 DEFAULT_CENTER = (35.7303,139.711)
 UNIT_TABLE = "housing_units_v1"
 SEARCH_TABLE = "housing_searches_v1"
@@ -1238,7 +1296,7 @@ class PublicWeb:
         self.local=threading.local();self.cancel_event=threading.Event();self.cache_lock=threading.RLock();self.http_flights={};self.host_slots={};self.detail_slots=threading.BoundedSemaphore(DETAIL_WORKERS);self.jhj_tile_cache={};self.jhj_tile_cached_at={};self.address_result_cache={};self.suumo_location_cache={}
         self.headers={'User-Agent':'SumaiCompassRebuild/1.0 (personal rental research)', 'Accept-Language':'ja'}
         self.host_gates={};self.host_last_request={};self.host_backoff={};self.route_cooldowns={};self.session_primed=threading.local();self.proxy_routes=[];self.route_preferred={};self.route_lock=threading.Lock();self.http_cache={};self.headers.update({'Accept':'text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8'})
-        self.robots={};self.lock=threading.Lock();self.layout_form_lock=threading.Lock();self.layout_form_cache={};self.provider_cache={};self.provider_lock=threading.RLock();self.unavailable_hosts={};self.failed_detail_urls={}
+        self.robots={};self.lock=threading.Lock();self.layout_form_lock=threading.Lock();self.layout_form_cache={};self.provider_cache={};self.provider_lock=threading.RLock();self.unavailable_hosts={};self.failed_detail_urls={};self.provider_runtime_disabled={}
     def configure(self,config):
         self.proxy_routes=list((config or {}).get('proxies',[]))
         trace(self,'transport_config',{'proxy_count':len(self.proxy_routes),'rental_route':'proxy' if self.proxy_routes else 'direct','other_services':'direct'},stage='http_config')
@@ -3866,7 +3924,7 @@ def search_all(db,conditions,screen,state=None):
     DIAG_CONTEXT.audit=audit;DIAG_CONTEXT.scope={}
     search=dict(id=audit.search_id,status='started',
                 started_at=utc_now(),finished_at=None,conditions=conditions,summary={})
-    units={};saved=set();issues=[];logs=[];acquisition_pending={};q=None
+    units={};saved=set();issues=[];logs=[];acquisition_pending={};q=None;provider_fallbacks=[]
     def log(message):
         audit.add('progress',diagnosis_code(message) if 'エラー' in message or '失敗' in message else 'progress','INFO',{'message':message})
         logs.append(f"{datetime.now().strftime('%H:%M:%S')}  {message}")
@@ -3907,6 +3965,17 @@ def search_all(db,conditions,screen,state=None):
         search['conditions']['regions']=[r['label'] for r in regions]
         state.new_regions=[r['label'] for r in regions]
         conditions['providers']=list(dict.fromkeys(canonical_provider(p) for p in conditions['providers']))
+        if 'HOME’S' in conditions['providers']:
+            homes_ok,homes_fallback=homes_preflight_or_fallback(web,regions)
+            if not homes_ok:
+                conditions['providers']=[p for p in conditions['providers'] if p!='HOME’S']
+                if 'SUUMO' not in conditions['providers']:conditions['providers'].insert(0,'SUUMO')
+                if homes_fallback:provider_fallbacks.append(dict(homes_fallback))
+                log('HOMESはHTTP 403のため、この実行では停止してSUUMOのみで続行します。')
+                audit.add('provider_fallback','homes_http403_fallback','WARNING',homes_fallback or {'provider':'HOME’S','reason':'HTTP 403','decision':'SUUMO only'})
+        search['conditions']['providers_after_fallback']=list(conditions['providers'])
+        if 'SUUMO' in conditions['providers'] and not getattr(web,'acquired_ids',None):
+            web.acquired_ids=db.load_recent_acquisition_ids()
         suumo_groups={};homes_groups={}
         if 'SUUMO' in conditions['providers']:
             for group in suumo_area_groups(regions,munis):suumo_groups[(str(group['code']),address_key(group['suumo_town']))]=group
@@ -3961,10 +4030,18 @@ def search_all(db,conditions,screen,state=None):
                     audit.add('collector','accepted' if kind=='unit' else kind,'ERROR' if kind=='issue' else 'INFO',{'event':kind,'value':audit_value})
                 q.put((index,kind,value))
             try:
+                if provider=='HOME’S':
+                    disabled=homes_runtime_disabled(web)
+                    if disabled:
+                        emit('provider_fallback',disabled);return
                 emit('message',provider+'｜'+region['label']+'｜検索を開始')
                 PROVIDER_COLLECTORS[provider](web,dict(region,search_layout=None),bounds,munis,emit)
             except SearchCancelled:return
             except Exception as exc:
+                if provider=='HOME’S' and is_homes_http403_error(exc):
+                    fallback=disable_homes_for_runtime(web,exc,getattr(exc,'diagnostic',{}).get('url','') if isinstance(getattr(exc,'diagnostic',{}),dict) else '')
+                    emit('provider_fallback',fallback or {'provider':'HOME’S','reason':'HTTP 403','message':'HOME’Sを停止しSUUMOのみで続行'})
+                    return
                 trace(web,diagnosis_code(str(exc)),{'exception_type':type(exc).__name__,'traceback':traceback.format_exc()},'ERROR','collector_exception')
                 emit('issue',provider+'｜'+(str(exc) if isinstance(exc,AppError) else type(exc).__name__))
                 emit('incomplete',1)
@@ -3995,6 +4072,10 @@ def search_all(db,conditions,screen,state=None):
                     elif kind=='issue':
                         issue_events+=1
                         issues.append(label+'｜'+str(value));log(issues[-1])
+                    elif kind=='provider_fallback':
+                        item=dict(value) if isinstance(value,dict) else {'provider':'HOME’S','reason':'HTTP 403','message':str(value)}
+                        if not any(x.get('provider')=='HOME’S' and x.get('reason')==item.get('reason') for x in provider_fallbacks):provider_fallbacks.append(item)
+                        log('HOMESはHTTP 403のため停止｜SUUMOのみで続行')
                     elif kind=='unit':
                         identity=compact_listing_key(value) or value['key'];value=dict(value,key=identity)
                         units[identity]=merge_listing(units.get(identity),value)
@@ -4047,7 +4128,8 @@ def search_all(db,conditions,screen,state=None):
         search['status']='cancelled' if web.cancel_event.is_set() else 'partial' if issues else 'completed'
         search['summary']={'confirmed':len(units),'saved':len(saved),'candidate':candidate,'detail':detail,'rejected':rejected,'already_acquired':skipped,'incomplete_tasks':incomplete,
                            'processed':len(saved)+rejected,'errors':rejected,
-                           'retained_with_missing_fields':sum(bool(r.get('missing_fields')) for r in units.values()),'price_unknown':sum(not r.get('rent') for r in units.values()),'issues':issues[-100:],'elapsed':round(time.monotonic()-started,3),'tasks':len(jobs)}
+                           'retained_with_missing_fields':sum(bool(r.get('missing_fields')) for r in units.values()),'price_unknown':sum(not r.get('rent') for r in units.values()),'issues':issues[-100:],'elapsed':round(time.monotonic()-started,3),'tasks':len(jobs),
+                           'provider_fallbacks':provider_fallbacks,'homes_http403_fallback':bool(provider_fallbacks)}
     except SearchCancelled:
         search['status']='cancelled'
         search['summary']={'confirmed':len(units),'saved':len(saved),'processed':len(saved)+rejected,'errors':rejected,'already_acquired':skipped,'issues':issues,'elapsed':round(time.monotonic()-started,3)}
@@ -4106,7 +4188,7 @@ def search_all(db,conditions,screen,state=None):
             'terminal_rejected':rejected,'unsaved':unsaved,'ui_processed':final_processed,'ui_errors':final_errors,
             'accounted_candidates':final_candidate,'reason':'候補・処理・保存・スキップと内部イベントの件数差を検出'})
     state.live_metrics={'processed':final_processed,'saved':len(saved),'errors':final_errors,'skipped':skipped}
-    search['summary'].update(confirmed=len(units),elapsed=round(time.monotonic()-started,3),new_saved=len(saved & getattr(db,'job_new_keys',set())),updated_saved=len(saved-getattr(db,'job_new_keys',set())),processed=final_processed,errors=final_errors,candidate=final_candidate,discovered_candidate=candidate,already_acquired=skipped,rejected=rejected,detail=detail,last_saved_at=getattr(state,'new_last_saved_at',None),saved=len(saved),unsaved=unsaved,acquisition_ids_pending=len(acquisition_pending),issues=issues[-100:])
+    search['summary'].update(confirmed=len(units),elapsed=round(time.monotonic()-started,3),new_saved=len(saved & getattr(db,'job_new_keys',set())),updated_saved=len(saved-getattr(db,'job_new_keys',set())),processed=final_processed,errors=final_errors,candidate=final_candidate,discovered_candidate=candidate,already_acquired=skipped,rejected=rejected,detail=detail,last_saved_at=getattr(state,'new_last_saved_at',None),saved=len(saved),unsaved=unsaved,acquisition_ids_pending=len(acquisition_pending),issues=issues[-100:],provider_fallbacks=provider_fallbacks,homes_http403_fallback=bool(provider_fallbacks))
     if unsaved:
         audit.add('database','unsaved_listings','ERROR',{'stage':'stop.final_save' if web.cancel_event.is_set() else 'search.final_save','unsaved':unsaved,'retained_in_server_memory':True})
         for row in units.values():
@@ -5470,9 +5552,22 @@ class AutomaticCollection:
         self.request_starts={};self.shared_web=PublicWeb();self.shared_web.cancel_event=self.stop_event
         self.last_job=None;self.current=None;self.message='検索候補の町名を確認しています';self.progress=0.;self.error=''
         self.thread=threading.Thread(target=self.run,daemon=True,name='housing-automatic-collection')
+    def apply_homes_403_fallback(self,regions):
+        providers=[canonical_provider(p) for p in (self.settings.get('providers') or [])]
+        if 'HOME’S' not in providers:return False
+        if self.settings.get('homes_disabled_reason')=='HTTP 403':
+            self.settings['providers']=['SUUMO'];return True
+        ok,item=homes_preflight_or_fallback(self.shared_web,regions)
+        if ok:return False
+        self.settings['providers']=['SUUMO'];self.settings['homes_disabled_reason']='HTTP 403';self.settings['homes_disabled_at']=utc_now()
+        self.summary['provider_fallbacks']=[item or {'provider':'HOME’S','reason':'HTTP 403'}]
+        self.summary['next_task_index']=0;self.summary['cycle_completed_indices']=[]
+        self.message='HOMESはHTTP 403のため、この自動収集ではSUUMOのみで続行します。'
+        return True
     def ensure_plan(self):
         with self.lock:
             if self.settings.get('auto_regions') and self.settings.get('auto_munis'):
+                self.apply_homes_403_fallback(self.settings.get('auto_regions') or [])
                 plan=automatic_task_plan(self.settings)
                 if plan:
                     self.summary['task_labels']=[p['label'] for p in plan];self.summary['total_tasks']=len(plan)
@@ -5484,6 +5579,7 @@ class AutomaticCollection:
         if not regions:raise AppError('自動収集する町が見つかりません。')
         with self.lock:
             self.settings['auto_regions']=regions;self.settings['auto_munis']=munis
+            self.apply_homes_403_fallback(regions)
             plan=automatic_task_plan(self.settings)
             if not plan:raise AppError('自動収集する町が見つかりません。')
             self.summary['task_labels']=[p['label'] for p in plan];self.summary['total_tasks']=len(plan)
@@ -5553,7 +5649,14 @@ class AutomaticCollection:
                     self.summary['statistics_started_at']=self.summary.get('statistics_started_at') or self.summary['last_started_at']
                     self.summary['collection_seconds']=float(self.summary.get('collection_seconds',0))+float(stats.get('elapsed',0))
                     self.summary['confirmed_observations']=int(self.summary.get('confirmed_observations',0))+len(snap['units'])
-                    if status in ('completed','partial') and not incomplete:
+                    homes_fallback=bool(stats.get('homes_http403_fallback'))
+                    if homes_fallback:
+                        self.settings['providers']=['SUUMO'];self.settings['homes_disabled_reason']='HTTP 403';self.settings['homes_disabled_at']=utc_now()
+                        self.summary['provider_fallbacks']=list(stats.get('provider_fallbacks') or [{'provider':'HOME’S','reason':'HTTP 403'}])
+                        self.summary['next_task_index']=0;self.summary['cycle_completed_indices']=[];self.summary.pop('cycle_reset_pending',None)
+                        new_plan=automatic_task_plan(self.settings);self.summary['task_labels']=[p['label'] for p in new_plan];self.summary['total_tasks']=len(new_plan)
+                        self.message='HOMESはHTTP 403のため停止しました。SUUMOのみで同じ対象範囲を続行します。'
+                    elif status in ('completed','partial') and not incomplete:
                         total=max(1,int(conditions.get('auto_total_tasks',len(plan)) or len(plan)))
                         index=int(conditions.get('auto_task_index',index) or 0)%total
                         completed={int(x) for x in self.summary.get('cycle_completed_indices',[]) if isinstance(x,(int,float)) or str(x).isdigit()}
@@ -5568,7 +5671,8 @@ class AutomaticCollection:
                     if status=='failed' or incomplete:
                         self.settings['enabled']=False;self.stop_event.set()
                         self.error='今回の町の全ページ確認を完了できませんでした。原因を確認して同じ町から再開してください。'
-                    self.message='取得に失敗したため自動収集を中止しました。' if status=='failed' or incomplete else '取得・保存処理を中止しました。' if status=='cancelled' else '保存完了。次の町へ進みます。'
+                    if not homes_fallback:
+                        self.message='取得に失敗したため自動収集を中止しました。' if status=='failed' or incomplete else '取得・保存処理を中止しました。' if status=='cancelled' else '保存完了。次の町へ進みます。'
                 self.persist()
         except Exception as exc:
             with self.lock:
@@ -5621,15 +5725,12 @@ def restore_automatic_collection():
             if not isinstance(rows,list):raise AppError('自動収集設定を読み取れません。')
             if not rows:return
             settings=rows[0].get('conditions') or {};summary=rows[0].get('summary') or {}
-            # v89 migration: previous automatic settings were SUUMO-only.  Keep the
-            # ward/town scope but restart the provider/town task index because the new
-            # interleaved plan contains both SUUMO and HOME'S tasks.
+            # Preserve a persisted SUUMO-only provider fallback.  A fresh manual start
+            # tests HOME'S again, but an automatic restart must not loop on the same 403.
             previous_providers=[canonical_provider(p) for p in (settings.get('providers') or [])]
-            settings['providers']=list(AUTOMATIC_REGION_PROVIDERS)
-            if previous_providers!=list(AUTOMATIC_REGION_PROVIDERS):
-                for key in ('next_task_index','current_task_index','total_tasks','task_labels','cycle_completed_indices','current_task_label','cycle_reset_pending'):
-                    summary.pop(key,None)
-                summary['next_task_index']=0;summary['cycle_completed_indices']=[]
+            if not previous_providers:settings['providers']=list(AUTOMATIC_REGION_PROVIDERS)
+            else:settings['providers']=[p for p in dict.fromkeys(previous_providers) if p in AUTOMATIC_REGION_PROVIDERS]
+            if settings.get('homes_disabled_reason')=='HTTP 403':settings['providers']=['SUUMO']
             validate_automatic_settings(settings);validate_automatic_summary(summary)
             st.session_state.automatic_saved_settings=settings;st.session_state.automatic_saved_summary=summary
             if not settings.get('enabled'):return
@@ -5718,7 +5819,7 @@ def automatic_collection_panel():
     saved=snap['settings'] if snap else st.session_state.get('automatic_saved_settings',{})
     ward_code=st.selectbox('自動収集する区',list(TOKYO_WARDS),index=list(TOKYO_WARDS).index(saved.get('ward_code','13116')),format_func=lambda code:TOKYO_WARDS[code],key='automatic_ward')
     town_codes=ward_town_selector(ward_code,'automatic',saved.get('town_codes',[]),disabled=busy)
-    st.caption('選択した町をSUUMO・HOMESの順で最後のページまで検索します。町名未選択なら区の全町が対象です。両サイトとも、マンションは築15年以内・①1LDK/2K/2DK→②2LDK/3K/3DK、一戸建ては築40年以内・50㎡以上を収集します。')
+    st.caption('選択した町をSUUMO・HOMESの順で最後のページまで検索します。町名未選択なら区の全町が対象です。両サイトとも、マンションは築15年以内・①1LDK/2K/2DK→②2LDK/3K/3DK、一戸建ては築40年以内・50㎡以上を収集します。HOMESがサーバー側でHTTP 403を返した場合はHOMESを停止し、SUUMOだけで収集を継続します。')
     manual=active_job();manual_busy=bool(manual and not manual.snapshot()['finished'])
     if st.button('選択した区で自動収集を開始・再開',key='automatic_start',disabled=busy or manual_busy):
         try:
@@ -5739,6 +5840,8 @@ def automatic_collection_panel():
         cumulative_errors=int(summary.get('error_observations',0))
         cumulative_skipped=int(summary.get('skipped_observations',0))
         st.caption(f'累計｜処理 {cumulative_processed}件｜保存 {cumulative_saved}件｜エラー {cumulative_errors}件｜スキップ {cumulative_skipped}件')
+        if (snap.get('settings') or {}).get('homes_disabled_reason')=='HTTP 403':
+            st.info('HOMESはHTTP 403のため、この自動収集では停止しています。SUUMOのみで継続中です。')
 
         labels=list(summary.get('task_labels') or [p['label'] for p in automatic_task_plan(snap.get('settings') or {})])
         if labels:
