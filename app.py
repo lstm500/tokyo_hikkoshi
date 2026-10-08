@@ -39,7 +39,7 @@ import streamlit as st
 from streamlit_folium import st_folium
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v95"
+BUILD = "REBUILD-01-v96"
 
 # ============================================================================
 # NON-NEGOTIABLE SUUMO ADDRESS POLICY -- DO NOT DELETE OR WEAKEN
@@ -86,9 +86,9 @@ SUUMO_MAP_ONLY_ADDRESS_POLICY = 'map_coordinate_plus_identity_corroboration_v2'
 # The detached-house branch is additive: do not weaken/remove the existing mansion flow.
 HOMES_TEXT_ADDRESS_FORBIDDEN = True
 HOMES_MAP_ONLY_ADDRESS_POLICY = 'map_image_or_published_center_plus_identity_v1'
-AUTOMATIC_REGION_PROVIDERS = ['SUUMO','HOME’S']
+AUTOMATIC_REGION_PROVIDERS = ['SUUMO']
 
-PROVIDER_OPTIONS = ("スマイティ","HOMES","SUUMO","カナリー","アットホーム","CHINTAI","Comfy","アパマンショップ")
+PROVIDER_OPTIONS = ('SUUMO',)
 PROVIDER_CANONICAL = {"HOMES":"HOME’S","HOME’S":"HOME’S","スマイティ":"スマイティ","SUUMO":"SUUMO","カナリー":"カナリー",
                       "アットホーム":"アットホーム","CHINTAI":"CHINTAI","Comfy":"Comfy","アパマンショップ":"アパマンショップ"}
 PROVIDER_DISPLAY = {"HOME’S":"HOMES",**{x:x for x in PROVIDER_OPTIONS if x!="HOMES"}}
@@ -4108,12 +4108,15 @@ PROVIDER_COLLECTORS={
 
 def search_all(db,conditions,screen,state=None):
     if state is None: state=st.session_state
+    # SUUMO-only release: ignore stale multi-provider requests from stored settings.
+    conditions['providers']=['SUUMO']
     bounds=tuple(conditions['bounds']);started=time.monotonic()
     audit=getattr(state,'audit',None) or AuditLog(conditions,(getattr(db,'key',''),));state.audit=audit;db.audit=audit
     DIAG_CONTEXT.audit=audit;DIAG_CONTEXT.scope={}
     search=dict(id=audit.search_id,status='started',
                 started_at=utc_now(),finished_at=None,conditions=conditions,summary={})
     units={};saved=set();issues=[];logs=[];acquisition_pending={};q=None;provider_fallbacks=[]
+    candidate=detail=rejected=skipped=incomplete=issue_events=0
     def log(message):
         audit.add('progress',diagnosis_code(message) if 'エラー' in message or '失敗' in message else 'progress','INFO',{'message':message})
         logs.append(f"{datetime.now().strftime('%H:%M:%S')}  {message}")
@@ -4222,7 +4225,7 @@ def search_all(db,conditions,screen,state=None):
                 conditions['auto_task_label']=jobs[index][0]['label']+'｜'+PROVIDER_DISPLAY.get(jobs[index][1],jobs[index][1])
                 jobs=[jobs[index]]
         db.job_new_keys=set()
-        q=queue.Queue();active={};done=0;candidate=detail=rejected=skipped=incomplete=issue_events=0;save_buffer={};save_failed_keys=set();last_flush=time.monotonic()
+        q=queue.Queue();active={};done=0;save_buffer={};save_failed_keys=set();last_flush=time.monotonic()
         def work(index,region,provider):
             if web.cancel_event.is_set():return
             DIAG_CONTEXT.audit=audit;DIAG_CONTEXT.scope={'task':index,'region':region['label'],'town':region['town'],'municipality_code':region['code'],'provider':provider}
@@ -5336,9 +5339,9 @@ def remember_search():
         code=state.get('manual_ward','13116')
         selected=list(state.get('new_providers',[]))
         providers=[canonical_provider(p) for p in selected]
-        providers=[p for p in dict.fromkeys(providers) if p in ('SUUMO','HOME’S')]
+        providers=[p for p in dict.fromkeys(providers) if p=='SUUMO']
         if not providers:
-            state.new_search={'status':'failed','summary':{'issues':['区・町名検索ではSUUMOまたはHOMESを取得元に選択してください。'],'saved':0,'confirmed':0}}
+            state.new_search={'status':'failed','summary':{'issues':['区・町名検索ではSUUMOを取得元に選択してください。'],'saved':0,'confirmed':0}}
             return
         state.new_request={'bounds':[34,138,37,141],'providers':providers,'ward_code':code,
                            'town_codes':list(state.get('manual_selected_'+code,[])), 'mode':'ward_search',
@@ -5346,7 +5349,7 @@ def remember_search():
         state.new_map_loaded=True
         return
     selected=list(state.get('new_providers',[]))
-    providers=list(dict.fromkeys(canonical_provider(p) for p in selected))
+    providers=[p for p in dict.fromkeys(canonical_provider(p) for p in selected) if p=='SUUMO']
     bounds=state.get('new_bounds')
     state.new_preferences={'new_providers':selected}
     state.new_map_loaded=True
@@ -5790,31 +5793,19 @@ def get_automatic_failure_export(max_age=60,refresh=True):
 class AutomaticCollection:
     """One low-concurrency collection loop per saved namespace; no Streamlit UI in its thread."""
     def __init__(self,db,settings,summary=None):
+        settings=dict(settings)
+        settings['providers']=['SUUMO']
+        settings.pop('homes_disabled_reason',None)
+        settings.pop('homes_disabled_at',None)
         validate_automatic_settings(settings);validate_automatic_summary(summary or {})
         self.db=db;self.settings=dict(settings);self.settings['interval_minutes']=0;self.summary=dict(summary or {});self.summary.pop('next_run_at',None);self.build=BUILD
         self.lock=threading.RLock();self.io_lock=threading.Lock();self.stop_event=threading.Event()
         self.request_starts={};self.shared_web=PublicWeb();self.shared_web.cancel_event=self.stop_event
         self.last_job=None;self.current=None;self.message='検索候補の町名を確認しています';self.progress=0.;self.error=''
         self.thread=threading.Thread(target=self.run,daemon=True,name='housing-automatic-collection')
-    def apply_homes_403_fallback(self,regions):
-        providers=[canonical_provider(p) for p in (self.settings.get('providers') or [])]
-        if 'HOME’S' not in providers:return False
-        old_plan=automatic_task_plan(self.settings)
-        if self.settings.get('homes_disabled_reason')=='HTTP 403':
-            self.settings['providers']=['SUUMO']
-            reconcile_automatic_task_progress(self.summary,old_plan,automatic_task_plan(self.settings))
-            return True
-        ok,item=homes_preflight_or_fallback(self.shared_web,regions)
-        if ok:return False
-        self.settings['providers']=['SUUMO'];self.settings['homes_disabled_reason']='HTTP 403';self.settings['homes_disabled_at']=utc_now()
-        self.summary['provider_fallbacks']=[item or {'provider':'HOME’S','reason':'HTTP 403'}]
-        reconcile_automatic_task_progress(self.summary,old_plan,automatic_task_plan(self.settings))
-        self.message='HOMESはHTTP 403のため、この自動収集ではSUUMOのみで続行します。'
-        return True
     def ensure_plan(self):
         with self.lock:
             if self.settings.get('auto_regions') and self.settings.get('auto_munis'):
-                self.apply_homes_403_fallback(self.settings.get('auto_regions') or [])
                 plan=automatic_task_plan(self.settings)
                 if plan:
                     if self.summary.get('task_labels')!=[p['label'] for p in plan]:
@@ -5829,7 +5820,6 @@ class AutomaticCollection:
         if not regions:raise AppError('自動収集する町が見つかりません。')
         with self.lock:
             self.settings['auto_regions']=regions;self.settings['auto_munis']=munis
-            self.apply_homes_403_fallback(regions)
             plan=automatic_task_plan(self.settings)
             if not plan:raise AppError('自動収集する町が見つかりません。')
             if self.summary.get('task_labels')!=[p['label'] for p in plan]:
@@ -5902,19 +5892,7 @@ class AutomaticCollection:
                     self.summary['statistics_started_at']=self.summary.get('statistics_started_at') or self.summary['last_started_at']
                     self.summary['collection_seconds']=float(self.summary.get('collection_seconds',0))+float(stats.get('elapsed',0))
                     self.summary['confirmed_observations']=int(self.summary.get('confirmed_observations',0))+len(snap['units'])
-                    homes_fallback=bool(stats.get('homes_http403_fallback'))
-                    if homes_fallback:
-                        original_task_label=plan[index]['label']
-                        original_provider=plan[index]['provider']
-                        self.settings['providers']=['SUUMO'];self.settings['homes_disabled_reason']='HTTP 403';self.settings['homes_disabled_at']=utc_now()
-                        self.summary['provider_fallbacks']=list(stats.get('provider_fallbacks') or [{'provider':'HOME’S','reason':'HTTP 403'}])
-                        completed_suumo=(original_task_label if original_provider=='SUUMO' and
-                                         status in ('completed','partial') and not incomplete else None)
-                        reconcile_automatic_task_progress(self.summary,plan,automatic_task_plan(self.settings),completed_suumo)
-                        if completed_suumo:
-                            self.summary['completed_runs']=int(self.summary.get('completed_runs',0))+1
-                        self.message='HOMESはHTTP 403のため停止しました。SUUMOのみで同じ対象範囲を続行します。'
-                    elif status in ('completed','partial') and not incomplete:
+                    if status in ('completed','partial') and not incomplete:
                         total=max(1,int(conditions.get('auto_total_tasks',len(plan)) or len(plan)))
                         index=int(conditions.get('auto_task_index',index) or 0)%total
                         completed={int(x) for x in self.summary.get('cycle_completed_indices',[]) if isinstance(x,(int,float)) or str(x).isdigit()}
@@ -5929,8 +5907,7 @@ class AutomaticCollection:
                     if status=='failed' or incomplete:
                         self.settings['enabled']=False;self.stop_event.set()
                         self.error='今回の町の全ページ確認を完了できませんでした。原因を確認して同じ町から再開してください。'
-                    if not homes_fallback:
-                        self.message='取得に失敗したため自動収集を中止しました。' if status=='failed' or incomplete else '取得・保存処理を中止しました。' if status=='cancelled' else '保存完了。次の町へ進みます。'
+                    self.message='取得に失敗したため自動収集を中止しました。' if status=='failed' or incomplete else '取得・保存処理を中止しました。' if status=='cancelled' else '保存完了。次の町へ進みます。'
                 self.persist()
         except Exception as exc:
             with self.lock:
@@ -5983,12 +5960,9 @@ def restore_automatic_collection():
             if not isinstance(rows,list):raise AppError('自動収集設定を読み取れません。')
             if not rows:return
             settings=rows[0].get('conditions') or {};summary=rows[0].get('summary') or {}
-            # Preserve a persisted SUUMO-only provider fallback.  A fresh manual start
-            # tests HOME'S again, but an automatic restart must not loop on the same 403.
-            previous_providers=[canonical_provider(p) for p in (settings.get('providers') or [])]
-            if not previous_providers:settings['providers']=list(AUTOMATIC_REGION_PROVIDERS)
-            else:settings['providers']=[p for p in dict.fromkeys(previous_providers) if p in AUTOMATIC_REGION_PROVIDERS]
-            if settings.get('homes_disabled_reason')=='HTTP 403':settings['providers']=['SUUMO']
+            settings['providers']=['SUUMO']
+            settings.pop('homes_disabled_reason',None)
+            settings.pop('homes_disabled_at',None)
             validate_automatic_settings(settings);validate_automatic_summary(summary)
             st.session_state.automatic_saved_settings=settings;st.session_state.automatic_saved_summary=summary
             if not settings.get('enabled'):return
@@ -6002,7 +5976,7 @@ def validate_automatic_settings(settings):
     codes=settings.get('town_codes',[])
     if not isinstance(codes,list) or any(not isinstance(c,str) or not re.fullmatch(re.escape(settings['ward_code'])+r'\d{3}',c) for c in codes):raise AppError('対象町名の設定が不正です。')
     providers=[canonical_provider(p) for p in (settings.get('providers') or [])]
-    if not providers or any(p not in AUTOMATIC_REGION_PROVIDERS for p in providers):raise AppError('自動収集の取得元はSUUMO・HOMESを指定してください。')
+    if providers!=['SUUMO']:raise AppError('SUUMO-only automatic collection requires SUUMO.')
 
 def validate_automatic_summary(summary):
     if not isinstance(summary,dict):raise AppError('自動収集の進捗形式が不正です。')
@@ -6063,7 +6037,7 @@ def schedule_automatic_upgrade(controller):
 
 @st.fragment(run_every='8s')
 def automatic_collection_panel():
-    st.subheader('アプリ内の自動収集（SUUMO・HOMES）')
+    st.subheader('アプリ内の自動収集（SUUMO）')
     st.caption('画面を閉じてもサーバー稼働中は収集します。休止・再起動では止まり、次にアプリを開くと保存した設定・町の順番から再開します。')
     controller=get_automatic_collection();snap=controller.snapshot() if controller else None
     if controller:
@@ -6079,7 +6053,7 @@ def automatic_collection_panel():
     saved=snap['settings'] if snap else st.session_state.get('automatic_saved_settings',{})
     ward_code=st.selectbox('自動収集する区',list(TOKYO_WARDS),index=list(TOKYO_WARDS).index(saved.get('ward_code','13116')),format_func=lambda code:TOKYO_WARDS[code],key='automatic_ward')
     town_codes=ward_town_selector(ward_code,'automatic',saved.get('town_codes',[]),disabled=busy)
-    st.caption('選択した町をSUUMO・HOMESの順で最後のページまで検索します。町名未選択なら区の全町が対象です。両サイトとも、マンションは築15年以内・①1LDK/2K/2DK→②2LDK/3K/3DK、一戸建ては築40年以内・50㎡以上を収集します。HOMESがサーバー側でHTTP 403を返した場合はHOMESを停止し、SUUMOだけで収集を継続します。')
+    st.caption('SUUMOのみで町ごとに最後のページまで検索します。マンションは築15年以内、1LDK/2K/2DK・2LDK/3K/3DK、一戸建て・その他は築40年以内・50㎡以上を対象とします。')
     manual=active_job();manual_busy=bool(manual and not manual.snapshot()['finished'])
     if st.button('選択した区で自動収集を開始・再開',key='automatic_start',disabled=busy or manual_busy):
         try:
@@ -6100,8 +6074,6 @@ def automatic_collection_panel():
         cumulative_errors=int(summary.get('error_observations',0))
         cumulative_skipped=int(summary.get('skipped_observations',0))
         st.caption(f'累計｜処理 {cumulative_processed}件｜保存 {cumulative_saved}件｜エラー {cumulative_errors}件｜スキップ {cumulative_skipped}件')
-        if (snap.get('settings') or {}).get('homes_disabled_reason')=='HTTP 403':
-            st.info('HOMESはHTTP 403のため、この自動収集では停止しています。SUUMOのみで継続中です。')
 
         labels=list(summary.get('task_labels') or [p['label'] for p in automatic_task_plan(snap.get('settings') or {})])
         if labels:
@@ -6240,25 +6212,26 @@ def main():
             south,west,north,east=bounds
             st.caption(f'検索する表示範囲：緯度 {south:.5f}〜{north:.5f}／経度 {west:.5f}〜{east:.5f}')
         else: st.info('地図の表示範囲を受信しています。表示後に地図を少し動かしてください。対象は東京と周辺地域です。')
-        saved_provider_defaults=preferences.get('new_providers',['HOMES','SUUMO'])
+        saved_provider_defaults=preferences.get('new_providers',['SUUMO'])
         provider_defaults=[PROVIDER_DISPLAY.get(canonical_provider(x),x) for x in saved_provider_defaults]
-        provider_defaults=[x for x in dict.fromkeys(provider_defaults) if x in PROVIDER_OPTIONS] or ['HOMES','SUUMO']
+        provider_defaults=[x for x in dict.fromkeys(provider_defaults) if x in PROVIDER_OPTIONS] or ['SUUMO']
         if 'new_providers' in state:
             current_provider_state=[PROVIDER_DISPLAY.get(canonical_provider(x),x) for x in list(state.get('new_providers',[]))]
             current_provider_state=[x for x in dict.fromkeys(current_provider_state) if x in PROVIDER_OPTIONS]
+            if not current_provider_state:current_provider_state=['SUUMO']
             if list(state.get('new_providers',[]))!=current_provider_state:state.new_providers=current_provider_state
-        providers=st.multiselect('物件の取得元（複数選択可）',list(PROVIDER_OPTIONS),default=provider_defaults,key='new_providers')
-        st.caption('スマイティ・HOMES・SUUMO・カナリー・アットホーム・CHINTAI・Comfy・アパマンショップから、使う取得元を1つ以上選択できます。')
+        providers=st.multiselect('物件の取得元（SUUMOのみ）',list(PROVIDER_OPTIONS),default=provider_defaults,key='new_providers',disabled=True)
+        st.caption('現在はSUUMOのみを取得元に使用します。')
         scope=st.radio('検索方法',['地図の表示範囲','区・町名を選択'],horizontal=True,key='manual_search_scope')
         searching=automatic_busy() or bool(active_job() and not active_job().snapshot()['finished'])
         if scope=='区・町名を選択':
             ward_code=st.selectbox('検索する区',list(TOKYO_WARDS),index=list(TOKYO_WARDS).index(state.get('manual_selected_ward','13116')),format_func=lambda code:TOKYO_WARDS[code],key='manual_ward',disabled=searching)
             state.manual_selected_ward=ward_code
             ward_town_selector(ward_code,'manual',disabled=searching)
-            st.caption('区・町名指定はSUUMO・HOMESを対象に、マンションは築15年以内・①1LDK/2K/2DK→②2LDK/3K/3DK、一戸建ては築40年以内・50㎡以上を検索・保存します。所在地文字列は使わず、各詳細ページの物件地図から詳細住所を推定します。')
+            st.caption('区・町名指定はSUUMOを対象に、マンションは築15年以内・①1LDK/2K/2DK→②2LDK/3K/3DK、一戸建ては築40年以内・50㎡以上を検索・保存します。所在地文字列は使わず、各詳細ページの物件地図から詳細住所を推定します。')
         st.button('表示中の地名から全件検索・保存' if scope=='地図の表示範囲' else '選択した区・町名を検索・保存',type='primary',use_container_width=True,
                   on_click=remember_search,key='new_start',disabled=searching or (scope=='地図の表示範囲' and (not bounds or not providers)))
-        st.caption('検索開始時の表示範囲から検索する町名を決めます。SUUMO・HOMESとも、マンションは築15年以内の2間取り群、一戸建ては築40年以内・50㎡以上を最後のページまで検索します。所在地文字列は住所推定に使わず、各詳細ページの物件地図から位置を取得し、番地まで推定します。住所は実所在地未確認の推定値です。保存は家賃・間取り・種別・詳細住所（推定）・データ取得日時です。')
+        st.caption('検索開始時の表示範囲から検索する町名を決めます。SUUMOでは、マンションは築15年以内の2間取り群、一戸建ては築40年以内・50㎡以上を最後のページまで検索します。所在地文字列は住所推定に使わず、各詳細ページの物件地図から位置を取得し、番地まで推定します。住所は実所在地未確認の推定値です。保存は家賃・間取り・種別・詳細住所（推定）・データ取得日時です。')
         background_status()
         result=state.new_search
         if result:
@@ -6399,10 +6372,10 @@ def main():
         st.caption('旧アプリの物件や検索状態を使用しません。旧テーブルのデータは削除しません。')
         st.caption(f'実行中の版：{BUILD}')
     with st.expander('取得・集計の範囲'):
-        st.write("HOMES・SUUMOとも、マンションは築15年以内・1LDK/2K/2DKまたは2LDK/3K/3DK、一戸建ては築40年以内・50㎡以上を検索します。HOMESが通常HTTPで403の場合は、Streamlit Cloud上の実Chromiumブラウザで同じ公開ページを1回再試行し、ブラウザでも拒否された場合だけSUUMOへ切り替えます。SUUMOの位置は「地図・周辺環境」の物件マーカー、HOMESの位置は「地図を見る」の画像ピンを最優先し、画像ピンを一意に取れない場合はHOME'Sが公開したGoogle地図座標を使います。地図由来の詳細住所を推定できない物件は保存しません。")
+        st.write('SUUMOのみで検索します。マンションは築15年以内、1LDK/2K/2DKまたは2LDK/3K/3DK。一戸建て・その他は築40年以内・50㎡以上を対象とします。住所は物件固有の地図の座標から推定します。')
         st.write('データベースへ保存する募集項目は家賃・間取り・種別（マンション／一戸建て）・詳細住所（推定）・データ取得日時です。取得日時はUTCで保存し、画面では日本時間で表示します。管理費・面積・築年数・画像・緯度経度・掲載URLは募集データとして保存しません。')
         st.write('募集情報は既存SupabaseのJSON保存領域へ保存するため、追加SQLは不要です。schema 4・5の保存データを読み込みます。旧データの取得日時は未記録と表示します。')
-        st.write("SUUMOは物件マーカー座標、HOMESは画像ピンまたはHOME'S公開地図座標を起点にし、国土地理院の住居表示住所データから街区符号・基礎番号を最近傍推定します。一覧・詳細ページの所在地文字列から住所や位置を補完しません。")
+        st.write('SUUMOは物件固有地図の座標を起点に、国土地理院の住居表示住所データから詳細住所を推定します。一覧・詳細ページの所在地文字列から住所や位置を補完しません。')
         st.write('地図範囲内の居住地名タイルと100m間隔の地点・範囲の端から地名・丁目を判定します。候補数・物件数・ページ数による打ち切りは行いません。通信失敗やページ送りの異常は未完了として表示します。掲載サイト側の非公開情報・取得制限や、地名データの欠落は取得できません。')
         st.write('検索中は取得した物件の座標を使って地図へ逐次反映します。保存データ読込時は住所から座標を一時生成します。座標はDBへ保存しません。')
         st.write('検索と保存はサーバーのバックグラウンドで実行し、画面は1秒ごとに進捗を表示します。サーバーの休止・再起動を越えて実行することはできません。募集終了物件の自動削除は行いません。')
