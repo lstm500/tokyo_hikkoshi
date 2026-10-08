@@ -38,7 +38,7 @@ import streamlit as st
 from streamlit_folium import st_folium
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v66"
+BUILD = "REBUILD-01-v68"
 PROVIDER_OPTIONS = ("スマイティ","HOMES","SUUMO","カナリー","アットホーム","CHINTAI","Comfy","アパマンショップ")
 PROVIDER_CANONICAL = {"HOMES":"HOME’S","HOME’S":"HOME’S","スマイティ":"スマイティ","SUUMO":"SUUMO","カナリー":"カナリー",
                       "アットホーム":"アットホーム","CHINTAI":"CHINTAI","Comfy":"Comfy","アパマンショップ":"アパマンショップ"}
@@ -848,6 +848,59 @@ class Database:
             offset+=len(rows)
         return events
 
+    def save_diagnostic_failures(self,events):
+        """Persist every acquisition/error event independently from periodic diagnostic chunks."""
+        if not events:return 0
+        payload=[]
+        for event in events:
+            if not isinstance(event,dict):continue
+            search_id=str(event.get('search_id') or '')
+            seq=event.get('seq')
+            if not re.fullmatch(r'[0-9a-f]{64}',search_id):continue
+            try:seq=int(seq)
+            except (TypeError,ValueError):continue
+            context=event.get('context') if isinstance(event.get('context'),dict) else {}
+            payload.append(dict(
+                namespace=self.namespace,
+                id=f'failure.{search_id}.{seq:010d}',
+                status='diagnostic_error',
+                started_at=event.get('time') or utc_now(),
+                finished_at=event.get('time') or utc_now(),
+                conditions={
+                    'record_type':'diagnostic_error','schema':1,'search_id':search_id,'seq':seq,
+                    'build':BUILD,'stage':event.get('stage'),'code':event.get('code'),'level':event.get('level'),
+                    'search_mode':event.get('_search_mode'),'ward_code':event.get('_ward_code'),'town_codes':event.get('_town_codes'),
+                    'context':context,
+                },
+                summary={'event':event},
+            ))
+        if not payload:return 0
+        saved=0
+        for offset in range(0,len(payload),100):
+            batch=payload[offset:offset+100]
+            result=self.call('POST',SEARCH_TABLE,{'on_conflict':'namespace,id','select':'id'},batch,
+                             'resolution=merge-duplicates,return=representation')
+            returned={r.get('id') for r in result if isinstance(r,dict)} if isinstance(result,list) else set()
+            expected={r['id'] for r in batch}
+            if not expected<=returned:raise AppError('取得エラーの永続保存を確認できません。')
+            saved+=len(batch)
+        return saved
+
+    def load_diagnostic_failures(self):
+        """Load every persisted failure/error event for this namespace, across all towns and runs."""
+        events=[];offset=0
+        while True:
+            rows=self.call('GET',SEARCH_TABLE,{'namespace':'eq.'+self.namespace,'status':'eq.diagnostic_error',
+                'select':'id,summary,conditions,started_at','order':'started_at.asc,id.asc','limit':1000,'offset':offset})
+            if not isinstance(rows,list):raise AppError('保存済み取得エラーを読み取れません。')
+            if not rows:break
+            for row in rows:
+                event=(row.get('summary') or {}).get('event')
+                if isinstance(event,dict):events.append(event)
+            if len(rows)<1000:break
+            offset+=len(rows)
+        return events
+
 
 GEO_HTTP_CACHE={}
 GEO_EMPTY_ADDRESS_TILES={}
@@ -873,7 +926,7 @@ def response_encoding(response):
 class PublicWeb:
     def __init__(self):
         self.address_points=None
-        self.local=threading.local();self.cancel_event=threading.Event();self.cache_lock=threading.RLock();self.http_flights={};self.host_slots={};self.detail_slots=threading.BoundedSemaphore(DETAIL_WORKERS);self.jhj_tile_cache={};self.jhj_tile_cached_at={};self.address_result_cache={}
+        self.local=threading.local();self.cancel_event=threading.Event();self.cache_lock=threading.RLock();self.http_flights={};self.host_slots={};self.detail_slots=threading.BoundedSemaphore(DETAIL_WORKERS);self.jhj_tile_cache={};self.jhj_tile_cached_at={};self.address_result_cache={};self.suumo_location_cache={}
         self.headers={'User-Agent':'SumaiCompassRebuild/1.0 (personal rental research)', 'Accept-Language':'ja'}
         self.host_gates={};self.host_last_request={};self.host_backoff={};self.route_cooldowns={};self.session_primed=threading.local();self.proxy_routes=[];self.route_preferred={};self.route_lock=threading.Lock();self.http_cache={};self.headers.update({'Accept':'text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8'})
         self.robots={};self.lock=threading.Lock();self.layout_form_lock=threading.Lock();self.layout_form_cache={};self.provider_cache={};self.provider_lock=threading.RLock();self.unavailable_hosts={};self.failed_detail_urls={}
@@ -2232,59 +2285,147 @@ def _suumo_next_url(soup,response_url,filter_params):
     return target
 
 
-def suumo_kankyo_url(soup,detail_url):
+def suumo_jnc_key(url):
+    match=re.search(r'/jnc_(\d+)',urlparse(url).path)
+    return match.group(1) if match else ''
+
+
+def suumo_bc_id(url):
+    u=urlparse(url);bc=parse_qs(u.query).get('bc',[''])[0]
+    if re.fullmatch(r'\d+',bc):return bc
+    match=re.search(r'/bc_(\d+)',u.path)
+    return match.group(1) if match else ''
+
+
+def suumo_kankyo_urls(soup,detail_url):
+    """Return published surroundings-map URLs, preferring the canonical BC route.
+
+    SUUMO JNC detail pages can expose both JNC and BC links. The observed v66 failure
+    came from using the JNC /kankyo/ page even though the canonical BC /kankyo/ page
+    contained js-gmapData with exactly one room marker. Prefer explicit/derived BC
+    pages, then fall back to JNC pages without inventing coordinates.
+    """
+    explicit=[];bc_links=[];jnc_links=[]
     for a in soup.select('a[href]'):
         label=normal(a.get_text(' ',strip=True))+' '+normal(a.get('title'))+' '+normal(a.get('aria-label'))
-        target=urljoin(detail_url,a.get('href',''));u=urlparse(target)
-        if u.hostname=='suumo.jp' and ('/kankyo/' in u.path or '地図・周辺環境' in label or '周辺環境' in label):return target
-    u=urlparse(detail_url);path=u.path.rstrip('/')+'/kankyo/'
-    return u._replace(path=path,fragment='').geturl()
+        target=urljoin(detail_url,a.get('href','')).split('#')[0];u=urlparse(target)
+        if u.hostname!='suumo.jp':continue
+        if '/kankyo/' not in u.path and '地図・周辺環境' not in label and '周辺環境' not in label:continue
+        if '/bc_' in u.path:bc_links.append(target)
+        elif '/jnc_' in u.path:jnc_links.append(target)
+        else:explicit.append(target)
+    candidates=[]
+    def add(url):
+        if not url:return
+        u=urlparse(url);url=u._replace(fragment='').geturl()
+        if safe_url(url,'SUUMO') and url not in candidates:candidates.append(url)
+    for url in bc_links:add(url)
+    bc=suumo_bc_id(detail_url)
+    if bc:add(f'https://suumo.jp/chintai/bc_{bc}/kankyo/')
+    # A detail page can contain a canonical BC detail link but no direct surroundings link.
+    for a in soup.select('a[href]'):
+        target=urljoin(detail_url,a.get('href','')).split('#')[0]
+        u=urlparse(target);m=re.fullmatch(r'/chintai/bc_(\d+)/?',u.path)
+        if u.hostname=='suumo.jp' and m:add(f'https://suumo.jp/chintai/bc_{m.group(1)}/kankyo/')
+    for url in jnc_links:add(url)
+    for url in explicit:add(url)
+    u=urlparse(detail_url)
+    if '/jnc_' in u.path:add(u._replace(path=u.path.rstrip('/')+'/kankyo/',fragment='').geturl())
+    return candidates
+
+
+def suumo_kankyo_url(soup,detail_url):
+    urls=suumo_kankyo_urls(soup,detail_url)
+    return urls[0] if urls else ''
+
+
+def _suumo_room_marker_points(web,soup,map_url):
+    """Extract only explicitly published type=room markers from SUUMO map JSON."""
+    nodes=[]
+    exact=soup.find('script',id='js-gmapData')
+    if exact:nodes.append(exact)
+    # Keep a conservative fallback for harmless markup changes: JSON script blocks
+    # that explicitly contain both a markers array and a room marker.
+    for node in soup.find_all('script'):
+        if node is exact:continue
+        raw=node.string if isinstance(node.string,str) else node.get_text('',strip=False)
+        if raw and '"markers"' in raw and '"room"' in raw:nodes.append(node)
+    for node in nodes:
+        raw=node.string if isinstance(node.string,str) else node.get_text('',strip=False)
+        raw=(raw or '').strip()
+        try:
+            data=json.loads(raw);markers=data.get('markers',[]) if isinstance(data,dict) else []
+        except (ValueError,TypeError,AttributeError) as exc:
+            trace(web,'suumo_marker_invalid',{'map_url':map_url,'exception_type':type(exc).__name__,'script_id':node.get('id','')},'WARNING','location');continue
+        points=[]
+        for marker in markers if isinstance(markers,list) else []:
+            if not isinstance(marker,dict) or normal(marker.get('type')).lower()!='room':continue
+            try:lat,lng=float(marker['lat']),float(marker['lng'])
+            except (ValueError,TypeError,KeyError):continue
+            if has_point({'latitude':lat,'longitude':lng}):points.append((lat,lng))
+        distinct=sorted(set(points))
+        if len(distinct)==1:return distinct[0],{'script_id':node.get('id',''),'marker_count':len(markers) if isinstance(markers,list) else 0,'room_marker_count':1}
+        trace(web,'suumo_marker_unresolved',{'map_url':map_url,'script_found':True,'script_id':node.get('id',''),
+              'room_markers':len(distinct),'marker_types':[x.get('type') for x in markers if isinstance(x,dict)] if isinstance(markers,list) else [],
+              'valid_room_points':distinct,'expected':'type=roomの有効座標が一意'},'WARNING','location')
+    return None,{'script_found':bool(nodes)}
 
 
 def suumo_location_from_kankyo_image(web,detail_soup,detail_url,bounds,munis,expected_towns=None,region_code=None):
-    """Read the actual room marker of the published dynamic map, then infer its address."""
-    target=suumo_kankyo_url(detail_soup,detail_url)
-    if not safe_url(target,'SUUMO'):raise AppError('SUUMOの地図・周辺環境URLを確認できません。')
-    if not web.permitted(target):raise AppError('SUUMOの地図・周辺環境ページの自動取得が許可されていません。')
-    reply=web.fetch(target);soup=BeautifulSoup(reply.text,'html.parser')
-    node=soup.find('script',id='js-gmapData');points=[]
-    if node:
-        try:
-            markers=[];data=json.loads(node.get_text());markers=data.get('markers',[])
-            for marker in markers if isinstance(markers,list) else []:
-                if not isinstance(marker,dict) or marker.get('type')!='room':continue
-                lat,lng=float(marker['lat']),float(marker['lng'])
-                if has_point({'latitude':lat,'longitude':lng}):points.append((lat,lng))
-        except (ValueError,TypeError,KeyError,AttributeError) as exc:
-            trace(web,'suumo_marker_invalid',{'map_url':target,'exception_type':type(exc).__name__},'WARNING','location')
-    # Never use center coordinates or facility markers as a property position.
-    if node:
-        distinct=set(points)
-        if len(distinct)!=1:
-            trace(web,'suumo_marker_unresolved',{'map_url':target,'room_markers':len(distinct),'marker_types':[x.get('type') for x in markers if isinstance(x,dict)] if isinstance(markers,list) else [],'valid_room_points':list(distinct),'expected':'type=roomの有効座標が一意'},'WARNING','location');return None
-        lat,lng=next(iter(distinct));method='SUUMO地図・周辺環境の物件マーカー座標→GSI住居表示住所推定'
-    else:
-        candidates=map_image_candidates(web,soup,target)
-        distinct={p[:2] for p in candidates if p[3]>=5}
-        if len(distinct)!=1:
-            trace(web,'suumo_marker_unresolved',{'map_url':target,'script_found':False,'image_candidates':candidates,'reason':'物件地図スクリプトがなく、画像ピン候補も一意に取得できない'},'WARNING','location');return None
-        lat,lng=next(iter(distinct));method='SUUMO地図画像ピン認識→GSI住居表示住所推定'
+    """Resolve SUUMO's published room marker, with canonical BC fallback and cache."""
+    jnc=suumo_jnc_key(detail_url)
+    cache_key='jnc:'+jnc if jnc else 'detail:'+detail_url
+    with web.cache_lock:cached=getattr(web,'suumo_location_cache',{}).get(cache_key)
+    if cached:
+        address=normal(cached.get('inferred_address'))
+        if not expected_towns or any(town_matches(t,address) for t in expected_towns):
+            trace(web,'suumo_location_cache_hit',{'detail_url':detail_url,'cache_key':cache_key,'address':address},stage='location')
+            return dict(cached)
+    targets=suumo_kankyo_urls(detail_soup,detail_url)
+    if not targets:raise AppError('SUUMOの地図・周辺環境URLを確認できません。')
+    fetched=[];lat=lng=None;method='';source='';failures=[]
+    # First prefer dynamic room-marker JSON on every published candidate URL.
+    for number,target in enumerate(targets,1):
+        web.check_cancel()
+        if not web.permitted(target):
+            failures.append({'url':target,'reason':'robots_not_permitted'});continue
+        try:reply=web.fetch(target)
+        except AppError as exc:
+            failures.append({'url':target,'reason':str(exc)});continue
+        soup=BeautifulSoup(reply.text,'html.parser');fetched.append((target,soup))
+        point,meta=_suumo_room_marker_points(web,soup,target)
+        if point:
+            lat,lng=point;source=target;method='SUUMO地図・周辺環境の物件マーカー座標→GSI住居表示住所推定'
+            if number>1:trace(web,'suumo_map_fallback_success',{'detail_url':detail_url,'map_url':target,'attempt':number,'attempted_urls':targets[:number]},stage='location')
+            break
+        failures.append({'url':target,'reason':'room_marker_not_unique_or_missing','meta':meta})
+    # Only if no dynamic marker exists, retain the verified georeferenced-image fallback.
+    if lat is None:
+        for target,soup in fetched:
+            candidates=map_image_candidates(web,soup,target);distinct={p[:2] for p in candidates if p[3]>=5}
+            if len(distinct)==1:
+                lat,lng=next(iter(distinct));source=target;method='SUUMO地図画像ピン認識→GSI住居表示住所推定';break
+        if lat is None:
+            trace(web,'suumo_marker_unresolved',{'detail_url':detail_url,'candidate_map_urls':targets,'failures':failures,
+                  'reason':'公開された地図候補からtype=roomの一意な物件マーカーを取得できない'},'WARNING','location');return None
     if not in_rectangle((lat,lng),bounds):
-        trace(web,'published_point_outside_bounds',{'map_url':target,'point':[lat,lng],'bounds':list(bounds),
+        trace(web,'published_point_outside_bounds',{'map_url':source,'point':[lat,lng],'bounds':list(bounds),
               'retained':True,'reason':'検索範囲外でも住所推定・保存を継続'},stage='location')
     inferred=map_point_to_residential_address(web,(lat,lng),munis,expected_code=region_code,expected_towns=expected_towns)
     if not inferred:return None
     address=inferred['address']
     if expected_towns and not any(town_matches(t,address) for t in expected_towns):
-        trace(web,'map_address_difference',{'map_url':target,'map_derived_address':address,'expected_towns':list(expected_towns),'retained':False},'WARNING','location');return None
+        trace(web,'map_address_difference',{'map_url':source,'map_derived_address':address,'expected_towns':list(expected_towns),'retained':False},'WARNING','location');return None
     location={'latitude':lat,'longitude':lng,'location_method':method,
               'map_address':address,'inferred_address':address,'address_match':'地図座標から詳細住所推定（実所在地未確認）',
-              'coordinate_precision':'listing_map','position_source_url':target,
+              'coordinate_precision':'listing_map','position_source_url':source,
               'address_precision':'同一町丁目の最近傍住居表示住所・推定値',
               'address_distance_m':round(inferred['distance_m'],2)}
+    with web.cache_lock:
+        if len(web.suumo_location_cache)>=12000:web.suumo_location_cache.pop(next(iter(web.suumo_location_cache)))
+        web.suumo_location_cache[cache_key]=dict(location)
     trace(web,'location_ok',{'source':'SUUMO物件地図マーカー','map_derived_address':address,'location':location},stage='location')
     return location
-
 
 def suumo_collect(web,region,bounds,munis,emit):
     """SUUMO: map towns -> town page/filter -> detail -> kankyo map -> compact save."""
@@ -2305,7 +2446,7 @@ def suumo_collect(web,region,bounds,munis,emit):
             signature=hashlib.sha256(str(buildings).encode()).hexdigest()
             if signature in seen_pages:
                 raise AppError('SUUMOのページ送りが同じ一覧を返しました。全ページを確認できていません。')
-            seen_pages.add(signature);page_candidates=[]
+            seen_pages.add(signature);page_candidates=[];page_skipped=0;skip_examples=[]
 
             for building in buildings:
                 # Do not read the list-page address. Town scope has already been fixed by the SUUMO town selector.
@@ -2333,8 +2474,8 @@ def suumo_collect(web,region,bounds,munis,emit):
                         if property_id:claimed.add(property_id)
                     obtained=getattr(web,'acquired_ids',{}).get(property_id)
                     if obtained and recent_acquisition(obtained):
-                        begin_listing(web,'SUUMO',url)
-                        trace(web,'listing_already_acquired',{'url':url,'property_id':property_id,'last_success_at':obtained,'reason':'過去3か月以内に取得・保存済み'},stage='collector')
+                        page_skipped+=1
+                        if len(skip_examples)<3:skip_examples.append({'url':url,'property_id':property_id,'last_success_at':obtained})
                         emit('skipped',1);continue
                     page_candidates.append(url)
             emit('candidate',len(page_candidates))
@@ -2386,7 +2527,8 @@ def suumo_collect(web,region,bounds,munis,emit):
                 if error:raise error
 
             next_url=_suumo_next_url(soup,reply.url,filter_params)
-            trace(web,'page_end',{'provider':'SUUMO','group':list(layouts),'page':page_number,'buildings':len(buildings),'new_candidates':len(page_candidates),'next_url':next_url or ''},stage='pagination')
+            trace(web,'page_end',{'provider':'SUUMO','group':list(layouts),'page':page_number,'buildings':len(buildings),
+                  'new_candidates':len(page_candidates),'already_acquired':page_skipped,'skip_examples':skip_examples,'next_url':next_url or ''},stage='pagination')
             if not next_url:break
             current_url=next_url;current_params=None;page_number+=1
         if not group_candidates:trace(web,'empty',{'provider':'SUUMO','region':region.get('label'),'group':list(layouts),'reason':'条件一覧に候補なし'},stage='collector')
@@ -2850,7 +2992,9 @@ def search_all(db,conditions,screen,state=None):
             regions=select_ward_towns(regions,conditions.get('town_codes',[]))
         if conditions.get('mode')=='automatic_collection':
             conditions['auto_regions']=regions;conditions['auto_munis']=munis
-        if region_errors: issues.append(f'地域判定で{region_errors}地点を確認できませんでした。')
+        if region_errors:
+            issues.append(f'地域判定で{region_errors}地点を確認できませんでした。')
+            audit.add('geography','region_lookup_failed','WARNING',{'failures':region_errors,'bounds':list(bounds)})
         search['conditions']['region_source']='SUUMO区の公開町名選択フォーム' if conditions.get('ward_code') else 'Geolonia町丁目一覧' if getattr(web,'reverse_unavailable',False) else '国土地理院地名判定'
         log('地名取得完了｜'+search['conditions']['region_source']+'｜'+str(len(regions))+'地域')
         search['conditions']['regions']=[r['label'] for r in regions]
@@ -2901,9 +3045,13 @@ def search_all(db,conditions,screen,state=None):
             DIAG_CONTEXT.audit=audit;DIAG_CONTEXT.scope={'task':index,'region':region['label'],'town':region['town'],'municipality_code':region['code'],'provider':provider}
             def emit(kind,value):
                 if kind!='unit':web.check_cancel()
-                audit_value=compact_saved_listing(value) if kind=='unit' and isinstance(value,dict) else value
-                if kind=='unit' and isinstance(audit_value,dict) and value.get('property_id'):audit_value={**audit_value,'property_id':value['property_id']}
-                audit.add('collector','accepted' if kind=='unit' else kind,'ERROR' if kind=='issue' else 'INFO',{'event':kind,'value':audit_value})
+                # Numeric progress counters are already preserved in page_end/final summaries.
+                # Avoid two diagnostic events per acquired-ID skip; large runs otherwise spend
+                # substantial time serializing logs rather than collecting data.
+                if kind not in ('candidate','detail','rejected','skipped','incomplete'):
+                    audit_value=compact_saved_listing(value) if kind=='unit' and isinstance(value,dict) else value
+                    if kind=='unit' and isinstance(audit_value,dict) and value.get('property_id'):audit_value={**audit_value,'property_id':value['property_id']}
+                    audit.add('collector','accepted' if kind=='unit' else kind,'ERROR' if kind=='issue' else 'INFO',{'event':kind,'value':audit_value})
                 q.put((index,kind,value))
             try:
                 emit('message',provider+'｜'+region['label']+'｜検索を開始')
@@ -2979,6 +3127,8 @@ def search_all(db,conditions,screen,state=None):
         search['status']='cancelled'
         search['summary']={'confirmed':len(units),'saved':len(saved),'issues':issues,'elapsed':round(time.monotonic()-started,3)}
     except Exception as exc:
+        audit.add('search',diagnosis_code(str(exc)),'ERROR',{'stage':'search_all','exception_type':type(exc).__name__,
+            'message':str(exc) if isinstance(exc,AppError) else f'検索エラー（{type(exc).__name__}）','traceback':traceback.format_exc()})
         search['status']='failed';issues.append(str(exc) if isinstance(exc,AppError) else f'検索エラー（{type(exc).__name__}）')
         search['summary']={'confirmed':len(units),'saved':len(saved),'issues':issues,'elapsed':round(time.monotonic()-started,3)}
     # On a consumer exception the executor has joined its workers. Preserve all
@@ -3007,7 +3157,10 @@ def search_all(db,conditions,screen,state=None):
     if acquisition_pending:
         try:
             db.save_acquisition_ids(list(acquisition_pending.values()));acquisition_pending.clear()
-        except Exception as exc:issues.append('最終保存での取得済みID保存失敗：'+(str(exc) if isinstance(exc,AppError) else type(exc).__name__))
+        except Exception as exc:
+            audit.add('database','save','ERROR',{'stage':'search.final_acquisition_ids','exception_type':type(exc).__name__,
+                'pending_ids':len(acquisition_pending),'message':str(exc) if isinstance(exc,AppError) else type(exc).__name__})
+            issues.append('最終保存での取得済みID保存失敗：'+(str(exc) if isinstance(exc,AppError) else type(exc).__name__))
     unsaved=sum(compact_listing_key(r) not in saved for r in units.values())
     search['summary'].update(confirmed=len(units),elapsed=round(time.monotonic()-started,3),new_saved=len(saved & getattr(db,'job_new_keys',set())),updated_saved=len(saved-getattr(db,'job_new_keys',set())),processed=search['summary'].get('detail',0)+search['summary'].get('already_acquired',0),last_saved_at=getattr(state,'new_last_saved_at',None),saved=len(saved),unsaved=unsaved,acquisition_ids_pending=len(acquisition_pending),issues=issues[-100:])
     if unsaved:
@@ -3016,10 +3169,14 @@ def search_all(db,conditions,screen,state=None):
     screen['status'].info('検索が終了しました。詳細作業ログをSupabaseへ保存しています。')
     audit.add('search','finish','INFO',{'status':search['status'],'summary':search['summary']})
     audit.persist(db,force=True)
-    search['summary']['diagnostics']={'search_id':audit.search_id,'events':audit.count,'persisted_events':audit.persisted_events}
+    search['summary']['diagnostics']={'search_id':audit.search_id,'events':audit.count,'persisted_events':audit.persisted_events,
+                                     'persisted_failures':audit.persisted_failures,'pending_failures':len(audit.pending_failures)}
     search['finished_at']=utc_now()
     try: db.save_search(search)
     except AppError as exc:
+        audit.add('database','save','ERROR',{'stage':'search.history','message':str(exc),'status':search.get('status')})
+        try:audit.persist(db,force=True)
+        except Exception:pass
         issues.append('検索履歴｜'+str(exc));search['summary']['issues']=issues
         if search['status']!='cancelled':search['status']='partial'
     screen['bar'].progress(1.,text='検索処理が終了しました')
@@ -3047,6 +3204,7 @@ DIAG_ADVICE={
  'location':('掲載座標・住所の位置を確認できない','掲載地図・JSON-LD・住所検索の各候補と表示範囲を比較する。番地や掲載座標がない物件を架空座標で補完しない。'),
  'outside':('物件が検索開始時の表示範囲外','ログの固定表示範囲と掲載座標を比較する。範囲内の物件を落とす場合は座標順序・境界の判定を修正する。'),
  'save':('Supabaseの保存または保存確認の失敗','物件確認数と保存確認数を比較し、キー・テーブル・権限・HTTP応答を確認する。未保存物件の再保存で復旧を検証する。'),
+ 'automatic_collection_failure':('自動収集コントローラーの実行失敗','発生した町・直前検索ID・例外種別を確認し、失敗町から再開する。'),
  'empty':('取得元の一覧に候補がない','地名・自治体コード・検索パラメータをログのURLで照合する。手動検索の件数と比較し、真の0件と検索条件/解析の誤りを区別する。'),
  'location_unverified':('掲載座標はあるが住所照合は未判定','地名照合サービスの失敗ログを確認する。掲載座標と実際の建物位置を手動で照合し、未判定を位置確認済みとして評価しない。'),
  'layout_assumed':('掲載間取りを単独検索の指定値で補完','検索条件・公開フォームの値と結果一覧を照合する。掲載間取りを確認できたら優先し、異なる明示間取りは除外する。補完済みを掲載確認済みとは扱わない。'),
@@ -3069,6 +3227,8 @@ DIAG_ADVICE={
  'map_link_result':('掲載ページから地図ページを追加確認','座標の出所と掲載住所を照合する。町丁目の代表点を建物座標として扱わない。'),
  'http_empty':('HTTP 202の空応答で掲載データが未到着','公開ページを手動で確認し、取得元のアクセス条件と公開API/データ提供を確認する。空本文をHTML解析失敗や間取り欠落と扱わない。'),
  'image_georef_missing':('地図画像の基準座標・縮尺が不明','画像URLや埋め込み地図の中心座標・ズームを確認する。基準のない画像から緯度経度を捏造しない。'),
+ 'suumo_map_fallback_success':('SUUMOの代替地図経路で物件位置を取得','JNC経路で取れない場合に、同じ募集のcanonical BC地図を確認してtype=roomマーカーを使用する。'),
+ 'suumo_location_cache_hit':('同一SUUMO物件の確認済み位置を再利用','同じJNC物件の別募集では確認済みの地図位置・住所を再利用し、地図ページと住所推定の重複通信を省く。'),
  'image_pin_result':('地図画像の物件ピン認識結果','認識ピクセル位置・地図基準座標・ズーム・逆投影後の座標を確認する。'),
  'position_pending':('掲載地図の位置再取得が未完了','掲載URL、地図リンク、画像認識・HTTPエラーのイベントを確認する。元の募集データは保持する。'),
  'position_repaired':('掲載地図から位置と住所を更新','position_source_urlと推定住所を比較する。番地を読み取れていない場合は町丁目までの推定として扱う。'),
@@ -3093,11 +3253,31 @@ def diagnosis_code(message):
     if any(x in text for x in ('接続','通信','DNS')):return 'network'
     return 'unknown'
 
+def diagnostic_failure_event(event):
+    """True for acquisition/processing failures that must be durably stored as they occur."""
+    if not isinstance(event,dict):return False
+    if str(event.get('level') or '').upper() in ('WARNING','ERROR','CRITICAL'):return True
+    code=str(event.get('code') or '')
+    if code in {
+        'listing_rejected','listing_failed','collector_exception','provider_unavailable','unsaved_listings',
+        'location_pending','position_pending','reverse_address_pending','address_tile_failed','map_address_unresolved',
+        'http_403','http_404','http_429','http_5xx','http_empty','http_challenge','timeout','network','proxy_error','save'
+    }:return True
+    details=event.get('details') if isinstance(event.get('details'),dict) else {}
+    for candidate in (details.get('status'),(details.get('technical_exception') or {}).get('status') if isinstance(details.get('technical_exception'),dict) else None):
+        try:
+            if int(candidate)>=400:return True
+        except (TypeError,ValueError):pass
+    return False
+
+
 class AuditLog:
     def __init__(self,conditions,secrets=()):
         fd,self.path=tempfile.mkstemp(prefix='sumai-log-',suffix='.jsonl');os.close(fd)
         self.lock=threading.RLock();self.count=0;self.offset=0;self.chunk=0;self.last_save=0.;self.persisted_events=0
         self.storage_error=None;self.search_id=hashlib.sha256(os.urandom(32)).hexdigest();self.secrets=tuple(str(v) for v in secrets if v)
+        self.search_mode=conditions.get('mode');self.ward_code=conditions.get('ward_code');self.town_codes=list(conditions.get('town_codes') or [])
+        self.pending_failures=[];self.persisted_failures=0;self.failure_storage_error=None
         self.add('search','start','INFO',{'build':BUILD,'bounds':conditions.get('bounds'),'providers':conditions.get('providers'),'filters':{'structure':None,'max_age':None,'layouts':list(LAYOUTS),'suumo':{'building_type':'マンション','max_age':15,'layout_groups':[list(x) for x in SUUMO_LAYOUT_GROUPS]}},'property_limit':None})
     def clean(self,value):
         if isinstance(value,dict):return {str(k):('[REDACTED]' if re.search(r'^(?:key|apikey|api_key|token|access_token|authorization|cookie|password|secret|SUPABASE_.*KEY)$',str(k),re.I) else self.clean(v)) for k,v in value.items()}
@@ -3116,12 +3296,36 @@ class AuditLog:
             self.count+=1
             context=getattr(DIAG_CONTEXT,'scope',{})
             event=self.clean(dict(seq=self.count,time=utc_now(),search_id=self.search_id,stage=stage,code=code,level=level,
-                                 context=context,details=details or {},observed=cause,improvement=advice))
+                                 context=context,details=details or {},observed=cause,improvement=advice,
+                                 _search_mode=self.search_mode,_ward_code=self.ward_code,_town_codes=self.town_codes))
             with open(self.path,'a',encoding='utf-8') as f:f.write(json.dumps(event,ensure_ascii=False,allow_nan=False)+'\n')
+            if diagnostic_failure_event(event):self.pending_failures.append(event)
     def records(self):
         with self.lock:
             with open(self.path,encoding='utf-8') as f:return [json.loads(line) for line in f if line.strip()]
+    def _persist_failures(self,db):
+        """Flush failure events on every persist poll, independent of the 30-second normal-log cadence."""
+        while True:
+            with self.lock:
+                batch=list(self.pending_failures[:100])
+            if not batch:
+                self.failure_storage_error=None;return
+            try:
+                db._saving_audit=True
+                saved=db.save_diagnostic_failures(batch)
+            except Exception as exc:
+                self.failure_storage_error=str(exc) if isinstance(exc,AppError) else type(exc).__name__
+                return
+            finally:
+                db._saving_audit=False
+            with self.lock:
+                seqs={int(e.get('seq',-1)) for e in batch}
+                self.pending_failures=[e for e in self.pending_failures if int(e.get('seq',-1)) not in seqs]
+                self.persisted_failures+=saved
     def persist(self,db,force=False):
+        # Error/warning events are written on every poll (normally within ~0.35 s during search).
+        # The complete verbose log remains chunked every 30 seconds to avoid needless DB traffic.
+        self._persist_failures(db)
         if not force and time.monotonic()-self.last_save<30:return
         self.last_save=time.monotonic()
         while True:
@@ -3146,6 +3350,8 @@ class AuditLog:
             self.offset=end;self.chunk+=1;self.persisted_events+=len(events)
             if not force:
                 self.storage_error=None;return
+            # A failure could have been appended while the normal chunk was being saved.
+            self._persist_failures(db)
 
 
 def begin_listing(web,provider,url):
@@ -3182,6 +3388,37 @@ def exclusion_rows(events):
              '取得値':json.dumps(e.get('details',{}).get('observed'),ensure_ascii=False),
              '期待値':json.dumps(e.get('details',{}).get('expected'),ensure_ascii=False)}
             for e in events if e.get('code') in ('listing_rejected','listing_failed')]
+
+
+def acquisition_failure_rows(events):
+    """Flatten every persisted warning/error into a CSV-friendly row without discarding intermediate failures."""
+    rows=[]
+    for e in events:
+        if not diagnostic_failure_event(e):continue
+        context=e.get('context') if isinstance(e.get('context'),dict) else {}
+        details=e.get('details') if isinstance(e.get('details'),dict) else {}
+        technical=details.get('technical_exception') if isinstance(details.get('technical_exception'),dict) else {}
+        observed=details.get('observed') if isinstance(details.get('observed'),dict) else {}
+        status=details.get('status') or technical.get('status') or observed.get('status')
+        listing_url=(context.get('listing_url') or details.get('listing_url') or
+                     (details.get('url') if '/chintai/' in str(details.get('url') or '') else ''))
+        communication_url=details.get('url') or details.get('map_url') or details.get('position_source_url') or ''
+        reason=details.get('reason') or details.get('message') or details.get('exception_type') or e.get('observed') or ''
+        rows.append({
+            '時刻UTC':e.get('time'),'検索ID':e.get('search_id'),'通番':e.get('seq'),'収集モード':e.get('_search_mode'),
+            '取得元':context.get('provider') or details.get('provider'),'地域':context.get('region'),'町名':context.get('town'),
+            '物件URL':listing_url,'通信URL':communication_url,'工程':e.get('stage'),'エラーコード':e.get('code'),
+            'レベル':e.get('level'),'HTTP状態':status,'理由':reason,
+            '詳細':json.dumps(details,ensure_ascii=False,separators=(',',':')),
+        })
+    return rows
+
+
+def csv_bytes_from_rows(rows,fieldnames=None):
+    output=io.StringIO()
+    fields=fieldnames or (list(rows[0]) if rows else ['時刻UTC','検索ID','通番','取得元','物件URL','工程','エラーコード','理由'])
+    writer=csv.DictWriter(output,fieldnames=fields,extrasaction='ignore');writer.writeheader();writer.writerows(rows)
+    return output.getvalue().encode('utf-8-sig')
 
 
 def trace(web,code,details=None,level='INFO',stage='parser'):
@@ -3229,18 +3466,22 @@ def diagnostic_downloads(events,prefix='current'):
     export_key=(events[0].get('search_id'),len(events),events[-1].get('seq'))
     export=st.session_state.get(prefix+'_log_export')
     if not export or export['key']!=export_key:
-        export={'key':export_key,'txt':diagnostic_report(events),'json':json.dumps({'schema':1,'events':events},ensure_ascii=False,separators=(',',':')).encode('utf-8')};export['decisions']=exclusion_rows(events)
-        reason_output=io.StringIO()
-        if export['decisions']:
-            reason_writer=csv.DictWriter(reason_output,fieldnames=list(export['decisions'][0]));reason_writer.writeheader();reason_writer.writerows(export['decisions'])
-        export['reasons_csv']=reason_output.getvalue().encode('utf-8-sig');export['preview']=export['txt'].decode('utf-8-sig').split('詳細イベント')[0];st.session_state[prefix+'_log_export']=export
+        export={'key':export_key,'txt':diagnostic_report(events),'json':json.dumps({'schema':1,'events':events},ensure_ascii=False,separators=(',',':')).encode('utf-8')}
+        export['decisions']=exclusion_rows(events)
+        export['failures']=acquisition_failure_rows(events)
+        export['reasons_csv']=csv_bytes_from_rows(export['decisions']) if export['decisions'] else b''
+        export['failures_csv']=csv_bytes_from_rows(export['failures']) if export['failures'] else b''
+        export['preview']=export['txt'].decode('utf-8-sig').split('詳細イベント')[0];st.session_state[prefix+'_log_export']=export
     st.download_button('詳細作業ログ・改善案をTXTでダウンロード',export['txt'],'sumai_work_log.txt','text/plain',key=prefix+'_txt',on_click='ignore')
     st.download_button('解析用の詳細ログをJSONでダウンロード',export['json'],
                        'sumai_work_log.json','application/json',key=prefix+'_json',on_click='ignore')
-    decisions=export['decisions']
+    failures=export['failures'];decisions=export['decisions']
+    if failures:
+        st.download_button('全エラーイベントをCSVでダウンロード',export['failures_csv'],'sumai_acquisition_failures.csv','text/csv',key=prefix+'_failures',on_click='ignore')
     if decisions:
-        st.download_button('物件ごとの除外・取得失敗理由をCSVでダウンロード',export['reasons_csv'],'sumai_exclusion_reasons.csv','text/csv',key=prefix+'_reasons',on_click='ignore')
+        st.download_button('物件ごとの最終除外・取得失敗理由をCSVでダウンロード',export['reasons_csv'],'sumai_exclusion_reasons.csv','text/csv',key=prefix+'_reasons',on_click='ignore')
     with st.expander('作業ログの原因別集計と改善案'):
+        if failures:st.caption(f'この検索のエラーイベント {len(failures)}件（中間エラーも省略せず記録）')
         if decisions:st.dataframe(decisions[-100:],hide_index=True)
         st.text(export['preview'])
         st.caption('全イベントはダウンロードに含まれます。画面には最新20イベントを表示します。')
@@ -3722,6 +3963,8 @@ class SearchJob:
             self.audit.add('search',diagnosis_code(str(exc)),'ERROR',{'message':str(exc) if isinstance(exc,AppError) else type(exc).__name__,'traceback':traceback.format_exc()})
             self.state.new_search={'status':'failed','conditions':conditions,'summary':{'issues':[str(exc) if isinstance(exc,AppError) else '検索処理エラー（'+type(exc).__name__+'）'],'saved':len(self.state.new_saved_keys),'confirmed':len(self.state.new_units)}}
         finally:
+            try:self.audit.persist(db,force=True)
+            except Exception:pass
             with self.lock: self.finished=True
     def request_stop(self):
         self.cancel_event.set()
@@ -3787,6 +4030,8 @@ class PositionRepairJob(SearchJob):
             history.update(status='partial',finished_at=utc_now(),summary={**history.get('summary',{}),'confirmed':len(rows),'saved':len(saved),'issues':[str(exc) if isinstance(exc,AppError) else '位置更新の保存・ログ処理に失敗しました']})
             self.audit.add('location','position_pending','ERROR',{'exception_type':type(exc).__name__,'retained':len(rows)})
         finally:
+            try:self.audit.persist(db,force=True)
+            except Exception:pass
             with self.lock:self.state.new_search=history;self.finished=True
 
 
@@ -3915,7 +4160,7 @@ def background_status():
     job=active_job()
     if job is None:return
     snap=job.snapshot()
-    st.caption(f"作業ログ {job.audit.count}イベント｜Supabase保存確認 {job.audit.persisted_events}イベント")
+    st.caption(f"作業ログ {job.audit.count}イベント｜通常ログ保存 {job.audit.persisted_events}イベント｜エラー都度保存 {job.audit.persisted_failures}件｜保存待ち {len(job.audit.pending_failures)}件")
     # Keep polling cheap: build a complete export only when explicitly requested.
     if st.button('作業ログを準備・更新（検索中も利用できます）',key='current_log_prepare'):
         try:
@@ -3930,6 +4175,7 @@ def background_status():
         st.caption(f"ダウンロード対象：{audit_cache['count']}イベント｜準備日時：{acquisition_time_jst(audit_cache['prepared_at'])}｜最新分を含めるには「準備・更新」を押してください。")
     else:
         st.caption('「作業ログを準備・更新」を押すとJSON・TXTのダウンロードボタンが表示されます。')
+    if job.audit.failure_storage_error:st.error('取得エラーのSupabase都度保存を確認できません。保存待ちを保持して再試行します：'+job.audit.failure_storage_error)
     if job.audit.storage_error:st.error('作業ログのSupabase保存を確認できません。準備・更新ボタンから、このサーバーに残るログをダウンロードできます。'+job.audit.storage_error)
 
     if not snap['finished']:
@@ -4027,9 +4273,17 @@ class AutomaticCollection:
                 self.persist()
         except Exception as exc:
             with self.lock:
+                active_job=self.current or self.last_job
                 self.error=str(exc) if isinstance(exc,AppError) else '自動収集エラー（'+type(exc).__name__+'）'
                 self.message='自動収集が停止しました。設定画面から再開してください。'
                 self.summary['last_status']='failed';self.settings['enabled']=False
+            try:
+                audit=active_job.audit if active_job is not None else AuditLog({
+                    'bounds':[34,138,37,141],'ward_code':self.settings.get('ward_code'),'town_codes':self.settings.get('town_codes',[]),
+                    'providers':['SUUMO'],'mode':'automatic_collection'},(getattr(self.db,'key',''),))
+                audit.add('automatic','automatic_collection_failure','ERROR',{'message':self.error,'exception_type':type(exc).__name__,'traceback':traceback.format_exc()})
+                audit.persist(self.db,force=True)
+            except Exception:pass
             try:self.persist()
             except Exception:pass
         finally:
@@ -4153,7 +4407,20 @@ def automatic_collection_panel():
             st.session_state.automatic_log_search_id=log_job.audit.search_id
     if st.session_state.get('automatic_log_events'):
         diagnostic_downloads(st.session_state.automatic_log_events,'automatic')
-        st.caption('ログは準備した時点の町・処理の記録です。更新するにはもう一度「準備・更新」を押してください。')
+        st.caption('このログは現在または直近の町の詳細ログです。エラー自体は町をまたいでSupabaseへ都度保存します。')
+    if st.button('Supabaseに保存済みの全取得エラーを準備・更新',key='automatic_all_failures_prepare'):
+        try:
+            with st.spinner('全検索・全町の保存済みエラーを読み込んでいます'):
+                error_db=controller.db if controller else Database()
+                events=error_db.load_diagnostic_failures();rows=acquisition_failure_rows(events)
+                st.session_state.all_acquisition_failures={'rows':rows,'csv':csv_bytes_from_rows(rows),'prepared_at':utc_now()}
+        except AppError as exc:st.error(str(exc))
+    all_failures=st.session_state.get('all_acquisition_failures')
+    if all_failures:
+        st.caption(f"Supabaseへ都度保存済みの取得エラー {len(all_failures['rows'])}件｜準備日時 {acquisition_time_jst(all_failures['prepared_at'])}")
+        st.download_button('全検索・全町の取得エラーCSVをダウンロード',all_failures['csv'],'sumai_all_acquisition_failures.csv','text/csv',key='automatic_all_failures_csv',on_click='ignore')
+        with st.expander('保存済み取得エラーの最新100件'):
+            st.dataframe(all_failures['rows'][-100:],hide_index=True)
     st.caption('物件ID・取得成功日時は再取得の管理情報として保存します。詳細住所と募集データの保存に成功した物件だけが取得済みになります。')
     st.caption('蓄積した物件は「保存物件をすべて読み込む」で地図へ表示できます。収集中も地図の自動再描画は行いません。')
 
