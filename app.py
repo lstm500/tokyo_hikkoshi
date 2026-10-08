@@ -38,7 +38,7 @@ import streamlit as st
 from streamlit_folium import st_folium
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v85"
+BUILD = "REBUILD-01-v86"
 
 # ============================================================================
 # NON-NEGOTIABLE ADDRESS ACQUISITION INVARIANT -- DO NOT DELETE OR WEAKEN.
@@ -53,6 +53,14 @@ BUILD = "REBUILD-01-v85"
 SUUMO_TEXT_ADDRESS_FORBIDDEN = True
 SUUMO_ADDRESS_POLICY_VERSION = 1
 SUUMO_MAP_ONLY_ADDRESS_ORIGIN = 'suumo_provider_map_coordinate_to_gsi_residential_only_v1'
+# NON-NEGOTIABLE SUUMO ACQUISITION RULES -- DO NOT REMOVE OR RELAX:
+# 1) Keep the detail URL exactly as returned by the successful SUUMO town-search result;
+#    do not rewrite JNC results to canonical BC detail URLs before parsing.
+# 2) BC/JNC identity may be used to select this listing's own /kankyo/ map page.
+# 3) Never use SUUMO's textual address for location, geocoding, address completion,
+#    validation, or the persisted address.  Saved address is map-coordinate -> GSI only.
+# 4) A prior acquired ID is skippable only when the linked saved listing still proves
+#    a detailed, map-derived address; incomplete legacy rows must be re-acquired.
 PROVIDER_OPTIONS = ("スマイティ","HOMES","SUUMO","カナリー","アットホーム","CHINTAI","Comfy","アパマンショップ")
 PROVIDER_CANONICAL = {"HOMES":"HOME’S","HOME’S":"HOME’S","スマイティ":"スマイティ","SUUMO":"SUUMO","カナリー":"カナリー",
                       "アットホーム":"アットホーム","CHINTAI":"CHINTAI","Comfy":"Comfy","アパマンショップ":"アパマンショップ"}
@@ -2551,6 +2559,11 @@ def suumo_detail_fields(soup):
     if not raw_rent:
         raw_rent=regex_after_label(visible,('賃料','家賃'),r'\d+(?:\.\d+)?\s*万円|\d[\d,]*\s*円')
     building_type=generic_labeled(soup,('建物種別','建物の種類','種別'))
+    if not building_type:
+        # Current SUUMO detail markup is not always a th/td or dt/dd pair.  Read the
+        # visible 建物種別 label as a fallback.  This is NOT an address fallback.
+        m=re.search(r'建物種別\s*[:：]?\s*(マンション|アパート|一戸建て|テラス・タウンハウス|その他)',visible)
+        if m:building_type=m.group(1)
     raw_age=structured.get('age') or generic_labeled(soup,('築年数','築年月','築年'))
     if not raw_age:
         raw_age=regex_after_label(visible,('築年数','築年月','築年'),r'(?:新築|築\s*\d{1,3}年|(?:19|20)\d{2}年\s*\d{1,2}月)')
@@ -2872,11 +2885,12 @@ def suumo_collect(web,region,bounds,munis,emit):
                             links.append((0 if '詳細を見る' in label else 1,url))
                     if not links:continue
                     url=min(links,key=lambda x:x[0])[1]
-                    # Normalize to SUUMO's stable BC route whenever the list link exposes
-                    # a BC id.  JNC links can redirect and are agency/page variants; BC is
-                    # the acquisition identity and maps back to the correct current detail.
-                    bc=suumo_bc_id(url)
-                    if bc:url=f'https://suumo.jp/chintai/bc_{bc}/'
+                    # STABLE ACQUISITION RULE -- DO NOT REWRITE THIS DETAIL URL.
+                    # The town-search result URL is the page variant that was actually returned
+                    # by the successful SUUMO listing search.  BC/JNC IDs are still used for
+                    # identity and the property-specific /kankyo/ map, but the detail parser must
+                    # read this original result URL.  Rewriting every result to /bc_.../ caused
+                    # valid mansion pages to be parsed as building_type='' in v85.
                     if url in seen_urls:continue
                     seen_urls.add(url)
                     group_candidates+=1
@@ -2914,8 +2928,15 @@ def suumo_collect(web,region,bounds,munis,emit):
                     layout=parsed_layout(fields['raw_layout'],rough=False)
                     if parsed_layout(fields['raw_layout']) not in layouts:
                         reject_listing(web,'SUUMO',url,'detail.layout','condition' if layout else 'missing_data','間取りが検索条件外、または読み取れない',{'raw':fields['raw_layout'],'parsed':layout},list(layouts));emit('rejected',1);trace(web,'layout',{'url':url,'observed':fields['raw_layout'],'parsed':layout,'requested_group':list(layouts),'reason':'detail_layout_not_in_group'},'WARNING');return
-                    if 'マンション' not in fields['building_type']:
-                        reject_listing(web,'SUUMO',url,'detail.building_type','condition' if fields['building_type'] else 'missing_data','建物種別がマンションと確認できない',fields['building_type'],'マンション');emit('rejected',1);trace(web,'structure',{'url':url,'building_type':fields['building_type'],'reason':'not_mansion'},'WARNING');return
+                    building_type=normal(fields.get('building_type'))
+                    if building_type and 'マンション' not in building_type:
+                        reject_listing(web,'SUUMO',url,'detail.building_type','condition','建物種別がマンションではない',building_type,'マンション');emit('rejected',1);trace(web,'structure',{'url':url,'building_type':building_type,'reason':'explicit_non_mansion'},'WARNING');return
+                    if not building_type:
+                        # Every candidate in this collector came from SUUMO ts=1 (マンション)
+                        # search results.  A missing detail-page label is parser incompleteness,
+                        # not evidence that the listing is non-mansion.  Do not discard it.
+                        building_type='マンション'
+                        trace(web,'structure_from_search_filter',{'url':url,'building_type':'マンション','source':'SUUMO検索条件 ts=1'},stage='parser')
                     age,ym=age_info(fields['raw_age'])
                     if age is None or age>15:
                         reject_listing(web,'SUUMO',url,'detail.age','missing_data' if age is None else 'condition','築年数が15年以内と確認できない',{'raw':fields['raw_age'],'years':age},'15年以内');emit('rejected',1);trace(web,'age',{'url':url,'raw_age':fields['raw_age'],'age':age,'reason':'detail_age_not_confirmed_within_15'},'WARNING');return
@@ -2933,7 +2954,7 @@ def suumo_collect(web,region,bounds,munis,emit):
                         reject_listing(web,'SUUMO',url,'address.detail','location_failure','住所が町丁目止まりのため保存しない',address,'番地・住居番号まで含む詳細住所');emit('rejected',1);return
 
                     # Schema 7 persists rent/layout/detailed-address/time plus the verified map coordinate.
-                    row=partial_listing('SUUMO',url,'SUUMO掲載募集',address,layout,rent,None,None,region,bounds,location,None,age,ym,'')
+                    row=partial_listing('SUUMO',url,'SUUMO掲載募集',address,layout,rent,None,None,region,bounds,location,building_type,age,ym,'')
                     if not row:reject_listing(web,'SUUMO',url,'listing.validation','invalid_data','保存必須項目の検証を通らない',{'rent':rent,'layout':layout,'address':address,'location':location},'有効な家賃・間取り・詳細住所・物件URL');emit('rejected',1);return
                     row['property_id']=suumo_property_id(url)
                     row['address_source']=location['location_method']
