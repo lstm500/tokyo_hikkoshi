@@ -38,7 +38,7 @@ import streamlit as st
 from streamlit_folium import st_folium
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v88"
+BUILD = "REBUILD-01-v89"
 
 # ============================================================================
 # NON-NEGOTIABLE SUUMO ADDRESS POLICY -- DO NOT DELETE OR WEAKEN
@@ -60,6 +60,27 @@ BUILD = "REBUILD-01-v88"
 # These rules are part of the application specification. Future edits must keep them.
 SUUMO_TEXT_ADDRESS_FORBIDDEN = True
 SUUMO_MAP_ONLY_ADDRESS_POLICY = 'map_coordinate_plus_identity_corroboration_v2'
+
+# ============================================================================
+# NON-NEGOTIABLE HOMES ADDRESS / REGION-SEARCH POLICY -- DO NOT DELETE OR WEAKEN
+# ============================================================================
+# 1) HOME'S list/detail-page textual address MUST NOT be used to create, geocode,
+#    complete, correct, compare, or validate the saved property address.
+# 2) HOME'S regional search starts from the internally derived ward/town list,
+#    opens the ward page, selects the matching 町域, then applies mansion / <=15y
+#    and the two layout groups in order.
+# 3) Every result is opened as an individual detail page. Rent/layout are read
+#    from that detail page; list-page 所在地 is ignored.
+# 4) Position/address acquisition starts from that listing's own 地図を見る map.
+#    Prefer the map image pin; when the map is an embedded Google map, published
+#    ll/center/@ coordinates are a fallback. Detailed address is inferred from
+#    map-derived coordinates and independent address/building data only.
+# 5) A listing must not be saved unless rent, target layout, and a detailed
+#    map-derived address are all available.
+# These rules are part of the application specification. Future edits must keep them.
+HOMES_TEXT_ADDRESS_FORBIDDEN = True
+HOMES_MAP_ONLY_ADDRESS_POLICY = 'map_image_or_published_center_plus_identity_v1'
+AUTOMATIC_REGION_PROVIDERS = ['SUUMO','HOME’S']
 
 PROVIDER_OPTIONS = ("スマイティ","HOMES","SUUMO","カナリー","アットホーム","CHINTAI","Comfy","アパマンショップ")
 PROVIDER_CANONICAL = {"HOMES":"HOME’S","HOME’S":"HOME’S","スマイティ":"スマイティ","SUUMO":"SUUMO","カナリー":"カナリー",
@@ -2081,45 +2102,139 @@ def homes_group_params(prepared,layouts):
 
 
 def homes_map_url(soup,detail_url):
-    for a in soup.select('a[href]'):
-        label=' '.join([normal(a.get_text(' ',strip=True)),normal(a.get('title')),normal(a.get('aria-label'))])
-        target=urljoin(detail_url,a.get('href','')).split('#')[0];u=urlparse(target)
-        if u.hostname=='www.homes.co.jp' and ('地図を見る' in label or re.search(r'地図|map',label,re.I)) and target!=detail_url:return target
+    """Return a HOME'S-owned map destination when present.
+
+    HOME'S often embeds Google Maps directly in the detail page.  External Google
+    URLs are therefore evidence carried by the HOME'S page, not a page we need to
+    fetch.  Returning detail_url is intentional when the map is embedded in place.
+    """
+    embedded=False
+    for tag in soup.select('a[href],iframe[src],img[src],script'):
+        raw=' '.join(str(tag.get(attr) or '') for attr in ('href','src'))
+        label=' '.join([normal(tag.get_text(' ',strip=True)),normal(tag.get('title')),normal(tag.get('aria-label')),raw])
+        if re.search(r'地図を見る|google\.com/maps|maps\.google|[?&](?:ll|center)=|@3[4-7]\.\d+,1(?:3[89]|40)\.\d+',label,re.I):embedded=True
+        if tag.name=='a' and tag.get('href'):
+            target=urljoin(detail_url,tag.get('href','')).split('#')[0];u=urlparse(target)
+            if u.hostname=='www.homes.co.jp' and target!=detail_url and re.search(r'地図|map',label+' '+u.path,re.I):return target
     links=map_links(soup,detail_url)
-    return links[0] if links else None
+    for target in links:
+        target=target.split('#')[0]
+        if urlparse(target).hostname=='www.homes.co.jp' and target!=detail_url:return target
+    return detail_url if embedded else None
 
 
-def homes_location_from_map_image(web,detail_soup,detail_url,bounds,munis,expected_towns=None,expected_code=None):
+def _homes_map_documents(web,detail_soup,detail_url):
+    """Collect provider-owned documents that contain the listing's map evidence."""
+    docs=[(detail_url,detail_soup)]
     target=homes_map_url(detail_soup,detail_url)
-    if not target:raise AppError('HOMES詳細ページの「地図を見る」を確認できません。')
-    if not web.permitted(target):raise AppError('HOMESの地図ページの自動取得が許可されていません。')
-    reply=web.fetch(target);soup=BeautifulSoup(reply.text,'html.parser')
-    all_candidates=map_image_candidates(web,soup,target)
-    candidates=[p for p in all_candidates if p[3]>=5]
-    trace(web,'homes_map_image_candidates',{'detail_url':detail_url,'map_url':target,'all_candidates':all_candidates,'usable_candidates':candidates,'bounds':list(bounds)},stage='image_location')
-    if not candidates:return None
-    priority=max(p[3] for p in candidates);best=[p for p in candidates if p[3]==priority]
-    distinct={(round(p[0],6),round(p[1],6)) for p in best}
-    if len(distinct)!=1:
-        trace(web,'map_multiple_candidates',{'source':'HOMES地図画像','same_priority_candidates':list(distinct)},'WARNING','image_location');return None
-    lat,lng,_,_=best[0]
+    if target and target!=detail_url and urlparse(target).hostname=='www.homes.co.jp':
+        if not web.permitted(target):raise AppError('HOMESの地図ページの自動取得が許可されていません。')
+        reply=web.fetch(target);docs.append((target,BeautifulSoup(reply.text,'html.parser')))
+    if not target:
+        # Some current HOME'S pages expose the map iframe without a separate HOME'S
+        # map URL.  The detail document itself is still the provider-published map page.
+        target=detail_url
+    return target,docs
+
+
+def _homes_identity_from_detail(soup,raw_layout='',raw_age='',raw_area=''):
+    """Non-address identity fields used only when map-coordinate address lookup misses."""
+    candidates=[]
+    for selector in ('h1','.mod-bukkenName','.prg-bukkenName','.property-name','meta[property="og:title"]'):
+        tag=soup.select_one(selector)
+        if not tag:continue
+        value=normal(tag.get('content') if tag.name=='meta' else tag.get_text(' ',strip=True))
+        if value:candidates.append(value)
+    generic=('賃貸マンション','賃貸物件','マンション','HOME’S','LIFULL HOME’S')
+    building_name=''
+    for value in candidates:
+        cleaned=re.sub(r'\s*[-｜|].*$','',value).strip()
+        if len(cleaned)>=3 and not any(g==cleaned for g in generic) and not re.search(r'徒歩\s*\d+分|賃貸マンション$',cleaned):
+            building_name=cleaned;break
+    return {'building_name':building_name,'raw_layout':raw_layout,'raw_age':raw_age,'raw_area':raw_area}
+
+
+def homes_location_from_map_image(web,detail_soup,detail_url,bounds,munis,expected_towns=None,expected_code=None,identity=None):
+    """HOME'S detail -> 地図を見る -> map image/Google center -> detailed address.
+
+    The listing/list textual address is deliberately absent from this function.
+    """
+    identity=dict(identity or {})
+    target,docs=_homes_map_documents(web,detail_soup,detail_url)
+    expected_towns=tuple(normal(x) for x in (expected_towns or ()) if normal(x))
+    all_candidates=[]
+    for map_url,soup in docs:
+        candidates=map_image_candidates(web,soup,map_url)
+        all_candidates.extend((p,map_url) for p in candidates if p[3]>=5)
+    # 1) Image-recognized provider map pin, as requested.  Require one top-priority point.
+    lat=lng=None;source=target;position_kind='';method=''
+    if all_candidates:
+        priority=max(p[0][3] for p in all_candidates);best=[item for item in all_candidates if item[0][3]==priority]
+        distinct={(round(item[0][0],6),round(item[0][1],6)) for item in best}
+        trace(web,'homes_map_image_candidates',{'detail_url':detail_url,'map_url':target,'usable_candidates':[x[0] for x in all_candidates],'top_priority':priority,'distinct_top':list(distinct),'bounds':list(bounds)},stage='image_location')
+        if len(distinct)==1:
+            lat,lng=next(iter(distinct));source=next(u for p,u in best if (round(p[0],6),round(p[1],6))==(lat,lng));position_kind='image_pin';method='HOMES「地図を見る」の地図画像ピン認識→詳細住所推定'
+        else:
+            trace(web,'map_multiple_candidates',{'source':'HOMES地図画像','same_priority_candidates':list(distinct),'decision':'continue_to_published_map_center'},'WARNING','image_location')
+    # 2) Current HOME'S pages may embed Google Maps and expose ll=/center=/@ coordinates.
+    # These coordinates are read from the HOME'S-published map document, never from text address.
+    if lat is None:
+        center_candidates=[]
+        for map_url,soup in docs:
+            point,meta=_suumo_map_center_points(soup,map_url)  # generic Google-map coordinate parser
+            if point:center_candidates.append((point,map_url,meta))
+        unique={x[0] for x in center_candidates}
+        if len(unique)==1:
+            (lat,lng),source,meta=center_candidates[0];position_kind='map_center';method='HOMES「地図を見る」の公開Google地図中心座標→詳細住所推定'
+            trace(web,'homes_map_center_fallback',{'detail_url':detail_url,'map_url':source,'point':[lat,lng],'meta':meta},stage='location')
+        elif len(unique)>1:
+            counts={}
+            for point,map_url,meta in center_candidates:counts[point]=counts.get(point,0)+1
+            ranked=sorted(counts.items(),key=lambda kv:(-kv[1],kv[0]))
+            if len(ranked)==1 or ranked[0][1]>ranked[1][1]:
+                (lat,lng),_=ranked[0];source=next(u for p,u,m in center_candidates if p==(lat,lng));position_kind='map_center';method='HOMES「地図を見る」の公開Google地図中心座標→詳細住所推定'
+    if lat is None:
+        trace(web,'homes_map_position_unresolved',{'detail_url':detail_url,'map_url':target,'reason':'地図画像ピン・公開Google地図中心座標のいずれも取得できない'},'WARNING','location')
+        return None
     if not in_rectangle((lat,lng),bounds):
-        trace(web,'published_point_outside_bounds',{'map_url':target,'point':[lat,lng],'bounds':list(bounds),'retained':True,'reason':'対象町域の確認を優先し、初期表示範囲外でも保存判定を継続'},stage='location')
-    inferred=map_point_to_residential_address(web,(lat,lng),munis,expected_code=expected_code,expected_towns=expected_towns)
-    if not inferred:return None
-    address=inferred['address']
-    if expected_towns and not any(town_matches(t,address) for t in expected_towns):
-        trace(web,'map_address_difference',{'source':'HOMES地図画像','map_derived_address':address,'expected_towns':list(expected_towns),'point':[lat,lng],'retained':False},'WARNING','location');return None
-    source=getattr(web,'image_point_sources',{}).get((lat,lng),target)
-    return {'latitude':lat,'longitude':lng,'location_method':'HOMES「地図を見る」の地図画像ピン認識→GSI住居表示住所推定',
-            'map_address':address,'inferred_address':address,'address_match':'地図画像から住所推定',
-            'coordinate_precision':'listing_map','position_source_url':source,
-            'address_precision':'地図ピン最近傍のGSI住居表示住所（街区符号・基礎番号）'}
+        trace(web,'published_point_outside_bounds',{'map_url':source,'point':[lat,lng],'bounds':list(bounds),'retained':True,'reason':'対象町域の確認を優先し、初期表示範囲外でも保存判定を継続'},stage='location')
+
+    # An image pin can use the strict town validator.  HOME'S map-center positions can
+    # be generalized, so use municipality first and let independent identity resolve a
+    # detailed address when the JHJ point is not defensible.
+    # The selected HOME'S 町域 is an allowed search-scope validator (not an address
+    # input).  Require the inferred detailed address to stay in that selected town.
+    strict_towns=expected_towns
+    max_distance=90 if position_kind=='image_pin' else 180
+    inferred=map_point_to_residential_address(web,(lat,lng),munis,max_distance_m=max_distance,expected_code=expected_code,expected_towns=strict_towns)
+    external=None
+    if not inferred:
+        external=_cross_source_address_from_identity(web,identity,(lat,lng),munis,expected_code)
+        inferred=external
+    if not inferred or not _detailed_address(inferred.get('address')):
+        trace(web,'homes_detailed_address_unresolved',{'detail_url':detail_url,'map_url':source,'point':[lat,lng],'position_kind':position_kind,'reason':'物件地図から詳細住所を推定できないため保存しない'},'WARNING','location')
+        return None
+    address=inferred['address'];external_used=bool(external)
+    if expected_towns and not external_used and not any(town_matches(t,address) for t in expected_towns):
+        trace(web,'map_address_difference',{'source':'HOMES物件地図','map_derived_address':address,'expected_towns':list(expected_towns),'point':[lat,lng],'retained':False},'WARNING','location');return None
+    ref=inferred.get('reference_point') or [lat,lng]
+    return {'latitude':float(ref[0]) if external_used else lat,'longitude':float(ref[1]) if external_used else lng,
+            'location_method':('HOMES物件固有地図→建物同一性を独立ソース照合→GSI住所確認' if external_used else method),
+            'map_address':address,'inferred_address':address,
+            'address_match':('独立ソースで建物同一性を照合しGSIで番地確認' if external_used else '物件地図座標から番地・住居番号相当まで推定'),
+            'coordinate_precision':'building' if external_used else 'listing_map',
+            'position_source_url':source,
+            'address_precision':('独立複数ソース照合＋GSI住所検索' if external_used else 'GSI住居表示・街区符号/基礎番号'),
+            'address_distance_m':round(float(inferred.get('distance_m') or 0),2),
+            'homes_map_hint_latitude':lat,'homes_map_hint_longitude':lng,
+            'homes_map_position_kind':position_kind}
 
 
 def homes_detail(web,url,region,bounds,munis,layouts):
     begin_listing(web,'HOME’S',url)
     text=web.fetch(url).text;soup=BeautifulSoup(text,'html.parser')
+    # Do not read the detail/list textual address.  Location/address comes from the
+    # provider-published map only (plus independent corroboration after map lookup).
     raw_layout=labeled(soup,('間取り','間取'))
     if not raw_layout:
         m=re.search(r'間取り\s*((?:\d+)(?:LDK|DK|K))',normal(soup.get_text(' ',strip=True)),re.I);raw_layout=m.group(1) if m else ''
@@ -2132,21 +2247,21 @@ def homes_detail(web,url,region,bounds,munis,layouts):
     if age is not None and age>15:return reject_listing(web,'HOME’S',url,'detail.age','condition','築年数が15年を超える',{'raw':raw_age,'years':age},'15年以内')
     rent=optional_amount(labeled(soup,('賃料','家賃')))
     if not rent:return reject_listing(web,'HOME’S',url,'detail.rent','missing_data','家賃を正の数値として読み取れない',{'raw':labeled(soup,('賃料','家賃')),'parsed':rent},'家賃（円）>0')
+    raw_area=labeled(soup,('専有面積','面積'))
+    identity=_homes_identity_from_detail(soup,raw_layout,raw_age,raw_area)
     expected_towns=region.get('visible_towns') or [region.get('town','')]
-    try:location=homes_location_from_map_image(web,soup,url,bounds,munis,expected_towns,region.get('code'))
+    try:location=homes_location_from_map_image(web,soup,url,bounds,munis,expected_towns,region.get('code'),identity)
     except AppError as exc:
-        trace(web,'location_pending',{'url':url,'message':str(exc),'source':'HOMES地図画像'},'WARNING','location');location=None
+        trace(web,'location_pending',{'url':url,'message':str(exc),'source':'HOMES地図を見る'},'WARNING','location');location=None
     if not location or not location.get('inferred_address'):
-        trace(web,'location_pending',{'url':url,'reason':'地図画像から住所を確定できないため保存しない','source':'HOMES地図画像'},'WARNING','location');return reject_listing(web,'HOME’S',url,'map.address_inference','location_failure','地図の物件位置から詳細住所を推定できない',location,'番地までの推定住所')
+        trace(web,'location_pending',{'url':url,'reason':'物件地図から詳細住所を推定できないため保存しない','source':'HOMES地図を見る'},'WARNING','location');return reject_listing(web,'HOME’S',url,'map.address_inference','location_failure','物件地図から詳細住所を推定できないため保存しない',location,'番地までの推定住所')
     address=location['inferred_address']
     row=partial_listing('HOME’S',url,'HOMES掲載募集',address,layout,rent,None,None,region,bounds,location,None,age,None,'')
-
     if not row:return reject_listing(web,'HOME’S',url,'listing.validation','invalid_data','保存必須項目の検証を通らない',{'rent':rent,'layout':layout,'address':address,'location':location},'有効な家賃・間取り・詳細住所・物件URL')
     return row
 
-
 def homes_collect(web,region,bounds,munis,emit):
-    """HOMES: grouped public search, parallel detail verification, map-image address."""
+    """HOMES: ward/town -> grouped filters -> each detail -> provider map -> detailed address."""
     prepared=homes_prepare_region(web,region);seen_urls=set();visible_towns=region.get('visible_towns') or [region.get('town','')]
     scope=dict(getattr(DIAG_CONTEXT,'scope',{}))
     for group_number,layouts in enumerate(HOMES_LAYOUT_GROUPS,1):
@@ -2159,7 +2274,10 @@ def homes_collect(web,region,bounds,munis,emit):
             seen_pages.add(signature);detail_urls=[]
             for a in soup.select('a[href]'):
                 label=normal(a.get_text(' ',strip=True));url=urljoin(reply.url,a.get('href','')).split('#')[0]
-                if safe_url(url,'HOME’S') and '/chintai/room/' in urlparse(url).path and ('詳細を見る' in label or '物件詳細' in label or label):
+                path=urlparse(url).path
+                is_detail=bool(re.search(r'^/chintai/(?:b-[^/]+|room/[^/]+)/?$',path))
+                explicit=('詳細を見る' in label or '物件詳細' in label or 'prg-detailLink' in str(a.get('class') or '') or 'prg-bukkenNameAnchor' in str(a.get('class') or ''))
+                if safe_url(url,'HOME’S') and is_detail and (explicit or label):
                     if url not in seen_urls:seen_urls.add(url);detail_urls.append(url)
             emit('candidate',len(detail_urls));found+=len(detail_urls)
 
@@ -4643,7 +4761,13 @@ def remember_search():
         return
     if state.get('manual_search_scope','地図の表示範囲')=='区・町名を選択':
         code=state.get('manual_ward','13116')
-        state.new_request={'bounds':[34,138,37,141],'providers':['SUUMO'],'ward_code':code,
+        selected=list(state.get('new_providers',[]))
+        providers=[canonical_provider(p) for p in selected]
+        providers=[p for p in dict.fromkeys(providers) if p in ('SUUMO','HOME’S')]
+        if not providers:
+            state.new_search={'status':'failed','summary':{'issues':['区・町名検索ではSUUMOまたはHOMESを取得元に選択してください。'],'saved':0,'confirmed':0}}
+            return
+        state.new_request={'bounds':[34,138,37,141],'providers':providers,'ward_code':code,
                            'town_codes':list(state.get('manual_selected_'+code,[])), 'mode':'ward_search',
                            'display':{'layouts':'all','monthly_limit':None,'aggregation':False}}
         state.new_map_loaded=True
@@ -4953,14 +5077,25 @@ def interactive_rental_map(pins,cells,facilities):
 AUTO_COLLECTION_ID='automatic.collection.settings'
 
 def automatic_task_plan(settings):
-    """Return the exact SUUMO town task order used by automatic collection."""
+    """Return the exact interleaved SUUMO/HOME'S town/provider task order."""
     if not isinstance(settings,dict):return []
-    regions=settings.get('auto_regions') or []
-    munis=settings.get('auto_munis') or {}
+    regions=settings.get('auto_regions') or [];munis=settings.get('auto_munis') or {}
     if not regions:return []
-    groups=suumo_area_groups(regions,munis)
-    return [{'index':i,'label':g.get('label') or ('東京都'+str(g.get('city_name') or '')+str(g.get('suumo_town') or g.get('town') or '')),
-             'town':g.get('suumo_town') or g.get('town') or ''} for i,g in enumerate(groups)]
+    providers=[canonical_provider(p) for p in (settings.get('providers') or AUTOMATIC_REGION_PROVIDERS)]
+    providers=[p for p in dict.fromkeys(providers) if p in AUTOMATIC_REGION_PROVIDERS]
+    target_sets=[]
+    for provider in providers:
+        groups=suumo_area_groups(regions,munis) if provider=='SUUMO' else homes_area_groups(regions,munis)
+        target_sets.append((provider,groups))
+    plan=[]
+    for number in range(max((len(groups) for _,groups in target_sets),default=0)):
+        for provider,groups in target_sets:
+            if number>=len(groups):continue
+            g=groups[number];town=g.get('suumo_town') if provider=='SUUMO' else g.get('homes_town')
+            plan.append({'index':len(plan),'provider':provider,
+                         'label':(g.get('label') or ('東京都'+str(g.get('city_name') or '')+str(town or g.get('town') or '')))+'｜'+PROVIDER_DISPLAY.get(provider,provider),
+                         'town':town or g.get('town') or ''})
+    return plan
 
 
 def load_persisted_error_events_fast(db):
@@ -5160,7 +5295,7 @@ class AutomaticCollection:
             try:
                 audit=active_job.audit if active_job is not None else AuditLog({
                     'bounds':[34,138,37,141],'ward_code':self.settings.get('ward_code'),'town_codes':self.settings.get('town_codes',[]),
-                    'providers':['SUUMO'],'mode':'automatic_collection'},(getattr(self.db,'key',''),))
+                    'providers':list(self.settings.get('providers') or AUTOMATIC_REGION_PROVIDERS),'mode':'automatic_collection'},(getattr(self.db,'key',''),))
                 audit.add('automatic','automatic_collection_failure','ERROR',{'message':self.error,'exception_type':type(exc).__name__,'traceback':traceback.format_exc()})
                 audit.persist(self.db,force=True)
             except Exception:pass
@@ -5202,6 +5337,15 @@ def restore_automatic_collection():
             if not isinstance(rows,list):raise AppError('自動収集設定を読み取れません。')
             if not rows:return
             settings=rows[0].get('conditions') or {};summary=rows[0].get('summary') or {}
+            # v89 migration: previous automatic settings were SUUMO-only.  Keep the
+            # ward/town scope but restart the provider/town task index because the new
+            # interleaved plan contains both SUUMO and HOME'S tasks.
+            previous_providers=[canonical_provider(p) for p in (settings.get('providers') or [])]
+            settings['providers']=list(AUTOMATIC_REGION_PROVIDERS)
+            if previous_providers!=list(AUTOMATIC_REGION_PROVIDERS):
+                for key in ('next_task_index','current_task_index','total_tasks','task_labels','cycle_completed_indices','current_task_label','cycle_reset_pending'):
+                    summary.pop(key,None)
+                summary['next_task_index']=0;summary['cycle_completed_indices']=[]
             validate_automatic_settings(settings);validate_automatic_summary(summary)
             st.session_state.automatic_saved_settings=settings;st.session_state.automatic_saved_summary=summary
             if not settings.get('enabled'):return
@@ -5214,7 +5358,8 @@ def validate_automatic_settings(settings):
     if settings.get('ward_code') not in TOKYO_WARDS:raise AppError('東京23区から対象区を選択してください。')
     codes=settings.get('town_codes',[])
     if not isinstance(codes,list) or any(not isinstance(c,str) or not re.fullmatch(re.escape(settings['ward_code'])+r'\d{3}',c) for c in codes):raise AppError('対象町名の設定が不正です。')
-    if settings.get('providers')!=['SUUMO']:raise AppError('自動収集はSUUMOを指定してください。')
+    providers=[canonical_provider(p) for p in (settings.get('providers') or [])]
+    if not providers or any(p not in AUTOMATIC_REGION_PROVIDERS for p in providers):raise AppError('自動収集の取得元はSUUMO・HOMESを指定してください。')
 
 def validate_automatic_summary(summary):
     if not isinstance(summary,dict):raise AppError('自動収集の進捗形式が不正です。')
@@ -5225,7 +5370,7 @@ def validate_automatic_summary(summary):
     if not isinstance(summary.get('last_summary',{}),dict):raise AppError('自動収集の前回結果が不正です。')
 
 def start_automatic_collection(ward_code,interval_minutes=0,town_codes=None):
-    settings={'enabled':True,'ward_code':ward_code,'providers':['SUUMO'],'interval_minutes':0,'created_at':utc_now(),'town_codes':sorted(set(town_codes or []))}
+    settings={'enabled':True,'ward_code':ward_code,'providers':list(AUTOMATIC_REGION_PROVIDERS),'interval_minutes':0,'created_at':utc_now(),'town_codes':sorted(set(town_codes or []))}
     validate_automatic_settings(settings)
     db=Database();db.web_config=rental_network_settings();registry,lock=automatic_registry();key=automatic_registry_key(db)
     with lock:
@@ -5234,7 +5379,8 @@ def start_automatic_collection(ward_code,interval_minutes=0,town_codes=None):
         old_snapshot=old.snapshot() if old else {}
         prior=old_snapshot.get('settings',st.session_state.get('automatic_saved_settings',{}))
         previous_summary=old_snapshot.get('summary',st.session_state.get('automatic_saved_summary',{}))
-        same_scope=prior.get('ward_code')==settings['ward_code'] and sorted(prior.get('town_codes',[]))==settings['town_codes']
+        same_scope=(prior.get('ward_code')==settings['ward_code'] and sorted(prior.get('town_codes',[]))==settings['town_codes'] and
+                    [canonical_provider(p) for p in (prior.get('providers') or [])]==list(AUTOMATIC_REGION_PROVIDERS))
         summary=previous_summary if same_scope else {}
         for item in ('auto_regions','auto_munis'):
             if same_scope and prior.get(item):settings[item]=prior[item]
@@ -5272,7 +5418,7 @@ def schedule_automatic_upgrade(controller):
 
 @st.fragment(run_every='8s')
 def automatic_collection_panel():
-    st.subheader('アプリ内の自動収集（SUUMO）')
+    st.subheader('アプリ内の自動収集（SUUMO・HOMES）')
     st.caption('画面を閉じてもサーバー稼働中は収集します。休止・再起動では止まり、次にアプリを開くと保存した設定・町の順番から再開します。')
     controller=get_automatic_collection();snap=controller.snapshot() if controller else None
     if controller:
@@ -5288,7 +5434,7 @@ def automatic_collection_panel():
     saved=snap['settings'] if snap else st.session_state.get('automatic_saved_settings',{})
     ward_code=st.selectbox('自動収集する区',list(TOKYO_WARDS),index=list(TOKYO_WARDS).index(saved.get('ward_code','13116')),format_func=lambda code:TOKYO_WARDS[code],key='automatic_ward')
     town_codes=ward_town_selector(ward_code,'automatic',saved.get('town_codes',[]),disabled=busy)
-    st.caption('選択した町を順番に最後のページまで検索します。町名未選択なら区の全町が対象です。築15年以内・マンション・1LDK/2K/2DK・2LDK/3K/3DKを収集します。')
+    st.caption('選択した町をSUUMO・HOMESの順で最後のページまで検索します。町名未選択なら区の全町が対象です。両サイトともマンション・築15年以内・①1LDK/2K/2DK→②2LDK/3K/3DKを収集します。')
     manual=active_job();manual_busy=bool(manual and not manual.snapshot()['finished'])
     if st.button('選択した区で自動収集を開始・再開',key='automatic_start',disabled=busy or manual_busy):
         try:
@@ -5455,10 +5601,10 @@ def main():
             ward_code=st.selectbox('検索する区',list(TOKYO_WARDS),index=list(TOKYO_WARDS).index(state.get('manual_selected_ward','13116')),format_func=lambda code:TOKYO_WARDS[code],key='manual_ward',disabled=searching)
             state.manual_selected_ward=ward_code
             ward_town_selector(ward_code,'manual',disabled=searching)
-            st.caption('区・町名指定はSUUMOを対象に、築15年以内・マンション・1LDK/2K/2DK/2LDK/3K/3DKを検索・保存します。地図の表示範囲では絞りません。')
+            st.caption('区・町名指定は取得元で選択したSUUMO・HOMESを対象に、マンション・築15年以内・①1LDK/2K/2DK→②2LDK/3K/3DKを検索・保存します。所在地文字列は使わず、各詳細ページの物件地図から詳細住所を推定します。')
         st.button('表示中の地名から全件検索・保存' if scope=='地図の表示範囲' else '選択した区・町名を検索・保存',type='primary',use_container_width=True,
                   on_click=remember_search,key='new_start',disabled=searching or (scope=='地図の表示範囲' and (not bounds or not providers)))
-        st.caption('検索開始時の表示範囲から検索する町名を決めます。SUUMOはその町の全丁目を対象に、範囲外でも詳細住所を推定して保存します。HOMESは区名→町域→マンション・築15年以内→①1LDK/2K/2DK→②2LDK/3K/3DK→詳細→「地図を見る」の画像認識、SUUMOは市区郡→町名→同じ2間取り群→詳細→「地図・周辺環境」の物件マーカー座標取得です。住所は実所在地未確認の推定値です。保存は家賃・間取り・詳細住所（推定）・データ取得日時です。')
+        st.caption('検索開始時の表示範囲から検索する町名を決めます。SUUMOはその町の全丁目を対象に、範囲外でも詳細住所を推定して保存します。HOMESは表示地図から作った区名・町名リスト→区→町域指定→マンション・築15年以内→①1LDK/2K/2DK→②2LDK/3K/3DK→各詳細→「地図を見る」の画像ピン/公開地図座標から住所推定、SUUMOは市区郡→町名→同じ2間取り群→各詳細→「地図・周辺環境」の物件マーカー座標取得です。住所は実所在地未確認の推定値です。保存は家賃・間取り・詳細住所（推定）・データ取得日時です。')
         background_status()
         result=state.new_search
         if result:
@@ -5599,10 +5745,10 @@ def main():
         st.caption('旧アプリの物件や検索状態を使用しません。旧テーブルのデータは削除しません。')
         st.caption(f'実行中の版：{BUILD}')
     with st.expander('取得・集計の範囲'):
-        st.write('HOMESは2つの間取り群で検索します。SUUMOは詳細ページで間取りを再取得し、マンション・築15年以内・1LDK/2K/2DKまたは2LDK/3K/3DKだけを採用します。SUUMOの位置は「地図・周辺環境」の物件マーカー、HOMESの位置は「地図を見る」の画像ピンから取得します。地図由来の詳細住所を推定できない物件は保存しません。')
+        st.write("HOMESは2つの間取り群で検索します。SUUMOは詳細ページで間取りを再取得し、マンション・築15年以内・1LDK/2K/2DKまたは2LDK/3K/3DKだけを採用します。SUUMOの位置は「地図・周辺環境」の物件マーカー、HOMESの位置は「地図を見る」の画像ピンを最優先し、画像ピンを一意に取れない場合はHOME'Sが公開したGoogle地図座標を使います。地図由来の詳細住所を推定できない物件は保存しません。")
         st.write('データベースへ保存する募集項目は家賃・間取り・詳細住所（推定）・データ取得日時です。取得日時はUTCで保存し、画面では日本時間で表示します。管理費・面積・築年数・画像・緯度経度・掲載URLは募集データとして保存しません。')
         st.write('募集情報は既存SupabaseのJSON保存領域へ保存するため、追加SQLは不要です。schema 4・5の保存データを読み込みます。旧データの取得日時は未記録と表示します。')
-        st.write('SUUMOは物件マーカー座標、HOMESは画像ピン座標を起点にし、国土地理院の住居表示住所データから街区符号・基礎番号を最近傍推定します。一覧・詳細ページの所在地文字列から住所や位置を補完しません。')
+        st.write("SUUMOは物件マーカー座標、HOMESは画像ピンまたはHOME'S公開地図座標を起点にし、国土地理院の住居表示住所データから街区符号・基礎番号を最近傍推定します。一覧・詳細ページの所在地文字列から住所や位置を補完しません。")
         st.write('地図範囲内の居住地名タイルと100m間隔の地点・範囲の端から地名・丁目を判定します。候補数・物件数・ページ数による打ち切りは行いません。通信失敗やページ送りの異常は未完了として表示します。掲載サイト側の非公開情報・取得制限や、地名データの欠落は取得できません。')
         st.write('検索中は取得した物件の座標を使って地図へ逐次反映します。保存データ読込時は住所から座標を一時生成します。座標はDBへ保存しません。')
         st.write('検索と保存はサーバーのバックグラウンドで実行し、画面は1秒ごとに進捗を表示します。サーバーの休止・再起動を越えて実行することはできません。募集終了物件の自動削除は行いません。')
