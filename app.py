@@ -38,7 +38,7 @@ import streamlit as st
 from streamlit_folium import st_folium
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v90"
+BUILD = "REBUILD-01-v91"
 
 # ============================================================================
 # NON-NEGOTIABLE SUUMO ADDRESS POLICY -- DO NOT DELETE OR WEAKEN
@@ -106,6 +106,30 @@ PER_HOST_SLOTS = 2
 PER_HOST_MIN_INTERVAL = 1.0
 ADDRESS_NEGATIVE_CACHE_SECONDS = 900
 PREF_ALIAS = {"11":"saitama","12":"chiba","13":"tokyo","14":"kanagawa"}
+
+# HOME'S Tokyo 23 wards: direct city-list URLs.
+# Do not fetch /chintai/mansion/tokyo/ or /chintai/kodate/tokyo/ first for these wards.
+# Those prefecture entry pages have returned CloudFront 403 from the app server, while
+# the public city-list URLs are independently addressable. Keep this mapping explicit.
+HOMES_TOKYO23_CITY_SLUGS = {
+    '13101':'chiyoda-city','13102':'chuo-city','13103':'minato-city',
+    '13104':'shinjuku-city','13105':'bunkyo-city','13106':'taito-city',
+    '13107':'sumida-city','13108':'koto-city','13109':'shinagawa-city',
+    '13110':'meguro-city','13111':'ota-city','13112':'setagaya-city',
+    '13113':'shibuya-city','13114':'nakano-city','13115':'suginami-city',
+    '13116':'toshima-city','13117':'kita-city','13118':'arakawa-city',
+    '13119':'itabashi-city','13120':'nerima-city','13121':'adachi-city',
+    '13122':'katsushika-city','13123':'edogawa-city',
+}
+
+def homes_direct_city_list_url(region, category='mansion'):
+    """Return HOME'S city list directly for Tokyo 23 wards; never use text address."""
+    code=str(region.get('code',''))
+    alias=PREF_ALIAS.get(str(region.get('pref','')))
+    slug=HOMES_TOKYO23_CITY_SLUGS.get(code)
+    if alias=='tokyo' and slug and category in ('mansion','kodate'):
+        return f'https://www.homes.co.jp/chintai/{category}/tokyo/{slug}/list/'
+    return None
 DEFAULT_CENTER = (35.7303,139.711)
 UNIT_TABLE = "housing_units_v1"
 SEARCH_TABLE = "housing_searches_v1"
@@ -2079,12 +2103,18 @@ def homes_prepare_region(web,region):
     if not alias:raise AppError('HOMESの対象都県を確認できません。')
     key=(alias,str(region.get('code','')),address_key(region.get('homes_town') or region.get('town','')))
     if key in cache:return cache[key]
-    root=f'https://www.homes.co.jp/chintai/mansion/{alias}/'
-    if not web.permitted(root):raise AppError('HOMESの市区郡選択ページの自動取得が許可されていません。')
-    root_reply=web.fetch(root);root_soup=BeautifulSoup(root_reply.text,'html.parser')
-    city=normal(region.get('city_name') or provider_city_name(region,{}));city_url=_named_homes_link(root_soup,root,city)
-    if not city_url:raise AppError('HOMESの市区郡一覧から'+city+'を確認できません。')
-    trace(web,'homes_city_selected',{'city':city,'url':city_url,'source':'表示地図から作成した区名・町名リスト'},stage='search_conditions')
+    city=normal(region.get('city_name') or provider_city_name(region,{}))
+    city_url=homes_direct_city_list_url(region,'mansion')
+    if city_url:
+        trace(web,'homes_city_selected',{'city':city,'url':city_url,'source':'東京都23区の公開区別list URLへ直接移動（都トップページを経由しない）'},stage='search_conditions')
+    else:
+        root=f'https://www.homes.co.jp/chintai/mansion/{alias}/'
+        if not web.permitted(root):raise AppError('HOMESの市区郡選択ページの自動取得が許可されていません。')
+        root_reply=web.fetch(root);root_soup=BeautifulSoup(root_reply.text,'html.parser')
+        city_url=_named_homes_link(root_soup,root,city)
+        if not city_url:raise AppError('HOMESの市区郡一覧から'+city+'を確認できません。')
+        trace(web,'homes_city_selected',{'city':city,'url':city_url,'source':'表示地図から作成した区名・町名リスト'},stage='search_conditions')
+    if not web.permitted(city_url):raise AppError('HOMESの区別一覧ページの自動取得が許可されていません。')
     city_reply=web.fetch(city_url);city_soup=BeautifulSoup(city_reply.text,'html.parser')
     wanted=normal(region.get('homes_town') or town_base_name(region.get('town','')))
     town_url=_named_homes_link(city_soup,city_url,wanted,'-town')
@@ -2141,11 +2171,17 @@ def homes_prepare_house_region(web,region):
     wanted=normal(region.get('homes_town') or town_base_name(region.get('town','')))
     key=(alias,str(region.get('code','')),address_key(wanted))
     if key in cache:return cache[key]
-    root=f'https://www.homes.co.jp/chintai/kodate/{alias}/'
-    if not web.permitted(root):raise AppError('HOMES一戸建ての市区郡選択ページの自動取得が許可されていません。')
-    root_reply=web.fetch(root);root_soup=BeautifulSoup(root_reply.text,'html.parser')
-    city=normal(region.get('city_name') or provider_city_name(region,{}));city_url=_named_homes_link(root_soup,root,city,'/kodate/')
-    if not city_url:raise AppError('HOMES一戸建ての市区郡一覧から'+city+'を確認できません。')
+    city=normal(region.get('city_name') or provider_city_name(region,{}))
+    city_url=homes_direct_city_list_url(region,'kodate')
+    if city_url:
+        trace(web,'homes_house_city_selected',{'city':city,'url':city_url,'source':'東京都23区の公開区別list URLへ直接移動（都トップページを経由しない）'},stage='search_conditions')
+    else:
+        root=f'https://www.homes.co.jp/chintai/kodate/{alias}/'
+        if not web.permitted(root):raise AppError('HOMES一戸建ての市区郡選択ページの自動取得が許可されていません。')
+        root_reply=web.fetch(root);root_soup=BeautifulSoup(root_reply.text,'html.parser')
+        city_url=_named_homes_link(root_soup,root,city,'/kodate/')
+        if not city_url:raise AppError('HOMES一戸建ての市区郡一覧から'+city+'を確認できません。')
+    if not web.permitted(city_url):raise AppError('HOMES一戸建ての区別一覧ページの自動取得が許可されていません。')
     city_reply=web.fetch(city_url);city_soup=BeautifulSoup(city_reply.text,'html.parser')
     town_url=_named_homes_link(city_soup,city_url,wanted,'-town');base_params={}
     if town_url:
