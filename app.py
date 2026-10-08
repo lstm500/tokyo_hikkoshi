@@ -38,7 +38,7 @@ import streamlit as st
 from streamlit_folium import st_folium
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v75"
+BUILD = "REBUILD-01-v77"
 PROVIDER_OPTIONS = ("スマイティ","HOMES","SUUMO","カナリー","アットホーム","CHINTAI","Comfy","アパマンショップ")
 PROVIDER_CANONICAL = {"HOMES":"HOME’S","HOME’S":"HOME’S","スマイティ":"スマイティ","SUUMO":"SUUMO","カナリー":"カナリー",
                       "アットホーム":"アットホーム","CHINTAI":"CHINTAI","Comfy":"Comfy","アパマンショップ":"アパマンショップ"}
@@ -73,6 +73,18 @@ HOMES_LAYOUT_GROUPS = (("1LDK", "2K", "2DK"), ("2LDK", "3K", "3DK"))
 DISPLAY_LAYOUT_GROUPS = {"group1": ("1LDK", "2K", "2DK"), "group2": ("2LDK", "3K", "3DK")}
 HOMES_LAYOUTS = tuple(x for group in HOMES_LAYOUT_GROUPS for x in group)
 ALL_TARGET_LAYOUTS = tuple(dict.fromkeys((*LAYOUTS,*SUUMO_LAYOUTS,*HOMES_LAYOUTS,'1SLDK','2SLDK','3SLDK','1SDK','2SDK','3SDK','1SK')))
+WARD_LABELS = {
+    "千代田区":(35.6938,139.7535), "中央区":(35.6707,139.7727), "港区":(35.6581,139.7516),
+    "新宿区":(35.6938,139.7034), "文京区":(35.7081,139.7522), "台東区":(35.7126,139.7800),
+    "墨田区":(35.7107,139.8015), "江東区":(35.6728,139.8174), "品川区":(35.6092,139.7302),
+    "目黒区":(35.6415,139.6982), "大田区":(35.5613,139.7161), "世田谷区":(35.6466,139.6532),
+    "渋谷区":(35.6640,139.6982), "中野区":(35.7075,139.6637), "杉並区":(35.6995,139.6364),
+    "豊島区":(35.7263,139.7167), "北区":(35.7528,139.7336), "荒川区":(35.7361,139.7833),
+    "板橋区":(35.7512,139.7093), "練馬区":(35.7356,139.6517), "足立区":(35.7753,139.8047),
+    "葛飾区":(35.7436,139.8476), "江戸川区":(35.7066,139.8682),
+}
+MAJOR_STATION_LABELS = ("東京","新宿","渋谷","池袋","品川","上野","秋葉原","大崎","目黒","恵比寿","中野","北千住","錦糸町","蒲田")
+
 STATIONS = {
     "東京": (35.6812,139.7671), "品川":(35.6285,139.7388), "大崎":(35.6197,139.7286),
     "五反田":(35.6264,139.7235), "目黒":(35.6339,139.7158), "恵比寿":(35.6467,139.7101),
@@ -3793,6 +3805,36 @@ class MonotoneBase(MacroElement):
     def __init__(self):
         super().__init__();self._name='MonotoneBase'
 
+
+class MapReferenceLabels(MacroElement):
+    """Keep ward names and major stations readable above dense translucent rent points."""
+    _template=Template("""{% macro script(this, kwargs) %}
+    var map = {{ this._parent.get_name() }};
+    var pane = map.getPane('referenceLabelPane');
+    if (pane) pane.style.pointerEvents = 'none';
+    var wardLabels = {{ this.ward_payload }};
+    var stationLabels = {{ this.station_payload }};
+    wardLabels.forEach(function(item) {
+        L.marker([item.lat,item.lng], {pane:'referenceLabelPane',interactive:false,
+            icon:L.divIcon({className:'',iconSize:null,html:
+                '<div style="white-space:nowrap;transform:translate(-50%,-50%);font-size:15px;font-weight:900;letter-spacing:.08em;color:#202020;text-shadow:-2px -2px 0 rgba(255,255,255,.98),2px -2px 0 rgba(255,255,255,.98),-2px 2px 0 rgba(255,255,255,.98),2px 2px 0 rgba(255,255,255,.98),0 0 5px rgba(255,255,255,1);">'+item.name+'</div>'})
+        }).addTo(map);
+    });
+    stationLabels.forEach(function(item) {
+        L.circleMarker([item.lat,item.lng],{pane:'referenceLabelPane',radius:3.3,color:'#202020',weight:1.2,fill:true,fillColor:'#ffffff',fillOpacity:.96,interactive:false}).addTo(map);
+        L.marker([item.lat,item.lng], {pane:'referenceLabelPane',interactive:false,
+            icon:L.divIcon({className:'',iconSize:null,iconAnchor:[0,11],html:
+                '<div style="white-space:nowrap;transform:translate(-50%,-100%);padding:1px 4px;border-radius:4px;background:rgba(255,255,255,.86);border:1px solid rgba(40,40,40,.35);font-size:11.5px;font-weight:850;color:#1f1f1f;box-shadow:0 1px 2px rgba(0,0,0,.12);">'+item.name+'駅</div>'})
+        }).addTo(map);
+    });
+    {% endmacro %}""")
+    def __init__(self):
+        super().__init__();self._name='MapReferenceLabels'
+        wards=[{'name':name,'lat':point[0],'lng':point[1]} for name,point in WARD_LABELS.items()]
+        stations=[{'name':name,'lat':STATIONS[name][0],'lng':STATIONS[name][1]} for name in MAJOR_STATION_LABELS if name in STATIONS]
+        self.ward_payload=json.dumps(wards,ensure_ascii=False,separators=(',',':')).replace('<','\u003c').replace('>','\u003e').replace('&','\u0026')
+        self.station_payload=json.dumps(stations,ensure_ascii=False,separators=(',',':')).replace('<','\u003c').replace('>','\u003e').replace('&','\u0026')
+
 def rental_map(rows,center,radius,cells,facilities):
     m=folium.Map(location=center,zoom_start=15,tiles=None,control_scale=True,prefer_canvas=True)
     folium.map.CustomPane('monotoneBase',z_index=200,pointer_events=False).add_to(m)
@@ -3800,12 +3842,10 @@ def rental_map(rows,center,radius,cells,facilities):
     folium.TileLayer('https://cyberjapandata.gsi.go.jp/xyz/std/{z}/{x}/{y}.png',
         attr='国土地理院',name='駅名・地名のモノトーン地図',max_zoom=18,pane='monotoneBase').add_to(m)
     folium.map.CustomPane('rentIndividualPane',z_index=410,pointer_events=False).add_to(m)
-    # Base-map station and town labels stay visible through translucent rent areas.
-    # Major station names also have persistent white-backed labels above the colors.
-    for name,point in STATIONS.items():
-        folium.CircleMarker(point,radius=2,color='#303030',weight=1,fill=True,fill_color='#ffffff',fill_opacity=1,
-            tooltip=folium.Tooltip(html.escape(name)+'駅',permanent=True,direction='top',
-                style='background:rgba(255,255,255,.94);color:#303030;border:0;font-size:12px;font-weight:700;box-shadow:none;padding:2px 4px;')).add_to(m)
+    # Reference labels live above the rent dots.  Rent dots remain translucent so the
+    # underlying roads, station names and ward geography stay legible even in dense areas.
+    folium.map.CustomPane('referenceLabelPane',z_index=625,pointer_events=False).add_to(m)
+    MapReferenceLabels().add_to(m)
     rental_features(rows,cells,facilities).add_to(m)
     return m
 
@@ -3827,8 +3867,8 @@ class IndividualRentPoints(MacroElement):
     }
     {{ this.get_name() }}_data.forEach(function(item) {
         L.circleMarker([item.lat,item.lng],{renderer:{{ this.get_name() }}_renderer,
-            radius:6.5,color:'#ffffff',weight:item.approx?1.8:1.0,interactive:false,
-            dashArray:item.approx?'2,2':null,fill:true,fillColor:item.color,fillOpacity:0.96})
+            radius:5.8,color:'#ffffff',weight:item.approx?1.35:0.75,opacity:0.62,interactive:false,
+            dashArray:item.approx?'2,2':null,fill:true,fillColor:item.color,fillOpacity:0.70})
         .addTo({{ this._parent.get_name() }});
     });
     {% endmacro %}""")
@@ -4193,16 +4233,16 @@ def saved_load_progress():
     if snap['phase']=='database':
         st.info(f"保存物件を読み込み中｜{snap['pages']}ページ確認｜経過 {snap['elapsed']}秒")
     elif snap['phase']=='refreshing':
-        st.info(f"最新の保存分を確認中｜現在 {snap['rows']}物件｜経過 {snap['elapsed']}秒")
+        st.info(f"最新の保存分を確認中｜保存物件 {snap['rows']}件｜色付き表示 {snap['placed']}件｜経過 {snap['elapsed']}秒")
     elif snap['finished'] and snap['phase']=='complete':
         checked=('｜最新確認 '+acquisition_time_jst(snap['latest_checked_at'])) if snap.get('latest_checked_at') else ''
-        st.success(f"読み込み完了｜保存物件 {snap['rows']}件｜地図準備完了{checked}｜所要 {snap['elapsed']}秒")
+        st.success(f"読み込み完了｜保存物件 {snap['rows']}件｜色付き表示 {snap['placed']}件｜地図準備完了{checked}｜所要 {snap['elapsed']}秒")
     elif snap['phase']=='failed':
         st.error(f"読み込み停止｜確認済み {snap['rows']}物件｜所要 {snap['elapsed']}秒")
     elif snap['phase']=='stopped':
         st.info(f"読み込みを中止しました｜確認済み {snap['rows']}物件｜所要 {snap['elapsed']}秒")
     else:
-        st.info(f"地図準備中｜保存物件 {snap['rows']}件｜経過 {snap['elapsed']}秒")
+        st.info(f"地図準備中｜保存物件 {snap['rows']}件｜色付き表示 {snap['placed']}件｜経過 {snap['elapsed']}秒")
     if snap['error']:st.error(snap['error'])
     if snap['phase']=='stopped':st.caption('中止しました。読み込み済みの物件は保持しています。')
     if searching:st.caption('物件検索が終わると読み込み済みデータを地図へ反映できます。')
