@@ -38,7 +38,7 @@ import streamlit as st
 from streamlit_folium import st_folium
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v77"
+BUILD = "REBUILD-01-v78"
 PROVIDER_OPTIONS = ("スマイティ","HOMES","SUUMO","カナリー","アットホーム","CHINTAI","Comfy","アパマンショップ")
 PROVIDER_CANONICAL = {"HOMES":"HOME’S","HOME’S":"HOME’S","スマイティ":"スマイティ","SUUMO":"SUUMO","カナリー":"カナリー",
                       "アットホーム":"アットホーム","CHINTAI":"CHINTAI","Comfy":"Comfy","アパマンショップ":"アパマンショップ"}
@@ -3730,6 +3730,11 @@ def physical_units(rows):
     return list(rows)
 
 
+def unique_map_position_count(rows):
+    """Count visually distinct coordinate positions, not listing records or marker layers."""
+    return len({(round(float(r['latitude']),6),round(float(r['longitude']),6)) for r in rows if has_point(r)})
+
+
 DISPLAY_REASONS={
  'invalid':'保存レコードのURL・家賃等が不正',
  'bounds':'現在の地図範囲外（位置不明なら検索範囲の重なりで判定）',
@@ -3771,8 +3776,8 @@ def display_pipeline(units,bounds,load=None):
 
 def display_diagnostic_downloads(report):
     stages=report['stages'];mapping=report['map']
-    st.caption(f"読み込んだ募集 {stages['loaded']}件｜現在の範囲 {stages['in_bounds']}件｜1件ずつ地図へ描画 {mapping['markers_total']}件｜位置未確認 {mapping['unconfirmed_positions']}件")
-    st.caption(f"家賃帯で色付け {mapping['colored_points']}点｜家賃未確認の灰色 {mapping['gray_points']}点｜同じ座標への重なり {mapping['overlapping_points']}点。月額上限・間取りによる除外、募集の集約は行いません。")
+    st.caption(f"読み込んだ募集 {stages['loaded']}件｜現在の範囲 {stages['in_bounds']}件｜座標あり {mapping['markers_total']}件｜地図上の位置 {mapping['unique_positions']}か所｜位置未確認 {mapping['unconfirmed_positions']}件")
+    st.caption(f"家賃帯で色付け対象 {mapping['colored_points']}件｜家賃未確認 {mapping['gray_points']}件｜同じ位置に重なる募集 {mapping['overlapping_points']}件。募集件数と、画面で見える位置の数は別です。")
     with st.expander('表示が少ない原因・全募集の診断ログ'):
         st.dataframe([{'理由':DISPLAY_REASONS[k],'募集件数':v} for k,v in report['reason_counts'].items()],hide_index=True)
         text=['住まいコンパス 1募集1点の表示診断',json.dumps({k:v for k,v in report.items() if k!='records'},ensure_ascii=False,indent=2),'募集ごとの判定：']
@@ -4027,6 +4032,7 @@ class SavedLoadJob:
             end=self.ended if self.ended is not None else time.monotonic();diag=dict(self.diagnostic or {})
             return {'token':self.token,'phase':self.phase,'finished':self.finished,'error':self.error,'complete_db':self.complete_db,
                 'rows':len(self.rows),'pages':self.pages,'addresses':self.total_addresses,'done_addresses':self.done_addresses,'placed':self.placed,
+                'unique_positions':unique_map_position_count(self.rows.values()),
                 'raw_records':int(diag.get('raw_records') or 0),'accepted_records':int(diag.get('accepted_records') or 0),
                 'property_id_records':int(diag.get('property_id_records') or 0),'legacy_records':int(diag.get('legacy_records') or 0),
                 'legacy_shadowed':int(diag.get('legacy_shadowed') or 0),'legacy_unmatched':int(diag.get('legacy_unmatched') or 0),
@@ -4211,7 +4217,8 @@ def apply_saved_load(job):
     rows,cache,diag=job.export();state=st.session_state
     state.address_point_cache=cache;state.new_units=rows;state.new_saved_keys=[r['key'] for r in rows]
     state.new_search=None;state.new_map_loaded=True;state.new_load_diagnostic=diag;state.pop('new_job_token',None)
-    state.new_notice=f"{len(rows)}件を表示しました。地図配置 {sum(has_point(r) for r in rows)}件・配置未確認 {sum(not has_point(r) for r in rows)}件。"
+    positioned=sum(has_point(r) for r in rows);positions=unique_map_position_count(rows)
+    state.new_notice=f"保存物件 {len(rows)}件を読み込みました。座標あり {positioned}件・地図上の位置 {positions}か所・位置未確認 {sum(not has_point(r) for r in rows)}件。"
     return True
 
 
@@ -4233,16 +4240,16 @@ def saved_load_progress():
     if snap['phase']=='database':
         st.info(f"保存物件を読み込み中｜{snap['pages']}ページ確認｜経過 {snap['elapsed']}秒")
     elif snap['phase']=='refreshing':
-        st.info(f"最新の保存分を確認中｜保存物件 {snap['rows']}件｜色付き表示 {snap['placed']}件｜経過 {snap['elapsed']}秒")
+        st.info(f"最新の保存分を確認中｜保存物件 {snap['rows']}件｜座標あり {snap['placed']}件｜地図上の位置 {snap['unique_positions']}か所｜経過 {snap['elapsed']}秒")
     elif snap['finished'] and snap['phase']=='complete':
         checked=('｜最新確認 '+acquisition_time_jst(snap['latest_checked_at'])) if snap.get('latest_checked_at') else ''
-        st.success(f"読み込み完了｜保存物件 {snap['rows']}件｜色付き表示 {snap['placed']}件｜地図準備完了{checked}｜所要 {snap['elapsed']}秒")
+        st.success(f"読み込み完了｜保存物件 {snap['rows']}件｜座標あり {snap['placed']}件｜地図上の位置 {snap['unique_positions']}か所｜地図準備完了{checked}｜所要 {snap['elapsed']}秒")
     elif snap['phase']=='failed':
         st.error(f"読み込み停止｜確認済み {snap['rows']}物件｜所要 {snap['elapsed']}秒")
     elif snap['phase']=='stopped':
         st.info(f"読み込みを中止しました｜確認済み {snap['rows']}物件｜所要 {snap['elapsed']}秒")
     else:
-        st.info(f"地図準備中｜保存物件 {snap['rows']}件｜色付き表示 {snap['placed']}件｜経過 {snap['elapsed']}秒")
+        st.info(f"地図準備中｜保存物件 {snap['rows']}件｜座標あり {snap['placed']}件｜地図上の位置 {snap['unique_positions']}か所｜経過 {snap['elapsed']}秒")
     if snap['error']:st.error(snap['error'])
     if snap['phase']=='stopped':st.caption('中止しました。読み込み済みの物件は保持しています。')
     if searching:st.caption('物件検索が終わると読み込み済みデータを地図へ反映できます。')
@@ -4755,6 +4762,33 @@ def start_automatic_collection(ward_code,interval_minutes=0,town_codes=None):
         st.session_state.automatic_settings_error='';controller.thread.start()
     return controller
 
+@st.cache_resource
+def automatic_upgrade_registry():
+    return set(),threading.RLock()
+
+
+def schedule_automatic_upgrade(controller):
+    if controller is None or getattr(controller,'build',None)==BUILD:return False
+    snap=controller.snapshot()
+    if not snap.get('running'):return False
+    key=automatic_registry_key(controller.db);pending,pending_lock=automatic_upgrade_registry();registry,registry_lock=automatic_registry()
+    with pending_lock:
+        if key in pending:return True
+        pending.add(key)
+    desired_settings=dict(snap.get('settings') or {});desired_settings['enabled']=True
+    def handoff():
+        try:
+            controller.request_stop();controller.thread.join()
+            latest=controller.snapshot();settings=dict(desired_settings);settings['enabled']=True
+            replacement=AutomaticCollection(controller.db,settings,dict(latest.get('summary') or {}));replacement.persist()
+            with registry_lock:registry[key]=replacement
+            replacement.thread.start()
+        finally:
+            with pending_lock:pending.discard(key)
+    threading.Thread(target=handoff,daemon=True,name='housing-automatic-upgrade').start()
+    return True
+
+
 @st.fragment(run_every='5s')
 def automatic_collection_panel():
     st.subheader('アプリ内の自動収集（SUUMO）')
@@ -4768,8 +4802,8 @@ def automatic_collection_panel():
         except Exception as exc:
             st.session_state['_compat_failures_error']=str(exc) if isinstance(exc,AppError) else type(exc).__name__
     busy=bool(snap and snap['running'])
-    if controller and getattr(controller,'build',None)!=BUILD:
-        st.warning('現在の自動収集エンジンはデプロイ前の旧版がサーバー内に残っています。エラー履歴は現行版で回収しますが、取得ロジックを最新版へ切り替えるには一度「自動収集を中止」してから「開始・再開」を押してください。保存済み物件は消えません。')
+    if controller and getattr(controller,'build',None)!=BUILD and busy:
+        schedule_automatic_upgrade(controller)
     bounds=st.session_state.get('new_bounds')
     saved=snap['settings'] if snap else st.session_state.get('automatic_saved_settings',{})
     ward_code=st.selectbox('自動収集する区',list(TOKYO_WARDS),index=list(TOKYO_WARDS).index(saved.get('ward_code','13116')),format_func=lambda code:TOKYO_WARDS[code],key='automatic_ward')
@@ -4942,12 +4976,13 @@ def main():
             if result.get('conditions',{}).get('regions'):
                 with st.expander('今回検索した地名・丁目'):
                     for label in result['conditions']['regions']: st.write(label)
-        st.caption('色分けは家賃＋管理費・共益費の月額です。各境界額は低い側の帯に含みます。1募集につき1点を、その募集の家賃帯で表示します。町丁目や区画の平均・中央値へまとめません。町丁目の位置しか分からない点は破線で表示します。同じ位置の募集は重なります。')
+        st.caption('色分けは家賃＋管理費・共益費の月額です。同じ住所・座標の募集は同じ位置に重なるため、募集件数と地図上で見える位置の数は一致しません。町丁目や区画の平均・中央値へはまとめません。')
         if state.get('new_map_loaded'):display_diagnostic_downloads(display_report)
-        c1,c2,c3=st.columns(3)
+        c1,c2,c3,c4=st.columns(4)
         c1.metric('現在の範囲の募集',len(rows))
-        c2.metric('家賃帯で色付けした募集',display_report['map']['colored_points'])
-        c3.metric('位置未確認の募集',display_report['map']['unconfirmed_positions'])
+        c2.metric('家賃帯のある募集',display_report['map']['colored_points'])
+        c3.metric('地図上の位置',display_report['map']['unique_positions'])
+        c4.metric('位置未確認の募集',display_report['map']['unconfirmed_positions'])
         if not state.get('new_map_loaded'):st.info('取得済みデータは「地図へ反映」で表示します。保存データは「保存データ」から読み込めます。')
         elif not rows:st.info('この表示範囲に配置できる保存データがありません。')
         if rows:
