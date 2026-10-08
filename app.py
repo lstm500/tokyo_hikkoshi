@@ -38,7 +38,7 @@ import streamlit as st
 from streamlit_folium import st_folium
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v61"
+BUILD = "REBUILD-01-v62"
 PROVIDER_OPTIONS = ("スマイティ","HOMES","SUUMO","カナリー","アットホーム","CHINTAI","Comfy","アパマンショップ")
 PROVIDER_CANONICAL = {"HOMES":"HOME’S","HOME’S":"HOME’S","スマイティ":"スマイティ","SUUMO":"SUUMO","カナリー":"カナリー",
                       "アットホーム":"アットホーム","CHINTAI":"CHINTAI","Comfy":"Comfy","アパマンショップ":"アパマンショップ"}
@@ -3389,12 +3389,14 @@ class SavedLoadJob:
     def __init__(self,db,bounds,cache=None):
         self.db=db;self.bounds=bounds;self.token=hashlib.sha256(os.urandom(32)).hexdigest();self.server_key=manual_registry_key(db)
         self.lock=threading.RLock();self.cancel_event=threading.Event();self.rows={};self.cache={}  # Session points lack timestamps; reuse only the TTL-controlled server cache.
-        self.phase='database';self.finished=False;self.error='';self.complete_db=False;self.pages=0;self.total_addresses=0;self.done_addresses=0;self.placed=0;self.diagnostic={};self.started=time.monotonic()
+        self.phase='database';self.finished=False;self.error='';self.complete_db=False;self.pages=0;self.total_addresses=0;self.done_addresses=0;self.placed=0;self.diagnostic={};self.started=time.monotonic();self.ended=None
         self.thread=threading.Thread(target=self.run,daemon=True,name='housing-saved-loader')
     def snapshot(self):
-        with self.lock:return {'token':self.token,'phase':self.phase,'finished':self.finished,'error':self.error,'complete_db':self.complete_db,
-            'rows':len(self.rows),'pages':self.pages,'addresses':self.total_addresses,'done_addresses':self.done_addresses,'placed':self.placed,
-            'elapsed':round(time.monotonic()-self.started,1),'stopping':self.cancel_event.is_set()}
+        with self.lock:
+            end=self.ended if self.ended is not None else time.monotonic()
+            return {'token':self.token,'phase':self.phase,'finished':self.finished,'error':self.error,'complete_db':self.complete_db,
+                'rows':len(self.rows),'pages':self.pages,'addresses':self.total_addresses,'done_addresses':self.done_addresses,'placed':self.placed,
+                'elapsed':round(end-self.started,1),'stopping':self.cancel_event.is_set()}
     def export(self):
         with self.lock:return [dict(r) for r in self.rows.values()],dict(self.cache),dict(self.diagnostic)
     def request_stop(self):self.cancel_event.set()
@@ -3430,7 +3432,7 @@ class SavedLoadJob:
         finally:
             with self.lock:
                 self.diagnostic.update(geocoded_total=self.placed,returned=len(self.rows),database_complete=self.complete_db)
-                self.finished=True
+                self.ended=time.monotonic();self.finished=True
 
 
 @st.cache_resource
@@ -3454,6 +3456,7 @@ def start_saved_load(bounds,cache=None,db=None):
             job=SavedLoadJob(db,bounds,cache);jobs[key]=job;job.thread.start()
     st.session_state.saved_load_token=job.token;st.session_state.saved_load_key=key
     st.session_state.pop('saved_load_export',None)
+    st.session_state.pop('saved_load_applied_token',None)
     return job
 
 
@@ -3478,15 +3481,36 @@ def apply_saved_load(job):
 def saved_load_progress():
     job=active_saved_load()
     if not job:return
-    snap=job.snapshot()
-    if snap['phase']=='database':st.info(f"保存データ読み込み中｜{snap['rows']}件・{snap['pages']}ページ｜経過 {snap['elapsed']}秒")
-    else:st.info(f"保存データ {snap['rows']}件｜地図準備 {snap['done_addresses']}/{snap['addresses']}住所｜配置 {snap['placed']}件｜経過 {snap['elapsed']}秒")
+    snap=job.snapshot();searching=manual_search_running()
+    applied=st.session_state.get('saved_load_applied_token')==job.token
+
+    # A completed saved-data load must transition to the map automatically.  In v61
+    # the worker could already be complete (e.g. 735/735 addresses) while the fragment
+    # continued to show an ever-increasing elapsed timer and waited for another button.
+    if snap['finished'] and snap['phase']=='complete' and not applied and not searching:
+        if apply_saved_load(job):
+            st.session_state.saved_load_applied_token=job.token
+            st.rerun()
+
+    if snap['phase']=='database':
+        st.info(f"保存データ読み込み中｜{snap['rows']}件・{snap['pages']}ページ｜経過 {snap['elapsed']}秒")
+    elif snap['finished'] and snap['phase']=='complete':
+        st.success(f"読み込み完了｜保存データ {snap['rows']}件｜地図準備 {snap['done_addresses']}/{snap['addresses']}住所｜配置 {snap['placed']}件｜所要 {snap['elapsed']}秒")
+    elif snap['phase']=='failed':
+        st.error(f"読み込み停止｜保存データ {snap['rows']}件｜地図準備 {snap['done_addresses']}/{snap['addresses']}住所｜配置 {snap['placed']}件｜所要 {snap['elapsed']}秒")
+    elif snap['phase']=='stopped':
+        st.info(f"読み込みを中止しました｜保存データ {snap['rows']}件｜地図準備 {snap['done_addresses']}/{snap['addresses']}住所｜配置 {snap['placed']}件｜所要 {snap['elapsed']}秒")
+    else:
+        st.info(f"保存データ {snap['rows']}件｜地図準備 {snap['done_addresses']}/{snap['addresses']}住所｜配置 {snap['placed']}件｜経過 {snap['elapsed']}秒")
     if snap['error']:st.error(snap['error'])
     if snap['phase']=='stopped':st.caption('中止しました。読み込み済みの物件は保持しています。')
-    if manual_search_running():st.caption('物件検索が終わると読み込み済みデータを地図へ反映できます。')
-    st.caption('地図操作は継続できます。地図は「読み込んだ物件を地図へ反映」を押すと更新します。')
-    if st.button('読み込んだ物件を地図へ反映',key='apply_saved_load',disabled=not snap['rows'] or manual_search_running()):
-        if apply_saved_load(job):st.rerun()
+    if searching:st.caption('物件検索が終わると読み込み済みデータを地図へ反映できます。')
+    elif snap['finished'] and snap['phase']=='complete':st.caption('読み込み完了後、自動的に地図へ反映します。')
+    else:st.caption('地図操作は継続できます。読み込み途中でも下のボタンで現在までの物件を地図へ反映できます。')
+    if not applied and st.button('読み込んだ物件を地図へ反映',key='apply_saved_load',disabled=not snap['rows'] or searching):
+        if apply_saved_load(job):
+            if snap['finished'] and snap['phase']=='complete':st.session_state.saved_load_applied_token=job.token
+            st.rerun()
     if not snap['finished'] and st.button('読み込み・地図準備を中止（読み込み済みを保持）',key='stop_saved_load',disabled=snap['stopping']):job.request_stop()
     if st.button('読み込み済み全物件のCSVを準備',key='prepare_saved_load_csv',disabled=not snap['rows']):
         rows,_,_=job.export();st.session_state.saved_load_export={'token':job.token,'csv':csv_bytes(rows),'count':len(rows)}
