@@ -38,7 +38,7 @@ import streamlit as st
 from streamlit_folium import st_folium
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v59"
+BUILD = "REBUILD-01-v60"
 PROVIDER_OPTIONS = ("スマイティ","HOMES","SUUMO","カナリー","アットホーム","CHINTAI","Comfy","アパマンショップ")
 PROVIDER_CANONICAL = {"HOMES":"HOME’S","HOME’S":"HOME’S","スマイティ":"スマイティ","SUUMO":"SUUMO","カナリー":"カナリー",
                       "アットホーム":"アットホーム","CHINTAI":"CHINTAI","Comfy":"Comfy","アパマンショップ":"アパマンショップ"}
@@ -105,8 +105,12 @@ CROWD = {
     '南武線':(156,'武蔵中原 → 武蔵小杉','7:30〜8:30'),
     '田園都市線':(138,'池尻大橋 → 渋谷','7:50〜8:50'),
 }
-BANDS = (150000,200000,225000,250000,275000,300000,350000)
-COLORS = ("#326b8b","#318a9b","#48a598","#8bb078","#bdb45c","#d89854","#cc7050","#aa4c56")
+BANDS = (100000,125000,150000,175000,200000,225000,250000,275000,300000,350000,400000)
+COLORS = ("#3346a8","#2468c4","#168fcb","#12aeb0","#159b70","#5eab39",
+          "#a4b72b","#d3b524","#e79820","#e66c24","#dc422c","#bd1829")
+RENT_BAND_LABELS = (f'{BANDS[0]/10000:g}万円以下',) + tuple(
+    f'{lower/10000:g}〜{upper/10000:g}万円' for lower,upper in zip(BANDS,BANDS[1:])
+) + (f'{BANDS[-1]/10000:g}万円超',)
 SQL = '''-- 新しいアプリ専用。既存の物件・ジョブ・テーブルは削除しません。
 create table if not exists public.housing_units_v1 (
  namespace text not null, key text not null, title text not null,
@@ -4079,9 +4083,9 @@ def main():
             if result.get('conditions',{}).get('regions'):
                 with st.expander('今回検索した地名・丁目'):
                     for label in result['conditions']['regions']: st.write(label)
-        legend=''.join(f'<span style="display:inline-block;margin:4px 10px 4px 0;color:#203f39;font-size:12px"><b style="color:{color}">■</b> {label}</span>' for color,label in zip(COLORS,['15万円以下','15〜20万円','20〜22.5万円','22.5〜25万円','25〜27.5万円','27.5〜30万円','30〜35万円','35万円超']))
+        legend=''.join(f'<span style="display:inline-block;margin:4px 10px 4px 0;color:#203f39;font-size:12px"><b style="color:{color}">■</b> {label}</span>' for color,label in zip(COLORS,RENT_BAND_LABELS))
         st.markdown(legend,unsafe_allow_html=True)
-        st.caption('1募集につき1点を、その募集の家賃帯で表示します。町丁目や区画の平均・中央値へまとめません。町丁目の位置しか分からない点は破線で表示します。同じ位置の募集は重なります。')
+        st.caption('色分けは家賃＋管理費・共益費の月額です。各境界額は低い側の帯に含みます。1募集につき1点を、その募集の家賃帯で表示します。町丁目や区画の平均・中央値へまとめません。町丁目の位置しか分からない点は破線で表示します。同じ位置の募集は重なります。')
         if state.get('new_map_loaded'):display_diagnostic_downloads(display_report)
         c1,c2,c3=st.columns(3)
         c1.metric('現在の範囲の募集',len(rows))
