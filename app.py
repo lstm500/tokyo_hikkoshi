@@ -38,7 +38,7 @@ import streamlit as st
 from streamlit_folium import st_folium
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v58"
+BUILD = "REBUILD-01-v59"
 PROVIDER_OPTIONS = ("スマイティ","HOMES","SUUMO","カナリー","アットホーム","CHINTAI","Comfy","アパマンショップ")
 PROVIDER_CANONICAL = {"HOMES":"HOME’S","HOME’S":"HOME’S","スマイティ":"スマイティ","SUUMO":"SUUMO","カナリー":"カナリー",
                       "アットホーム":"アットホーム","CHINTAI":"CHINTAI","Comfy":"Comfy","アパマンショップ":"アパマンショップ"}
@@ -527,6 +527,31 @@ def rental_network_settings():
     return {'proxies':routes}
 
 
+@st.cache_resource
+def saved_position_memory():
+    return {'points':{},'flights':{},'lock':threading.RLock(),
+            'http':{'gates':{},'slots':{},'starts':{},'backoff':{},'lock':threading.RLock()}}
+
+
+def remember_saved_position(memory,address,point):
+    if not memory or not point:return
+    try:
+        lat,lng,title=point
+        if not has_point({'latitude':lat,'longitude':lng}):return
+    except (ValueError,TypeError):return
+    with memory['lock']:
+        points=memory['points']
+        if len(points)>=12000 and normal(address) not in points:points.pop(next(iter(points)))
+        points[normal(address)]=(time.monotonic(),(float(lat),float(lng),str(title)))
+
+
+def cached_saved_position(memory,address):
+    if not memory:return None
+    with memory['lock']:
+        entry=memory['points'].get(normal(address))
+        return entry[1] if entry and time.monotonic()-entry[0]<86400 else None
+
+
 class Database:
     """Fresh typed storage; no legacy tables/payloads or job lookups."""
     def __init__(self, config=None):
@@ -555,7 +580,7 @@ class Database:
                 if len(parts)!=3 or payload.get('role')!='service_role': raise ValueError()
             except Exception: raise AppError('Secret keyまたはservice_roleキーを設定してください。') from None
             self.headers['Authorization']='Bearer '+self.key
-        self.session=requests.Session()
+        self.session=requests.Session();self.address_points=saved_position_memory()
     def call(self,method,table,params=None,data=None,prefer=None):
         if table not in (UNIT_TABLE,SEARCH_TABLE,PLACE_TABLE): raise AppError('保存先が不正です。')
         headers=dict(self.headers)
@@ -676,16 +701,18 @@ class Database:
         self.acquisition_cache=out;self.acquisition_cache_at=time.monotonic()
         return out
 
-    def load_units(self,bounds=None,layouts=None):
+    def load_units(self,bounds=None,layouts=None,on_progress=None,cancel_event=None):
         out=[];offset=0
         self.last_load_diagnostic={'time':utc_now(),'bounds':list(bounds) if bounds else None,'layouts':list(layouts) if layouts is not None else None,
                                    'pages':[],'excluded':{'invalid':0,'layout':0,'legacy_schema':0},'raw_records':0,'storage_schema':6,'geocode_on_load':True}
         while True:
-            rows=self.call('GET',SEARCH_TABLE,{'namespace':'eq.'+self.namespace,'select':'summary,conditions','status':'eq.rental_listing','order':'id.asc','limit':500,'offset':offset})
+            if cancel_event is not None and cancel_event.is_set():raise SearchCancelled()
+            rows=self.call('GET',SEARCH_TABLE,{'namespace':'eq.'+self.namespace,'select':'summary,conditions','status':'eq.rental_listing','order':'id.asc','limit':1000,'offset':offset})
             if not isinstance(rows,list):raise AppError('保存した募集情報を読み取れません。')
             self.last_load_diagnostic['pages'].append({'table':SEARCH_TABLE,'offset':offset,'returned':len(rows),'server_filters':['namespace','rental_listing']})
             self.last_load_diagnostic['raw_records']+=len(rows)
             if not rows:break
+            page_start=len(out)
             for item in rows:
                 meta=item.get('conditions') or {}
                 if int(meta.get('schema') or 0) not in (4,5,6):
@@ -698,6 +725,7 @@ class Database:
                 out.append({**compact,'key':key,'title':compact['address'],'rent':compact['rent'],'layout':compact['layout'],'address':compact['address'],
                             'fetched_at':compact.get('fetched_at'),'fees':0,'loaded_from_compact_storage':True})
             offset+=len(rows)
+            if on_progress:on_progress(out[page_start:],dict(self.last_load_diagnostic))
         # Do not count legacy copies again when an ID record covers that observation.
         represented={hashlib.sha256(json.dumps({k:r[k] for k in ('rent','layout','address')},ensure_ascii=False,sort_keys=True,separators=(',',':')).encode()).hexdigest() for r in out if r.get('property_id')}
         out=[r for r in out if r.get('property_id') or r['key'] not in represented]
@@ -767,6 +795,7 @@ def response_encoding(response):
 
 class PublicWeb:
     def __init__(self):
+        self.address_points=None
         self.local=threading.local();self.cancel_event=threading.Event();self.cache_lock=threading.RLock();self.http_flights={};self.host_slots={};self.detail_slots=threading.BoundedSemaphore(4);self.jhj_tile_cache={};self.jhj_tile_cached_at={};self.address_result_cache={}
         self.headers={'User-Agent':'SumaiCompassRebuild/1.0 (personal rental research)', 'Accept-Language':'ja'}
         self.host_gates={};self.host_last_request={};self.host_backoff={};self.route_cooldowns={};self.session_primed=threading.local();self.proxy_routes=[];self.route_preferred={};self.route_lock=threading.Lock();self.http_cache={};self.headers.update({'Accept':'text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8'})
@@ -783,12 +812,16 @@ class PublicWeb:
         if self.cancel_event.is_set():raise SearchCancelled()
     def pause(self,seconds):
         if self.cancel_event.wait(max(0.,seconds)):raise SearchCancelled()
+    def host_policy(self,host):
+        if self.address_points and host and host.endswith('.gsi.go.jp'):return self.address_points['http']
+        return {'gates':self.host_gates,'slots':self.host_slots,'starts':self.host_last_request,'backoff':self.host_backoff,'lock':self.route_lock}
     def route_request(self,session,method,url,options):
         self.check_cancel();host=urlparse(url).hostname
         headers=dict(self.headers);headers.update(options.get('headers',{}));options={k:v for k,v in options.items() if k!='headers'}
-        with self.route_lock:
-            gate=self.host_gates.setdefault(host,threading.Lock())
-            slots=self.host_slots.setdefault(host,threading.BoundedSemaphore(2))
+        policy=self.host_policy(host)
+        with policy['lock']:
+            gate=policy['gates'].setdefault(host,threading.Lock())
+            slots=policy['slots'].setdefault(host,threading.BoundedSemaphore(2))
         while not slots.acquire(timeout=.1):self.check_cancel()
         try:
             while not gate.acquire(timeout=.1):self.check_cancel()
@@ -799,10 +832,10 @@ class PublicWeb:
                     if crawl:interval=max(interval,float(crawl))
                     if rate and rate.requests:interval=max(interval,float(rate.seconds)/rate.requests)
                 while True:
-                    delay=max(0.,self.host_last_request.get(host,0.)+interval-time.monotonic(),self.host_backoff.get(host,0.)-time.monotonic())
+                    delay=max(0.,policy['starts'].get(host,0.)+interval-time.monotonic(),policy['backoff'].get(host,0.)-time.monotonic())
                     if delay<=0:break
                     self.pause(delay)
-                self.check_cancel();self.host_last_request[host]=time.monotonic()
+                self.check_cancel();policy['starts'][host]=time.monotonic()
             finally:gate.release()
             # Keep one-second start spacing, but do not serialize the response wait.
             return session.request(method,url,headers=headers,timeout=(4,12),allow_redirects=False,**options)
@@ -862,7 +895,8 @@ class PublicWeb:
                         except (ValueError,TypeError):
                             try:delay=max(0.,(parsedate_to_datetime(raw)-datetime.now(timezone.utc)).total_seconds())
                             except (ValueError,TypeError,OverflowError):delay=2**attempt
-                        with self.route_lock:self.host_backoff[host]=max(self.host_backoff.get(host,0.),time.monotonic()+delay)
+                        policy=self.host_policy(host)
+                        with policy['lock']:policy['backoff'][host]=max(policy['backoff'].get(host,0.),time.monotonic()+delay)
                         if delay>30:
                             with self.route_lock:self.route_cooldowns[(host,index)]=time.monotonic()+delay
                             trace(self,'route_cooldown',{'host':host,'route_number':index+1,'remaining_seconds':round(delay),'reason':'Retry-After'},stage='transport');break
@@ -1116,6 +1150,8 @@ def map_point_to_residential_address(web,point,munis,max_distance_m=90):
         return dict(cached[1])
     result=_map_point_to_residential_address(web,point,munis,max_distance_m)
     if result:
+        reference=result.get('reference_point')
+        if reference:remember_saved_position(web.address_points,result['address'],(*reference,result['address']))
         with web.cache_lock:
             cache=web.address_result_cache
             if len(cache)>=12000:cache.pop(next(iter(cache)))
@@ -2662,6 +2698,7 @@ def search_all(db,conditions,screen,state=None):
     if not getattr(db,'collection_checked',False):db.check();db.collection_checked=True
     db.save_search(search);log('保存先確認OK。新しい検索を開始しました。')
     web=getattr(state,'shared_web',None) or PublicWeb();web.audit=audit
+    web.address_points=getattr(db,'address_points',None)
     web.http_cache.clear();web.failed_detail_urls.clear();web.unavailable_hosts.clear();web.claimed_ids=set()
     if hasattr(state,'request_starts'):web.host_last_request=state.request_starts
     if hasattr(state,'cancel_event'):web.cancel_event=state.cancel_event
@@ -3288,24 +3325,170 @@ def geocode_saved_address(web,address):
     return lat,lng,title
 
 
-def hydrate_saved_units(rows,bounds,cache=None):
-    """Coordinates are created only when saved compact records are loaded; never persisted."""
-    cache=cache if isinstance(cache,dict) else {};addresses=list(dict.fromkeys(r['address'] for r in rows if r.get('address')));web=PublicWeb()
+def geocode_saved_address_cached(web,address):
+    memory=getattr(web,'address_points',None)
+    cached=cached_saved_position(memory,address)
+    if cached:return cached
+    if not memory:return geocode_saved_address(web,address)
+    key=normal(address)
+    with memory['lock']:
+        flight=memory['flights'].get(key);owner=flight is None
+        if owner:flight=futures.Future();memory['flights'][key]=flight
+    if not owner:
+        while not flight.done():web.pause(.05)
+        try:return flight.result()
+        except SearchCancelled:
+            web.check_cancel()
+            with memory['lock']:
+                if memory['flights'].get(key) is flight:memory['flights'].pop(key,None)
+            return geocode_saved_address_cached(web,address)
+    try:
+        point=geocode_saved_address(web,address)
+        remember_saved_position(memory,address,point);flight.set_result(point);return point
+    except BaseException as exc:
+        flight.set_exception(exc);raise
+    finally:
+        with memory['lock']:
+            if memory['flights'].get(key) is flight:memory['flights'].pop(key,None)
+
+
+def hydrated_listing(row,point):
+    if not point:return dict(row,coordinate_precision='unknown',location_method='保存住所の地図配置を確認できない')
+    lat,lng,title=point
+    return dict(row,latitude=lat,longitude=lng,coordinate_precision='address',location_method='保存済み地図由来住所を読み込み時に住所検索',map_address=title,address_match='保存住所から再配置')
+
+
+def hydrate_saved_units(rows,bounds,cache=None,web=None,notify=None):
+    cache=cache if isinstance(cache,dict) else {};addresses=list(dict.fromkeys(r['address'] for r in rows if r.get('address')));web=web or PublicWeb()
     def locate_address(address):
-        if address in cache:return cache[address]
-        point=geocode_saved_address(web,address);cache[address]=point;return point
-    for address,point,error in bounded_results(addresses,locate_address,workers=6):
-        if address is not None and error:cache[address]=None
-    hydrated=[]
-    for row in rows:
-        point=cache.get(row.get('address'))
-        if not point:
-            hydrated.append(dict(row,coordinate_precision='unknown',location_method='保存住所の地図配置を確認できない'));continue
-        lat,lng,title=point
-        # Keep off-screen saved records in memory so panning can reveal their points.
-        item=dict(row,latitude=lat,longitude=lng,coordinate_precision='address',location_method='保存済み地図由来住所を読み込み時に住所検索',map_address=title,address_match='保存住所から再配置')
-        hydrated.append(item)
-    return hydrated,cache
+        web.check_cancel()
+        if not getattr(web,'address_points',None) and cache.get(address):return cache[address]
+        return geocode_saved_address_cached(web,address)
+    pending=[]
+    for address in addresses:
+        web.check_cancel()
+        memory=getattr(web,'address_points',None)
+        point=cached_saved_position(memory,address) if memory else cache.get(address)
+        if point:
+            cache[address]=point
+            if notify:notify(address,point,None)
+        else:pending.append(address)
+    for address,point,error in bounded_results(pending,locate_address,workers=2,stop_event=web.cancel_event):
+        if address is None:continue
+        cache[address]=point if not error else None
+        if notify:notify(address,cache[address],error)
+    return [hydrated_listing(row,cache.get(row.get('address'))) for row in rows],cache
+
+
+class SavedLoadJob:
+    """DB rows become available independently of geocoding; no Streamlit in worker."""
+    def __init__(self,db,bounds,cache=None):
+        self.db=db;self.bounds=bounds;self.token=hashlib.sha256(os.urandom(32)).hexdigest();self.server_key=manual_registry_key(db)
+        self.lock=threading.RLock();self.cancel_event=threading.Event();self.rows={};self.cache={}  # Session points lack timestamps; reuse only the TTL-controlled server cache.
+        self.phase='database';self.finished=False;self.error='';self.complete_db=False;self.pages=0;self.total_addresses=0;self.done_addresses=0;self.placed=0;self.diagnostic={};self.started=time.monotonic()
+        self.thread=threading.Thread(target=self.run,daemon=True,name='housing-saved-loader')
+    def snapshot(self):
+        with self.lock:return {'token':self.token,'phase':self.phase,'finished':self.finished,'error':self.error,'complete_db':self.complete_db,
+            'rows':len(self.rows),'pages':self.pages,'addresses':self.total_addresses,'done_addresses':self.done_addresses,'placed':self.placed,
+            'elapsed':round(time.monotonic()-self.started,1),'stopping':self.cancel_event.is_set()}
+    def export(self):
+        with self.lock:return [dict(r) for r in self.rows.values()],dict(self.cache),dict(self.diagnostic)
+    def request_stop(self):self.cancel_event.set()
+    def run(self):
+        web=PublicWeb();web.cancel_event=self.cancel_event;web.address_points=getattr(self.db,'address_points',None)
+        def page(rows,diag):
+            with self.lock:
+                for row in rows:
+                    point=self.cache.get(row['address']) or cached_saved_position(web.address_points,row['address'])
+                    if point:self.cache[row['address']]=point
+                    self.rows[row['key']]=hydrated_listing(row,point)
+                self.pages+=1;self.placed=sum(has_point(r) for r in self.rows.values());self.diagnostic=diag
+        try:
+            stored=self.db.load_units(None,on_progress=page,cancel_event=self.cancel_event)
+            addresses=list(dict.fromkeys(r['address'] for r in stored));by_address={a:[] for a in addresses}
+            with self.lock:
+                self.rows={r['key']:hydrated_listing(r,self.cache.get(r['address']) or cached_saved_position(web.address_points,r['address'])) for r in stored}
+                self.complete_db=True;self.phase='positions';self.total_addresses=len(addresses);self.placed=sum(has_point(r) for r in self.rows.values())
+                for row in stored:by_address[row['address']].append(row['key'])
+            def positioned(address,point,error):
+                with self.lock:
+                    self.done_addresses+=1
+                    for key in by_address[address]:
+                        old=self.rows[key];new=hydrated_listing(old,point);self.rows[key]=new
+                        self.placed+=int(has_point(new))-int(has_point(old))
+                    self.cache[address]=point
+            hydrate_saved_units(stored,self.bounds,self.cache,web,positioned)
+            with self.lock:self.phase='complete'
+        except SearchCancelled:
+            with self.lock:self.phase='stopped'
+        except Exception as exc:
+            with self.lock:self.error=str(exc) if isinstance(exc,AppError) else '読み込みエラー（'+type(exc).__name__+'）';self.phase='failed'
+        finally:
+            with self.lock:
+                self.diagnostic.update(geocoded_total=self.placed,returned=len(self.rows),database_complete=self.complete_db)
+                self.finished=True
+
+
+@st.cache_resource
+def saved_load_registry():return {},threading.RLock()
+
+
+def active_saved_load():
+    jobs,lock=saved_load_registry();token=st.session_state.get('saved_load_token');key=st.session_state.get('saved_load_key')
+    with lock:
+        job=jobs.get(key)
+        current_key=st.session_state.get('current_storage_key',key)
+        return job if job and job.token==token and current_key==key else None
+
+
+def start_saved_load(bounds,cache=None,db=None):
+    db=db or Database();key=manual_registry_key(db);jobs,lock=saved_load_registry()
+    with lock:
+        current=jobs.get(key)
+        if current and not current.snapshot()['finished']:job=current
+        else:
+            job=SavedLoadJob(db,bounds,cache);jobs[key]=job;job.thread.start()
+    st.session_state.saved_load_token=job.token;st.session_state.saved_load_key=key
+    st.session_state.pop('saved_load_export',None)
+    return job
+
+
+def manual_search_running():
+    jobs,lock=job_registry();token=st.session_state.get('new_job_token');server_key=st.session_state.get('manual_server_key')
+    with lock:
+        job=jobs.get(token)
+        if job and not job.finished:return True
+        return any(getattr(j,'server_key',None)==server_key and not j.finished for j in jobs.values()) if server_key else False
+
+
+def apply_saved_load(job):
+    if active_saved_load() is not job or manual_search_running():return False
+    rows,cache,diag=job.export();state=st.session_state
+    state.address_point_cache=cache;state.new_units=rows;state.new_saved_keys=[r['key'] for r in rows]
+    state.new_search=None;state.new_map_loaded=True;state.new_load_diagnostic=diag;state.pop('new_job_token',None)
+    state.new_notice=f"{len(rows)}件を表示しました。地図配置 {sum(has_point(r) for r in rows)}件・配置未確認 {sum(not has_point(r) for r in rows)}件。"
+    return True
+
+
+@st.fragment(run_every='2s')
+def saved_load_progress():
+    job=active_saved_load()
+    if not job:return
+    snap=job.snapshot()
+    if snap['phase']=='database':st.info(f"保存データ読み込み中｜{snap['rows']}件・{snap['pages']}ページ｜経過 {snap['elapsed']}秒")
+    else:st.info(f"保存データ {snap['rows']}件｜地図準備 {snap['done_addresses']}/{snap['addresses']}住所｜配置 {snap['placed']}件｜経過 {snap['elapsed']}秒")
+    if snap['error']:st.error(snap['error'])
+    if snap['phase']=='stopped':st.caption('中止しました。読み込み済みの物件は保持しています。')
+    if manual_search_running():st.caption('物件検索が終わると読み込み済みデータを地図へ反映できます。')
+    st.caption('地図操作は継続できます。地図は「読み込んだ物件を地図へ反映」を押すと更新します。')
+    if st.button('読み込んだ物件を地図へ反映',key='apply_saved_load',disabled=not snap['rows'] or manual_search_running()):
+        if apply_saved_load(job):st.rerun()
+    if not snap['finished'] and st.button('読み込み・地図準備を中止（読み込み済みを保持）',key='stop_saved_load',disabled=snap['stopping']):job.request_stop()
+    if st.button('読み込み済み全物件のCSVを準備',key='prepare_saved_load_csv',disabled=not snap['rows']):
+        rows,_,_=job.export();st.session_state.saved_load_export={'token':job.token,'csv':csv_bytes(rows),'count':len(rows)}
+    export=st.session_state.get('saved_load_export')
+    if export and export['token']==job.token:
+        st.download_button(f"読み込み済み {export['count']}件のCSV",export['csv'],'sumai_saved_units.csv','text/csv',key='download_saved_load_csv',on_click='ignore')
 
 
 def capture_viewport():
@@ -3819,6 +4002,8 @@ def main():
         try: start_search(request)
         except AppError as exc: state.new_search={'status':'failed','summary':{'issues':[str(exc)],'saved':0,'confirmed':0}}
     preferences=state.get('new_preferences',{})
+    try:state.current_storage_key=manual_registry_key(Database())
+    except Exception:state.current_storage_key=None
     tabs=st.tabs(['住まいを探す','保存データ','通勤・周辺施設','初期設定'])
     with tabs[0]:
         st.subheader('地図を動かして、探す地域を表示してください')
@@ -3916,16 +4101,9 @@ def main():
         st.subheader('Supabaseに保存した物件')
         st.caption('保存物件をまとめて読み込みます。範囲外の物件も保持し、地図を動かすと表示できます。地図操作中の自動読み込みは行いません。')
         if st.button('保存物件をすべて読み込む',key='new_load',use_container_width=True,disabled=bool(active_job() and not active_job().snapshot()['finished'])):
-            try:
-                with st.spinner('家賃・間取り・住所を読み込み、住所から地図表示位置を一時生成しています'):
-                    db=Database();stored=db.load_units(None)
-                    rows,cache=hydrate_saved_units(stored,bounds,state.get('address_point_cache'))
-                    state.address_point_cache=cache
-                    diag=getattr(db,'last_load_diagnostic',{'returned':len(stored),'bounds':bounds,'time':utc_now()});diag['geocoded_total']=sum(has_point(r) for r in rows);diag['in_bounds_after_address_geocode']=sum(listing_in_bounds(r,bounds) for r in rows);state.new_load_diagnostic=diag
-                state.new_units=rows;state.new_saved_keys=[r['key'] for r in rows];state.new_search=None;state.new_map_loaded=True
-                state.pop('new_job_token',None)
-                state.new_notice=f'{len(rows)}件を読み込みました。地図配置 {sum(has_point(r) for r in rows)}件・配置未確認 {sum(not has_point(r) for r in rows)}件。配置未確認のデータも一覧・CSVに保持しています。';st.rerun()
-            except AppError as exc: st.error(str(exc))
+            try:start_saved_load(bounds,state.get('address_point_cache'))
+            except AppError as exc:st.error(str(exc))
+        saved_load_progress()
         if state.get('new_notice'): st.success(state.new_notice)
         st.caption('DBには家賃・間取り・詳細住所（推定）・データ取得日時を保存します。読み込み時に住所を一時的に座標化して地図へ色付けし、その座標は保存しません。')
         st.download_button('現在の物件データをCSVで保存',csv_bytes(state.new_units),'sumai_rebuild_units.csv','text/csv',use_container_width=True)
