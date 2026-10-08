@@ -38,29 +38,23 @@ import streamlit as st
 from streamlit_folium import st_folium
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v86"
+BUILD = "REBUILD-01-v87"
 
 # ============================================================================
-# NON-NEGOTIABLE ADDRESS ACQUISITION INVARIANT -- DO NOT DELETE OR WEAKEN.
-# 住所取得の固定仕様（削除・緩和禁止）:
-# - SUUMOの一覧ページ・詳細ページ・JSON-LD等に表示された「文字の住所」を、
-#   保存住所の作成、位置決定、ジオコーディング、番地補完に一切使用してはならない。
-# - SUUMOの住所は「その物件自身の地図ページから得た座標」だけを起点にし、
-#   GSI住居表示データから街区符号・基礎番号まで推定して作成する。
-# - 町名・丁目だけしか得られない場合は保存しない・取得済みにしない。
-# - 既存データも、この条件を満たすことを確認できない取得IDはスキップ対象にせず再取得する。
-# Any future change that reads/geocodes a SUUMO textual address is a specification violation.
+# NON-NEGOTIABLE SUUMO ADDRESS POLICY -- DO NOT DELETE OR WEAKEN
+# ============================================================================
+# 1) SUUMO listing/list/detail-page textual address MUST NOT be used to create,
+#    geocode, complete, correct, compare, or validate the saved property address.
+# 2) Property position MUST come from that listing's own published map page.
+# 3) Detailed address inference MUST start from the map-derived coordinate.
+# 4) Search-scope municipality/town names may be used only to verify that a map
+#    point belongs to the requested search scope; they are not address input.
+# 5) A saved acquisition ID whose linked saved address is only town/chome-level
+#    MUST NOT suppress re-fetch.  It remains a re-acquisition target.
+# These rules are part of the application specification. Future edits must keep them.
 SUUMO_TEXT_ADDRESS_FORBIDDEN = True
-SUUMO_ADDRESS_POLICY_VERSION = 1
-SUUMO_MAP_ONLY_ADDRESS_ORIGIN = 'suumo_provider_map_coordinate_to_gsi_residential_only_v1'
-# NON-NEGOTIABLE SUUMO ACQUISITION RULES -- DO NOT REMOVE OR RELAX:
-# 1) Keep the detail URL exactly as returned by the successful SUUMO town-search result;
-#    do not rewrite JNC results to canonical BC detail URLs before parsing.
-# 2) BC/JNC identity may be used to select this listing's own /kankyo/ map page.
-# 3) Never use SUUMO's textual address for location, geocoding, address completion,
-#    validation, or the persisted address.  Saved address is map-coordinate -> GSI only.
-# 4) A prior acquired ID is skippable only when the linked saved listing still proves
-#    a detailed, map-derived address; incomplete legacy rows must be re-acquired.
+SUUMO_MAP_ONLY_ADDRESS_POLICY = 'map_coordinate_only_v1'
+
 PROVIDER_OPTIONS = ("スマイティ","HOMES","SUUMO","カナリー","アットホーム","CHINTAI","Comfy","アパマンショップ")
 PROVIDER_CANONICAL = {"HOMES":"HOME’S","HOME’S":"HOME’S","スマイティ":"スマイティ","SUUMO":"SUUMO","カナリー":"カナリー",
                       "アットホーム":"アットホーム","CHINTAI":"CHINTAI","Comfy":"Comfy","アパマンショップ":"アパマンショップ"}
@@ -253,26 +247,6 @@ def address_key(value):
         return (str(number) if number is not None else text)+'丁目'
     return re.sub(r'([一二三四五六七八九十]+)丁目',convert,value)
 
-
-
-def is_detailed_residential_address(value):
-    """True only when an address reaches block/house-number detail, not merely town/chome.
-
-    Examples accepted: 小茂根2丁目16-5 / 代々木5-1-5 / 16番5号.
-    Examples rejected: 小茂根2丁目 / 小茂根2 / 代々木5丁目.
-    """
-    text=address_key(normal(value)).replace(' ','').replace('　','')
-    if not text:return False
-    # Require at least a block and a subordinate house/base number. A single chome
-    # number is intentionally insufficient for persistence.
-    patterns=(
-        r'\d+丁目\d+(?:番(?:地)?|[-－ー−])\d+(?:号)?$',
-        r'\d+丁目\d+番(?:地)?\d+(?:号)?$',
-        r'\d+[-－ー−]\d+[-－ー−]\d+(?:号)?$',
-        r'\d+番(?:地)?\d+(?:号)?$',
-        r'\d+[-－ー−]\d+$',
-    )
-    return any(re.search(p,text) for p in patterns)
 
 
 def saved_address_point_key(address):
@@ -480,14 +454,32 @@ def acquisition_time_jst(value):
     except (ValueError,TypeError):return '未記録'
 
 
-def compact_saved_listing(row):
-    """Persistent listing payload.
+def saved_address_requires_reacquisition(value):
+    """Return True only for clearly incomplete saved addresses.
 
-    v85 keeps the verified provider-map coordinate with the listing.  For SUUMO,
-    address text from list/detail pages is forbidden: the saved detailed address must
-    be derived only from this listing's map coordinate through GSI residential data.
-    The verified map point is persisted directly together with provenance metadata.
+    This function is used solely to decide whether an old acquisition ID may be
+    skipped.  It does NOT geocode or create an address and never reads a provider
+    page.  Town/chome-only rows are deliberately re-fetched.
     """
+    address=normal(value).replace('　','').strip()
+    if not address:return True
+    # Examples that must be re-fetched: 高島平二丁目 / 高島平2丁目.
+    if re.search(r'(?:[0-9０-９一二三四五六七八九十百]+丁目)\s*$',address):return True
+    # A clearly detailed Japanese address has something after 丁目, or an explicit
+    # block/lot/house-number separator.  Do not reject legacy detailed rows merely
+    # because their notation differs.
+    if '丁目' in address:
+        tail=address.rsplit('丁目',1)[1]
+        return not bool(re.search(r'[0-9０-９一二三四五六七八九十百]',tail))
+    if re.search(r'[0-9０-９]+\s*[-‐‑‒–—―ー−－]\s*[0-9０-９]+',address):return False
+    if re.search(r'[0-9０-９]+\s*番(?:地)?|[0-9０-９]+\s*号',address):return False
+    # Do not force a re-fetch for older non-chome notations unless they are empty;
+    # the explicit user requirement here is to re-fetch town/chome-only rows.
+    return False
+
+
+def compact_saved_listing(row):
+    """Persistent listing payload: rent, layout, inferred address and acquisition time."""
     try:
         rent=row.get('rent');layout=normal(row.get('layout'));address=normal(row.get('address') or row.get('inferred_address'))
         if not isinstance(rent,(int,float)) or not math.isfinite(float(rent)) or float(rent)<=0:return None
@@ -500,55 +492,8 @@ def compact_saved_listing(row):
         result={'rent':int(round(float(rent))),'layout':layout,'address':address[:220],'fetched_at':stamp or None}
         property_id=row.get('property_id')
         if isinstance(property_id,str) and re.fullmatch(r'SUUMO:(?:bc|jnc):\d+',property_id):result['property_id']=property_id
-        if has_point(row):
-            result['latitude']=round(float(row['latitude']),7);result['longitude']=round(float(row['longitude']),7)
-            precision=normal(row.get('coordinate_precision'))
-            if precision:result['coordinate_precision']=precision[:80]
-            method=normal(row.get('location_method'))
-            if method:result['location_method']=method[:220]
-            source=normal(row.get('position_source_url'))
-            if source and source.startswith('https://'):result['position_source_url']=source[:600]
-            map_address=normal(row.get('map_address') or row.get('inferred_address'))
-            if map_address:result['map_address']=map_address[:220]
-            address_precision=normal(row.get('address_precision'))
-            if address_precision:result['address_precision']=address_precision[:220]
-            address_match=normal(row.get('address_match'))
-            if address_match:result['address_match']=address_match[:220]
-            address_origin=normal(row.get('address_origin'))
-            if address_origin:result['address_origin']=address_origin[:160]
         return result
     except (ValueError,TypeError,AttributeError):return None
-
-
-def suumo_map_address_provenance_ok(row):
-    """Return True only when a SUUMO saved address is provably map-derived.
-
-    This is a hard persistence/skip gate.  A detailed-looking text address alone is
-    never sufficient.  New v85+ rows carry SUUMO_MAP_ONLY_ADDRESS_ORIGIN explicitly;
-    v84 rows can also pass only when their persisted metadata independently proves
-    that a SUUMO /kankyo/ map coordinate was converted through GSI residential data
-    without using page address text.
-    """
-    if not isinstance(row,dict) or not is_detailed_residential_address(row.get('address') or row.get('inferred_address')):
-        return False
-    if not has_point(row):return False
-    source=normal(row.get('position_source_url'))
-    try:u=urlparse(source)
-    except Exception:return False
-    if u.scheme!='https' or u.hostname!='suumo.jp' or '/kankyo/' not in u.path:return False
-    precision=normal(row.get('address_precision'))
-    if 'GSI住居表示' not in precision or '街区符号' not in precision or '基礎番号' not in precision:return False
-    origin=normal(row.get('address_origin'))
-    if origin==SUUMO_MAP_ONLY_ADDRESS_ORIGIN:return True
-    # Compatibility only for v84, which already wrote the explicit text-address-nonuse
-    # marker before address_origin itself was persisted.  Do not broaden this fallback.
-    return '文字住所不使用' in normal(row.get('address_match'))
-
-
-def suumo_map_address_row_is_strict(row):
-    """Hard gate for every newly persisted/ledgered SUUMO observation."""
-    return bool(isinstance(row,dict) and normal(row.get('address_origin'))==SUUMO_MAP_ONLY_ADDRESS_ORIGIN
-                and suumo_map_address_provenance_ok(row))
 
 
 def newest_observation(old,new):
@@ -619,7 +564,7 @@ def merge_listing(old,new):
     for k,v in new.items():
         if v is not None and v!='' and k!='missing_fields':out[k]=v
         elif old.get(k) is not None and old.get(k)!='':retained.append(k)
-    rank={'town':1,'address':2,'building':3,'listing_map_center':3,'listing_map':4}
+    rank={'town':1,'address':2,'building':3,'listing_map':4}
     if has_point(old) and (not has_point(new) or rank.get(old.get('coordinate_precision'),0)>rank.get(new.get('coordinate_precision'),0)):
         for k in ('latitude','longitude','coordinate_precision','location_method','map_address','inferred_address','position_source_url','address_precision','address_match'):
             if k in old:out[k]=old[k];retained.append(k)
@@ -738,9 +683,6 @@ class Database:
         for row in rows:
             property_id=row.get('property_id')
             if not property_id:continue
-            # HARD RULE: an acquisition ID may never suppress re-fetch unless the
-            # linked SUUMO observation itself proves map-only detailed-address origin.
-            if str(property_id).startswith('SUUMO:') and not suumo_map_address_row_is_strict(row):continue
             stamp=row.get('fetched_at') or utc_now()
             try:
                 parsed=datetime.fromisoformat(stamp.replace('Z','+00:00'))
@@ -750,7 +692,7 @@ class Database:
             if property_id in unique and unique[property_id]['finished_at']>=stamp:continue
             unique[property_id]={'namespace':self.namespace,'id':'acquired.'+hashlib.sha256(property_id.encode()).hexdigest(),
                 'status':'rental_acquisition','started_at':stamp,'finished_at':stamp,
-                'conditions':{'provider':'SUUMO','property_id':property_id,'schema':4,'address_quality':'detailed_residential','address_origin':SUUMO_MAP_ONLY_ADDRESS_ORIGIN},
+                'conditions':{'provider':'SUUMO','property_id':property_id,'schema':2},
                 'summary':{'last_success_at':stamp,'listing_key':compact_listing_key(row)}}
         return list(unique.values())
 
@@ -758,29 +700,14 @@ class Database:
         address_points={}
         for r in rows:
             address=normal(r.get('address') or r.get('inferred_address')) if isinstance(r,dict) else ''
-            # Schema 7 persists the listing's own coordinate, so the shared address cache
-            # is only useful for genuinely detailed addresses.  Do not let many SUUMO
-            # listings with the same town/chome label overwrite each other in a global
-            # address->point cache.
-            detailed_address=bool(re.search(r'\d+(?:[-ー−－番]\d+|番地?\d+|号)',address))
-            if address and detailed_address and isinstance(r,dict) and has_point(r) and r.get('coordinate_precision') not in ('town','unknown'):
+            if address and isinstance(r,dict) and has_point(r) and r.get('coordinate_precision') not in ('town','unknown'):
                 address_points[address]=(float(r['latitude']),float(r['longitude']),normal(r.get('map_address') or address))
-        unique={};rejected_address_quality=0
+        unique={}
         for r in rows:
-            # HARD RULE -- DO NOT REMOVE: SUUMO saves require BOTH a detailed address
-            # and proof that the address was inferred from this listing's own map coordinate.
-            # A textual address, even when it looks complete, must never pass this gate.
-            if isinstance(r,dict) and r.get('provider')=='SUUMO' and not suumo_map_address_row_is_strict(r):
-                rejected_address_quality+=1
-                continue
-            # Other providers keep the existing detailed-address quality gate.
-            if isinstance(r,dict) and r.get('provider') and r.get('provider')!='SUUMO' and not is_detailed_residential_address(r.get('address') or r.get('inferred_address')):
-                rejected_address_quality+=1
-                continue
             compact=compact_saved_listing(r)
             if compact:
                 key=compact_listing_key(compact);unique[key]=newest_observation(unique.get(key),compact)
-        saved=set();items=list(unique.items());self.last_save_stats={'new':0,'updated':0,'failed':rejected_address_quality,'address_quality_rejected':rejected_address_quality}
+        saved=set();items=list(unique.items());self.last_save_stats={'new':0,'updated':0,'failed':0}
         if not hasattr(self,'job_new_keys'):self.job_new_keys=set()
         if not hasattr(self,'covered_acquisitions'):self.covered_acquisitions={}
         for offset in range(0,len(items),200):
@@ -794,8 +721,8 @@ class Database:
                 for key,compact in batch:
                     if not compact.get('fetched_at') and stamps.get(key):compact['fetched_at']=stamps[key]
             payload=[dict(namespace=self.namespace,id='listing.'+key,status='rental_listing',started_at=utc_now(),finished_at=None,
-                conditions={'record_type':'rental_listing','schema':7,'fields':['property_id','rent','layout','address','fetched_at','latitude','longitude','coordinate_precision','address_precision','address_match'],
-                            'address_origin':'provider_map_coordinate_with_published_or_gsi_address'},summary={'listing':compact}) for key,compact in batch]
+                conditions={'record_type':'rental_listing','schema':6,'fields':['property_id','rent','layout','address','fetched_at'],
+                            'address_origin':'suumo_room_marker_to_gsi_residential_address;homes_map_image'},summary={'listing':compact}) for key,compact in batch]
             result=self.call('POST',SEARCH_TABLE,{'on_conflict':'namespace,id','select':'id'},payload,'resolution=ignore-duplicates,return=representation')
             if not isinstance(result,list):raise AppError('Supabaseから新規保存の確認が得られません。')
             inserted={str(r.get('id','')).removeprefix('listing.') for r in result if isinstance(r,dict) and r.get('id')}
@@ -830,18 +757,15 @@ class Database:
         if not {r['id'] for r in payload}<=returned:raise AppError('物件IDの取得済み管理情報を保存できません。')
 
     def load_recent_acquisition_ids(self):
-        """Return only IDs whose linked saved listing is already map-derived and detailed.
+        """Load recent SUUMO acquisition IDs, but re-fetch chome-only saved rows.
 
-        HARD RULE -- DO NOT REMOVE OR SHORT-CIRCUIT:
-        The acquisition ledger alone is never trusted, regardless of schema/version.
-        Every recent SUUMO acquisition ID is joined back to its rental_listing row.  If
-        that row is missing, town/chome-only, lacks a verified SUUMO map coordinate, or
-        cannot prove GSI block/base-number inference, the ID is omitted from this result.
-        Omitted IDs are therefore re-fetched even when an acquired.* row exists.
+        Performance rule: this runs in the search worker, never in the Streamlit UI
+        thread, and is cached for 15 minutes.  It uses one keyset scan of saved
+        listings rather than one query per property.
         """
         cached=getattr(self,'acquisition_cache',None)
         if cached is not None and time.monotonic()-getattr(self,'acquisition_cache_at',0)<900:return cached
-        candidates=[];offset=0;cutoff=acquisition_cutoff().isoformat(timespec='seconds');pages=0;raw=0
+        ledger={};listing_key_by_property={};offset=0;cutoff=acquisition_cutoff().isoformat(timespec='seconds');pages=0;raw=0
         while True:
             rows=self.call('GET',SEARCH_TABLE,{'namespace':'eq.'+self.namespace,'status':'eq.rental_acquisition',
                 'finished_at':'gte.'+cutoff,'select':'conditions,summary,finished_at','order':'id.asc','limit':1000,'offset':offset})
@@ -852,39 +776,52 @@ class Database:
                 property_id=conditions.get('property_id');stamp=summary.get('last_success_at') or row.get('finished_at')
                 if not property_id or not re.fullmatch(r'SUUMO:(?:bc|jnc):\d+',str(property_id)):continue
                 if not recent_acquisition(stamp):continue
-                listing_key=normal(summary.get('listing_key'))
-                # No linked listing means there is nothing trustworthy to skip.
-                candidates.append((str(property_id),stamp,listing_key))
+                previous=ledger.get(property_id)
+                if previous is None or str(stamp)>str(previous):
+                    ledger[property_id]=stamp;listing_key_by_property[property_id]=normal(summary.get('listing_key'))
             if len(rows)<1000:break
             offset+=len(rows)
 
-        out={};checked=0;requeued_missing_listing=0;requeued_incomplete=0;requeued_unverified_origin=0
-        for batch_start in range(0,len(candidates),200):
-            batch=candidates[batch_start:batch_start+200]
-            keys=list(dict.fromkeys(key for _,_,key in batch if key))
-            found=[]
-            if keys:
-                found=self.call('GET',SEARCH_TABLE,{'namespace':'eq.'+self.namespace,'status':'eq.rental_listing',
-                    'select':'id,summary','id':'in.('+','.join('listing.'+k for k in keys)+')','limit':200})
-                if not isinstance(found,list):raise AppError('取得済み物件の住所品質を確認できません。')
-            listings={}
-            for item in found:
-                key=str(item.get('id') or '').removeprefix('listing.')
-                listings[key]=((item.get('summary') or {}).get('listing') or {})
-            for property_id,stamp,key in batch:
-                checked+=1
-                listing=listings.get(key) if key else None
-                if not isinstance(listing,dict) or not listing:
-                    requeued_missing_listing+=1;continue
-                if not is_detailed_residential_address(listing.get('address') or listing.get('inferred_address')):
-                    requeued_incomplete+=1;continue
-                if not suumo_map_address_provenance_ok(listing):
-                    requeued_unverified_origin+=1;continue
-                previous=out.get(property_id)
-                if previous is None or str(stamp)>str(previous):out[property_id]=stamp
-        self.last_acquisition_load_stats={'pages':pages,'raw_records':raw,'recent_ids':len(out),'full_listing_scan':False,
-            'acquisition_ids_checked_against_listing':checked,'requeued_missing_listing':requeued_missing_listing,
-            'requeued_incomplete_address':requeued_incomplete,'requeued_unverified_address_origin':requeued_unverified_origin}
+        # Only quality-check IDs that actually have a linked listing key.  One scan
+        # builds key->address for all current saved listings and stays off the UI thread.
+        wanted={k for k in listing_key_by_property.values() if k};addresses={};addresses_by_property={};last_id='';listing_pages=0
+        # Scan saved listings once.  This also covers old acquisition-ledger rows that
+        # predate listing_key: property_id in the saved listing is used as the join key.
+        while True:
+            params={'namespace':'eq.'+self.namespace,'status':'eq.rental_listing','select':'id,summary','order':'id.asc','limit':1000}
+            if last_id:params['id']='gt.'+last_id
+            rows=self.call('GET',SEARCH_TABLE,params)
+            if not isinstance(rows,list):raise AppError('取得済み物件の住所品質を確認できません。')
+            listing_pages+=1
+            if not rows:break
+            for item in rows:
+                rid=str(item.get('id') or '')
+                if not rid.startswith('listing.'):continue
+                key=rid.removeprefix('listing.')
+                listing=((item.get('summary') or {}).get('listing') or {})
+                if not isinstance(listing,dict):continue
+                address=normal(listing.get('address') or listing.get('inferred_address'))
+                if key in wanted:addresses[key]=address
+                pid=normal(listing.get('property_id'))
+                if re.fullmatch(r'SUUMO:(?:bc|jnc):\d+',pid):addresses_by_property[pid]=address
+            new_last=str(rows[-1].get('id') or '')
+            if not new_last or new_last==last_id:break
+            last_id=new_last
+            if len(rows)<1000:break
+
+        out={};requeued_incomplete=0;requeued_missing=0
+        for property_id,stamp in ledger.items():
+            key=listing_key_by_property.get(property_id)
+            address=addresses.get(key) if key else None
+            if address is None:address=addresses_by_property.get(property_id)
+            # Acquisition ID alone is never enough: no saved listing or a town/chome-
+            # only saved address means this property is a re-acquisition target.
+            if address is None:requeued_missing+=1;continue
+            if saved_address_requires_reacquisition(address):
+                requeued_incomplete+=1;continue
+            out[property_id]=stamp
+        self.last_acquisition_load_stats={'pages':pages,'raw_records':raw,'recent_ids':len(out),'full_listing_scan':bool(wanted),
+            'listing_pages':listing_pages,'requeued_incomplete_address':requeued_incomplete,'requeued_missing_listing':requeued_missing}
         self.acquisition_cache=out;self.acquisition_cache_at=time.monotonic()
         return out
 
@@ -901,7 +838,7 @@ class Database:
         self.last_load_diagnostic={'time':utc_now(),'bounds':list(bounds) if bounds else None,'layouts':list(layouts) if layouts is not None else None,
                                    'pages':[],'excluded':{'invalid':0,'layout':0,'legacy_schema':0},'raw_records':0,'accepted_records':0,
                                    'property_id_records':0,'legacy_records':0,'legacy_shadowed':0,'legacy_unmatched':0,
-                                   'storage_schema':7,'geocode_on_load':True,'pagination':'id_keyset'}
+                                   'storage_schema':6,'geocode_on_load':True,'pagination':'id_keyset'}
         while True:
             if cancel_event is not None and cancel_event.is_set():raise SearchCancelled()
             params={'namespace':'eq.'+self.namespace,'select':'id,summary,conditions','status':'eq.rental_listing','order':'id.asc','limit':1000}
@@ -914,7 +851,7 @@ class Database:
             page_start=len(out)
             for item in rows:
                 meta=item.get('conditions') or {}
-                if int(meta.get('schema') or 0) not in (4,5,6,7,8):
+                if int(meta.get('schema') or 0) not in (4,5,6):
                     self.last_load_diagnostic['excluded']['legacy_schema']+=1;continue
                 raw=(item.get('summary') or {}).get('listing')
                 compact=compact_saved_listing(raw if isinstance(raw,dict) else {})
@@ -968,7 +905,7 @@ class Database:
             if not rows:break
             for item in rows:
                 meta=item.get('conditions') or {}
-                if int(meta.get('schema') or 0) not in (4,5,6,7,8):continue
+                if int(meta.get('schema') or 0) not in (4,5,6):continue
                 raw=(item.get('summary') or {}).get('listing')
                 compact=compact_saved_listing(raw if isinstance(raw,dict) else {})
                 if not compact:continue
@@ -1582,11 +1519,12 @@ def map_point_to_residential_address(web,point,munis,max_distance_m=90,expected_
 
 
 def _map_point_to_residential_address(web,point,munis,max_distance_m=90,expected_code=None,expected_towns=()):
-    """Map coordinate -> nearest GSI block/base-number address.
+    """Map pin -> nearest GSI residential-address point with a verified town.
 
-    Coordinate-first invariant: this function never receives or uses a listing-page
-    textual address.  The provider map point is the sole location input; expected_code
-    and expected_towns come from the user-selected search scope, not the listing text.
+    Fast path: the provider search already supplies a municipality/town constraint. We
+    compare the nearest JHJ residential point against that constraint and avoid a
+    separate reverse-geocoder request when they agree. Boundary/ambiguous cases fall
+    back to the reverse geocoder before acceptance, preserving the stricter check.
     """
     x,y=_tile_xy(point,18);candidates=[];tile_errors=[];feature_count=0
     z=18;n=2**z
@@ -1922,11 +1860,11 @@ def map_image_candidates(web,soup,source_url):
         try:zoom=float(params.get('zoom',[data_zoom])[0]);scale=float(params.get('scale',[1])[0])
         except (ValueError,TypeError):zoom=None;scale=1
         if not match or zoom is None or not math.isfinite(zoom) or not math.isfinite(scale) or not (0<=zoom<=22 and scale in (1,2)):
-            trace(web,'image_georef_missing',{'image_host':urlparse(url).hostname,'reason':'地図画像の基準座標・ズームを読み取れない'},'INFO','image_location');continue
+            trace(web,'image_georef_missing',{'image_host':urlparse(url).hostname,'reason':'地図画像の基準座標・ズームを読み取れない'},'WARNING','image_location');continue
         supported=urlparse(url).hostname in ('maps.googleapis.com','maps.google.com') and 'staticmap' in urlparse(url).path
         size=re.fullmatch(r'(\d+)x(\d+)',params.get('size',[''])[0])
         if not supported or not size:
-            trace(web,'image_georef_missing',{'reason':'地図画像の投影方式・元の画像サイズを検証できない'},'INFO','image_location');continue
+            trace(web,'image_georef_missing',{'reason':'地図画像の投影方式・元の画像サイズを検証できない'},'WARNING','image_location');continue
         try:
             if not web.permitted(url):continue
             response=web.fetch(url)
@@ -1934,7 +1872,7 @@ def map_image_candidates(web,soup,source_url):
             actual=Image.open(io.BytesIO(response.content)).size
             expected=(int(size[1])*int(scale),int(size[2])*int(scale))
             if actual!=expected:
-                trace(web,'image_georef_missing',{'reason':'元画像と宣言サイズが一致せず、拡縮・切り抜きの可能性','actual_size':list(actual),'expected_size':list(expected)},'INFO','image_location');continue
+                trace(web,'image_georef_missing',{'reason':'元画像と宣言サイズが一致せず、拡縮・切り抜きの可能性','actual_size':list(actual),'expected_size':list(expected)},'WARNING','image_location');continue
             point,details=image_pin_point(response.content,(float(match[1]),float(match[2])),zoom,scale)
             details.update(image_url=url,image_sha256=hashlib.sha256(response.content).hexdigest(),projection='Google Static Maps Web Mercator')
             trace(web,'image_pin_result',details,'INFO' if point else 'WARNING','image_location')
@@ -2541,11 +2479,10 @@ def suumo_group_params(prepared,layouts,page=1):
 
 
 def suumo_detail_fields(soup):
-    """Read SUUMO detail fields except address; location/address are map-derived only."""
+    """Read current SUUMO detail fields without relying on the list address."""
     visible=' '.join(soup.stripped_strings);structured=json_listing_fields(soup)
-    # Hard invariant: do not read or use SUUMO's textual address for location or saved address.
-    # The provider's property map is the sole origin of the coordinate; the detailed
-    # address is inferred from that coordinate using GSI residential-address data.
+    # HARD RULE -- DO NOT REMOVE: SUUMO textual address is deliberately not read.
+    # Location/address acquisition uses only this listing's published property map.
     address=''
     raw_layout=structured.get('layout') or generic_labeled(soup,('間取り','間取'))
     if not raw_layout:
@@ -2559,40 +2496,11 @@ def suumo_detail_fields(soup):
     if not raw_rent:
         raw_rent=regex_after_label(visible,('賃料','家賃'),r'\d+(?:\.\d+)?\s*万円|\d[\d,]*\s*円')
     building_type=generic_labeled(soup,('建物種別','建物の種類','種別'))
-    if not building_type:
-        # Current SUUMO detail markup is not always a th/td or dt/dd pair.  Read the
-        # visible 建物種別 label as a fallback.  This is NOT an address fallback.
-        m=re.search(r'建物種別\s*[:：]?\s*(マンション|アパート|一戸建て|テラス・タウンハウス|その他)',visible)
-        if m:building_type=m.group(1)
     raw_age=structured.get('age') or generic_labeled(soup,('築年数','築年月','築年'))
     if not raw_age:
         raw_age=regex_after_label(visible,('築年数','築年月','築年'),r'(?:新築|築\s*\d{1,3}年|(?:19|20)\d{2}年\s*\d{1,2}月)')
     return {'visible':visible,'address':normal(address),'raw_layout':normal(raw_layout),'raw_rent':normal(raw_rent),
             'building_type':normal(building_type),'raw_age':normal(raw_age),'structured':structured}
-
-
-def enforce_nonnegotiable_suumo_address_policy():
-    """Fail closed if the map-only address rule is accidentally weakened.
-
-    Keep this check and the top-of-file policy together.  Removing either is a
-    specification violation.
-    """
-    if SUUMO_TEXT_ADDRESS_FORBIDDEN is not True or SUUMO_ADDRESS_POLICY_VERSION!=1:
-        raise RuntimeError('SUUMO住所取得の固定ルールが無効化されています。')
-    fake=BeautifulSoup('<dl><dt>所在地</dt><dd>東京都板橋区小茂根2丁目16-5</dd></dl>','html.parser')
-    if suumo_detail_fields(fake).get('address'):
-        raise RuntimeError('SUUMO文字住所を読み取る経路は禁止されています。')
-    text_only={'property_id':'SUUMO:bc:1','address':'東京都板橋区小茂根2丁目16-5',
-               'latitude':35.75,'longitude':139.68,'position_source_url':'https://suumo.jp/chintai/bc_1/kankyo/',
-               'address_precision':'文字住所','address_match':'掲載住所'}
-    if suumo_map_address_provenance_ok(text_only):
-        raise RuntimeError('SUUMO文字住所が取得済み判定を通過しています。')
-    incomplete={'property_id':'SUUMO:bc:1','address':'東京都板橋区小茂根2丁目',
-                'latitude':35.75,'longitude':139.68,'position_source_url':'https://suumo.jp/chintai/bc_1/kankyo/',
-                'address_precision':'SUUMO掲載地図座標→GSI住居表示（街区符号・基礎番号）推定',
-                'address_match':'文字住所不使用','address_origin':SUUMO_MAP_ONLY_ADDRESS_ORIGIN}
-    if suumo_map_address_row_is_strict(incomplete):
-        raise RuntimeError('町丁目止まりの住所が取得済み判定を通過しています。')
 
 
 def _suumo_next_url(soup,response_url,filter_params):
@@ -2621,66 +2529,45 @@ def suumo_bc_id(url):
 
 
 def suumo_kankyo_urls(soup,detail_url):
-    """Return surroundings-map URLs for THIS listing only.
+    """Return published surroundings-map URLs, preferring the canonical BC route.
 
-    A SUUMO detail page contains many links to other listings.  Older builds collected
-    every /bc_.../kankyo/ link on the page and could therefore read a different
-    property's map.  That produced valid-looking coordinates in another town and made
-    every candidate fail the town/municipality check.  Restrict candidates to the BC/JNC
-    identifiers of the current detail URL.
+    SUUMO JNC detail pages can expose both JNC and BC links. The observed v66 failure
+    came from using the JNC /kankyo/ page even though the canonical BC /kankyo/ page
+    contained js-gmapData with exactly one room marker. Prefer explicit/derived BC
+    pages, then fall back to JNC pages without inventing coordinates.
     """
-    own_bc=suumo_bc_id(detail_url);own_jnc=suumo_jnc_key(detail_url);candidates=[]
+    explicit=[];bc_links=[];jnc_links=[]
+    for a in soup.select('a[href]'):
+        label=normal(a.get_text(' ',strip=True))+' '+normal(a.get('title'))+' '+normal(a.get('aria-label'))
+        target=urljoin(detail_url,a.get('href','')).split('#')[0];u=urlparse(target)
+        if u.hostname!='suumo.jp':continue
+        if '/kankyo/' not in u.path and '地図・周辺環境' not in label and '周辺環境' not in label:continue
+        if '/bc_' in u.path:bc_links.append(target)
+        elif '/jnc_' in u.path:jnc_links.append(target)
+        else:explicit.append(target)
+    candidates=[]
     def add(url):
         if not url:return
         u=urlparse(url);url=u._replace(fragment='').geturl()
-        if u.hostname!='suumo.jp' or not safe_url(url,'SUUMO') or url in candidates:return
-        path=u.path
-        m_bc=re.search(r'/bc_(\d+)',path);m_jnc=re.search(r'/jnc_(\d+)',path)
-        qbc=parse_qs(u.query).get('bc',[''])[0]
-        same_bc=bool(own_bc and ((m_bc and m_bc.group(1)==own_bc) or qbc==own_bc))
-        same_jnc=bool(own_jnc and m_jnc and m_jnc.group(1)==own_jnc)
-        if same_bc or same_jnc:candidates.append(url)
-    # Canonical property-specific BC route first.
-    if own_bc:add(f'https://suumo.jp/chintai/bc_{own_bc}/kankyo/')
+        if safe_url(url,'SUUMO') and url not in candidates:candidates.append(url)
+    for url in bc_links:add(url)
+    bc=suumo_bc_id(detail_url)
+    if bc:add(f'https://suumo.jp/chintai/bc_{bc}/kankyo/')
+    # A detail page can contain a canonical BC detail link but no direct surroundings link.
     for a in soup.select('a[href]'):
-        label=normal(a.get_text(' ',strip=True))+' '+normal(a.get('title'))+' '+normal(a.get('aria-label'))
         target=urljoin(detail_url,a.get('href','')).split('#')[0]
-        if '/kankyo/' in urlparse(target).path or '地図・周辺環境' in label or '周辺環境' in label:add(target)
-    # Same JNC surroundings page is a fallback when the canonical BC page lacks data.
-    if own_jnc:
-        u=urlparse(detail_url);add(u._replace(path=f'/chintai/jnc_{own_jnc}/kankyo/',fragment='').geturl())
+        u=urlparse(target);m=re.fullmatch(r'/chintai/bc_(\d+)/?',u.path)
+        if u.hostname=='suumo.jp' and m:add(f'https://suumo.jp/chintai/bc_{m.group(1)}/kankyo/')
+    for url in jnc_links:add(url)
+    for url in explicit:add(url)
+    u=urlparse(detail_url)
+    if '/jnc_' in u.path:add(u._replace(path=u.path.rstrip('/')+'/kankyo/',fragment='').geturl())
     return candidates
+
 
 def suumo_kankyo_url(soup,detail_url):
     urls=suumo_kankyo_urls(soup,detail_url)
     return urls[0] if urls else ''
-
-
-def _suumo_map_center_candidates(soup,text):
-    """Conservative SUUMO map-center candidates used only after property-ID scoping."""
-    points=[]
-    def add(lat,lng,source):
-        try:
-            lat,lng=float(lat),float(lng)
-            if not has_point({'latitude':lat,'longitude':lng}):return
-            key=(round(lat,7),round(lng,7))
-            if key not in {(round(x[0],7),round(x[1],7)) for x in points}:points.append((lat,lng,source))
-        except (ValueError,TypeError):pass
-    # Prefer center values in the property-specific js-gmapData JSON when present.
-    node=soup.find('script',id='js-gmapData')
-    raw=(node.string if node is not None and isinstance(node.string,str) else node.get_text('',strip=False) if node is not None else '') or ''
-    try:data=json.loads(raw.strip()) if raw.strip() else None
-    except (ValueError,TypeError):data=None
-    if isinstance(data,dict):
-        center=data.get('center') or data.get('mapCenter') or data.get('map_center')
-        if isinstance(center,dict):add(center.get('lat') or center.get('latitude'),center.get('lng') or center.get('lon') or center.get('longitude'),'js-gmapData.center')
-        elif isinstance(center,(list,tuple)) and len(center)>=2:add(center[0],center[1],'js-gmapData.center')
-        for la,lo in (('centerLat','centerLng'),('mapLat','mapLng'),('lat','lng'),('latitude','longitude')):
-            if la in data and lo in data:add(data.get(la),data.get(lo),'js-gmapData.'+la)
-    # Static markup sometimes exposes only map/setView/center fields rather than JSON.
-    for lat,lng,method,priority in coordinate(soup,text):
-        if priority<=2 and ('中心' in method or '地図URL' in method or '座標入力' in method):add(lat,lng,method)
-    return points
 
 
 def _suumo_room_marker_points(web,soup,map_url):
@@ -2711,60 +2598,24 @@ def _suumo_room_marker_points(web,soup,map_url):
         if len(distinct)==1:return distinct[0],{'script_id':node.get('id',''),'marker_count':len(markers) if isinstance(markers,list) else 0,'room_marker_count':1}
         trace(web,'suumo_marker_unresolved',{'map_url':map_url,'script_found':True,'script_id':node.get('id',''),
               'room_markers':len(distinct),'marker_types':[x.get('type') for x in markers if isinstance(x,dict)] if isinstance(markers,list) else [],
-              'valid_room_points':distinct,'expected':'type=roomの有効座標が一意'},'INFO','location')
-    return None,{'script_found':bool(nodes),'center_candidates':_suumo_map_center_candidates(soup,str(soup))}
-
-
-def _suumo_region_matches(official,expected_code=None,expected_towns=None):
-    if not official:return False
-    if expected_code and str(official.get('code') or '')!=str(expected_code):return False
-    towns=tuple(normal(x) for x in (expected_towns or ()) if normal(x))
-    if towns and not any(town_matches(t,official.get('town','')) or address_key(t)==address_key(official.get('town','')) for t in towns):return False
-    return True
-
-
-def _suumo_verify_map_point(web,point,munis,expected_code=None,expected_towns=None,source=''):
-    """Verify a provider-published point by the official GSI reverse geocoder.
-
-    Exact residential-number tiles are deliberately NOT a validity gate.  Those
-    experimental tiles are sparse and were the dominant source of false negatives in
-    v81.  The provider map supplies the point; GSI only confirms municipality/town.
-    """
-    try:official=reverse(web,point,munis,force=True)
-    except Exception as exc:
-        trace(web,'suumo_point_verify_failed',{'point':list(point),'source':source,'exception_type':type(exc).__name__},'WARNING','location')
-        return None
-    if not official:
-        trace(web,'suumo_point_verify_failed',{'point':list(point),'source':source,'reason':'GSI逆ジオコーダで町丁目を確認できない'},'WARNING','location')
-        return None
-    if not _suumo_region_matches(official,expected_code,expected_towns):
-        trace(web,'suumo_point_region_mismatch',{'point':list(point),'source':source,'official_code':official.get('code'),'official_town':official.get('town'),
-              'expected_code':expected_code,'expected_towns':list(expected_towns or ())},'INFO','location')
-        return None
-    return official
+              'valid_room_points':distinct,'expected':'type=roomの有効座標が一意'},'WARNING','location')
+    return None,{'script_found':bool(nodes)}
 
 
 def suumo_location_from_kankyo_image(web,detail_soup,detail_url,bounds,munis,expected_towns=None,region_code=None):
-    """Map-only SUUMO location pipeline.
-
-    Hard invariant: listing-page textual address is never read, geocoded, compared,
-    or persisted.  Position comes only from this listing's published map page:
-    room marker -> map center -> map image pin.  A detailed address is then inferred
-    from that map coordinate using GSI JHJ residential-address points.  If block/base
-    number detail cannot be inferred from the map coordinate, the listing is not saved.
-    """
-    bc=suumo_bc_id(detail_url);jnc=suumo_jnc_key(detail_url)
-    cache_key=('v84:bc:'+bc) if bc else ('v84:jnc:'+jnc if jnc else 'v84:detail:'+detail_url)
+    """Resolve SUUMO's published room marker, with canonical BC fallback and cache."""
+    jnc=suumo_jnc_key(detail_url)
+    cache_key='jnc:'+jnc if jnc else 'detail:'+detail_url
     with web.cache_lock:cached=getattr(web,'suumo_location_cache',{}).get(cache_key)
     if cached:
         address=normal(cached.get('inferred_address'))
-        if is_detailed_residential_address(address) and (not expected_towns or any(town_matches(t,address) for t in expected_towns)):
+        if not expected_towns or any(town_matches(t,address) for t in expected_towns):
             trace(web,'suumo_location_cache_hit',{'detail_url':detail_url,'cache_key':cache_key,'address':address},stage='location')
             return dict(cached)
     targets=suumo_kankyo_urls(detail_soup,detail_url)
-    fetched=[];failures=[];center_options=[]
-    lat=lng=None;method='';source='';official=None;precision='listing_map'
-
+    if not targets:raise AppError('SUUMOの地図・周辺環境URLを確認できません。')
+    fetched=[];lat=lng=None;method='';source='';failures=[]
+    # First prefer dynamic room-marker JSON on every published candidate URL.
     for number,target in enumerate(targets,1):
         web.check_cancel()
         if not web.permitted(target):
@@ -2772,84 +2623,40 @@ def suumo_location_from_kankyo_image(web,detail_soup,detail_url,bounds,munis,exp
         try:reply=web.fetch(target)
         except AppError as exc:
             failures.append({'url':target,'reason':str(exc)});continue
-        soup=BeautifulSoup(reply.text,'html.parser');fetched.append((target,soup,reply.text))
+        soup=BeautifulSoup(reply.text,'html.parser');fetched.append((target,soup))
         point,meta=_suumo_room_marker_points(web,soup,target)
         if point:
-            checked=_suumo_verify_map_point(web,point,munis,region_code,expected_towns,target)
-            if checked:
-                lat,lng=point;official=checked;source=target
-                method='SUUMO地図・周辺環境の物件マーカー座標→GSI詳細住所推定';precision='listing_map'
-                if number>1:trace(web,'suumo_map_fallback_success',{'detail_url':detail_url,'map_url':target,'attempt':number,'attempted_urls':targets[:number]},stage='location')
-                break
-            failures.append({'url':target,'reason':'room_marker_region_mismatch','point':list(point)})
-        centers=meta.get('center_candidates') or _suumo_map_center_candidates(soup,reply.text)
-        for item in centers:
-            center_options.append((item[0],item[1],target,item[2] if len(item)>2 else 'map_center'))
-        if not point:failures.append({'url':target,'reason':'room_marker_not_unique_or_missing','meta':meta})
-
-    if lat is None:
-        seen=set()
-        for clat,clng,target,csource in center_options:
-            key=(round(clat,7),round(clng,7))
-            if key in seen:continue
-            seen.add(key)
-            checked=_suumo_verify_map_point(web,(clat,clng),munis,region_code,expected_towns,target)
-            if not checked:continue
-            lat,lng=clat,clng;official=checked;source=target;precision='listing_map_center'
-            method='SUUMO物件固有の周辺環境地図中心→GSI詳細住所推定'
-            trace(web,'suumo_center_fallback_success',{'detail_url':detail_url,'map_url':source,'point':[lat,lng],
-                  'center_source':csource,'official_town':official.get('town')},stage='location')
+            lat,lng=point;source=target;method='SUUMO地図・周辺環境の物件マーカー座標→GSI住居表示住所推定'
+            if number>1:trace(web,'suumo_map_fallback_success',{'detail_url':detail_url,'map_url':target,'attempt':number,'attempted_urls':targets[:number]},stage='location')
             break
-
+        failures.append({'url':target,'reason':'room_marker_not_unique_or_missing','meta':meta})
+    # Only if no dynamic marker exists, retain the verified georeferenced-image fallback.
     if lat is None:
-        for target,soup,raw_text in fetched:
-            verified=[]
-            for candidate in map_image_candidates(web,soup,target):
-                if candidate[3]<5:continue
-                trial=candidate[:2]
-                checked=_suumo_verify_map_point(web,trial,munis,region_code,expected_towns,target)
-                if checked:verified.append((trial,checked))
-            distinct={(round(x[0][0],7),round(x[0][1],7)) for x in verified}
+        for target,soup in fetched:
+            candidates=map_image_candidates(web,soup,target);distinct={p[:2] for p in candidates if p[3]>=5}
             if len(distinct)==1:
-                trial,checked=verified[0];lat,lng=trial;official=checked;source=target;precision='listing_map'
-                method='SUUMO地図画像ピン認識→GSI詳細住所推定';break
-
-    if lat is None or official is None:
-        trace(web,'suumo_location_unresolved',{'detail_url':detail_url,'candidate_map_urls':targets,'failures':failures,
-              'reason':'この物件自身の地図ページから検索対象町内の物件座標を確認できない'},'WARNING','location')
-        return None
-
+                lat,lng=next(iter(distinct));source=target;method='SUUMO地図画像ピン認識→GSI住居表示住所推定';break
+        if lat is None:
+            trace(web,'suumo_marker_unresolved',{'detail_url':detail_url,'candidate_map_urls':targets,'failures':failures,
+                  'reason':'公開された地図候補からtype=roomの一意な物件マーカーを取得できない'},'WARNING','location');return None
     if not in_rectangle((lat,lng),bounds):
         trace(web,'published_point_outside_bounds',{'map_url':source,'point':[lat,lng],'bounds':list(bounds),
-              'retained':True,'reason':'区・町名検索では表示範囲外でも地図由来座標の検証を継続'},stage='location')
-
-    try:
-        residential=map_point_to_residential_address(web,(lat,lng),munis,max_distance_m=90,
-            expected_code=region_code,expected_towns=expected_towns)
-    except Exception as exc:
-        trace(web,'suumo_detailed_address_lookup_failed',{'detail_url':detail_url,'map_url':source,'point':[lat,lng],
-            'exception_type':type(exc).__name__},'WARNING','location')
-        residential=None
-    if not residential or not is_detailed_residential_address(residential.get('address')):
-        trace(web,'suumo_detailed_address_unresolved',{'detail_url':detail_url,'map_url':source,'point':[lat,lng],
-            'official_town':normal((official or {}).get('label')),
-            'reason':'地図由来座標から番地・住居番号まで推定できないため保存しない'},'WARNING','location')
-        return None
-
-    address=normal(residential['address'])
-    location={'latitude':float(lat),'longitude':float(lng),'location_method':method,
-              'map_address':normal(official.get('label')),'inferred_address':address,
-              'address_match':'掲載地図座標から番地・住居番号まで推定（文字住所不使用・実所在地未確認）',
-              'coordinate_precision':precision,'position_source_url':source,
-              'address_precision':'SUUMO掲載地図座標→GSI住居表示（街区符号・基礎番号）推定',
-              'address_origin':SUUMO_MAP_ONLY_ADDRESS_ORIGIN,
-              'address_distance_m':round(float(residential.get('distance_m') or 0),2)}
+              'retained':True,'reason':'検索範囲外でも住所推定・保存を継続'},stage='location')
+    inferred=map_point_to_residential_address(web,(lat,lng),munis,expected_code=region_code,expected_towns=expected_towns)
+    if not inferred:return None
+    address=inferred['address']
+    if expected_towns and not any(town_matches(t,address) for t in expected_towns):
+        trace(web,'map_address_difference',{'map_url':source,'map_derived_address':address,'expected_towns':list(expected_towns),'retained':False},'WARNING','location');return None
+    location={'latitude':lat,'longitude':lng,'location_method':method,
+              'map_address':address,'inferred_address':address,'address_match':'地図座標から詳細住所推定（実所在地未確認）',
+              'coordinate_precision':'listing_map','position_source_url':source,
+              'address_precision':'同一町丁目の最近傍住居表示住所・推定値',
+              'address_distance_m':round(inferred['distance_m'],2)}
     with web.cache_lock:
         if len(web.suumo_location_cache)>=12000:web.suumo_location_cache.pop(next(iter(web.suumo_location_cache)))
         web.suumo_location_cache[cache_key]=dict(location)
-    trace(web,'location_ok',{'source':'SUUMO物件固有地図のみ','map_derived_address':address,'location':location},stage='location')
+    trace(web,'location_ok',{'source':'SUUMO物件地図マーカー','map_derived_address':address,'location':location},stage='location')
     return location
-
 
 def suumo_collect(web,region,bounds,munis,emit):
     """SUUMO: map towns -> town page/filter -> detail -> kankyo map -> compact save."""
@@ -2885,12 +2692,6 @@ def suumo_collect(web,region,bounds,munis,emit):
                             links.append((0 if '詳細を見る' in label else 1,url))
                     if not links:continue
                     url=min(links,key=lambda x:x[0])[1]
-                    # STABLE ACQUISITION RULE -- DO NOT REWRITE THIS DETAIL URL.
-                    # The town-search result URL is the page variant that was actually returned
-                    # by the successful SUUMO listing search.  BC/JNC IDs are still used for
-                    # identity and the property-specific /kankyo/ map, but the detail parser must
-                    # read this original result URL.  Rewriting every result to /bc_.../ caused
-                    # valid mansion pages to be parsed as building_type='' in v85.
                     if url in seen_urls:continue
                     seen_urls.add(url)
                     group_candidates+=1
@@ -2923,20 +2724,13 @@ def suumo_collect(web,region,bounds,munis,emit):
                     begin_listing(web,'SUUMO',url)
                     if not web.permitted(url):raise AppError('SUUMO詳細ページの自動取得が許可されていません。')
                     detail_reply=web.fetch(url);detail=BeautifulSoup(detail_reply.text,'html.parser');fields=suumo_detail_fields(detail)
-                    # Position/address are derived only from this listing's provider map.
-                    # SUUMO's textual address is deliberately not read or used.
+                    # The detail-page address is intentionally not used for location/address acquisition.
+                    # Only rent/layout/building type/age are read here; address comes from the property map below.
                     layout=parsed_layout(fields['raw_layout'],rough=False)
                     if parsed_layout(fields['raw_layout']) not in layouts:
                         reject_listing(web,'SUUMO',url,'detail.layout','condition' if layout else 'missing_data','間取りが検索条件外、または読み取れない',{'raw':fields['raw_layout'],'parsed':layout},list(layouts));emit('rejected',1);trace(web,'layout',{'url':url,'observed':fields['raw_layout'],'parsed':layout,'requested_group':list(layouts),'reason':'detail_layout_not_in_group'},'WARNING');return
-                    building_type=normal(fields.get('building_type'))
-                    if building_type and 'マンション' not in building_type:
-                        reject_listing(web,'SUUMO',url,'detail.building_type','condition','建物種別がマンションではない',building_type,'マンション');emit('rejected',1);trace(web,'structure',{'url':url,'building_type':building_type,'reason':'explicit_non_mansion'},'WARNING');return
-                    if not building_type:
-                        # Every candidate in this collector came from SUUMO ts=1 (マンション)
-                        # search results.  A missing detail-page label is parser incompleteness,
-                        # not evidence that the listing is non-mansion.  Do not discard it.
-                        building_type='マンション'
-                        trace(web,'structure_from_search_filter',{'url':url,'building_type':'マンション','source':'SUUMO検索条件 ts=1'},stage='parser')
+                    if 'マンション' not in fields['building_type']:
+                        reject_listing(web,'SUUMO',url,'detail.building_type','condition' if fields['building_type'] else 'missing_data','建物種別がマンションと確認できない',fields['building_type'],'マンション');emit('rejected',1);trace(web,'structure',{'url':url,'building_type':fields['building_type'],'reason':'not_mansion'},'WARNING');return
                     age,ym=age_info(fields['raw_age'])
                     if age is None or age>15:
                         reject_listing(web,'SUUMO',url,'detail.age','missing_data' if age is None else 'condition','築年数が15年以内と確認できない',{'raw':fields['raw_age'],'years':age},'15年以内');emit('rejected',1);trace(web,'age',{'url':url,'raw_age':fields['raw_age'],'age':age,'reason':'detail_age_not_confirmed_within_15'},'WARNING');return
@@ -2949,12 +2743,10 @@ def suumo_collect(web,region,bounds,munis,emit):
                         location=None;trace(web,'location_pending',{'url':url,'message':str(exc),'source':'SUUMO地図・周辺環境の物件マーカー'},'WARNING','location')
                     address=location.get('inferred_address','') if location else ''
                     if not address:
-                        reject_listing(web,'SUUMO',url,'map.address_inference','location_failure','物件位置または詳細住所を確認できない',location,'この物件自身の地図座標＋番地・住居番号まで確認できる住所');emit('rejected',1);trace(web,'location_pending',{'url':url,'reason':'物件固有地図は確認できても番地・住居番号まで確定できない場合は保存しない','source':'SUUMO物件固有地図のみ'},'WARNING','location');return
-                    if not is_detailed_residential_address(address):
-                        reject_listing(web,'SUUMO',url,'address.detail','location_failure','住所が町丁目止まりのため保存しない',address,'番地・住居番号まで含む詳細住所');emit('rejected',1);return
+                        reject_listing(web,'SUUMO',url,'map.address_inference','location_failure','物件位置から詳細住所を推定できない',location,'同一町丁目の90m以内に番地を持つ住所候補');emit('rejected',1);trace(web,'location_pending',{'url':url,'reason':'物件地図から詳細住所を推定できないため保存しない','source':'SUUMO地図・周辺環境の物件マーカー'},'WARNING','location');return
 
-                    # Schema 7 persists rent/layout/detailed-address/time plus the verified map coordinate.
-                    row=partial_listing('SUUMO',url,'SUUMO掲載募集',address,layout,rent,None,None,region,bounds,location,building_type,age,ym,'')
+                    # Rent, layout, inferred address and acquisition time survive Database.save_units().
+                    row=partial_listing('SUUMO',url,'SUUMO掲載募集',address,layout,rent,None,None,region,bounds,location,None,age,ym,'')
                     if not row:reject_listing(web,'SUUMO',url,'listing.validation','invalid_data','保存必須項目の検証を通らない',{'rent':rent,'layout':layout,'address':address,'location':location},'有効な家賃・間取り・詳細住所・物件URL');emit('rejected',1);return
                     row['property_id']=suumo_property_id(url)
                     row['address_source']=location['location_method']
@@ -3641,10 +3433,10 @@ def search_all(db,conditions,screen,state=None):
     final_candidate=int(skipped)+final_processed
     terminal_observed=rejected+unsaved
     if terminal_observed!=final_errors or int(candidate)!=final_candidate:
-        audit.add('accounting','candidate_accounting_normalized','INFO',{
+        audit.add('accounting','candidate_accounting_mismatch','ERROR',{
             'discovered_candidates':candidate,'detail_started':detail,'saved':len(saved),'skipped':skipped,
             'terminal_rejected':rejected,'unsaved':unsaved,'ui_processed':final_processed,'ui_errors':final_errors,
-            'accounted_candidates':final_candidate,'reason':'画面件数は 処理=保存+エラー、候補=処理+スキップ に正規化'})
+            'accounted_candidates':final_candidate,'reason':'候補・処理・保存・スキップと内部イベントの件数差を検出'})
     state.live_metrics={'processed':final_processed,'saved':len(saved),'errors':final_errors,'skipped':skipped}
     search['summary'].update(confirmed=len(units),elapsed=round(time.monotonic()-started,3),new_saved=len(saved & getattr(db,'job_new_keys',set())),updated_saved=len(saved-getattr(db,'job_new_keys',set())),processed=final_processed,errors=final_errors,candidate=final_candidate,discovered_candidate=candidate,already_acquired=skipped,rejected=rejected,detail=detail,last_saved_at=getattr(state,'new_last_saved_at',None),saved=len(saved),unsaved=unsaved,acquisition_ids_pending=len(acquisition_pending),issues=issues[-100:])
     if unsaved:
@@ -3746,27 +3538,16 @@ def diagnosis_code(message):
     return 'unknown'
 
 def diagnostic_failure_event(event):
-    """True only for actionable acquisition/processing failures.
-
-    Do not pollute the error CSV with expected fallback mechanics.  A missing experimental
-    GSI address tile, an HTTP attempt record, a non-georeferenced decorative/static image,
-    or a missing SUUMO room marker can all be normal when a later verified fallback works.
-    The terminal listing failure (if every fallback fails) is still persisted separately.
-    """
+    """True for acquisition/processing failures that must be durably stored as they occur."""
     if not isinstance(event,dict):return False
-    code=str(event.get('code') or '')
-    details=event.get('details') if isinstance(event.get('details'),dict) else {}
-    benign={'transport_attempt','image_georef_missing','address_tile_empty','address_tile_empty_response',
-            'suumo_marker_unresolved','candidate_accounting_normalized'}
-    if code in benign:return False
-    url=str(details.get('url') or details.get('map_url') or '')
-    if code=='http_404' and 'cyberjapandata.gsi.go.jp/xyz/experimental_jhj/' in url:return False
     if str(event.get('level') or '').upper() in ('WARNING','ERROR','CRITICAL'):return True
+    code=str(event.get('code') or '')
     if code in {
         'listing_rejected','listing_failed','collector_exception','provider_unavailable','unsaved_listings',
         'location_pending','position_pending','reverse_address_pending','address_tile_failed','map_address_unresolved',
         'http_403','http_404','http_429','http_5xx','http_empty','http_challenge','timeout','network','proxy_error','save'
     }:return True
+    details=event.get('details') if isinstance(event.get('details'),dict) else {}
     for candidate in (details.get('status'),(details.get('technical_exception') or {}).get('status') if isinstance(details.get('technical_exception'),dict) else None):
         try:
             if int(candidate)>=400:return True
@@ -4234,8 +4015,7 @@ def fetch_facilities(center,kind):
 
 
 def csv_bytes(rows):
-    keys=['property_id','rent','layout','address','fetched_at','latitude','longitude','coordinate_precision','location_method','position_source_url','map_address']
-    file=io.StringIO();writer=csv.DictWriter(file,fieldnames=keys,extrasaction='ignore');writer.writeheader()
+    keys=['property_id','rent','layout','address','fetched_at'];file=io.StringIO();writer=csv.DictWriter(file,fieldnames=keys);writer.writeheader()
     for row in rows:
         compact=compact_saved_listing(row)
         if compact:writer.writerow(compact)
@@ -4247,20 +4027,12 @@ def read_csv(content):
         rows=[]
         for raw in csv.DictReader(io.StringIO(content.decode('utf-8-sig'))):
             row={'property_id':normal(raw.get('property_id')) or None,'rent':int(raw['rent']),'layout':normal(raw['layout']),'address':normal(raw['address']),'fetched_at':normal(raw.get('fetched_at')) or None}
-            try:
-                if normal(raw.get('latitude')) and normal(raw.get('longitude')):
-                    row['latitude']=float(raw['latitude']);row['longitude']=float(raw['longitude'])
-                    row['coordinate_precision']=normal(raw.get('coordinate_precision')) or 'building'
-                    row['location_method']=normal(raw.get('location_method'))
-                    row['position_source_url']=normal(raw.get('position_source_url'))
-                    row['map_address']=normal(raw.get('map_address'))
-            except (ValueError,TypeError):pass
             compact=compact_saved_listing(row)
             if not compact:raise ValueError()
             key=compact_listing_key(compact);rows.append({'key':key,'title':compact['address'],**compact,'fetched_at':compact.get('fetched_at'),'fees':0,'loaded_from_compact_storage':True})
         if not rows:raise ValueError()
         return rows
-    except (UnicodeError,ValueError,KeyError,TypeError,csv.Error):raise AppError('家賃・間取り・住所と、任意の取得日時・座標列を持つCSVを指定してください。') from None
+    except (UnicodeError,ValueError,KeyError,TypeError,csv.Error):raise AppError('家賃・間取り・住所と、任意の取得日時（fetched_at）列を持つCSVを指定してください。') from None
 
 
 def geocode_saved_address(web,address):
@@ -4307,19 +4079,13 @@ def geocode_saved_address_cached(web,address):
 
 
 def hydrated_listing(row,point):
-    # Schema 7 listings already carry their verified provider-map coordinate.  Never
-    # replace that with a later address geocode, which can collapse many listings onto
-    # one town/chome representative point.
-    if has_point(row):return dict(row)
     if not point:return dict(row,coordinate_precision='unknown',location_method='保存住所の地図配置を確認できない')
     lat,lng,title=point
-    return dict(row,latitude=lat,longitude=lng,coordinate_precision='address',location_method='保存住所を読み込み時に住所検索',map_address=title,address_match='保存住所から再配置')
+    return dict(row,latitude=lat,longitude=lng,coordinate_precision='address',location_method='保存済み地図由来住所を読み込み時に住所検索',map_address=title,address_match='保存住所から再配置')
 
 
 def hydrate_saved_units(rows,bounds,cache=None,web=None,notify=None):
-    cache=cache if isinstance(cache,dict) else {};web=web or PublicWeb()
-    # Only old rows without a persisted point need address geocoding.
-    addresses=list(dict.fromkeys(r['address'] for r in rows if r.get('address') and not has_point(r)))
+    cache=cache if isinstance(cache,dict) else {};addresses=list(dict.fromkeys(r['address'] for r in rows if r.get('address')));web=web or PublicWeb()
     def locate_address(address):
         web.check_cancel()
         if cache.get(address):return cache[address]
@@ -4371,10 +4137,8 @@ class SavedLoadJob:
         def page(rows,diag):
             with self.lock:
                 for row in rows:
-                    point=None
-                    if not has_point(row):
-                        point=self.cache.get(row['address']) or cached_saved_position(web.address_points,row['address'])
-                        if point:self.cache[row['address']]=point
+                    point=self.cache.get(row['address']) or cached_saved_position(web.address_points,row['address'])
+                    if point:self.cache[row['address']]=point
                     self.rows[row['key']]=hydrated_listing(row,point)
                 self.pages+=1;self.placed=sum(has_point(r) for r in self.rows.values());self.diagnostic=diag
         def row_signature(row):
@@ -4390,7 +4154,7 @@ class SavedLoadJob:
                 self.diagnostic=dict(getattr(self.db,'last_load_diagnostic',self.diagnostic) or self.diagnostic)
                 self.storage_record_audit=[dict(r) for r in getattr(self.db,'last_load_record_audit',[]) if isinstance(r,dict)]
                 known_storage_ids={str(r.get('Supabase行ID') or '') for r in self.storage_record_audit if r.get('Supabase行ID')}
-            addresses=list(dict.fromkeys(r['address'] for r in stored if r.get('address') and not has_point(r)));known_addresses=set(addresses);by_address={a:[] for a in addresses}
+            addresses=list(dict.fromkeys(r['address'] for r in stored));known_addresses=set(addresses);by_address={a:[] for a in addresses}
             # Persistent cache is loaded in one paged DB pass.  This avoids repeating
             # GSI address searches on every click after the first successful placement.
             persistent={}
@@ -4402,10 +4166,9 @@ class SavedLoadJob:
                 remember_saved_position(web.address_points,address,point)
             with self.lock:
                 self.persistent_cache_hits=len(persistent)
-                self.rows={r['key']:hydrated_listing(r,None if has_point(r) else (self.cache.get(r['address']) or cached_saved_position(web.address_points,r['address']))) for r in stored}
+                self.rows={r['key']:hydrated_listing(r,self.cache.get(r['address']) or cached_saved_position(web.address_points,r['address'])) for r in stored}
                 self.complete_db=True;self.phase='positions';self.total_addresses=len(addresses);self.placed=sum(has_point(r) for r in self.rows.values())
-                for row in stored:
-                    if not has_point(row) and row.get('address') in by_address:by_address[row['address']].append(row['key'])
+                for row in stored:by_address[row['address']].append(row['key'])
             newly_geocoded={}
             def positioned(address,point,error):
                 with self.lock:
@@ -4447,7 +4210,7 @@ class SavedLoadJob:
                                     '家賃':r.get('rent'),'間取り':r.get('layout'),'住所':r.get('address'),'取得日時':r.get('fetched_at') or '',
                                     '分類':'物件ID確認済み・地図表示対象' if r.get('property_id') else '旧形式IDなし・最新差分'})
                         known_storage_ids.update(str(r.get('storage_id')) for r in new_storage)
-                    delta_addresses=list(dict.fromkeys(r['address'] for r in delta if r.get('address') and not has_point(r)))
+                    delta_addresses=list(dict.fromkeys(r['address'] for r in delta if r.get('address')))
                     new_addresses=[a for a in delta_addresses if a not in known_addresses]
                     persistent_delta={}
                     if new_addresses:
@@ -4477,14 +4240,13 @@ class SavedLoadJob:
                             except AppError as exc:
                                 with self.lock:self.diagnostic['catchup_address_cache_save_error']=str(exc)
                         known_addresses.update(new_addresses)
-                    hydrated_delta=[hydrated_listing(r,None if has_point(r) else (self.cache.get(r['address']) or cached_saved_position(web.address_points,r['address']))) for r in delta]
+                    hydrated_delta=[hydrated_listing(r,self.cache.get(r['address']) or cached_saved_position(web.address_points,r['address'])) for r in delta]
                     with self.lock:
                         for row in hydrated_delta:self.rows[row['key']]=row
                         self.rows=remove_legacy_duplicates(self.rows.values())
                         self.placed=sum(has_point(r) for r in self.rows.values())
-                        # total_addresses tracks only legacy rows that actually required
-                        # address geocoding.  Schema-7 rows already have their own point.
-                        self.done_addresses=min(self.done_addresses,self.total_addresses)
+                        self.total_addresses=len({r.get('address') for r in self.rows.values() if r.get('address')})
+                        self.done_addresses=max(self.done_addresses,self.total_addresses)
                 with self.lock:
                     after={k:row_signature(v) for k,v in self.rows.items()}
                     changed=sum(before.get(k)!=v for k,v in after.items())+sum(k not in after for k in before)
@@ -4999,14 +4761,16 @@ def automatic_failure_export_registry():
     return {},threading.RLock()
 
 
-def get_automatic_failure_export(max_age=60):
+def get_automatic_failure_export(max_age=60,refresh=True):
     db=Database();key=manual_registry_key(db)+'|'+BUILD
     jobs,lock=automatic_failure_export_registry()
     with lock:
         job=jobs.get(key)
         if job is None:
             job=AutomaticFailureExport(db);jobs[key]=job
-    job.refresh(max_age=max_age)
+    # Historical-error export can be expensive.  Never start/refresh it while the
+    # collector is actively fetching listings; the existing cached CSV stays usable.
+    if refresh:job.refresh(max_age=max_age)
     return job
 
 
@@ -5238,7 +5002,7 @@ def schedule_automatic_upgrade(controller):
     return True
 
 
-@st.fragment(run_every='5s')
+@st.fragment(run_every='8s')
 def automatic_collection_panel():
     st.subheader('アプリ内の自動収集（SUUMO）')
     st.caption('画面を閉じてもサーバー稼働中は収集します。休止・再起動では止まり、次にアプリを開くと保存した設定・町の順番から再開します。')
@@ -5285,11 +5049,13 @@ def automatic_collection_panel():
             completed={i for i in completed if 0<=i<total}
             current_label=labels[current_index] if busy else '停止中'
             st.markdown(f"**検索対象 {total}町｜完了 {len(completed)}町｜現在 {current_label}**")
-            table=[]
+            # Mobile browsers became sluggish when a 50+ row interactive dataframe
+            # was rebuilt every fragment poll.  Keep the same information as plain text.
+            lines=[]
             for i,label in enumerate(labels):
                 status='検索中' if busy and i==current_index else '完了' if i in completed else '待機'
-                table.append({'状態':status,'順番':f'{i+1}/{total}','検索対象':label})
-            st.dataframe(table,hide_index=True,use_container_width=True,height=min(420,42*(len(table)+1)))
+                lines.append(f'{status}｜{i+1}/{total}｜{label}')
+            with st.expander('検索対象の町一覧',expanded=False):st.code('\n'.join(lines),language=None)
         elif busy:
             st.caption('検索対象の町名をバックグラウンドで確認しています。')
 
@@ -5303,9 +5069,10 @@ def automatic_collection_panel():
         if log_job:
             try:
                 cache=st.session_state.get('automatic_log_cache')
-                cache_key=(log_job.audit.search_id,int(log_job.audit.count))
-                if not isinstance(cache,dict) or cache.get('key')!=cache_key:
-                    cache={'key':cache_key,'events':log_job.audit.records()}
+                search_id=log_job.audit.search_id;now=time.monotonic()
+                stale=not isinstance(cache,dict) or cache.get('search_id')!=search_id or now-float(cache.get('at',0) or 0)>=60 or not busy
+                if stale:
+                    cache={'search_id':search_id,'count':int(log_job.audit.count),'at':now,'events':log_job.audit.records()}
                     st.session_state.automatic_log_cache=cache
                 diagnostic_downloads(cache.get('events') or [],'automatic')
             except Exception as exc:
@@ -5314,7 +5081,7 @@ def automatic_collection_panel():
             st.caption('詳細ログは収集開始後に自動で表示されます。')
 
     try:
-        error_job=get_automatic_failure_export(max_age=45 if busy else 120);failure=error_job.snapshot()
+        error_job=get_automatic_failure_export(max_age=120,refresh=not busy);failure=error_job.snapshot()
         if failure['loaded']:
             st.download_button(f"全取得エラーCSV（1エラー1行・{len(failure['rows'])}行）",
                                failure['csv'],'sumai_all_acquisition_errors.csv','text/csv',
@@ -5324,7 +5091,7 @@ def automatic_collection_panel():
         else:
             st.download_button('全取得エラーCSV',b'','sumai_all_acquisition_errors.csv','text/csv',
                                key='automatic_all_errors_csv_wait',disabled=True,use_container_width=True)
-            st.caption('全検索・全町のエラー履歴をバックグラウンドで読み込んでいます。操作は不要です。')
+            st.caption('収集中は取得処理を優先します。エラーCSVは停止・完了後に裏で自動読込します。操作は不要です。')
         if failure['error']:st.error('エラーCSVの自動更新に失敗しました：'+failure['error'])
     except Exception as exc:
         st.error('エラーCSVを出力できませんでした：'+(str(exc) if isinstance(exc,AppError) else type(exc).__name__))
@@ -5333,7 +5100,6 @@ def automatic_collection_panel():
     st.caption('蓄積した物件は下の「最新の保存物件を読み込む・反映」で地図へ表示できます。収集中も地図の自動再描画は行いません。')
 
 def main():
-    enforce_nonnegotiable_suumo_address_policy()
     st.set_page_config(page_title='住まいコンパス｜新しい住まいを探す',page_icon='🏡',layout='wide',initial_sidebar_state='collapsed')
     st.markdown(CSS,unsafe_allow_html=True)
     st.markdown(f'<div class="hero"><span class="badge">SUMAI COMPASS · {BUILD}</span><h1>次の住まいを、地図から。</h1><p>掲載物件を確認し、家賃と暮らしやすさを比べます。<br>間取りと家賃帯を、取得できた情報で比較します。</p></div>',unsafe_allow_html=True)
@@ -5566,11 +5332,11 @@ def main():
         st.caption(f'実行中の版：{BUILD}')
     with st.expander('取得・集計の範囲'):
         st.write('HOMESは2つの間取り群で検索します。SUUMOは詳細ページで間取りを再取得し、マンション・築15年以内・1LDK/2K/2DKまたは2LDK/3K/3DKだけを採用します。SUUMOの位置は「地図・周辺環境」の物件マーカー、HOMESの位置は「地図を見る」の画像ピンから取得します。地図由来の詳細住所を推定できない物件は保存しません。')
-        st.write('データベースへ保存する募集項目は家賃・間取り・地図由来の詳細住所（推定）・データ取得日時・確認済み地図座標です。取得日時はUTCで保存し、画面では日本時間で表示します。SUUMOでは文字住所を保存住所の作成や位置補完に使用しません。')
+        st.write('データベースへ保存する募集項目は家賃・間取り・詳細住所（推定）・データ取得日時です。取得日時はUTCで保存し、画面では日本時間で表示します。管理費・面積・築年数・画像・緯度経度・掲載URLは募集データとして保存しません。')
         st.write('募集情報は既存SupabaseのJSON保存領域へ保存するため、追加SQLは不要です。schema 4・5の保存データを読み込みます。旧データの取得日時は未記録と表示します。')
         st.write('SUUMOは物件マーカー座標、HOMESは画像ピン座標を起点にし、国土地理院の住居表示住所データから街区符号・基礎番号を最近傍推定します。一覧・詳細ページの所在地文字列から住所や位置を補完しません。')
         st.write('地図範囲内の居住地名タイルと100m間隔の地点・範囲の端から地名・丁目を判定します。候補数・物件数・ページ数による打ち切りは行いません。通信失敗やページ送りの異常は未完了として表示します。掲載サイト側の非公開情報・取得制限や、地名データの欠落は取得できません。')
-        st.write('検索中は取得した物件の地図座標を使って地図へ逐次反映します。確認済み座標は保存し、保存データ読込時もその座標を優先して同じ位置へ表示します。')
+        st.write('検索中は取得した物件の座標を使って地図へ逐次反映します。保存データ読込時は住所から座標を一時生成します。座標はDBへ保存しません。')
         st.write('検索と保存はサーバーのバックグラウンドで実行し、画面は1秒ごとに進捗を表示します。サーバーの休止・再起動を越えて実行することはできません。募集終了物件の自動削除は行いません。')
         st.caption('地名取得の代替経路：Geolonia Japanese Addresses v2（デジタル庁アドレス・ベース・レジストリ由来、CC BY 4.0）。町代表点を使って近隣自治体の全町丁目を検索します。地名データの欠落や境界の完全な網羅は保証できません。')
         st.link_button('町丁目データの出典・ライセンス','https://github.com/geolonia/japanese-addresses-v2')
