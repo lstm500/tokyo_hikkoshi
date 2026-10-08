@@ -38,7 +38,7 @@ import streamlit as st
 from streamlit_folium import st_folium
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v78"
+BUILD = "REBUILD-01-v81"
 PROVIDER_OPTIONS = ("スマイティ","HOMES","SUUMO","カナリー","アットホーム","CHINTAI","Comfy","アパマンショップ")
 PROVIDER_CANONICAL = {"HOMES":"HOME’S","HOME’S":"HOME’S","スマイティ":"スマイティ","SUUMO":"SUUMO","カナリー":"カナリー",
                       "アットホーム":"アットホーム","CHINTAI":"CHINTAI","Comfy":"Comfy","アパマンショップ":"アパマンショップ"}
@@ -524,7 +524,7 @@ def merge_listing(old,new):
     for k,v in new.items():
         if v is not None and v!='' and k!='missing_fields':out[k]=v
         elif old.get(k) is not None and old.get(k)!='':retained.append(k)
-    rank={'town':1,'address':2,'building':3,'listing_map':4}
+    rank={'town':1,'address':2,'building':3,'listing_map_center':3,'listing_map':4}
     if has_point(old) and (not has_point(new) or rank.get(old.get('coordinate_precision'),0)>rank.get(new.get('coordinate_precision'),0)):
         for k in ('latitude','longitude','coordinate_precision','location_method','map_address','inferred_address','position_source_url','address_precision','address_match'):
             if k in old:out[k]=old[k];retained.append(k)
@@ -2401,8 +2401,8 @@ def suumo_group_params(prepared,layouts,page=1):
 def suumo_detail_fields(soup):
     """Read current SUUMO detail fields without relying on the list address."""
     visible=' '.join(soup.stripped_strings);structured=json_listing_fields(soup)
-    # Address text on the detail page is deliberately not read. Location/address acquisition uses the published property map.
-    address=''
+    # Keep the published address only as validation/evidence for map fallback. The saved position still comes from a provider map coordinate.
+    address=structured.get('address') or generic_labeled(soup,('所在地','住所','物件所在地','所在地住所'))
     raw_layout=structured.get('layout') or generic_labeled(soup,('間取り','間取'))
     if not raw_layout:
         raw_layout=regex_after_label(visible,('間取り','間取'),r'(?:ワンルーム|\d+(?:S?LDK|S?DK|SK|LK|K|L|R))')
@@ -2448,45 +2448,66 @@ def suumo_bc_id(url):
 
 
 def suumo_kankyo_urls(soup,detail_url):
-    """Return published surroundings-map URLs, preferring the canonical BC route.
+    """Return surroundings-map URLs for THIS listing only.
 
-    SUUMO JNC detail pages can expose both JNC and BC links. The observed v66 failure
-    came from using the JNC /kankyo/ page even though the canonical BC /kankyo/ page
-    contained js-gmapData with exactly one room marker. Prefer explicit/derived BC
-    pages, then fall back to JNC pages without inventing coordinates.
+    A SUUMO detail page contains many links to other listings.  Older builds collected
+    every /bc_.../kankyo/ link on the page and could therefore read a different
+    property's map.  That produced valid-looking coordinates in another town and made
+    every candidate fail the town/municipality check.  Restrict candidates to the BC/JNC
+    identifiers of the current detail URL.
     """
-    explicit=[];bc_links=[];jnc_links=[]
-    for a in soup.select('a[href]'):
-        label=normal(a.get_text(' ',strip=True))+' '+normal(a.get('title'))+' '+normal(a.get('aria-label'))
-        target=urljoin(detail_url,a.get('href','')).split('#')[0];u=urlparse(target)
-        if u.hostname!='suumo.jp':continue
-        if '/kankyo/' not in u.path and '地図・周辺環境' not in label and '周辺環境' not in label:continue
-        if '/bc_' in u.path:bc_links.append(target)
-        elif '/jnc_' in u.path:jnc_links.append(target)
-        else:explicit.append(target)
-    candidates=[]
+    own_bc=suumo_bc_id(detail_url);own_jnc=suumo_jnc_key(detail_url);candidates=[]
     def add(url):
         if not url:return
         u=urlparse(url);url=u._replace(fragment='').geturl()
-        if safe_url(url,'SUUMO') and url not in candidates:candidates.append(url)
-    for url in bc_links:add(url)
-    bc=suumo_bc_id(detail_url)
-    if bc:add(f'https://suumo.jp/chintai/bc_{bc}/kankyo/')
-    # A detail page can contain a canonical BC detail link but no direct surroundings link.
+        if u.hostname!='suumo.jp' or not safe_url(url,'SUUMO') or url in candidates:return
+        path=u.path
+        m_bc=re.search(r'/bc_(\d+)',path);m_jnc=re.search(r'/jnc_(\d+)',path)
+        qbc=parse_qs(u.query).get('bc',[''])[0]
+        same_bc=bool(own_bc and ((m_bc and m_bc.group(1)==own_bc) or qbc==own_bc))
+        same_jnc=bool(own_jnc and m_jnc and m_jnc.group(1)==own_jnc)
+        if same_bc or same_jnc:candidates.append(url)
+    # Canonical property-specific BC route first.
+    if own_bc:add(f'https://suumo.jp/chintai/bc_{own_bc}/kankyo/')
     for a in soup.select('a[href]'):
+        label=normal(a.get_text(' ',strip=True))+' '+normal(a.get('title'))+' '+normal(a.get('aria-label'))
         target=urljoin(detail_url,a.get('href','')).split('#')[0]
-        u=urlparse(target);m=re.fullmatch(r'/chintai/bc_(\d+)/?',u.path)
-        if u.hostname=='suumo.jp' and m:add(f'https://suumo.jp/chintai/bc_{m.group(1)}/kankyo/')
-    for url in jnc_links:add(url)
-    for url in explicit:add(url)
-    u=urlparse(detail_url)
-    if '/jnc_' in u.path:add(u._replace(path=u.path.rstrip('/')+'/kankyo/',fragment='').geturl())
+        if '/kankyo/' in urlparse(target).path or '地図・周辺環境' in label or '周辺環境' in label:add(target)
+    # Same JNC surroundings page is a fallback when the canonical BC page lacks data.
+    if own_jnc:
+        u=urlparse(detail_url);add(u._replace(path=f'/chintai/jnc_{own_jnc}/kankyo/',fragment='').geturl())
     return candidates
-
 
 def suumo_kankyo_url(soup,detail_url):
     urls=suumo_kankyo_urls(soup,detail_url)
     return urls[0] if urls else ''
+
+
+def _suumo_map_center_candidates(soup,text):
+    """Conservative SUUMO map-center candidates used only after property-ID scoping."""
+    points=[]
+    def add(lat,lng,source):
+        try:
+            lat,lng=float(lat),float(lng)
+            if not has_point({'latitude':lat,'longitude':lng}):return
+            key=(round(lat,7),round(lng,7))
+            if key not in {(round(x[0],7),round(x[1],7)) for x in points}:points.append((lat,lng,source))
+        except (ValueError,TypeError):pass
+    # Prefer center values in the property-specific js-gmapData JSON when present.
+    node=soup.find('script',id='js-gmapData')
+    raw=(node.string if node is not None and isinstance(node.string,str) else node.get_text('',strip=False) if node is not None else '') or ''
+    try:data=json.loads(raw.strip()) if raw.strip() else None
+    except (ValueError,TypeError):data=None
+    if isinstance(data,dict):
+        center=data.get('center') or data.get('mapCenter') or data.get('map_center')
+        if isinstance(center,dict):add(center.get('lat') or center.get('latitude'),center.get('lng') or center.get('lon') or center.get('longitude'),'js-gmapData.center')
+        elif isinstance(center,(list,tuple)) and len(center)>=2:add(center[0],center[1],'js-gmapData.center')
+        for la,lo in (('centerLat','centerLng'),('mapLat','mapLng'),('lat','lng'),('latitude','longitude')):
+            if la in data and lo in data:add(data.get(la),data.get(lo),'js-gmapData.'+la)
+    # Static markup sometimes exposes only map/setView/center fields rather than JSON.
+    for lat,lng,method,priority in coordinate(soup,text):
+        if priority<=2 and ('中心' in method or '地図URL' in method or '座標入力' in method):add(lat,lng,method)
+    return points
 
 
 def _suumo_room_marker_points(web,soup,map_url):
@@ -2518,10 +2539,10 @@ def _suumo_room_marker_points(web,soup,map_url):
         trace(web,'suumo_marker_unresolved',{'map_url':map_url,'script_found':True,'script_id':node.get('id',''),
               'room_markers':len(distinct),'marker_types':[x.get('type') for x in markers if isinstance(x,dict)] if isinstance(markers,list) else [],
               'valid_room_points':distinct,'expected':'type=roomの有効座標が一意'},'WARNING','location')
-    return None,{'script_found':bool(nodes)}
+    return None,{'script_found':bool(nodes),'center_candidates':_suumo_map_center_candidates(soup,str(soup))}
 
 
-def suumo_location_from_kankyo_image(web,detail_soup,detail_url,bounds,munis,expected_towns=None,region_code=None):
+def suumo_location_from_kankyo_image(web,detail_soup,detail_url,bounds,munis,expected_towns=None,region_code=None,detail_address=''):
     """Resolve SUUMO's published room marker, with canonical BC fallback and cache."""
     jnc=suumo_jnc_key(detail_url)
     cache_key='jnc:'+jnc if jnc else 'detail:'+detail_url
@@ -2533,8 +2554,8 @@ def suumo_location_from_kankyo_image(web,detail_soup,detail_url,bounds,munis,exp
             return dict(cached)
     targets=suumo_kankyo_urls(detail_soup,detail_url)
     if not targets:raise AppError('SUUMOの地図・周辺環境URLを確認できません。')
-    fetched=[];lat=lng=None;method='';source='';failures=[]
-    # First prefer dynamic room-marker JSON on every published candidate URL.
+    fetched=[];lat=lng=None;method='';source='';failures=[];center_options=[]
+    # First prefer the current listing's explicit dynamic room marker.
     for number,target in enumerate(targets,1):
         web.check_cancel()
         if not web.permitted(target):
@@ -2542,33 +2563,58 @@ def suumo_location_from_kankyo_image(web,detail_soup,detail_url,bounds,munis,exp
         try:reply=web.fetch(target)
         except AppError as exc:
             failures.append({'url':target,'reason':str(exc)});continue
-        soup=BeautifulSoup(reply.text,'html.parser');fetched.append((target,soup))
+        soup=BeautifulSoup(reply.text,'html.parser');fetched.append((target,soup,reply.text))
         point,meta=_suumo_room_marker_points(web,soup,target)
         if point:
             lat,lng=point;source=target;method='SUUMO地図・周辺環境の物件マーカー座標→GSI住居表示住所推定'
             if number>1:trace(web,'suumo_map_fallback_success',{'detail_url':detail_url,'map_url':target,'attempt':number,'attempted_urls':targets[:number]},stage='location')
             break
+        for item in (meta.get('center_candidates') or _suumo_map_center_candidates(soup,reply.text)):
+            center_options.append((item[0],item[1],target,item[2] if len(item)>2 else 'map_center'))
         failures.append({'url':target,'reason':'room_marker_not_unique_or_missing','meta':meta})
-    # Only if no dynamic marker exists, retain the verified georeferenced-image fallback.
+    # SUUMO currently has property-specific surroundings pages where room markers are
+    # omitted but the map center represents the advertised property area.  Accept that
+    # lower-confidence center only after GSI verifies it belongs to the requested town.
+    inferred=None
+    if lat is None and center_options:
+        ranked=[]
+        seen=set()
+        for clat,clng,target,csource in center_options:
+            key=(round(clat,7),round(clng,7))
+            if key in seen:continue
+            seen.add(key)
+            try:checked=map_point_to_residential_address(web,(clat,clng),munis,max_distance_m=180,expected_code=region_code,expected_towns=expected_towns)
+            except AppError:checked=None
+            if checked:ranked.append((float(checked.get('distance_m',999999)),clat,clng,target,csource,checked))
+        if ranked:
+            _,lat,lng,source,csource,inferred=min(ranked,key=lambda x:x[0])
+            method='SUUMO物件固有の周辺環境地図中心→GSI町丁目検証・住居表示住所推定'
+            trace(web,'suumo_center_fallback_success',{'detail_url':detail_url,'map_url':source,'point':[lat,lng],'center_source':csource,'address':inferred.get('address'),'detail_address':detail_address},stage='location')
+    # The generic image scanner is a last resort and is now limited to the current
+    # listing's own map pages.  It is never allowed to borrow another BC listing's map.
     if lat is None:
-        for target,soup in fetched:
+        for target,soup,raw_text in fetched:
             candidates=map_image_candidates(web,soup,target);distinct={p[:2] for p in candidates if p[3]>=5}
             if len(distinct)==1:
-                lat,lng=next(iter(distinct));source=target;method='SUUMO地図画像ピン認識→GSI住居表示住所推定';break
+                trial=next(iter(distinct))
+                try:checked=map_point_to_residential_address(web,trial,munis,expected_code=region_code,expected_towns=expected_towns)
+                except AppError:checked=None
+                if checked:
+                    lat,lng=trial;source=target;method='SUUMO地図画像ピン認識→GSI住居表示住所推定';inferred=checked;break
         if lat is None:
             trace(web,'suumo_marker_unresolved',{'detail_url':detail_url,'candidate_map_urls':targets,'failures':failures,
-                  'reason':'公開された地図候補からtype=roomの一意な物件マーカーを取得できない'},'WARNING','location');return None
+                  'reason':'この物件自身の地図から検証可能な物件位置を取得できない'},'WARNING','location');return None
     if not in_rectangle((lat,lng),bounds):
         trace(web,'published_point_outside_bounds',{'map_url':source,'point':[lat,lng],'bounds':list(bounds),
               'retained':True,'reason':'検索範囲外でも住所推定・保存を継続'},stage='location')
-    inferred=map_point_to_residential_address(web,(lat,lng),munis,expected_code=region_code,expected_towns=expected_towns)
+    if inferred is None:inferred=map_point_to_residential_address(web,(lat,lng),munis,expected_code=region_code,expected_towns=expected_towns)
     if not inferred:return None
     address=inferred['address']
     if expected_towns and not any(town_matches(t,address) for t in expected_towns):
         trace(web,'map_address_difference',{'map_url':source,'map_derived_address':address,'expected_towns':list(expected_towns),'retained':False},'WARNING','location');return None
     location={'latitude':lat,'longitude':lng,'location_method':method,
               'map_address':address,'inferred_address':address,'address_match':'地図座標から詳細住所推定（実所在地未確認）',
-              'coordinate_precision':'listing_map','position_source_url':source,
+              'coordinate_precision':'listing_map_center' if '地図中心' in method else 'listing_map','position_source_url':source,
               'address_precision':'同一町丁目の最近傍住居表示住所・推定値',
               'address_distance_m':round(inferred['distance_m'],2)}
     with web.cache_lock:
@@ -2657,7 +2703,7 @@ def suumo_collect(web,region,bounds,munis,emit):
                     if not rent:
                         reject_listing(web,'SUUMO',url,'detail.rent','missing_data','家賃を読み取れない',{'raw':fields['raw_rent'],'parsed':rent},'家賃（円）>0');emit('rejected',1);trace(web,'parse',{'url':url,'missing':'detail_rent','visible_head':fields['visible'][:400]},'WARNING');return
 
-                    try:location=suumo_location_from_kankyo_image(web,detail,url,bounds,munis,collection_towns,region.get('code'))
+                    try:location=suumo_location_from_kankyo_image(web,detail,url,bounds,munis,collection_towns,region.get('code'),fields.get('address',''))
                     except AppError as exc:
                         location=None;trace(web,'location_pending',{'url':url,'message':str(exc),'source':'SUUMO地図・周辺環境の物件マーカー'},'WARNING','location')
                     address=location.get('inferred_address','') if location else ''
@@ -3700,26 +3746,25 @@ def compare_logs(old,new):
     return [{'項目':key,'前回':a.get(key,0),'今回':b.get(key,0),'差分':b.get(key,0)-a.get(key,0)} for key in sorted(set(a)|set(b))]
 
 def diagnostic_downloads(events,prefix='current'):
-    if not events:return
-    # Include an explicit export format in the cache key.  Streamlit session_state can
-    # survive a hot deploy; an older cached dict must never be indexed with newer keys.
-    export_key=(events[0].get('search_id'),len(events),events[-1].get('seq'),'unified-error-v1')
+    """Render log downloads immediately. Error CSV is unified elsewhere."""
+    if not events:
+        st.caption('詳細ログはまだありません。')
+        return
+    export_key=(events[0].get('search_id'),len(events),events[-1].get('seq'),'direct-log-v2')
     export=st.session_state.get(prefix+'_log_export')
-    if not isinstance(export,dict) or export.get('format')!='unified-error-v1' or export.get('key')!=export_key:
-        error_rows=acquisition_failure_rows(events)
-        export={'format':'unified-error-v1','key':export_key,'txt':diagnostic_report(events),
-                'json':json.dumps({'schema':1,'events':events},ensure_ascii=False,separators=(',',':')).encode('utf-8'),
-                'errors':error_rows,'errors_csv':csv_bytes_from_rows(error_rows)}
+    if not isinstance(export,dict) or export.get('format')!='direct-log-v2' or export.get('key')!=export_key:
+        export={'format':'direct-log-v2','key':export_key,'txt':diagnostic_report(events),
+                'json':json.dumps({'schema':1,'events':events},ensure_ascii=False,separators=(',',':')).encode('utf-8')}
         export['preview']=export['txt'].decode('utf-8-sig').split('詳細イベント')[0]
         st.session_state[prefix+'_log_export']=export
-    error_rows=export.get('errors') or []
-    st.download_button('詳細作業ログ・改善案をTXTでダウンロード',export['txt'],'sumai_work_log.txt','text/plain',key=prefix+'_txt',on_click='ignore')
-    st.download_button('解析用の詳細ログをJSONでダウンロード',export['json'],
-                       'sumai_work_log.json','application/json',key=prefix+'_json',on_click='ignore')
-    st.download_button(f"取得エラーCSV（1エラー1行・{len(error_rows)}行）",export.get('errors_csv') or csv_bytes_from_rows(error_rows),
-                       'sumai_acquisition_errors.csv','text/csv',key=prefix+'_errors',on_click='ignore')
+    c1,c2=st.columns(2)
+    with c1:
+        st.download_button('詳細ログ TXT',export['txt'],'sumai_work_log.txt','text/plain',
+                           key=prefix+'_txt',on_click='ignore',use_container_width=True)
+    with c2:
+        st.download_button('詳細ログ JSON',export['json'],'sumai_work_log.json','application/json',
+                           key=prefix+'_json',on_click='ignore',use_container_width=True)
     with st.expander('作業ログの原因別集計と改善案'):
-        if error_rows:st.caption(f'取得エラー {len(error_rows)}行（同じ物件で複数エラーがあれば複数行）')
         st.text(export['preview'])
         st.caption('全イベントはダウンロードに含まれます。画面には最新20イベントを表示します。')
         st.dataframe([{'時刻UTC':e['time'],'工程':e['stage'],'理由':e['code'],'取得元・地名':str(e.get('context',{})),
@@ -3733,6 +3778,11 @@ def physical_units(rows):
 def unique_map_position_count(rows):
     """Count visually distinct coordinate positions, not listing records or marker layers."""
     return len({(round(float(r['latitude']),6),round(float(r['longitude']),6)) for r in rows if has_point(r)})
+
+def visible_colored_dot_count(rows):
+    """KPI: visually distinguishable colored rent dots. Exact coordinate overlaps count as one dot."""
+    return len({(round(float(r['latitude']),6),round(float(r['longitude']),6))
+                for r in rows if has_point(r) and r.get('rent')})
 
 
 DISPLAY_REASONS={
@@ -3766,7 +3816,9 @@ def display_pipeline(units,bounds,load=None):
     report={'schema':2,'build':BUILD,'time':utc_now(),'filters':{'bounds':bounds,'layouts':None,'monthly_limit':None,'structure':None,'age':None},
         'aggregation':False,'load':load,'stages':{'loaded':len(units),'in_bounds':len(rows),'individual_points':len(points)},
         'reason_counts':counts,'map':{'markers_total':len(points),'colored_points':counts['town']+counts['address']+counts['building'],
-        'gray_points':counts['unpriced'],'unique_positions':len(set(points)), 'overlapping_points':len(points)-len(set(points)),
+        'gray_points':counts['unpriced'],'unique_positions':len(set(points)),
+        'colored_unique_positions':visible_colored_dot_count(rows),
+        'overlapping_points':len(points)-len(set(points)),
         'renderer':'Canvas','aggregation':False,'unconfirmed_positions':sum(not has_point(r) or r.get('coordinate_precision') in ('town','address') for r in rows)}, 'records':records,
         'improvements':['位置未確認の場合は掲載URL・住所・掲載地図の読取結果を確認して座標取得を改善する。取得済み募集は捨てない。',
             '町丁目しか分からない募集はその位置を明記する。同じ座標の点は重なるが、件数をまとめたり実在しない位置へ散らしたりしない。',
@@ -3776,8 +3828,8 @@ def display_pipeline(units,bounds,load=None):
 
 def display_diagnostic_downloads(report):
     stages=report['stages'];mapping=report['map']
-    st.caption(f"読み込んだ募集 {stages['loaded']}件｜現在の範囲 {stages['in_bounds']}件｜座標あり {mapping['markers_total']}件｜地図上の位置 {mapping['unique_positions']}か所｜位置未確認 {mapping['unconfirmed_positions']}件")
-    st.caption(f"家賃帯で色付け対象 {mapping['colored_points']}件｜家賃未確認 {mapping['gray_points']}件｜同じ位置に重なる募集 {mapping['overlapping_points']}件。募集件数と、画面で見える位置の数は別です。")
+    st.caption(f"地図の〇 {mapping['colored_unique_positions']}個｜読み込んだ募集 {stages['loaded']}件｜現在の範囲 {stages['in_bounds']}件｜座標あり {mapping['markers_total']}件｜位置未確認 {mapping['unconfirmed_positions']}件")
+    st.caption(f"地図の〇＝家賃色を付けて地図上で区別できる座標位置。完全に同じ座標へ重なる募集は1個として数えます。家賃帯対象 {mapping['colored_points']}件｜家賃未確認 {mapping['gray_points']}件｜重なり {mapping['overlapping_points']}件。")
     with st.expander('表示が少ない原因・全募集の診断ログ'):
         st.dataframe([{'理由':DISPLAY_REASONS[k],'募集件数':v} for k,v in report['reason_counts'].items()],hide_index=True)
         text=['住まいコンパス 1募集1点の表示診断',json.dumps({k:v for k,v in report.items() if k!='records'},ensure_ascii=False,indent=2),'募集ごとの判定：']
@@ -4033,6 +4085,7 @@ class SavedLoadJob:
             return {'token':self.token,'phase':self.phase,'finished':self.finished,'error':self.error,'complete_db':self.complete_db,
                 'rows':len(self.rows),'pages':self.pages,'addresses':self.total_addresses,'done_addresses':self.done_addresses,'placed':self.placed,
                 'unique_positions':unique_map_position_count(self.rows.values()),
+                'visible_colored_dots':visible_colored_dot_count(self.rows.values()),
                 'raw_records':int(diag.get('raw_records') or 0),'accepted_records':int(diag.get('accepted_records') or 0),
                 'property_id_records':int(diag.get('property_id_records') or 0),'legacy_records':int(diag.get('legacy_records') or 0),
                 'legacy_shadowed':int(diag.get('legacy_shadowed') or 0),'legacy_unmatched':int(diag.get('legacy_unmatched') or 0),
@@ -4218,7 +4271,8 @@ def apply_saved_load(job):
     state.address_point_cache=cache;state.new_units=rows;state.new_saved_keys=[r['key'] for r in rows]
     state.new_search=None;state.new_map_loaded=True;state.new_load_diagnostic=diag;state.pop('new_job_token',None)
     positioned=sum(has_point(r) for r in rows);positions=unique_map_position_count(rows)
-    state.new_notice=f"保存物件 {len(rows)}件を読み込みました。座標あり {positioned}件・地図上の位置 {positions}か所・位置未確認 {sum(not has_point(r) for r in rows)}件。"
+    dots=visible_colored_dot_count(rows)
+    state.new_notice=f"地図の〇 {dots}個｜保存物件 {len(rows)}件｜座標あり {positioned}件｜位置未確認 {sum(not has_point(r) for r in rows)}件。"
     return True
 
 
@@ -4240,16 +4294,16 @@ def saved_load_progress():
     if snap['phase']=='database':
         st.info(f"保存物件を読み込み中｜{snap['pages']}ページ確認｜経過 {snap['elapsed']}秒")
     elif snap['phase']=='refreshing':
-        st.info(f"最新の保存分を確認中｜保存物件 {snap['rows']}件｜座標あり {snap['placed']}件｜地図上の位置 {snap['unique_positions']}か所｜経過 {snap['elapsed']}秒")
+        st.info(f"最新の保存分を確認中｜地図の〇 {snap['visible_colored_dots']}個｜保存物件 {snap['rows']}件｜座標あり {snap['placed']}件｜経過 {snap['elapsed']}秒")
     elif snap['finished'] and snap['phase']=='complete':
         checked=('｜最新確認 '+acquisition_time_jst(snap['latest_checked_at'])) if snap.get('latest_checked_at') else ''
-        st.success(f"読み込み完了｜保存物件 {snap['rows']}件｜座標あり {snap['placed']}件｜地図上の位置 {snap['unique_positions']}か所｜地図準備完了{checked}｜所要 {snap['elapsed']}秒")
+        st.success(f"読み込み完了｜地図の〇 {snap['visible_colored_dots']}個｜保存物件 {snap['rows']}件｜座標あり {snap['placed']}件｜地図準備完了{checked}｜所要 {snap['elapsed']}秒")
     elif snap['phase']=='failed':
         st.error(f"読み込み停止｜確認済み {snap['rows']}物件｜所要 {snap['elapsed']}秒")
     elif snap['phase']=='stopped':
         st.info(f"読み込みを中止しました｜確認済み {snap['rows']}物件｜所要 {snap['elapsed']}秒")
     else:
-        st.info(f"地図準備中｜保存物件 {snap['rows']}件｜座標あり {snap['placed']}件｜地図上の位置 {snap['unique_positions']}か所｜経過 {snap['elapsed']}秒")
+        st.info(f"地図準備中｜地図の〇 {snap['visible_colored_dots']}個｜保存物件 {snap['rows']}件｜座標あり {snap['placed']}件｜経過 {snap['elapsed']}秒")
     if snap['error']:st.error(snap['error'])
     if snap['phase']=='stopped':st.caption('中止しました。読み込み済みの物件は保持しています。')
     if searching:st.caption('物件検索が終わると読み込み済みデータを地図へ反映できます。')
@@ -4549,28 +4603,24 @@ def background_progress():
 
 @st.fragment(run_every='10s')
 def background_status():
-    """Render diagnostics below the search controls; progress itself is shown under the map."""
+    """Render current-search diagnostics with download buttons always available."""
     job=active_job()
     if job is None:return
     snap=job.snapshot()
-    st.caption(f"作業ログ {job.audit.count}イベント｜通常ログ保存 {job.audit.persisted_events}イベント｜エラー都度保存 {job.audit.persisted_failures}件｜保存待ち {len(job.audit.pending_failures)}件")
-    # Keep polling cheap: build a complete export only when explicitly requested.
-    if st.button('作業ログを準備・更新（検索中も利用できます）',key='current_log_prepare'):
-        try:
-            with st.spinner('現在までの作業ログを準備しています'):
-                events=job.audit.records()
-                st.session_state.diagnostic_export_cache={'id':job.audit.search_id,'events':events,'count':len(events),'prepared_at':utc_now()}
-        except Exception as exc:
-            st.error('作業ログを準備できませんでした：'+type(exc).__name__)
-    audit_cache=st.session_state.get('diagnostic_export_cache')
-    if audit_cache and audit_cache['id']==job.audit.search_id:
-        diagnostic_downloads(audit_cache['events'])
-        st.caption(f"ダウンロード対象：{audit_cache['count']}イベント｜準備日時：{acquisition_time_jst(audit_cache['prepared_at'])}｜最新分を含めるには「準備・更新」を押してください。")
-    else:
-        st.caption('「作業ログを準備・更新」を押すとJSON・TXTのダウンロードボタンが表示されます。')
-    if job.audit.failure_storage_error:st.error('取得エラーのSupabase都度保存を確認できません。保存待ちを保持して再試行します：'+job.audit.failure_storage_error)
-    if job.audit.storage_error:st.error('作業ログのSupabase保存を確認できません。準備・更新ボタンから、このサーバーに残るログをダウンロードできます。'+job.audit.storage_error)
-
+    st.caption(f"作業ログ {job.audit.count}イベント｜Supabase保存確認 {job.audit.persisted_events}イベント")
+    try:
+        cache=st.session_state.get('diagnostic_export_cache')
+        cache_key=(job.audit.search_id,int(job.audit.count))
+        if not isinstance(cache,dict) or cache.get('key')!=cache_key:
+            cache={'key':cache_key,'events':job.audit.records(),'prepared_at':utc_now()}
+            st.session_state.diagnostic_export_cache=cache
+        diagnostic_downloads(cache.get('events') or [],'current')
+    except Exception as exc:
+        st.error('詳細ログを出力できませんでした：'+type(exc).__name__)
+    if job.audit.failure_storage_error:
+        st.error('取得エラーのSupabase都度保存を確認できません。保存待ちを保持して再試行します：'+job.audit.failure_storage_error)
+    if job.audit.storage_error:
+        st.error('作業ログのSupabase保存を確認できません。この画面のTXT/JSONはサーバーに残るログから直接出力します。'+job.audit.storage_error)
     if not snap['finished']:
         if snap['log']:st.code(snap['log'],language=None)
         st.caption('画面を操作しても検索と保存は継続します。サーバーの休止・再起動では実行が終了します。')
@@ -4599,14 +4649,127 @@ def interactive_rental_map(pins,cells,facilities):
 
 AUTO_COLLECTION_ID='automatic.collection.settings'
 
+def automatic_task_plan(settings):
+    """Return the exact SUUMO town task order used by automatic collection."""
+    if not isinstance(settings,dict):return []
+    regions=settings.get('auto_regions') or []
+    munis=settings.get('auto_munis') or {}
+    if not regions:return []
+    groups=suumo_area_groups(regions,munis)
+    return [{'index':i,'label':g.get('label') or ('東京都'+str(g.get('city_name') or '')+str(g.get('suumo_town') or g.get('town') or '')),
+             'town':g.get('suumo_town') or g.get('town') or ''} for i,g in enumerate(groups)]
+
+
+def load_persisted_error_events_fast(db):
+    """Load current per-error rows first so a usable CSV becomes available quickly."""
+    events=[];seen=set();last_id=''
+    while True:
+        params={'namespace':'eq.'+db.namespace,'status':'eq.diagnostic_error','select':'id,summary','order':'id.asc','limit':1000}
+        if last_id:params['id']='gt.'+last_id
+        rows=db.call('GET',SEARCH_TABLE,params)
+        if not isinstance(rows,list):raise AppError('保存済み取得エラーを読み取れません。')
+        if not rows:break
+        for row in rows:
+            event=(row.get('summary') or {}).get('event')
+            if not isinstance(event,dict) or not diagnostic_failure_event(event):continue
+            key=(str(event.get('search_id') or ''),str(event.get('seq') or ''),str(event.get('stage') or ''),str(event.get('code') or ''))
+            if key in seen:continue
+            seen.add(key);events.append(event)
+        new_last=str(rows[-1].get('id') or '')
+        if not new_last or new_last==last_id:break
+        last_id=new_last
+        if len(rows)<1000:break
+    events.sort(key=lambda e:(str(e.get('time') or ''),str(e.get('search_id') or ''),int(e.get('seq') or 0)))
+    return events
+
+
+class AutomaticFailureExport:
+    """Refresh the unified error CSV in the background; the UI never waits for preparation."""
+    def __init__(self,db):
+        self.db=db;self.lock=threading.RLock();self.running=False;self.loaded=False;self.error='';self.phase='idle'
+        self.rows=[];self.csv=csv_bytes_from_rows([]);self.updated_at=None;self.updated_monotonic=0.;self.thread=None
+    def refresh(self,max_age=60):
+        with self.lock:
+            if self.running:return
+            if self.loaded and time.monotonic()-self.updated_monotonic<max_age:return
+            self.running=True;self.error='';self.phase='current_errors'
+            self.thread=threading.Thread(target=self._run,daemon=True,name='housing-error-export')
+            self.thread.start()
+    def _run(self):
+        try:
+            fast_events=load_persisted_error_events_fast(self.db)
+            fast_rows=acquisition_failure_rows(fast_events)
+            with self.lock:
+                self.rows=fast_rows;self.csv=csv_bytes_from_rows(fast_rows);self.updated_at=utc_now()
+                self.updated_monotonic=time.monotonic();self.loaded=True;self.error='';self.phase='historical_backfill'
+            # Older builds stored errors only inside diagnostic-log chunks. Merge those
+            # after the current per-error rows are already downloadable.
+            events=load_diagnostic_failures_compat(self.db)
+            rows=acquisition_failure_rows(events)
+            with self.lock:
+                self.rows=rows;self.csv=csv_bytes_from_rows(rows);self.updated_at=utc_now()
+                self.updated_monotonic=time.monotonic();self.loaded=True;self.error='';self.phase='complete'
+        except Exception as exc:
+            with self.lock:
+                self.error=str(exc) if isinstance(exc,AppError) else type(exc).__name__
+                if self.loaded:self.phase='partial'
+        finally:
+            with self.lock:self.running=False
+    def snapshot(self):
+        with self.lock:
+            return {'running':self.running,'loaded':self.loaded,'error':self.error,'phase':self.phase,'rows':list(self.rows),
+                    'csv':self.csv,'updated_at':self.updated_at}
+
+
+@st.cache_resource
+def automatic_failure_export_registry():
+    return {},threading.RLock()
+
+
+def get_automatic_failure_export(max_age=60):
+    db=Database();key=manual_registry_key(db)+'|'+BUILD
+    jobs,lock=automatic_failure_export_registry()
+    with lock:
+        job=jobs.get(key)
+        if job is None:
+            job=AutomaticFailureExport(db);jobs[key]=job
+    job.refresh(max_age=max_age)
+    return job
+
+
 class AutomaticCollection:
     """One low-concurrency collection loop per saved namespace; no Streamlit UI in its thread."""
     def __init__(self,db,settings,summary=None):
         validate_automatic_settings(settings);validate_automatic_summary(summary or {})
         self.db=db;self.settings=dict(settings);self.settings['interval_minutes']=0;self.summary=dict(summary or {});self.summary.pop('next_run_at',None);self.build=BUILD
         self.lock=threading.RLock();self.io_lock=threading.Lock();self.stop_event=threading.Event()
-        self.request_starts={};self.shared_web=PublicWeb();self.last_job=None;self.current=None;self.message='自動収集を準備しています';self.progress=0.;self.error=''
+        self.request_starts={};self.shared_web=PublicWeb();self.shared_web.cancel_event=self.stop_event
+        self.last_job=None;self.current=None;self.message='検索候補の町名を確認しています';self.progress=0.;self.error=''
         self.thread=threading.Thread(target=self.run,daemon=True,name='housing-automatic-collection')
+    def ensure_plan(self):
+        with self.lock:
+            if self.settings.get('auto_regions') and self.settings.get('auto_munis'):
+                plan=automatic_task_plan(self.settings)
+                if plan:
+                    self.summary['task_labels']=[p['label'] for p in plan];self.summary['total_tasks']=len(plan)
+                    return plan
+        self.shared_web.cancel_event=self.stop_event
+        if hasattr(self.shared_web,'configure'):self.shared_web.configure(getattr(self.db,'web_config',{}))
+        regions,munis,_=suumo_ward_regions(self.shared_web,self.settings['ward_code'])
+        regions=select_ward_towns(regions,self.settings.get('town_codes',[]))
+        if not regions:raise AppError('自動収集する町が見つかりません。')
+        with self.lock:
+            self.settings['auto_regions']=regions;self.settings['auto_munis']=munis
+            plan=automatic_task_plan(self.settings)
+            if not plan:raise AppError('自動収集する町が見つかりません。')
+            self.summary['task_labels']=[p['label'] for p in plan];self.summary['total_tasks']=len(plan)
+            if 'cycle_completed_indices' not in self.summary:
+                nxt=int(self.summary.get('next_task_index',0) or 0)%len(plan)
+                self.summary['cycle_completed_indices']=list(range(nxt))
+            self.summary.setdefault('cycle_number',1)
+            self.message=f'検索候補 {len(plan)}町を確認しました。'
+        self.persist()
+        return plan
     def persist(self):
         with self.io_lock:
             with self.lock:
@@ -4630,25 +4793,34 @@ class AutomaticCollection:
         self.persist()
     def run(self):
         try:
+            self.ensure_plan()
             while not self.stop_event.is_set():
                 with self.lock:
                     if self.stop_event.is_set():break
+                    plan=automatic_task_plan(self.settings)
+                    if not plan:raise AppError('自動収集する町が見つかりません。')
+                    total=len(plan);index=int(self.summary.get('next_task_index',0) or 0)%total
+                    if self.summary.pop('cycle_reset_pending',False):
+                        self.summary['cycle_completed_indices']=[]
+                        self.summary['cycle_number']=int(self.summary.get('cycle_number',1) or 1)+1
+                    self.summary['task_labels']=[p['label'] for p in plan];self.summary['total_tasks']=total
+                    self.summary['current_task_index']=index;self.summary['current_task_label']=plan[index]['label']
                     conditions={'bounds':[34,138,37,141],'ward_code':self.settings['ward_code'],'providers':list(self.settings['providers']),
-                                'mode':'automatic_collection','auto_task_index':int(self.summary.get('next_task_index',0)),
+                                'mode':'automatic_collection','auto_task_index':index,
                                 'town_codes':list(self.settings.get('town_codes',[]))}
                     for key in ('auto_regions','auto_munis'):
                         if self.settings.get(key):conditions[key]=self.settings[key]
                     self.summary['last_started_at']=utc_now();self.summary['current_status']='running'
+                    self.message='検索中｜'+plan[index]['label']
                     job=SearchJob(self.db,conditions)
                     if hasattr(job,'state'):job.state.request_starts=self.request_starts;job.state.shared_web=self.shared_web
                     self.current=job
                 self.persist()
-                # Run synchronously on this daemon. The normal search persists each acquired batch.
                 job.run(self.db,conditions)
                 snap=job.snapshot();result=snap.get('result') or {};status=result.get('status','failed');incomplete=bool(result.get('summary',{}).get('incomplete_tasks'))
                 with self.lock:
                     self.last_job=job;self.current=None;self.progress=1.;self.summary['last_finished_at']=utc_now();self.summary['last_status']=status
-                    self.summary['current_status']='stopped';self.summary['last_task']=conditions.get('auto_task_label','地域判定')
+                    self.summary['current_status']='stopped';self.summary['last_task']=conditions.get('auto_task_label',self.summary.get('current_task_label','地域判定'))
                     self.summary['last_summary']=result.get('summary',{})
                     self.summary['saved_observations']=int(self.summary.get('saved_observations',0))+len(snap['saved'])
                     stats=result.get('summary',{})
@@ -4658,17 +4830,21 @@ class AutomaticCollection:
                     self.summary['collection_seconds']=float(self.summary.get('collection_seconds',0))+float(stats.get('elapsed',0))
                     self.summary['confirmed_observations']=int(self.summary.get('confirmed_observations',0))+len(snap['units'])
                     if status in ('completed','partial') and not incomplete:
-                        total=max(1,int(conditions.get('auto_total_tasks',1)))
-                        self.summary['next_task_index']=(int(conditions.get('auto_task_index',0))+1)%total
-                        self.summary['total_tasks']=total
+                        total=max(1,int(conditions.get('auto_total_tasks',len(plan)) or len(plan)))
+                        index=int(conditions.get('auto_task_index',index) or 0)%total
+                        completed={int(x) for x in self.summary.get('cycle_completed_indices',[]) if isinstance(x,(int,float)) or str(x).isdigit()}
+                        completed.add(index);self.summary['cycle_completed_indices']=sorted(i for i in completed if 0<=i<total)
+                        next_index=(index+1)%total;self.summary['next_task_index']=next_index;self.summary['total_tasks']=total
                         self.summary['completed_runs']=int(self.summary.get('completed_runs',0))+1
+                        if next_index==0:
+                            self.summary['last_cycle_completed_at']=utc_now();self.summary['cycle_reset_pending']=True
                         for key in ('auto_regions','auto_munis'):
                             if conditions.get(key):self.settings[key]=conditions[key]
                     self.summary.pop('next_run_at',None)
                     if status=='failed' or incomplete:
                         self.settings['enabled']=False;self.stop_event.set()
                         self.error='今回の町の全ページ確認を完了できませんでした。原因を確認して同じ町から再開してください。'
-                    self.message='取得に失敗したため自動収集を中止しました。' if status=='failed' or incomplete else '取得・保存処理を中止しました。' if status=='cancelled' else '今回の収集を保存しました。待機せず次の町へ進みます。'
+                    self.message='取得に失敗したため自動収集を中止しました。' if status=='failed' or incomplete else '取得・保存処理を中止しました。' if status=='cancelled' else '保存完了。次の町へ進みます。'
                 self.persist()
         except Exception as exc:
             with self.lock:
@@ -4804,12 +4980,10 @@ def automatic_collection_panel():
     busy=bool(snap and snap['running'])
     if controller and getattr(controller,'build',None)!=BUILD and busy:
         schedule_automatic_upgrade(controller)
-    bounds=st.session_state.get('new_bounds')
     saved=snap['settings'] if snap else st.session_state.get('automatic_saved_settings',{})
     ward_code=st.selectbox('自動収集する区',list(TOKYO_WARDS),index=list(TOKYO_WARDS).index(saved.get('ward_code','13116')),format_func=lambda code:TOKYO_WARDS[code],key='automatic_ward')
     town_codes=ward_town_selector(ward_code,'automatic',saved.get('town_codes',[]),disabled=busy)
-    st.caption('町ごとの待機時間はありません。件数・ページ数の取得上限は設けず、各町を最後のページまで確認してから次の町へ進みます。')
-    st.caption('選択した町を順番に検索します。町名未選択なら区の全町が対象です。築15年以内・マンション・1LDK/2K/2DK・2LDK/3K/3DKが対象です。過去3か月以内の取得済みIDは詳細取得前にスキップします。設定は停止後に変更できます。')
+    st.caption('選択した町を順番に最後のページまで検索します。町名未選択なら区の全町が対象です。築15年以内・マンション・1LDK/2K/2DK・2LDK/3K/3DKを収集します。')
     manual=active_job();manual_busy=bool(manual and not manual.snapshot()['finished'])
     if st.button('選択した区で自動収集を開始・再開',key='automatic_start',disabled=busy or manual_busy):
         try:
@@ -4830,44 +5004,60 @@ def automatic_collection_panel():
         cumulative_errors=int(summary.get('error_observations',0))
         cumulative_skipped=int(summary.get('skipped_observations',0))
         st.caption(f'累計｜処理 {cumulative_processed}件｜保存 {cumulative_saved}件｜エラー {cumulative_errors}件｜スキップ {cumulative_skipped}件')
+
+        labels=list(summary.get('task_labels') or [p['label'] for p in automatic_task_plan(snap.get('settings') or {})])
+        if labels:
+            total=len(labels);current_index=int(summary.get('current_task_index',summary.get('next_task_index',0)) or 0)%total
+            completed={int(x) for x in summary.get('cycle_completed_indices',[]) if isinstance(x,(int,float)) or str(x).isdigit()}
+            completed={i for i in completed if 0<=i<total}
+            current_label=labels[current_index] if busy else '停止中'
+            st.markdown(f"**検索対象 {total}町｜完了 {len(completed)}町｜現在 {current_label}**")
+            table=[]
+            for i,label in enumerate(labels):
+                status='検索中' if busy and i==current_index else '完了' if i in completed else '待機'
+                table.append({'状態':status,'順番':f'{i+1}/{total}','検索対象':label})
+            st.dataframe(table,hide_index=True,use_container_width=True,height=min(420,42*(len(table)+1)))
+        elif busy:
+            st.caption('検索対象の町名をバックグラウンドで確認しています。')
+
         for issue in summary.get('last_summary',{}).get('issues',[])[:4]:st.error(issue)
         if snap['error']:st.error(snap['error'])
     if st.session_state.get('automatic_settings_error'):st.error(st.session_state.automatic_settings_error)
-    if controller and st.button('自動収集のログを準備・更新',key='automatic_log_prepare'):
+
+    st.markdown('#### ログ・エラー出力')
+    if controller:
         with controller.lock:log_job=controller.current or controller.last_job
         if log_job:
-            events=log_job.audit.records();st.session_state.automatic_log_events=events
-            st.session_state.automatic_log_search_id=log_job.audit.search_id
-    if st.session_state.get('automatic_log_events'):
-        diagnostic_downloads(st.session_state.automatic_log_events,'automatic')
-        st.caption('このログは現在または直近の町の詳細ログです。エラー自体は町をまたいでSupabaseへ都度保存します。')
-    if st.button('全取得エラーCSVを準備・更新',key='automatic_all_failures_prepare'):
-        try:
-            with st.spinner('全検索・全町の保存済みエラーを読み込んでいます'):
-                # A cached automatic-collection controller can survive a Streamlit hot reload and
-                # still hold a Database instance created by the previous app version.  Call the
-                # current implementation compatibly instead of assuming the cached object's class
-                # already has the newly added diagnostic methods.
-                # Always use a fresh current-version Database object.  The active automatic
-                # controller may have been created by an older build and kept alive by
-                # st.cache_resource across deploys.
-                error_db=Database()
-                events=error_db.load_diagnostic_failures();rows=acquisition_failure_rows(events)
-                st.session_state.all_acquisition_failures={'format':'unified-error-v1','rows':rows,'csv':csv_bytes_from_rows(rows),'prepared_at':utc_now()}
-        except AppError as exc:st.error(str(exc))
-        except Exception as exc:st.error('保存済み取得エラーの読み込みに失敗しました：'+type(exc).__name__)
-    all_failures=st.session_state.get('all_acquisition_failures')
-    if all_failures is not None:
-        rows=all_failures.get('rows') or []
-        prepared_at=all_failures.get('prepared_at') or utc_now()
-        unified_csv=all_failures.get('csv') or csv_bytes_from_rows(rows)
-        st.caption(f"取得エラー {len(rows)}行｜1エラー1行｜準備日時 {acquisition_time_jst(prepared_at)}")
-        st.download_button('全検索・全町の取得エラーCSVをダウンロード',unified_csv,'sumai_all_acquisition_errors.csv','text/csv',key='automatic_all_errors_csv',on_click='ignore')
-        with st.expander('保存済み取得エラーの最新100件'):
-            st.dataframe(rows[-100:],hide_index=True)
-    st.caption('物件ID・取得成功日時は再取得の管理情報として保存します。詳細住所と募集データの保存に成功した物件だけが取得済みになります。')
-    st.caption('蓄積した物件は「保存物件をすべて読み込む」で地図へ表示できます。収集中も地図の自動再描画は行いません。')
+            try:
+                cache=st.session_state.get('automatic_log_cache')
+                cache_key=(log_job.audit.search_id,int(log_job.audit.count))
+                if not isinstance(cache,dict) or cache.get('key')!=cache_key:
+                    cache={'key':cache_key,'events':log_job.audit.records()}
+                    st.session_state.automatic_log_cache=cache
+                diagnostic_downloads(cache.get('events') or [],'automatic')
+            except Exception as exc:
+                st.error('詳細ログを出力できませんでした：'+type(exc).__name__)
+        else:
+            st.caption('詳細ログは収集開始後に自動で表示されます。')
 
+    try:
+        error_job=get_automatic_failure_export(max_age=45 if busy else 120);failure=error_job.snapshot()
+        if failure['loaded']:
+            st.download_button(f"全取得エラーCSV（1エラー1行・{len(failure['rows'])}行）",
+                               failure['csv'],'sumai_all_acquisition_errors.csv','text/csv',
+                               key='automatic_all_errors_csv',on_click='ignore',use_container_width=True)
+            status='過去ログも裏で統合中' if failure['running'] and failure.get('phase')=='historical_backfill' else '裏で最新化中' if failure['running'] else '最新'
+            st.caption(f"エラーCSV：{status}｜最終同期 {acquisition_time_jst(failure.get('updated_at'))}｜同じ物件で複数エラーがあれば複数行です。")
+        else:
+            st.download_button('全取得エラーCSV',b'','sumai_all_acquisition_errors.csv','text/csv',
+                               key='automatic_all_errors_csv_wait',disabled=True,use_container_width=True)
+            st.caption('全検索・全町のエラー履歴をバックグラウンドで読み込んでいます。操作は不要です。')
+        if failure['error']:st.error('エラーCSVの自動更新に失敗しました：'+failure['error'])
+    except Exception as exc:
+        st.error('エラーCSVを出力できませんでした：'+(str(exc) if isinstance(exc,AppError) else type(exc).__name__))
+
+    st.caption('物件ID・取得成功日時は再取得の管理情報として保存します。詳細住所と募集データの保存に成功した物件だけが取得済みになります。')
+    st.caption('蓄積した物件は下の「最新の保存物件を読み込む・反映」で地図へ表示できます。収集中も地図の自動再描画は行いません。')
 
 def main():
     st.set_page_config(page_title='住まいコンパス｜新しい住まいを探す',page_icon='🏡',layout='wide',initial_sidebar_state='collapsed')
@@ -4976,12 +5166,12 @@ def main():
             if result.get('conditions',{}).get('regions'):
                 with st.expander('今回検索した地名・丁目'):
                     for label in result['conditions']['regions']: st.write(label)
-        st.caption('色分けは家賃＋管理費・共益費の月額です。同じ住所・座標の募集は同じ位置に重なるため、募集件数と地図上で見える位置の数は一致しません。町丁目や区画の平均・中央値へはまとめません。')
+        st.caption('KPIは地図の〇の数です。家賃色を付けて地図上で区別できる座標位置を1個として数え、同一座標への重なりで水増ししません。保存物件件数とは別です。')
         if state.get('new_map_loaded'):display_diagnostic_downloads(display_report)
         c1,c2,c3,c4=st.columns(4)
-        c1.metric('現在の範囲の募集',len(rows))
-        c2.metric('家賃帯のある募集',display_report['map']['colored_points'])
-        c3.metric('地図上の位置',display_report['map']['unique_positions'])
+        c1.metric('地図の〇（KPI）',display_report['map']['colored_unique_positions'])
+        c2.metric('現在の範囲の募集',len(rows))
+        c3.metric('家賃帯のある募集',display_report['map']['colored_points'])
         c4.metric('位置未確認の募集',display_report['map']['unconfirmed_positions'])
         if not state.get('new_map_loaded'):st.info('取得済みデータは「地図へ反映」で表示します。保存データは「保存データ」から読み込めます。')
         elif not rows:st.info('この表示範囲に配置できる保存データがありません。')
