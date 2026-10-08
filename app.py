@@ -20,6 +20,7 @@ import os
 import calendar
 import queue
 import re
+import shutil
 import statistics
 import tempfile
 import traceback
@@ -38,7 +39,7 @@ import streamlit as st
 from streamlit_folium import st_folium
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v92"
+BUILD = "REBUILD-01-v93"
 
 # ============================================================================
 # NON-NEGOTIABLE SUUMO ADDRESS POLICY -- DO NOT DELETE OR WEAKEN
@@ -131,6 +132,20 @@ def homes_direct_city_list_url(region, category='mansion'):
         return f'https://www.homes.co.jp/chintai/{category}/tokyo/{slug}/list/'
     return None
 
+# HOME'S transport policy (v93):
+# - First use the existing lightweight HTTP client.
+# - If HOME'S itself returns HTTP 403, retry that same public URL with an actual
+#   headless Chromium browser when Chromium/Selenium are installed.  This is a
+#   normal browser navigation path: no stealth plugin, CAPTCHA bypass, fingerprint
+#   spoofing, proxy rotation, or access-control circumvention is implemented.
+# - Keep one browser session/cookie jar and one HOME'S navigation at a time.
+# - If HOME'S also refuses the real browser, stop HOME'S for that run and continue
+#   with SUUMO exactly as before.
+HOMES_BROWSER_FALLBACK = True
+HOMES_BROWSER_PAGE_TIMEOUT = 20
+HOMES_BROWSER_RENDER_WAIT = 0.8
+HOMES_BROWSER_MIN_INTERVAL = 2.0
+
 # HOME'S availability policy:
 # - A server-side HTTP 403 from HOME'S is treated as provider unavailability, not
 #   as a reason to stop the whole collection.
@@ -169,6 +184,8 @@ def disable_homes_for_runtime(web,exc,url=''):
         if not isinstance(state,dict):state={};web.provider_runtime_disabled=state
         state['HOME’S']=dict(item)
     trace(web,'homes_http403_fallback',item,'WARNING','provider_fallback')
+    try:web.close_homes_browser()
+    except Exception:pass
     return item
 
 
@@ -1297,6 +1314,10 @@ class PublicWeb:
         self.headers={'User-Agent':'SumaiCompassRebuild/1.0 (personal rental research)', 'Accept-Language':'ja'}
         self.host_gates={};self.host_last_request={};self.host_backoff={};self.route_cooldowns={};self.session_primed=threading.local();self.proxy_routes=[];self.route_preferred={};self.route_lock=threading.Lock();self.http_cache={};self.headers.update({'Accept':'text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8'})
         self.robots={};self.lock=threading.Lock();self.layout_form_lock=threading.Lock();self.layout_form_cache={};self.provider_cache={};self.provider_lock=threading.RLock();self.unavailable_hosts={};self.failed_detail_urls={};self.provider_runtime_disabled={}
+        # HOME'S browser transport is lazy: Chromium is launched only after a genuine
+        # server-side 403 from the normal HTTP path.  It is serialized because a
+        # single human browser session is the intended navigation model.
+        self.homes_browser_lock=threading.RLock();self.homes_browser_driver=None;self.homes_transport_mode='http';self.homes_browser_last_start=0.0;self.homes_browser_error=''
     def configure(self,config):
         self.proxy_routes=list((config or {}).get('proxies',[]))
         trace(self,'transport_config',{'proxy_count':len(self.proxy_routes),'rental_route':'proxy' if self.proxy_routes else 'direct','other_services':'direct'},stage='http_config')
@@ -1323,7 +1344,7 @@ class PublicWeb:
         try:
             while not gate.acquire(timeout=.1):self.check_cancel()
             try:
-                interval=PER_HOST_MIN_INTERVAL;parser=self.robots.get(urlparse(url).scheme+'://'+urlparse(url).netloc)
+                interval=HOMES_BROWSER_MIN_INTERVAL if host=='www.homes.co.jp' else PER_HOST_MIN_INTERVAL;parser=self.robots.get(urlparse(url).scheme+'://'+urlparse(url).netloc)
                 if parser:
                     crawl=parser.crawl_delay(self.headers['User-Agent']);rate=parser.request_rate(self.headers['User-Agent'])
                     if crawl:interval=max(interval,float(crawl))
@@ -1337,6 +1358,98 @@ class PublicWeb:
             # Keep one-second start spacing, but do not serialize the response wait.
             return session.request(method,url,headers=headers,timeout=(4,12),allow_redirects=False,**options)
         finally:slots.release()
+    def _homes_browser_binary(self):
+        """Return an installed Chromium-family binary without downloading anything."""
+        for candidate in ('chromium','chromium-browser','google-chrome','google-chrome-stable'):
+            path=shutil.which(candidate)
+            if path:return path
+        return ''
+    def _homes_browser_driver(self):
+        """Lazily create one real Chromium browser for HOME'S public pages."""
+        if self.homes_browser_driver is not None:return self.homes_browser_driver
+        if not HOMES_BROWSER_FALLBACK:raise AppError('HOME’Sブラウザ取得は無効です。')
+        binary=self._homes_browser_binary()
+        if not binary:
+            error=AppError('HOME’Sをブラウザ取得するChromiumがありません。packages.txtにchromium / chromium-driverが必要です。')
+            error.diagnostic={'browser_transport':'unavailable','reason':'chromium_not_found'};raise error
+        try:
+            from selenium import webdriver
+            from selenium.webdriver.chrome.options import Options
+            from selenium.webdriver.chrome.service import Service
+        except Exception as exc:
+            error=AppError('HOME’Sをブラウザ取得するSeleniumがありません。requirements.txtにseleniumが必要です。')
+            error.diagnostic={'browser_transport':'unavailable','reason':'selenium_not_found','exception_type':type(exc).__name__};raise error
+        options=Options();options.binary_location=binary
+        # These are execution-environment flags, not stealth/fingerprint modifications.
+        for arg in ('--headless=new','--no-sandbox','--disable-dev-shm-usage','--window-size=1365,1200','--lang=ja-JP'):
+            options.add_argument(arg)
+        options.page_load_strategy='normal'
+        driver_path=shutil.which('chromedriver')
+        try:
+            driver=webdriver.Chrome(service=Service(executable_path=driver_path) if driver_path else Service(),options=options)
+            driver.set_page_load_timeout(HOMES_BROWSER_PAGE_TIMEOUT)
+            try:driver.set_script_timeout(10)
+            except Exception:pass
+        except Exception as exc:
+            error=AppError('HOME’S用Chromiumを起動できません。Streamlit CloudのChromium/driver設定を確認してください。')
+            error.diagnostic={'browser_transport':'startup_failed','reason':'webdriver_start_failed','exception_type':type(exc).__name__};raise error
+        self.homes_browser_driver=driver
+        trace(self,'homes_browser_started',{'binary':binary,'driver':driver_path or 'selenium-manager','mode':'headless-chromium','stealth':False},stage='transport')
+        return driver
+    def close_homes_browser(self):
+        with self.homes_browser_lock:
+            driver=self.homes_browser_driver;self.homes_browser_driver=None
+            if driver is not None:
+                try:driver.quit()
+                except Exception:pass
+    def homes_browser_fetch(self,url,params=None):
+        """Fetch a HOME'S public GET page through a real Chromium navigation.
+
+        This is deliberately conservative: one browser, one navigation at a time,
+        no CAPTCHA solving/stealth/proxy rotation.  A browser-side 403 still opens
+        the existing SUUMO fallback circuit rather than being bypassed.
+        """
+        u=urlparse(url)
+        if u.scheme!='https' or u.hostname!='www.homes.co.jp':raise AppError('HOME’Sブラウザ取得先が不正です。')
+        pairs=list((params or {}).items()) if isinstance(params,dict) else list(params or [])
+        target=requests.Request('GET',url,params=pairs or None).prepare().url
+        with self.homes_browser_lock:
+            self.check_cancel()
+            delay=max(0.,self.homes_browser_last_start+HOMES_BROWSER_MIN_INTERVAL-time.monotonic())
+            if delay:self.pause(delay)
+            self.homes_browser_last_start=time.monotonic()
+            driver=self._homes_browser_driver()
+            try:
+                current=urlparse(getattr(driver,'current_url','') or '')
+                target_u=urlparse(target)
+                # Same-host moves use normal browser navigation so cookies/session state
+                # are preserved just as they are during ordinary browsing.
+                if current.hostname==target_u.hostname and getattr(driver,'current_url','').startswith('http'):
+                    driver.execute_script('window.location.assign(arguments[0]);',target)
+                else:
+                    driver.get(target)
+                deadline=time.monotonic()+HOMES_BROWSER_PAGE_TIMEOUT
+                while time.monotonic()<deadline:
+                    self.check_cancel()
+                    try:
+                        if driver.execute_script('return document.readyState')=='complete':break
+                    except Exception:pass
+                    self.pause(.1)
+                if HOMES_BROWSER_RENDER_WAIT:self.pause(HOMES_BROWSER_RENDER_WAIT)
+                source=driver.page_source or '';final_url=driver.current_url or target;title=normal(driver.title)
+            except SearchCancelled:raise
+            except Exception as exc:
+                error=AppError('HOME’Sのブラウザ取得に失敗しました。')
+                error.diagnostic={'browser_transport':'navigation_failed','url':target,'exception_type':type(exc).__name__};raise error
+            blocked=bool(re.search(r'(?:ERROR:\s*The request could not be satisfied|Access Denied|403 Forbidden|Request blocked|captcha|verify (?:you|your)|security check)',title+' '+source[:5000],re.I))
+            if blocked or not source.strip():
+                error=AppError('www.homes.co.jp：ブラウザでもHTTP 403相当のアクセス拒否が返りました。')
+                error.diagnostic={'status':403,'browser_transport':'blocked','url':final_url,'page_title':title,'bytes':len(source.encode("utf-8"))};raise error
+            response=requests.Response();response.status_code=200;response.url=final_url;response.encoding='utf-8'
+            response._content=source.encode('utf-8');response.headers['Content-Type']='text/html; charset=UTF-8';response.headers['X-Sumai-Transport']='chromium'
+            self.homes_transport_mode='browser'
+            trace(self,'homes_browser_ok',{'url':target,'response_url':final_url,'status':200,'bytes':len(response.content),'page_title':title,'session':'persistent','parallelism':1},stage='transport')
+            return response
     def response_info(self,response):
         title=response_title(response.text) if 'html' in response.headers.get('Content-Type','').lower() else ''
         challenge=bool(re.search(r'^(?:just a moment|access denied|attention required|403 forbidden|verify (?:you|your)|security check)',title,re.I))
@@ -1381,7 +1494,7 @@ class PublicWeb:
                     trace(self,'transport_attempt',{'url':url,'method':method,'route':'proxy' if route else 'direct','route_number':index+1 if route else None,'attempt':attempt+1,'status':status,'bytes':len(response.content),**info},stage='transport')
                     last=response
                     blocked=status==403 or info['challenge_page']
-                    if rental and blocked and attempt==0 and u.path not in ('/','/robots.txt'):
+                    if rental and blocked and attempt==0 and host!='www.homes.co.jp' and u.path not in ('/','/robots.txt'):
                         if self.prime_session(session,root,options,index+1):
                             headers=dict(options.get('headers',{}));headers['Referer']=root+'/';options['headers']=headers
                             trace(self,'session_retry',{'url':url,'route_number':index+1,'change':'same-route public entry cookies and actual Referer'},stage='transport');continue
@@ -1421,6 +1534,10 @@ class PublicWeb:
         allowed=tuple(RENTAL_HOSTS)+('mreversegeocoder.gsi.go.jp','msearch.gsi.go.jp','maps.gsi.go.jp','cyberjapandata.gsi.go.jp','japanese-addresses-v2.geoloniamaps.com','geolonia.github.io','img01.suumo.com','img02.suumo.com','maps.googleapis.com','maps.google.com','html.duckduckgo.com','www.google.com','search.yahoo.co.jp','myhome.nifty.com','www.mansion-review.jp','www.e-room.co','www.housecom.jp','vidax-gotanda.jp')
         u=urlparse(url)
         if u.scheme!='https' or u.hostname not in allowed or u.username or u.password: raise AppError('取得先が不正です。')
+        # After one genuine HOME'S 403, use one persistent real Chromium session for
+        # the rest of this run instead of repeatedly sending blocked raw HTTP requests.
+        if method=='GET' and u.hostname=='www.homes.co.jp' and u.path!='/robots.txt' and self.homes_transport_mode=='browser':
+            return self.homes_browser_fetch(url,kwargs.get('params'))
         if method=='GET' and not kwargs.get('params') and url in self.http_cache:
             trace(self,'cache_hit',{'url':url,'source':'successful_detail_http_cache'},stage='http_cache');return self.http_cache[url]
         if u.hostname in self.unavailable_hosts:raise AppError(self.unavailable_hosts[u.hostname])
@@ -1441,6 +1558,18 @@ class PublicWeb:
         except requests.Timeout as exc:
             error=AppError(f'{u.hostname}：接続または応答がタイムアウトしました。');error.diagnostic={'exception_type':type(exc).__name__,'reason':'接続経路の通信失敗'};raise error from None
         except requests.HTTPError as exc:
+            # HOME'S sometimes rejects Streamlit Cloud's lightweight HTTP client while
+            # serving the same public page to an ordinary browser.  On a genuine 403,
+            # retry once through real Chromium.  If Chromium is unavailable or is also
+            # refused, the existing circuit breaker switches the run to SUUMO only.
+            if method=='GET' and u.hostname=='www.homes.co.jp' and u.path!='/robots.txt' and exc.response.status_code==403 and HOMES_BROWSER_FALLBACK:
+                try:
+                    trace(self,'homes_http403_browser_retry',{'url':url,'parameters':kwargs.get('params') or {},'decision':'real_chromium_once'},'WARNING','transport')
+                    return self.homes_browser_fetch(url,kwargs.get('params'))
+                except AppError as browser_exc:
+                    diagnostic=dict(getattr(browser_exc,'diagnostic',{}) or {});diagnostic.setdefault('status',403);diagnostic['raw_http_status']=403
+                    browser_exc.diagnostic=diagnostic;self.homes_browser_error=str(browser_exc)
+                    raise browser_exc from None
             message=f'{u.hostname}：HTTP {exc.response.status_code}（公開ページの取得失敗）。'
             if method=='GET' and not kwargs.get('params'):self.failed_detail_urls[url]=message
             error=AppError(message);error.diagnostic={**self.response_info(exc.response),'status':exc.response.status_code}
@@ -6139,7 +6268,7 @@ def main():
         st.caption('旧アプリの物件や検索状態を使用しません。旧テーブルのデータは削除しません。')
         st.caption(f'実行中の版：{BUILD}')
     with st.expander('取得・集計の範囲'):
-        st.write("HOMES・SUUMOとも、マンションは築15年以内・1LDK/2K/2DKまたは2LDK/3K/3DK、一戸建ては築40年以内・50㎡以上を検索します。SUUMOの位置は「地図・周辺環境」の物件マーカー、HOMESの位置は「地図を見る」の画像ピンを最優先し、画像ピンを一意に取れない場合はHOME'Sが公開したGoogle地図座標を使います。地図由来の詳細住所を推定できない物件は保存しません。")
+        st.write("HOMES・SUUMOとも、マンションは築15年以内・1LDK/2K/2DKまたは2LDK/3K/3DK、一戸建ては築40年以内・50㎡以上を検索します。HOMESが通常HTTPで403の場合は、Streamlit Cloud上の実Chromiumブラウザで同じ公開ページを1回再試行し、ブラウザでも拒否された場合だけSUUMOへ切り替えます。SUUMOの位置は「地図・周辺環境」の物件マーカー、HOMESの位置は「地図を見る」の画像ピンを最優先し、画像ピンを一意に取れない場合はHOME'Sが公開したGoogle地図座標を使います。地図由来の詳細住所を推定できない物件は保存しません。")
         st.write('データベースへ保存する募集項目は家賃・間取り・種別（マンション／一戸建て）・詳細住所（推定）・データ取得日時です。取得日時はUTCで保存し、画面では日本時間で表示します。管理費・面積・築年数・画像・緯度経度・掲載URLは募集データとして保存しません。')
         st.write('募集情報は既存SupabaseのJSON保存領域へ保存するため、追加SQLは不要です。schema 4・5の保存データを読み込みます。旧データの取得日時は未記録と表示します。')
         st.write("SUUMOは物件マーカー座標、HOMESは画像ピンまたはHOME'S公開地図座標を起点にし、国土地理院の住居表示住所データから街区符号・基礎番号を最近傍推定します。一覧・詳細ページの所在地文字列から住所や位置を補完しません。")
