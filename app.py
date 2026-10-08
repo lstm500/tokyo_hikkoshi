@@ -38,7 +38,7 @@ import streamlit as st
 from streamlit_folium import st_folium
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v69"
+BUILD = "REBUILD-01-v71"
 PROVIDER_OPTIONS = ("スマイティ","HOMES","SUUMO","カナリー","アットホーム","CHINTAI","Comfy","アパマンショップ")
 PROVIDER_CANONICAL = {"HOMES":"HOME’S","HOME’S":"HOME’S","スマイティ":"スマイティ","SUUMO":"SUUMO","カナリー":"カナリー",
                       "アットホーム":"アットホーム","CHINTAI":"CHINTAI","Comfy":"Comfy","アパマンショップ":"アパマンショップ"}
@@ -734,14 +734,26 @@ class Database:
         return out
 
     def load_units(self,bounds=None,layouts=None,on_progress=None,cancel_event=None):
-        out=[];offset=0
+        """Load saved rental rows using keyset pagination and report storage-vs-display counts.
+
+        Older app versions stored rows without a provider property_id and keyed them by
+        rent/layout/address.  Newer rows are keyed by property_id.  Both records can remain
+        in Supabase after migration.  They are not silently described as separate current
+        listings: the diagnostic explicitly reports how many legacy rows are shadowed by an
+        ID-backed row, while unmatched legacy rows remain visible.
+        """
+        out=[];last_id=''
         self.last_load_diagnostic={'time':utc_now(),'bounds':list(bounds) if bounds else None,'layouts':list(layouts) if layouts is not None else None,
-                                   'pages':[],'excluded':{'invalid':0,'layout':0,'legacy_schema':0},'raw_records':0,'storage_schema':6,'geocode_on_load':True}
+                                   'pages':[],'excluded':{'invalid':0,'layout':0,'legacy_schema':0},'raw_records':0,'accepted_records':0,
+                                   'property_id_records':0,'legacy_records':0,'legacy_shadowed':0,'legacy_unmatched':0,
+                                   'storage_schema':6,'geocode_on_load':True,'pagination':'id_keyset'}
         while True:
             if cancel_event is not None and cancel_event.is_set():raise SearchCancelled()
-            rows=self.call('GET',SEARCH_TABLE,{'namespace':'eq.'+self.namespace,'select':'summary,conditions','status':'eq.rental_listing','order':'id.asc','limit':1000,'offset':offset})
+            params={'namespace':'eq.'+self.namespace,'select':'id,summary,conditions','status':'eq.rental_listing','order':'id.asc','limit':1000}
+            if last_id:params['id']='gt.'+last_id
+            rows=self.call('GET',SEARCH_TABLE,params)
             if not isinstance(rows,list):raise AppError('保存した募集情報を読み取れません。')
-            self.last_load_diagnostic['pages'].append({'table':SEARCH_TABLE,'offset':offset,'returned':len(rows),'server_filters':['namespace','rental_listing']})
+            self.last_load_diagnostic['pages'].append({'table':SEARCH_TABLE,'after_id':last_id or None,'returned':len(rows),'server_filters':['namespace','rental_listing']})
             self.last_load_diagnostic['raw_records']+=len(rows)
             if not rows:break
             page_start=len(out)
@@ -754,30 +766,49 @@ class Database:
                 if not compact:self.last_load_diagnostic['excluded']['invalid']+=1;continue
                 if layouts is not None and compact['layout'] not in layouts:self.last_load_diagnostic['excluded']['layout']+=1;continue
                 key=compact_listing_key(compact)
-                out.append({**compact,'key':key,'title':compact['address'],'rent':compact['rent'],'layout':compact['layout'],'address':compact['address'],
+                out.append({**compact,'key':key,'storage_id':str(item.get('id') or ''),'title':compact['address'],'rent':compact['rent'],'layout':compact['layout'],'address':compact['address'],
                             'fetched_at':compact.get('fetched_at'),'fees':0,'loaded_from_compact_storage':True})
-            offset+=len(rows)
+            self.last_load_diagnostic['accepted_records']=len(out)
             if on_progress:on_progress(out[page_start:],dict(self.last_load_diagnostic))
-        # Do not count legacy copies again when an ID record covers that observation.
-        represented={hashlib.sha256(json.dumps({k:r[k] for k in ('rent','layout','address')},ensure_ascii=False,sort_keys=True,separators=(',',':')).encode()).hexdigest() for r in out if r.get('property_id')}
-        out=[r for r in out if r.get('property_id') or r['key'] not in represented]
-        unique=list({r['key']:r for r in out}.values())
-        self.last_load_diagnostic.update(before_key_merge=len(out),key_duplicates=len(out)-len(unique),returned=len(unique))
+            new_last=str(rows[-1].get('id') or '')
+            if not new_last or new_last==last_id:raise AppError('保存データのページ位置を確定できません。')
+            last_id=new_last
+            if len(rows)<1000:break
+        property_rows=[r for r in out if r.get('property_id')]
+        legacy_rows=[r for r in out if not r.get('property_id')]
+        represented={hashlib.sha256(json.dumps({k:r[k] for k in ('rent','layout','address')},ensure_ascii=False,sort_keys=True,separators=(',',':')).encode()).hexdigest() for r in property_rows}
+        shadowed=[r for r in legacy_rows if r['key'] in represented]
+        unmatched=[r for r in legacy_rows if r['key'] not in represented]
+        display_rows=property_rows+unmatched
+        unique=list({r['key']:r for r in display_rows}.values())
+        shadowed_storage_ids={r.get('storage_id') for r in shadowed}
+        self.last_load_record_audit=[]
+        for r in out:
+            if r.get('property_id'):classification='物件ID確認済み・地図表示対象'
+            elif r.get('storage_id') in shadowed_storage_ids:classification='旧形式IDなし・ID確認済みデータと家賃/間取り/住所一致・二重表示候補'
+            else:classification='旧形式IDなし・独立レコード・地図表示対象'
+            self.last_load_record_audit.append({'Supabase行ID':r.get('storage_id'),'物件ID':r.get('property_id') or '',
+                '家賃':r.get('rent'),'間取り':r.get('layout'),'住所':r.get('address'),'取得日時':r.get('fetched_at') or '',
+                '分類':classification})
+        self.last_load_diagnostic.update(property_id_records=len(property_rows),legacy_records=len(legacy_rows),legacy_shadowed=len(shadowed),
+                                         legacy_unmatched=len(unmatched),before_key_merge=len(display_rows),key_duplicates=len(display_rows)-len(unique),returned=len(unique))
         return unique
 
     def load_units_since(self,since,layouts=None,cancel_event=None):
         """Load listing rows written/updated since a saved-data refresh started.
 
-        save_units updates SEARCH_TABLE.started_at on every listing upsert.  A short
-        catch-up pass therefore captures listings committed while the full saved-data
-        scan or address preparation was running, without rereading the whole inventory.
+        Uses immutable id keyset pagination so concurrent inserts cannot shift offset pages.
+        save_units updates SEARCH_TABLE.started_at on every listing upsert; repeated catch-up
+        passes therefore capture writes that land while the full scan is running.
         """
         if not since:return []
-        out=[];offset=0
+        out=[];last_id=''
         while True:
             if cancel_event is not None and cancel_event.is_set():raise SearchCancelled()
-            rows=self.call('GET',SEARCH_TABLE,{'namespace':'eq.'+self.namespace,'select':'summary,conditions,started_at',
-                'status':'eq.rental_listing','started_at':'gte.'+str(since),'order':'id.asc','limit':1000,'offset':offset})
+            params={'namespace':'eq.'+self.namespace,'select':'id,summary,conditions,started_at',
+                'status':'eq.rental_listing','started_at':'gte.'+str(since),'order':'id.asc','limit':1000}
+            if last_id:params['id']='gt.'+last_id
+            rows=self.call('GET',SEARCH_TABLE,params)
             if not isinstance(rows,list):raise AppError('最新の保存物件を再確認できません。')
             if not rows:break
             for item in rows:
@@ -788,11 +819,14 @@ class Database:
                 if not compact:continue
                 if layouts is not None and compact['layout'] not in layouts:continue
                 key=compact_listing_key(compact)
-                out.append({**compact,'key':key,'title':compact['address'],'rent':compact['rent'],'layout':compact['layout'],'address':compact['address'],
+                out.append({**compact,'key':key,'storage_id':str(item.get('id') or ''),'title':compact['address'],'rent':compact['rent'],'layout':compact['layout'],'address':compact['address'],
                             'fetched_at':compact.get('fetched_at'),'fees':0,'loaded_from_compact_storage':True})
+            new_last=str(rows[-1].get('id') or '')
+            if not new_last or new_last==last_id:raise AppError('最新保存分のページ位置を確定できません。')
+            last_id=new_last
             if len(rows)<1000:break
-            offset+=len(rows)
-        represented={hashlib.sha256(json.dumps({k:r[k] for k in ('rent','layout','address')},ensure_ascii=False,sort_keys=True,separators=(',',':')).encode()).hexdigest() for r in out if r.get('property_id')}
+        property_rows=[r for r in out if r.get('property_id')]
+        represented={hashlib.sha256(json.dumps({k:r[k] for k in ('rent','layout','address')},ensure_ascii=False,sort_keys=True,separators=(',',':')).encode()).hexdigest() for r in property_rows}
         out=[r for r in out if r.get('property_id') or r['key'] not in represented]
         return list({r['key']:r for r in out}.values())
 
@@ -919,19 +953,88 @@ class Database:
         return saved
 
     def load_diagnostic_failures(self):
-        """Load every persisted failure/error event for this namespace, across all towns and runs."""
-        events=[];offset=0
+        """Load failures from both v68+ per-error rows and older diagnostic-log chunks.
+
+        Automatic collectors can survive Streamlit hot reloads.  A collector started on
+        v66/v67 therefore has no per-error persistence hook even while the UI is already
+        running newer code.  Historical diagnostic_log chunks remain authoritative, so
+        reconstruct failures from them and merge with diagnostic_error rows by search/seq.
+        """
+        events=[];seen=set()
+        def add_event(event):
+            if not isinstance(event,dict) or not diagnostic_failure_event(event):return
+            key=(str(event.get('search_id') or ''),str(event.get('seq') or ''),str(event.get('stage') or ''),str(event.get('code') or ''))
+            if key in seen:return
+            seen.add(key);events.append(event)
+        last_id=''
         while True:
-            rows=self.call('GET',SEARCH_TABLE,{'namespace':'eq.'+self.namespace,'status':'eq.diagnostic_error',
-                'select':'id,summary,conditions,started_at','order':'started_at.asc,id.asc','limit':1000,'offset':offset})
+            params={'namespace':'eq.'+self.namespace,'status':'eq.diagnostic_error','select':'id,summary,conditions,started_at','order':'id.asc','limit':1000}
+            if last_id:params['id']='gt.'+last_id
+            rows=self.call('GET',SEARCH_TABLE,params)
             if not isinstance(rows,list):raise AppError('保存済み取得エラーを読み取れません。')
             if not rows:break
-            for row in rows:
-                event=(row.get('summary') or {}).get('event')
-                if isinstance(event,dict):events.append(event)
+            for row in rows:add_event((row.get('summary') or {}).get('event'))
+            new_last=str(rows[-1].get('id') or '')
+            if not new_last or new_last==last_id:break
+            last_id=new_last
             if len(rows)<1000:break
-            offset+=len(rows)
+        # Backfill errors recorded before per-error rows existed (and errors from a cached
+        # pre-v68 controller that is still running after code deployment).
+        last_id=''
+        while True:
+            params={'namespace':'eq.'+self.namespace,'status':'eq.diagnostic_log','select':'id,summary','order':'id.asc','limit':500}
+            if last_id:params['id']='gt.'+last_id
+            rows=self.call('GET',SEARCH_TABLE,params)
+            if not isinstance(rows,list):raise AppError('過去の詳細作業ログを読み取れません。')
+            if not rows:break
+            for row in rows:
+                for event in ((row.get('summary') or {}).get('events') or []):add_event(event)
+            new_last=str(rows[-1].get('id') or '')
+            if not new_last or new_last==last_id:break
+            last_id=new_last
+            if len(rows)<500:break
+        events.sort(key=lambda e:(str(e.get('time') or ''),str(e.get('search_id') or ''),int(e.get('seq') or 0)))
         return events
+
+
+def save_diagnostic_failures_compat(db,events):
+    """Use the current Database implementation even when a cached controller holds an older Database instance."""
+    method=getattr(db,'save_diagnostic_failures',None)
+    if callable(method):return method(events)
+    return Database.save_diagnostic_failures(db,events)
+
+
+def load_diagnostic_failures_compat(db):
+    """Read persisted failures from old cached Database instances after a Streamlit hot reload."""
+    method=getattr(db,'load_diagnostic_failures',None)
+    if callable(method):return method()
+    return Database.load_diagnostic_failures(db)
+
+
+def persist_cached_controller_failures(controller):
+    """Bridge a still-running pre-v68 automatic controller into current error persistence.
+
+    Streamlit cache_resource can keep an AutomaticCollection/AuditLog instance created by
+    an older app build.  Those AuditLog objects have no pending_failures queue, so scan only
+    their newly appended local events and persist current failure semantics with a fresh DB.
+    """
+    if controller is None:return 0
+    with controller.lock:
+        jobs=[j for j in (getattr(controller,'current',None),getattr(controller,'last_job',None)) if j is not None]
+    marker=st.session_state.setdefault('_compat_failure_saved_seq',{})
+    db=Database();saved=0
+    for job in jobs:
+        audit=getattr(job,'audit',None)
+        if audit is None or hasattr(audit,'pending_failures'):continue
+        search_id=str(getattr(audit,'search_id','') or '')
+        if not search_id:continue
+        try:events=audit.records()
+        except Exception:continue
+        last=int(marker.get(search_id,0) or 0)
+        new=[e for e in events if int(e.get('seq') or 0)>last and diagnostic_failure_event(e)]
+        if new:saved+=save_diagnostic_failures_compat(db,new)
+        marker[search_id]=max([last]+[int(e.get('seq') or 0) for e in events])
+    return saved
 
 
 GEO_HTTP_CACHE={}
@@ -3344,7 +3447,7 @@ class AuditLog:
                 self.failure_storage_error=None;return
             try:
                 db._saving_audit=True
-                saved=db.save_diagnostic_failures(batch)
+                saved=save_diagnostic_failures_compat(db,batch)
             except Exception as exc:
                 self.failure_storage_error=str(exc) if isinstance(exc,AppError) else type(exc).__name__
                 return
@@ -3502,14 +3605,13 @@ def diagnostic_downloads(events,prefix='current'):
         export['decisions']=exclusion_rows(events)
         export['failures']=acquisition_failure_rows(events)
         export['reasons_csv']=csv_bytes_from_rows(export['decisions']) if export['decisions'] else b''
-        export['failures_csv']=csv_bytes_from_rows(export['failures']) if export['failures'] else b''
+        export['failures_csv']=csv_bytes_from_rows(export['failures'])
         export['preview']=export['txt'].decode('utf-8-sig').split('詳細イベント')[0];st.session_state[prefix+'_log_export']=export
     st.download_button('詳細作業ログ・改善案をTXTでダウンロード',export['txt'],'sumai_work_log.txt','text/plain',key=prefix+'_txt',on_click='ignore')
     st.download_button('解析用の詳細ログをJSONでダウンロード',export['json'],
                        'sumai_work_log.json','application/json',key=prefix+'_json',on_click='ignore')
     failures=export['failures'];decisions=export['decisions']
-    if failures:
-        st.download_button('全エラーイベントをCSVでダウンロード',export['failures_csv'],'sumai_acquisition_failures.csv','text/csv',key=prefix+'_failures',on_click='ignore')
+    st.download_button(f"全エラーイベントをCSVでダウンロード（{len(failures)}件）",export['failures_csv'],'sumai_acquisition_failures.csv','text/csv',key=prefix+'_failures',on_click='ignore')
     if decisions:
         st.download_button('物件ごとの最終除外・取得失敗理由をCSVでダウンロード',export['reasons_csv'],'sumai_exclusion_reasons.csv','text/csv',key=prefix+'_reasons',on_click='ignore')
     with st.expander('作業ログの原因別集計と改善案'):
@@ -3787,18 +3889,23 @@ class SavedLoadJob:
         self.db=db;self.bounds=bounds;self.token=hashlib.sha256(os.urandom(32)).hexdigest();self.server_key=manual_registry_key(db)
         self.lock=threading.RLock();self.cancel_event=threading.Event();self.rows={};self.cache={}  # Session points lack timestamps; reuse only the TTL-controlled server cache.
         self.phase='database';self.finished=False;self.error='';self.complete_db=False;self.pages=0;self.total_addresses=0;self.done_addresses=0;self.placed=0;self.persistent_cache_hits=0;self.geocoded_addresses=0;self.diagnostic={};self.started=time.monotonic();self.started_at_utc=utc_now();self.ended=None
-        self.catchup_rounds=0;self.catchup_rows=0;self.catchup_changes=0;self.latest_checked_at=None
+        self.catchup_rounds=0;self.catchup_rows=0;self.catchup_changes=0;self.latest_checked_at=None;self.storage_record_audit=[]
         self.thread=threading.Thread(target=self.run,daemon=True,name='housing-saved-loader')
     def snapshot(self):
         with self.lock:
-            end=self.ended if self.ended is not None else time.monotonic()
+            end=self.ended if self.ended is not None else time.monotonic();diag=dict(self.diagnostic or {})
             return {'token':self.token,'phase':self.phase,'finished':self.finished,'error':self.error,'complete_db':self.complete_db,
                 'rows':len(self.rows),'pages':self.pages,'addresses':self.total_addresses,'done_addresses':self.done_addresses,'placed':self.placed,
+                'raw_records':int(diag.get('raw_records') or 0),'accepted_records':int(diag.get('accepted_records') or 0),
+                'property_id_records':int(diag.get('property_id_records') or 0),'legacy_records':int(diag.get('legacy_records') or 0),
+                'legacy_shadowed':int(diag.get('legacy_shadowed') or 0),'legacy_unmatched':int(diag.get('legacy_unmatched') or 0),
                 'persistent_cache_hits':self.persistent_cache_hits,'geocoded_addresses':self.geocoded_addresses,
                 'catchup_rounds':self.catchup_rounds,'catchup_rows':self.catchup_rows,'catchup_changes':self.catchup_changes,
                 'latest_checked_at':self.latest_checked_at,'elapsed':round(end-self.started,1),'stopping':self.cancel_event.is_set()}
     def export(self):
         with self.lock:return [dict(r) for r in self.rows.values()],dict(self.cache),dict(self.diagnostic)
+    def export_storage_record_audit(self):
+        with self.lock:return [dict(r) for r in self.storage_record_audit]
     def request_stop(self):self.cancel_event.set()
     def run(self):
         web=PublicWeb();web.cancel_event=self.cancel_event;web.address_points=getattr(self.db,'address_points',None)
@@ -3818,6 +3925,10 @@ class SavedLoadJob:
             return {compact_listing_key(r):r for r in rows if compact_listing_key(r)}
         try:
             stored=self.db.load_units(None,on_progress=page,cancel_event=self.cancel_event)
+            with self.lock:
+                self.diagnostic=dict(getattr(self.db,'last_load_diagnostic',self.diagnostic) or self.diagnostic)
+                self.storage_record_audit=[dict(r) for r in getattr(self.db,'last_load_record_audit',[]) if isinstance(r,dict)]
+                known_storage_ids={str(r.get('Supabase行ID') or '') for r in self.storage_record_audit if r.get('Supabase行ID')}
             addresses=list(dict.fromkeys(r['address'] for r in stored));known_addresses=set(addresses);by_address={a:[] for a in addresses}
             # Persistent cache is loaded in one paged DB pass.  This avoids repeating
             # GSI address searches on every click after the first successful placement.
@@ -3862,6 +3973,18 @@ class SavedLoadJob:
                     self.catchup_rounds+=1;self.catchup_rows=max(self.catchup_rows,len(delta))
                     before={k:row_signature(v) for k,v in self.rows.items()}
                 if delta:
+                    new_storage=[r for r in delta if r.get('storage_id') and str(r.get('storage_id')) not in known_storage_ids]
+                    if new_storage:
+                        with self.lock:
+                            self.diagnostic['raw_records']=int(self.diagnostic.get('raw_records') or 0)+len(new_storage)
+                            self.diagnostic['accepted_records']=int(self.diagnostic.get('accepted_records') or 0)+len(new_storage)
+                            self.diagnostic['property_id_records']=int(self.diagnostic.get('property_id_records') or 0)+sum(bool(r.get('property_id')) for r in new_storage)
+                            self.diagnostic['legacy_records']=int(self.diagnostic.get('legacy_records') or 0)+sum(not bool(r.get('property_id')) for r in new_storage)
+                            for r in new_storage:
+                                self.storage_record_audit.append({'Supabase行ID':r.get('storage_id'),'物件ID':r.get('property_id') or '',
+                                    '家賃':r.get('rent'),'間取り':r.get('layout'),'住所':r.get('address'),'取得日時':r.get('fetched_at') or '',
+                                    '分類':'物件ID確認済み・地図表示対象' if r.get('property_id') else '旧形式IDなし・最新差分'})
+                        known_storage_ids.update(str(r.get('storage_id')) for r in new_storage)
                     delta_addresses=list(dict.fromkeys(r['address'] for r in delta if r.get('address')))
                     new_addresses=[a for a in delta_addresses if a not in known_addresses]
                     persistent_delta={}
@@ -3938,6 +4061,7 @@ def start_saved_load(bounds,cache=None,db=None):
             job=SavedLoadJob(db,bounds,cache);jobs[key]=job;job.thread.start()
     st.session_state.saved_load_token=job.token;st.session_state.saved_load_key=key
     st.session_state.pop('saved_load_export',None)
+    st.session_state.pop('saved_record_audit_export',None)
     st.session_state.pop('saved_load_applied_token',None)
     st.session_state.pop('new_notice',None)
     return job
@@ -3975,19 +4099,22 @@ def saved_load_progress():
             st.session_state.saved_load_applied_token=job.token
             st.rerun()
 
+    db_records=snap.get('raw_records') or snap.get('accepted_records') or snap['rows']
     if snap['phase']=='database':
-        st.info(f"DB確認中｜読み込み候補 {snap['rows']}件・{snap['pages']}ページ｜経過 {snap['elapsed']}秒")
+        st.info(f"DB確認中｜Supabase保存レコード {db_records}件・{snap['pages']}ページ｜読込キー {snap['rows']}件｜経過 {snap['elapsed']}秒")
     elif snap['phase']=='refreshing':
-        st.info(f"最新保存分を再確認中｜保存データ {snap['rows']}件｜地図準備 {snap['done_addresses']}/{snap['addresses']}住所｜配置 {snap['placed']}件｜差分反映 {snap['catchup_changes']}件｜経過 {snap['elapsed']}秒")
+        st.info(f"最新保存分を再確認中｜地図表示物件 {snap['rows']}件｜地図準備 {snap['done_addresses']}/{snap['addresses']}住所｜配置 {snap['placed']}件｜差分反映 {snap['catchup_changes']}件｜経過 {snap['elapsed']}秒")
     elif snap['finished'] and snap['phase']=='complete':
         checked=('｜最新確認 '+acquisition_time_jst(snap['latest_checked_at'])) if snap.get('latest_checked_at') else ''
-        st.success(f"読み込み完了｜保存データ {snap['rows']}件｜地図準備 {snap['done_addresses']}/{snap['addresses']}住所｜配置 {snap['placed']}件｜住所キャッシュ {snap['persistent_cache_hits']}件｜差分反映 {snap['catchup_changes']}件{checked}｜所要 {snap['elapsed']}秒")
+        st.success(f"読み込み完了｜地図表示物件 {snap['rows']}件｜地図準備 {snap['done_addresses']}/{snap['addresses']}住所｜配置 {snap['placed']}件｜住所キャッシュ {snap['persistent_cache_hits']}件｜差分反映 {snap['catchup_changes']}件{checked}｜所要 {snap['elapsed']}秒")
+        if snap.get('raw_records'):
+            st.caption(f"Supabase保存レコード {snap['raw_records']}件｜物件ID確認済み {snap['property_id_records']}件｜旧形式IDなし {snap['legacy_records']}件。旧形式のうち、ID確認済みデータと家賃・間取り・住所が一致する {snap['legacy_shadowed']}件は二重表示候補として地図から除外し、一致しない {snap['legacy_unmatched']}件は表示しています。")
     elif snap['phase']=='failed':
-        st.error(f"読み込み停止｜保存データ {snap['rows']}件｜地図準備 {snap['done_addresses']}/{snap['addresses']}住所｜配置 {snap['placed']}件｜所要 {snap['elapsed']}秒")
+        st.error(f"読み込み停止｜DB保存レコード {db_records}件｜地図表示物件 {snap['rows']}件｜地図準備 {snap['done_addresses']}/{snap['addresses']}住所｜配置 {snap['placed']}件｜所要 {snap['elapsed']}秒")
     elif snap['phase']=='stopped':
-        st.info(f"読み込みを中止しました｜保存データ {snap['rows']}件｜地図準備 {snap['done_addresses']}/{snap['addresses']}住所｜配置 {snap['placed']}件｜所要 {snap['elapsed']}秒")
+        st.info(f"読み込みを中止しました｜DB保存レコード {db_records}件｜地図表示物件 {snap['rows']}件｜地図準備 {snap['done_addresses']}/{snap['addresses']}住所｜配置 {snap['placed']}件｜所要 {snap['elapsed']}秒")
     else:
-        st.info(f"保存データ {snap['rows']}件｜地図準備 {snap['done_addresses']}/{snap['addresses']}住所｜配置 {snap['placed']}件｜住所キャッシュ {snap['persistent_cache_hits']}件｜経過 {snap['elapsed']}秒")
+        st.info(f"地図表示物件 {snap['rows']}件｜地図準備 {snap['done_addresses']}/{snap['addresses']}住所｜配置 {snap['placed']}件｜住所キャッシュ {snap['persistent_cache_hits']}件｜経過 {snap['elapsed']}秒")
     if snap['error']:st.error(snap['error'])
     if snap['phase']=='stopped':st.caption('中止しました。読み込み済みの物件は保持しています。')
     if searching:st.caption('物件検索が終わると読み込み済みデータを地図へ反映できます。')
@@ -3998,11 +4125,17 @@ def saved_load_progress():
             if snap['finished'] and snap['phase']=='complete':st.session_state.saved_load_applied_token=job.token
             st.rerun()
     if not snap['finished'] and st.button('読み込み・地図準備を中止（読み込み済みを保持）',key='stop_saved_load',disabled=snap['stopping']):job.request_stop()
-    if st.button('読み込み済み全物件のCSVを準備',key='prepare_saved_load_csv',disabled=not snap['rows']):
+    if st.button('地図表示対象の物件CSVを準備',key='prepare_saved_load_csv',disabled=not snap['rows']):
         rows,_,_=job.export();st.session_state.saved_load_export={'token':job.token,'csv':csv_bytes(rows),'count':len(rows)}
     export=st.session_state.get('saved_load_export')
     if export and export['token']==job.token:
-        st.download_button(f"読み込み済み {export['count']}件のCSV",export['csv'],'sumai_saved_units.csv','text/csv',key='download_saved_load_csv',on_click='ignore')
+        st.download_button(f"地図表示対象 {export['count']}件のCSV",export['csv'],'sumai_saved_units.csv','text/csv',key='download_saved_load_csv',on_click='ignore')
+    if snap['finished'] and snap['phase']=='complete' and st.button('Supabase保存レコードの内訳CSVを準備',key='prepare_saved_record_audit'):
+        audit_rows=job.export_storage_record_audit()
+        st.session_state.saved_record_audit_export={'token':job.token,'count':len(audit_rows),'csv':csv_bytes_from_rows(audit_rows)}
+    audit_export=st.session_state.get('saved_record_audit_export')
+    if audit_export and audit_export['token']==job.token:
+        st.download_button(f"Supabase保存レコード内訳 {audit_export['count']}件のCSV",audit_export['csv'],'sumai_saved_record_breakdown.csv','text/csv',key='download_saved_record_audit',on_click='ignore')
 
 
 def capture_viewport():
@@ -4305,7 +4438,7 @@ class AutomaticCollection:
     """One low-concurrency collection loop per saved namespace; no Streamlit UI in its thread."""
     def __init__(self,db,settings,summary=None):
         validate_automatic_settings(settings);validate_automatic_summary(summary or {})
-        self.db=db;self.settings=dict(settings);self.settings['interval_minutes']=0;self.summary=dict(summary or {});self.summary.pop('next_run_at',None)
+        self.db=db;self.settings=dict(settings);self.settings['interval_minutes']=0;self.summary=dict(summary or {});self.summary.pop('next_run_at',None);self.build=BUILD
         self.lock=threading.RLock();self.io_lock=threading.Lock();self.stop_event=threading.Event()
         self.request_starts={};self.shared_web=PublicWeb();self.last_job=None;self.current=None;self.message='自動収集を準備しています';self.progress=0.;self.error=''
         self.thread=threading.Thread(target=self.run,daemon=True,name='housing-automatic-collection')
@@ -4318,7 +4451,7 @@ class AutomaticCollection:
     def snapshot(self):
         with self.lock:
             job=self.current
-            result=dict(settings=dict(self.settings),summary=dict(self.summary),message=self.message,error=self.error,
+            result=dict(settings=dict(self.settings),summary=dict(self.summary),message=self.message,error=self.error,build=getattr(self,'build',None),
                         running=self.thread.is_alive(),stopping=self.stop_event.is_set(),progress=self.progress)
         if job:
             snap=job.snapshot();result.update(message=snap['message'],progress=snap['progress'],current=snap)
@@ -4469,7 +4602,16 @@ def automatic_collection_panel():
     st.subheader('アプリ内の自動収集（SUUMO）')
     st.caption('画面を閉じてもサーバー稼働中は収集します。休止・再起動では止まり、次にアプリを開くと保存した設定・町の順番から再開します。')
     controller=get_automatic_collection();snap=controller.snapshot() if controller else None
+    if controller:
+        try:
+            bridged=persist_cached_controller_failures(controller)
+            if bridged:st.session_state['_compat_failures_last_saved']=bridged
+            st.session_state.pop('_compat_failures_error',None)
+        except Exception as exc:
+            st.session_state['_compat_failures_error']=str(exc) if isinstance(exc,AppError) else type(exc).__name__
     busy=bool(snap and snap['running'])
+    if controller and getattr(controller,'build',None)!=BUILD:
+        st.warning('現在の自動収集エンジンはデプロイ前の旧版がサーバー内に残っています。エラー履歴は現行版で回収しますが、取得ロジックを最新版へ切り替えるには一度「自動収集を中止」してから「開始・再開」を押してください。保存済み物件は消えません。')
     bounds=st.session_state.get('new_bounds')
     saved=snap['settings'] if snap else st.session_state.get('automatic_saved_settings',{})
     ward_code=st.selectbox('自動収集する区',list(TOKYO_WARDS),index=list(TOKYO_WARDS).index(saved.get('ward_code','13116')),format_func=lambda code:TOKYO_WARDS[code],key='automatic_ward')
@@ -4512,10 +4654,18 @@ def automatic_collection_panel():
     if st.button('Supabaseに保存済みの全取得エラーを準備・更新',key='automatic_all_failures_prepare'):
         try:
             with st.spinner('全検索・全町の保存済みエラーを読み込んでいます'):
-                error_db=controller.db if controller else Database()
+                # A cached automatic-collection controller can survive a Streamlit hot reload and
+                # still hold a Database instance created by the previous app version.  Call the
+                # current implementation compatibly instead of assuming the cached object's class
+                # already has the newly added diagnostic methods.
+                # Always use a fresh current-version Database object.  The active automatic
+                # controller may have been created by an older build and kept alive by
+                # st.cache_resource across deploys.
+                error_db=Database()
                 events=error_db.load_diagnostic_failures();rows=acquisition_failure_rows(events)
                 st.session_state.all_acquisition_failures={'rows':rows,'csv':csv_bytes_from_rows(rows),'prepared_at':utc_now()}
         except AppError as exc:st.error(str(exc))
+        except Exception as exc:st.error('保存済み取得エラーの読み込みに失敗しました：'+type(exc).__name__)
     all_failures=st.session_state.get('all_acquisition_failures')
     if all_failures:
         st.caption(f"Supabaseへ都度保存済みの取得エラー {len(all_failures['rows'])}件｜準備日時 {acquisition_time_jst(all_failures['prepared_at'])}")
