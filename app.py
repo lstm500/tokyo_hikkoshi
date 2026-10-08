@@ -38,7 +38,7 @@ import streamlit as st
 from streamlit_folium import st_folium
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v62"
+BUILD = "REBUILD-01-v63"
 PROVIDER_OPTIONS = ("スマイティ","HOMES","SUUMO","カナリー","アットホーム","CHINTAI","Comfy","アパマンショップ")
 PROVIDER_CANONICAL = {"HOMES":"HOME’S","HOME’S":"HOME’S","スマイティ":"スマイティ","SUUMO":"SUUMO","カナリー":"カナリー",
                       "アットホーム":"アットホーム","CHINTAI":"CHINTAI","Comfy":"Comfy","アパマンショップ":"アパマンショップ"}
@@ -53,6 +53,7 @@ DEFAULT_CENTER = (35.7303,139.711)
 UNIT_TABLE = "housing_units_v1"
 SEARCH_TABLE = "housing_searches_v1"
 PLACE_TABLE = "housing_places_v1"
+ADDRESS_POINT_KIND = "saved_address_point_v1"
 GROUPS = {"1K・1L・1DK": ("1K", "1L", "1DK"), "1LDK・2DK": ("1LDK", "2DK"),
           "2LDK・3DK": ("2LDK", "3DK"), "3LDK": ("3LDK",)}
 LAYOUTS = tuple(x for group in GROUPS.values() for x in group)
@@ -204,6 +205,12 @@ def address_key(value):
             number=digits.get(text)
         return (str(number) if number is not None else text)+'丁目'
     return re.sub(r'([一二三四五六七八九十]+)丁目',convert,value)
+
+
+
+def saved_address_point_key(address):
+    value=normal(address)
+    return hashlib.sha256(('saved-address-point-v1\0'+value).encode('utf-8')).hexdigest() if value else None
 
 
 
@@ -625,6 +632,11 @@ class Database:
         return list(unique.values())
 
     def save_units(self,rows):
+        address_points={}
+        for r in rows:
+            address=normal(r.get('address') or r.get('inferred_address')) if isinstance(r,dict) else ''
+            if address and isinstance(r,dict) and has_point(r) and r.get('coordinate_precision') not in ('town','unknown'):
+                address_points[address]=(float(r['latitude']),float(r['longitude']),normal(r.get('map_address') or address))
         unique={}
         for r in rows:
             compact=compact_saved_listing(r)
@@ -661,6 +673,9 @@ class Database:
             saved.update(key for key,_ in batch)
             self.last_save_stats['new']+=len(inserted);self.last_save_stats['updated']+=len(updates)
         if not set(unique)<=saved:raise AppError('Supabaseから募集情報の保存確認が得られません。')
+        if address_points:
+            try:self.save_address_points(address_points)
+            except AppError as exc:self.last_save_stats['address_cache_error']=str(exc)
         return saved
     def save_search(self,search):
         result=self.call('POST',SEARCH_TABLE,{'on_conflict':'namespace,id','select':'id'},
@@ -736,6 +751,51 @@ class Database:
         unique=list({r['key']:r for r in out}.values())
         self.last_load_diagnostic.update(before_key_merge=len(out),key_duplicates=len(out)-len(unique),returned=len(unique))
         return unique
+    def save_address_points(self,points):
+        """Persist address -> coordinate mappings so saved-listing loads do not geocode again."""
+        if not isinstance(points,dict) or not points:return 0
+        payload=[]
+        for address,point in points.items():
+            address=normal(address);key=saved_address_point_key(address)
+            if not key or not point:continue
+            try:
+                lat,lng=float(point[0]),float(point[1])
+            except (ValueError,TypeError,IndexError):continue
+            if not has_point({'latitude':lat,'longitude':lng}):continue
+            payload.append(dict(namespace=self.namespace,key=key,title=address[:220],kind=ADDRESS_POINT_KIND,
+                                latitude=lat,longitude=lng,fetched_at=utc_now()))
+        saved=0
+        for offset in range(0,len(payload),500):
+            batch=payload[offset:offset+500]
+            result=self.call('POST',PLACE_TABLE,{'on_conflict':'namespace,key','select':'key'},batch,
+                             'resolution=merge-duplicates,return=representation')
+            returned={r.get('key') for r in result if isinstance(r,dict)} if isinstance(result,list) else set()
+            expected={r['key'] for r in batch}
+            if not expected<=returned:raise AppError('住所座標キャッシュの保存を確認できません。')
+            saved+=len(expected)
+        return saved
+
+    def load_address_points(self,addresses,cancel_event=None):
+        """Load persistent address coordinates in pages and return only requested addresses."""
+        wanted={saved_address_point_key(a):normal(a) for a in addresses if saved_address_point_key(a)}
+        if not wanted:return {}
+        out={};offset=0
+        while True:
+            if cancel_event is not None and cancel_event.is_set():raise SearchCancelled()
+            rows=self.call('GET',PLACE_TABLE,{'namespace':'eq.'+self.namespace,'kind':'eq.'+ADDRESS_POINT_KIND,
+                'select':'key,title,latitude,longitude','order':'key.asc','limit':1000,'offset':offset})
+            if not isinstance(rows,list):raise AppError('住所座標キャッシュを読み取れません。')
+            for row in rows:
+                key=str(row.get('key') or '')
+                address=wanted.get(key)
+                if not address:continue
+                try:point=(float(row['latitude']),float(row['longitude']),address)
+                except (KeyError,ValueError,TypeError):continue
+                if has_point({'latitude':point[0],'longitude':point[1]}):out[address]=point
+            if len(out)>=len(wanted) or len(rows)<1000:break
+            offset+=len(rows)
+        return out
+
     def save_places(self,rows,kind):
         if not rows: return set()
         payload=[dict(namespace=self.namespace,key=hashlib.sha256((kind+r['name']+str(r['lat'])+str(r['lng'])).encode()).hexdigest(),
@@ -3366,13 +3426,13 @@ def hydrate_saved_units(rows,bounds,cache=None,web=None,notify=None):
     cache=cache if isinstance(cache,dict) else {};addresses=list(dict.fromkeys(r['address'] for r in rows if r.get('address')));web=web or PublicWeb()
     def locate_address(address):
         web.check_cancel()
-        if not getattr(web,'address_points',None) and cache.get(address):return cache[address]
+        if cache.get(address):return cache[address]
         return geocode_saved_address_cached(web,address)
     pending=[]
     for address in addresses:
         web.check_cancel()
         memory=getattr(web,'address_points',None)
-        point=cached_saved_position(memory,address) if memory else cache.get(address)
+        point=cache.get(address) or (cached_saved_position(memory,address) if memory else None)
         if point:
             cache[address]=point
             if notify:notify(address,point,None)
@@ -3389,13 +3449,14 @@ class SavedLoadJob:
     def __init__(self,db,bounds,cache=None):
         self.db=db;self.bounds=bounds;self.token=hashlib.sha256(os.urandom(32)).hexdigest();self.server_key=manual_registry_key(db)
         self.lock=threading.RLock();self.cancel_event=threading.Event();self.rows={};self.cache={}  # Session points lack timestamps; reuse only the TTL-controlled server cache.
-        self.phase='database';self.finished=False;self.error='';self.complete_db=False;self.pages=0;self.total_addresses=0;self.done_addresses=0;self.placed=0;self.diagnostic={};self.started=time.monotonic();self.ended=None
+        self.phase='database';self.finished=False;self.error='';self.complete_db=False;self.pages=0;self.total_addresses=0;self.done_addresses=0;self.placed=0;self.persistent_cache_hits=0;self.geocoded_addresses=0;self.diagnostic={};self.started=time.monotonic();self.ended=None
         self.thread=threading.Thread(target=self.run,daemon=True,name='housing-saved-loader')
     def snapshot(self):
         with self.lock:
             end=self.ended if self.ended is not None else time.monotonic()
             return {'token':self.token,'phase':self.phase,'finished':self.finished,'error':self.error,'complete_db':self.complete_db,
                 'rows':len(self.rows),'pages':self.pages,'addresses':self.total_addresses,'done_addresses':self.done_addresses,'placed':self.placed,
+                'persistent_cache_hits':self.persistent_cache_hits,'geocoded_addresses':self.geocoded_addresses,
                 'elapsed':round(end-self.started,1),'stopping':self.cancel_event.is_set()}
     def export(self):
         with self.lock:return [dict(r) for r in self.rows.values()],dict(self.cache),dict(self.diagnostic)
@@ -3412,10 +3473,21 @@ class SavedLoadJob:
         try:
             stored=self.db.load_units(None,on_progress=page,cancel_event=self.cancel_event)
             addresses=list(dict.fromkeys(r['address'] for r in stored));by_address={a:[] for a in addresses}
+            # Persistent cache is loaded in one paged DB pass.  This avoids repeating
+            # GSI address searches on every click after the first successful placement.
+            persistent={}
+            try:persistent=self.db.load_address_points(addresses,self.cancel_event)
+            except AppError as exc:
+                with self.lock:self.diagnostic['persistent_address_cache_load_error']=str(exc)
+            for address,point in persistent.items():
+                self.cache[address]=point
+                remember_saved_position(web.address_points,address,point)
             with self.lock:
+                self.persistent_cache_hits=len(persistent)
                 self.rows={r['key']:hydrated_listing(r,self.cache.get(r['address']) or cached_saved_position(web.address_points,r['address'])) for r in stored}
                 self.complete_db=True;self.phase='positions';self.total_addresses=len(addresses);self.placed=sum(has_point(r) for r in self.rows.values())
                 for row in stored:by_address[row['address']].append(row['key'])
+            newly_geocoded={}
             def positioned(address,point,error):
                 with self.lock:
                     self.done_addresses+=1
@@ -3423,7 +3495,14 @@ class SavedLoadJob:
                         old=self.rows[key];new=hydrated_listing(old,point);self.rows[key]=new
                         self.placed+=int(has_point(new))-int(has_point(old))
                     self.cache[address]=point
+                    if point and address not in persistent:newly_geocoded[address]=point;self.geocoded_addresses+=1
             hydrate_saved_units(stored,self.bounds,self.cache,web,positioned)
+            if newly_geocoded:
+                try:
+                    self.db.save_address_points(newly_geocoded)
+                    with self.lock:self.diagnostic['persistent_address_cache_saved']=len(newly_geocoded)
+                except AppError as exc:
+                    with self.lock:self.diagnostic['persistent_address_cache_save_error']=str(exc)
             with self.lock:self.phase='complete'
         except SearchCancelled:
             with self.lock:self.phase='stopped'
@@ -3431,7 +3510,8 @@ class SavedLoadJob:
             with self.lock:self.error=str(exc) if isinstance(exc,AppError) else '読み込みエラー（'+type(exc).__name__+'）';self.phase='failed'
         finally:
             with self.lock:
-                self.diagnostic.update(geocoded_total=self.placed,returned=len(self.rows),database_complete=self.complete_db)
+                self.diagnostic.update(geocoded_total=self.placed,returned=len(self.rows),database_complete=self.complete_db,
+                                       persistent_address_cache_hits=self.persistent_cache_hits,newly_geocoded_addresses=self.geocoded_addresses)
                 self.ended=time.monotonic();self.finished=True
 
 
@@ -3495,13 +3575,13 @@ def saved_load_progress():
     if snap['phase']=='database':
         st.info(f"保存データ読み込み中｜{snap['rows']}件・{snap['pages']}ページ｜経過 {snap['elapsed']}秒")
     elif snap['finished'] and snap['phase']=='complete':
-        st.success(f"読み込み完了｜保存データ {snap['rows']}件｜地図準備 {snap['done_addresses']}/{snap['addresses']}住所｜配置 {snap['placed']}件｜所要 {snap['elapsed']}秒")
+        st.success(f"読み込み完了｜保存データ {snap['rows']}件｜地図準備 {snap['done_addresses']}/{snap['addresses']}住所｜配置 {snap['placed']}件｜住所キャッシュ {snap['persistent_cache_hits']}件｜所要 {snap['elapsed']}秒")
     elif snap['phase']=='failed':
         st.error(f"読み込み停止｜保存データ {snap['rows']}件｜地図準備 {snap['done_addresses']}/{snap['addresses']}住所｜配置 {snap['placed']}件｜所要 {snap['elapsed']}秒")
     elif snap['phase']=='stopped':
         st.info(f"読み込みを中止しました｜保存データ {snap['rows']}件｜地図準備 {snap['done_addresses']}/{snap['addresses']}住所｜配置 {snap['placed']}件｜所要 {snap['elapsed']}秒")
     else:
-        st.info(f"保存データ {snap['rows']}件｜地図準備 {snap['done_addresses']}/{snap['addresses']}住所｜配置 {snap['placed']}件｜経過 {snap['elapsed']}秒")
+        st.info(f"保存データ {snap['rows']}件｜地図準備 {snap['done_addresses']}/{snap['addresses']}住所｜配置 {snap['placed']}件｜住所キャッシュ {snap['persistent_cache_hits']}件｜経過 {snap['elapsed']}秒")
     if snap['error']:st.error(snap['error'])
     if snap['phase']=='stopped':st.caption('中止しました。読み込み済みの物件は保持しています。')
     if searching:st.caption('物件検索が終わると読み込み済みデータを地図へ反映できます。')
