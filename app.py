@@ -39,7 +39,7 @@ import streamlit as st
 from streamlit_folium import st_folium
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v93"
+BUILD = "REBUILD-01-v95"
 
 # ============================================================================
 # NON-NEGOTIABLE SUUMO ADDRESS POLICY -- DO NOT DELETE OR WEAKEN
@@ -221,7 +221,14 @@ DISPLAY_LAYOUT_GROUPS = {"group1": ("1LDK", "2K", "2DK"), "group2": ("2LDK", "3K
 HOMES_LAYOUTS = tuple(x for group in HOMES_LAYOUT_GROUPS for x in group)
 HOUSE_MAX_AGE = 40
 HOUSE_MIN_AREA = 50.0
-SUUMO_HOUSE_PARAMS = {'ts':'3','cn':'40','mb':'50','pc':'50'}
+# SUUMO building type filter: mansion=1, apartment=2, house/other=3.
+# Search 1 and 3 in separate passes so each has its own age/layout rules.
+SUUMO_BUILDING_TYPE_CODES = {'マンション':'1','アパート':'2','一戸建て・その他':'3'}
+SUUMO_TARGET_BUILDING_TYPES = ('マンション','一戸建て・その他')
+# SUUMO's public age dropdown may not offer a 40-year value. Do not submit
+# an unconfirmed cn=40 code which could produce an apparent zero-result page.
+# Keep the >=50 sqm public search filter and verify <=40 years in each detail.
+SUUMO_HOUSE_PARAMS = {'ts':SUUMO_BUILDING_TYPE_CODES['一戸建て・その他'],'mb':'50','pc':'50'}
 ALL_TARGET_LAYOUTS = tuple(dict.fromkeys((*LAYOUTS,*SUUMO_LAYOUTS,*HOMES_LAYOUTS,'1SLDK','2SLDK','3SLDK','1SDK','2SDK','3SDK','1SK')))
 WARD_LABELS = {
     "千代田区":(35.6938,139.7535), "中央区":(35.6707,139.7727), "港区":(35.6581,139.7516),
@@ -2593,12 +2600,14 @@ def homes_collect(web,region,bounds,munis,emit):
                             emit('unit',row);return 1
                         emit('rejected',1);return 0
                     except (AppError,ValueError,TypeError) as exc:
+                        if is_homes_http403_error(exc):raise
                         trace(web,'listing_failed',{'provider':'HOME’S','url':url,'decision':'failed','failed_stage':'detail.request_or_parse','category':'acquisition_failure','reason':str(exc),'exception_type':type(exc).__name__,'observed':getattr(exc,'diagnostic',{}),'expected':'物件詳細と必要項目を取得','evidence':list(getattr(web.local,'listing_evidence',[]))},'ERROR','rejection')
                         emit('rejected',1);emit('issue','HOMES詳細確認｜'+str(exc));trace(web,'detail_optional_error',{'url':url,'message':str(exc)},'WARNING','collector');return 0
                 finally:web.detail_slots.release()
 
             for item,_,error in bounded_results(list(enumerate(detail_urls,1)),detail_work,workers=DETAIL_PAGE_WORKERS,stop_event=web.cancel_event):
                 if error:
+                    if is_homes_http403_error(error):raise error
                     url=item[1] if isinstance(item,tuple) and len(item)>1 else ''
                     trace(web,'listing_failed',{'provider':'HOME\u2019S','url':url,'decision':'failed','failed_stage':'detail.worker',
                         'category':'acquisition_failure','reason':'parallel detail worker exception','exception_type':type(error).__name__,
@@ -2676,11 +2685,13 @@ def homes_house_collect(web,region,bounds,munis,emit):
                         emit('unit',row);return 1
                     emit('rejected',1);return 0
                 except (AppError,ValueError,TypeError) as exc:
+                    if is_homes_http403_error(exc):raise
                     trace(web,'listing_failed',{'provider':'HOME’S','url':url,'decision':'failed','failed_stage':'house.detail','category':'acquisition_failure','reason':str(exc),'exception_type':type(exc).__name__},'ERROR','rejection')
                     emit('rejected',1);emit('issue','HOMES一戸建て詳細確認｜'+str(exc));return 0
             finally:web.detail_slots.release()
         for item,_,error in bounded_results(list(enumerate(detail_urls,1)),detail_work,workers=DETAIL_PAGE_WORKERS,stop_event=web.cancel_event):
             if error:
+                if is_homes_http403_error(error):raise error
                 url=item[1] if isinstance(item,tuple) and len(item)>1 else ''
                 trace(web,'listing_failed',{'provider':'HOME’S','url':url,'decision':'failed','failed_stage':'house.detail.worker','category':'acquisition_failure','reason':'parallel detail worker exception','exception_type':type(error).__name__},'ERROR','rejection')
                 emit('rejected',1);emit('issue','HOMES一戸建て detail worker | '+type(error).__name__)
@@ -2873,7 +2884,7 @@ def suumo_ward_regions(web,code):
             name=re.sub(r'\s*[（(][\d,]+(?:件)?[）)]\s*$','',name)
             if not name:continue
             prepared={'url':url,'base_params':{**params,'oz':oz},'town':name,'selection_method':'区の公開町名選択フォーム',
-                      'mansion':('ts','1'),'age15':('cn','15'),'layout_filters':{layout:('md',value) for layout,value in SUUMO_LAYOUT_CODES.items()}}
+                      'mansion':('ts',SUUMO_BUILDING_TYPE_CODES['マンション']),'age15':('cn','15'),'layout_filters':{layout:('md',value) for layout,value in SUUMO_LAYOUT_CODES.items()}}
             regions[oz]={'code':code,'pref':'13','town':name,'suumo_town':name,'city_name':TOKYO_WARDS[code],
                          'label':'東京都'+TOKYO_WARDS[code]+name,'suumo_prepared':prepared}
     if not regions:raise AppError('選択した区のSUUMO町名リストを取得できません。')
@@ -2988,7 +2999,7 @@ def suumo_prepare_region(web,region):
         'base_params':base_params,
         'town':wanted,
         'selection_method':method,
-        'mansion':('ts','1'),
+        'mansion':('ts',SUUMO_BUILDING_TYPE_CODES['マンション']),
         'age15':('cn','15'),
         'layout_filters':{layout:('md',code) for layout,code in SUUMO_LAYOUT_CODES.items()},
     }
@@ -3000,7 +3011,7 @@ def suumo_prepare_region(web,region):
 
 def suumo_group_params(prepared,layouts,page=1):
     params=dict(prepared['base_params'])
-    params['ts']='1'                 # 建物の種類：マンション
+    params['ts']=SUUMO_BUILDING_TYPE_CODES['マンション']  # 建物の種類：マンション（アパートは除外）
     params['cn']='15'                # 築年数：15年以内
     params['md']=[SUUMO_LAYOUT_CODES[x] for x in layouts]
     params['pc']='50'
@@ -3008,6 +3019,37 @@ def suumo_group_params(prepared,layouts,page=1):
     # A form-control town selection can still use FR301, so retain its public page parameter there.
     if '/jj/chintai/ichiran/FR301FC001/' in prepared['url'] and page>1:params['page']=page
     return params
+
+
+def suumo_result_buildings(soup):
+    """Read SUUMO's building-list cards, allowing div/li layout variation."""
+    return soup.select('div.cassetteitem, li.cassetteitem')
+
+
+def suumo_explicit_zero_results(soup):
+    """Accept zero listings only when the response explicitly says so.
+
+    '該当する物件' alone or an unrelated '0件' is NOT zero-result evidence.
+    Treat changed markup, error pages and access verification as incomplete.
+    """
+    text=normal(soup.get_text(' ',strip=True))
+    patterns=(
+        r'条件に(?:あ|合)う物件(?:が|は)ありません',
+        r'ご希望の条件に(?:あ|合)う物件(?:が|は)ありません',
+        r'該当(?:する)?物件(?:が|は)(?:ありません|見つかりません)',
+        r'物件が見つかりません(?:でした)?',
+        r'検索結果(?:は|が)?\s*0\s*件',
+        r'該当(?:物件|件数)(?:は|が)?\s*0\s*件',
+        r'\b0\s*件\s*不動産会社が掲載',
+    )
+    return any(re.search(pattern,text) for pattern in patterns)
+
+
+def suumo_house_other_type(value):
+    """SUUMO's third category includes terrace/town houses and 'other'."""
+    text=normal(value).replace(' ','')
+    if not text or re.search(r'アパート|マンション',text):return False
+    return bool(re.search(r'一戸建(?:て)?|戸建(?:て)?|貸家|テラスハウス|タウンハウス|連棟|その他',text))
 
 
 def _clean_suumo_building_name(value):
@@ -3065,12 +3107,14 @@ def _suumo_next_url(soup,response_url,filter_params):
     target=generic_next_page(soup,response_url,'SUUMO')
     if not target:return None
     u=urlparse(target)
-    if not u.query:
-        # Some SEO pagination hrefs omit the current filters in crawled/static HTML.
-        # Reattach only the search filters; the oz_ path itself retains the town.
-        keep={k:v for k,v in filter_params.items() if k in ('ts','cn','md','mb','pc','ar','bs','ta','sc','srch_navi')}
-        target=u._replace(query=urlencode(keep,doseq=True)).geturl()
-    return target
+    # Even when the pagination href contains ?page=..., the site may omit the
+    # active building type, area, age or layout filters. Keep the search scope
+    # stable across every page, without overwriting the page number or path.
+    query=parse_qs(u.query,keep_blank_values=True)
+    for key,value in filter_params.items():
+        if key in ('ts','cn','md','mb','pc','ar','bs','ta','sc','srch_navi','oz'):
+            query[key]=[str(v) for v in value] if isinstance(value,(tuple,list)) else [str(value)]
+    return u._replace(query=urlencode(query,doseq=True)).geturl()
 
 
 def suumo_jnc_key(url):
@@ -3431,10 +3475,15 @@ def suumo_collect(web,region,bounds,munis,emit):
         emit('message',f'SUUMO条件{group_number}｜マンション｜築15年以内｜'+ '・'.join(layouts))
         while current_url:
             reply=web.fetch(current_url,params=current_params if current_params else None);soup=BeautifulSoup(reply.text,'html.parser')
-            buildings=soup.select('div.cassetteitem')
+            buildings=suumo_result_buildings(soup)
             if not buildings:
-                page_text=normal(soup.get_text(' ',strip=True))
-                if any(t in page_text for t in ('該当する物件','該当物件','物件が見つかりません','0件')):break
+                if suumo_explicit_zero_results(soup):
+                    trace(web,'empty',{'provider':'SUUMO','group':list(layouts),'page':page_number,
+                          'url':reply.url,'reason':'公開検索結果に0件の明示表示'},stage='pagination')
+                    break
+                trace(web,'parse',{'provider':'SUUMO','group':list(layouts),'page':page_number,
+                      'url':reply.url,'page_title':normal(soup.title.get_text(' ',strip=True)) if soup.title else '',
+                      'reason':'物件カードも明示的な0件表示もない'},'ERROR','pagination')
                 raise AppError(f'SUUMO 条件{group_number}・{page_number}ページ目の一覧を確認できません。')
             signature=hashlib.sha256(str(buildings).encode()).hexdigest()
             if signature in seen_pages:
@@ -3534,18 +3583,26 @@ def suumo_collect(web,region,bounds,munis,emit):
 
 
 def suumo_house_collect(web,region,bounds,munis,emit):
-    """SUUMO detached houses: same town route, ts=3, <=40y, >=50 sqm."""
+    """SUUMO third building-type category: house/other, <=40y, >=50 sqm."""
     prepared=suumo_prepare_region(web,region);filter_params=dict(prepared['base_params']);filter_params.update(SUUMO_HOUSE_PARAMS)
     current_url=prepared['url'];current_params=filter_params;seen_pages=set();seen_urls=set();seen_ids=set();page_number=1;found=0
     collection_towns=[town_base_name(region.get('town',''))];scope=dict(getattr(DIAG_CONTEXT,'scope',{}))
-    emit('message','SUUMO条件3｜一戸建て・貸家｜築40年以内｜50㎡以上')
+    emit('message','SUUMO条件3｜一戸建て・その他（アパート除外）｜築40年以内｜50㎡以上')
+    trace(web,'suumo_building_type_filter',{'selected':'一戸建て・その他','ts':filter_params['ts'],
+        'excluded':'アパート','age_years_checked_in_detail':HOUSE_MAX_AGE,
+        'min_area_sqm':HOUSE_MIN_AREA},stage='search_conditions')
     while current_url:
         reply=web.fetch(current_url,params=current_params if current_params else None);current_params=None;soup=BeautifulSoup(reply.text,'html.parser')
-        buildings=soup.select('div.cassetteitem')
+        buildings=suumo_result_buildings(soup)
         if not buildings:
-            page_text=normal(soup.get_text(' ',strip=True))
-            if any(t in page_text for t in ('該当する物件','該当物件','物件が見つかりません','0件')):break
-            raise AppError(f'SUUMO 一戸建て・{page_number}ページ目の一覧を確認できません。')
+            if suumo_explicit_zero_results(soup):
+                trace(web,'empty',{'provider':'SUUMO','group':'一戸建て・その他','page':page_number,
+                      'url':reply.url,'reason':'公開検索結果に0件の明示表示'},stage='pagination')
+                break
+            trace(web,'parse',{'provider':'SUUMO','group':'一戸建て・その他','page':page_number,
+                  'url':reply.url,'page_title':normal(soup.title.get_text(' ',strip=True)) if soup.title else '',
+                  'reason':'物件カードも明示的な0件表示もない','requested_type_code':filter_params['ts']},'ERROR','pagination')
+            raise AppError(f'SUUMO 一戸建て・その他・{page_number}ページ目の一覧を確認できません。')
         signature=hashlib.sha256(str(buildings).encode()).hexdigest()
         if signature in seen_pages:raise AppError('SUUMO一戸建てのページ送りが同じ一覧を返しました。全ページを確認できていません。')
         seen_pages.add(signature);page_candidates=[];page_skipped=0;skip_examples=[]
@@ -3588,8 +3645,11 @@ def suumo_house_collect(web,region,bounds,munis,emit):
                     if not layout:
                         reject_listing(web,'SUUMO',url,'detail.layout','missing_data','一戸建ての間取りを読み取れない',fields['raw_layout'],'間取り');emit('rejected',1);return
                     type_text=normal(fields.get('building_type'))
-                    if type_text and not re.search(r'一戸建(?:て)?|戸建(?:て)?|貸家',type_text):
-                        reject_listing(web,'SUUMO',url,'detail.building_type','condition','建物種別が一戸建て・貸家と一致しない',type_text,'一戸建て・貸家');emit('rejected',1);return
+                    if not suumo_house_other_type(type_text):
+                        reject_listing(web,'SUUMO',url,'detail.building_type',
+                            'condition' if type_text else 'missing_data',
+                            '建物種別が「一戸建て・その他」と確認できない（アパート除外）',
+                            type_text,'一戸建て・その他');emit('rejected',1);return
                     age,ym=age_info(fields['raw_age'])
                     if age is None or age>HOUSE_MAX_AGE:
                         reject_listing(web,'SUUMO',url,'detail.age','missing_data' if age is None else 'condition','築年数が40年以内と確認できない',{'raw':fields['raw_age'],'years':age},'40年以内');emit('rejected',1);return
@@ -4139,10 +4199,28 @@ def search_all(db,conditions,screen,state=None):
                 if number<len(targets):jobs.append((targets[number],provider))
         if conditions.get('mode')=='automatic_collection':
             if not jobs:raise AppError('自動収集する町が見つかりません。対象範囲を変更してください。')
-            index=int(conditions.get('auto_task_index',0))%len(jobs)
-            conditions['auto_total_tasks']=len(jobs);conditions['auto_task_index']=index
-            conditions['auto_task_label']=jobs[index][0]['label']+'｜'+jobs[index][1]
-            jobs=[jobs[index]]
+            requested_label=normal(conditions.get('auto_task_label'))
+            if requested_label:
+                matches=[(i,region,provider) for i,(region,provider) in enumerate(jobs)
+                         if region['label']+'｜'+PROVIDER_DISPLAY.get(provider,provider)==requested_label]
+                if len(matches)==1:
+                    index=matches[0][0]
+                    conditions['auto_total_tasks']=len(jobs);conditions['auto_task_index']=index
+                    jobs=[jobs[index]]
+                elif (not matches and provider_fallbacks and
+                      requested_label.endswith('｜HOMES')):
+                    # The current HOME'S task has become unavailable. Do not use
+                    # its old numeric index to run a *different SUUMO town*.
+                    conditions['auto_homes_task_skipped_403']=True
+                    conditions['auto_total_tasks']=len(jobs)
+                    jobs=[]
+                else:
+                    raise AppError('自動収集の対象町・取得元が一致しません。誤った町を検索しないため停止します：'+requested_label)
+            else:
+                index=int(conditions.get('auto_task_index',0))%len(jobs)
+                conditions['auto_total_tasks']=len(jobs);conditions['auto_task_index']=index
+                conditions['auto_task_label']=jobs[index][0]['label']+'｜'+PROVIDER_DISPLAY.get(jobs[index][1],jobs[index][1])
+                jobs=[jobs[index]]
         db.job_new_keys=set()
         q=queue.Queue();active={};done=0;candidate=detail=rejected=skipped=incomplete=issue_events=0;save_buffer={};save_failed_keys=set();last_flush=time.monotonic()
         def work(index,region,provider):
@@ -5593,6 +5671,43 @@ def automatic_task_plan(settings):
     return plan
 
 
+def reconcile_automatic_task_progress(summary, old_plan, new_plan, just_completed_label=None):
+    """Preserve completed provider/town tasks when HOME'S disappears or returns.
+
+    Task indices are positions in an *interleaved provider list*, not stable town
+    identities.  Reusing a numeric index after a 403 can run the wrong town;
+    resetting it to zero discards successfully completed SUUMO work.  Always
+    transfer progress by full, provider-qualified task labels instead.
+    """
+    old_labels=list(summary.get('task_labels') or [task['label'] for task in old_plan])
+    raw_completed=summary.get('cycle_completed_indices')
+    if raw_completed is None:
+        # Compatibility with older settings that stored only the next index.
+        raw_completed=list(range(max(0,int(summary.get('next_task_index',0) or 0))))
+    completed_labels={old_labels[int(i)] for i in raw_completed
+                      if str(i).isdigit() and 0<=int(i)<len(old_labels)}
+    if just_completed_label:
+        completed_labels.add(just_completed_label)
+    new_labels=[task['label'] for task in new_plan]
+    completed=[i for i,label in enumerate(new_labels) if label in completed_labels]
+    summary['task_labels']=new_labels
+    summary['total_tasks']=len(new_labels)
+    summary['cycle_completed_indices']=completed
+    if new_labels and len(completed)==len(new_labels):
+        if not summary.get('cycle_reset_pending'):
+            summary['last_cycle_completed_at']=utc_now()
+        summary['cycle_reset_pending']=True
+        next_index=0
+    else:
+        summary.pop('cycle_reset_pending',None)
+        completed_set=set(completed)
+        next_index=next((i for i in range(len(new_labels)) if i not in completed_set),0)
+    summary['next_task_index']=next_index
+    summary['current_task_index']=next_index
+    summary['current_task_label']=new_labels[next_index] if new_labels else ''
+    return next_index
+
+
 def load_persisted_error_events_fast(db):
     """Load current per-error rows first so a usable CSV becomes available quickly."""
     events=[];seen=set();last_id=''
@@ -5684,13 +5799,16 @@ class AutomaticCollection:
     def apply_homes_403_fallback(self,regions):
         providers=[canonical_provider(p) for p in (self.settings.get('providers') or [])]
         if 'HOME’S' not in providers:return False
+        old_plan=automatic_task_plan(self.settings)
         if self.settings.get('homes_disabled_reason')=='HTTP 403':
-            self.settings['providers']=['SUUMO'];return True
+            self.settings['providers']=['SUUMO']
+            reconcile_automatic_task_progress(self.summary,old_plan,automatic_task_plan(self.settings))
+            return True
         ok,item=homes_preflight_or_fallback(self.shared_web,regions)
         if ok:return False
         self.settings['providers']=['SUUMO'];self.settings['homes_disabled_reason']='HTTP 403';self.settings['homes_disabled_at']=utc_now()
         self.summary['provider_fallbacks']=[item or {'provider':'HOME’S','reason':'HTTP 403'}]
-        self.summary['next_task_index']=0;self.summary['cycle_completed_indices']=[]
+        reconcile_automatic_task_progress(self.summary,old_plan,automatic_task_plan(self.settings))
         self.message='HOMESはHTTP 403のため、この自動収集ではSUUMOのみで続行します。'
         return True
     def ensure_plan(self):
@@ -5699,7 +5817,10 @@ class AutomaticCollection:
                 self.apply_homes_403_fallback(self.settings.get('auto_regions') or [])
                 plan=automatic_task_plan(self.settings)
                 if plan:
-                    self.summary['task_labels']=[p['label'] for p in plan];self.summary['total_tasks']=len(plan)
+                    if self.summary.get('task_labels')!=[p['label'] for p in plan]:
+                        reconcile_automatic_task_progress(self.summary,[],plan)
+                    else:
+                        self.summary['total_tasks']=len(plan)
                     return plan
         self.shared_web.cancel_event=self.stop_event
         if hasattr(self.shared_web,'configure'):self.shared_web.configure(getattr(self.db,'web_config',{}))
@@ -5711,7 +5832,10 @@ class AutomaticCollection:
             self.apply_homes_403_fallback(regions)
             plan=automatic_task_plan(self.settings)
             if not plan:raise AppError('自動収集する町が見つかりません。')
-            self.summary['task_labels']=[p['label'] for p in plan];self.summary['total_tasks']=len(plan)
+            if self.summary.get('task_labels')!=[p['label'] for p in plan]:
+                reconcile_automatic_task_progress(self.summary,[],plan)
+            else:
+                self.summary['total_tasks']=len(plan)
             if 'cycle_completed_indices' not in self.summary:
                 nxt=int(self.summary.get('next_task_index',0) or 0)%len(plan)
                 self.summary['cycle_completed_indices']=list(range(nxt))
@@ -5755,7 +5879,7 @@ class AutomaticCollection:
                     self.summary['task_labels']=[p['label'] for p in plan];self.summary['total_tasks']=total
                     self.summary['current_task_index']=index;self.summary['current_task_label']=plan[index]['label']
                     conditions={'bounds':[34,138,37,141],'ward_code':self.settings['ward_code'],'providers':list(self.settings['providers']),
-                                'mode':'automatic_collection','auto_task_index':index,
+                                'mode':'automatic_collection','auto_task_index':index,'auto_task_label':plan[index]['label'],
                                 'town_codes':list(self.settings.get('town_codes',[]))}
                     for key in ('auto_regions','auto_munis'):
                         if self.settings.get(key):conditions[key]=self.settings[key]
@@ -5780,10 +5904,15 @@ class AutomaticCollection:
                     self.summary['confirmed_observations']=int(self.summary.get('confirmed_observations',0))+len(snap['units'])
                     homes_fallback=bool(stats.get('homes_http403_fallback'))
                     if homes_fallback:
+                        original_task_label=plan[index]['label']
+                        original_provider=plan[index]['provider']
                         self.settings['providers']=['SUUMO'];self.settings['homes_disabled_reason']='HTTP 403';self.settings['homes_disabled_at']=utc_now()
                         self.summary['provider_fallbacks']=list(stats.get('provider_fallbacks') or [{'provider':'HOME’S','reason':'HTTP 403'}])
-                        self.summary['next_task_index']=0;self.summary['cycle_completed_indices']=[];self.summary.pop('cycle_reset_pending',None)
-                        new_plan=automatic_task_plan(self.settings);self.summary['task_labels']=[p['label'] for p in new_plan];self.summary['total_tasks']=len(new_plan)
+                        completed_suumo=(original_task_label if original_provider=='SUUMO' and
+                                         status in ('completed','partial') and not incomplete else None)
+                        reconcile_automatic_task_progress(self.summary,plan,automatic_task_plan(self.settings),completed_suumo)
+                        if completed_suumo:
+                            self.summary['completed_runs']=int(self.summary.get('completed_runs',0))+1
                         self.message='HOMESはHTTP 403のため停止しました。SUUMOのみで同じ対象範囲を続行します。'
                     elif status in ('completed','partial') and not incomplete:
                         total=max(1,int(conditions.get('auto_total_tasks',len(plan)) or len(plan)))
@@ -5893,9 +6022,11 @@ def start_automatic_collection(ward_code,interval_minutes=0,town_codes=None):
         old_snapshot=old.snapshot() if old else {}
         prior=old_snapshot.get('settings',st.session_state.get('automatic_saved_settings',{}))
         previous_summary=old_snapshot.get('summary',st.session_state.get('automatic_saved_summary',{}))
-        same_scope=(prior.get('ward_code')==settings['ward_code'] and sorted(prior.get('town_codes',[]))==settings['town_codes'] and
-                    [canonical_provider(p) for p in (prior.get('providers') or [])]==list(AUTOMATIC_REGION_PROVIDERS))
-        summary=previous_summary if same_scope else {}
+        # Provider availability is not part of the town scope. A previously saved
+        # SUUMO-only run must keep its completed towns when HOME'S is re-probed.
+        same_scope=(prior.get('ward_code')==settings['ward_code'] and
+                    sorted(prior.get('town_codes',[]))==settings['town_codes'])
+        summary=dict(previous_summary) if same_scope else {}
         for item in ('auto_regions','auto_munis'):
             if same_scope and prior.get(item):settings[item]=prior[item]
         controller=AutomaticCollection(db,settings,summary);controller.persist()
