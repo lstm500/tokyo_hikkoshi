@@ -39,7 +39,7 @@ import streamlit as st
 from streamlit_folium import st_folium
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v96"
+BUILD = "REBUILD-01-v97"
 
 # ============================================================================
 # NON-NEGOTIABLE SUUMO ADDRESS POLICY -- DO NOT DELETE OR WEAKEN
@@ -4122,8 +4122,19 @@ def search_all(db,conditions,screen,state=None):
         logs.append(f"{datetime.now().strftime('%H:%M:%S')}  {message}")
         screen['log'].code('\n'.join(logs[-15:]),language=None)
     screen['status'].info('検索実行中｜保存先の接続・新しいテーブルを確認しています')
-    if not getattr(db,'collection_checked',False):db.check();db.collection_checked=True
-    db.save_search(search);log('保存先確認OK。新しい検索を開始しました。')
+    try:
+        if not getattr(db,'collection_checked',False):db.check();db.collection_checked=True
+        db.save_search(search)
+    except Exception as exc:
+        message=str(exc) if isinstance(exc,AppError) else type(exc).__name__+': '+str(exc)
+        audit.add('database','save','ERROR',{'stage':'search.preflight','message':message,'traceback':traceback.format_exc()})
+        search['status']='failed'
+        search['summary']={'confirmed':0,'saved':0,'processed':0,'errors':0,'already_acquired':0,
+                           'issues':['保存先の初期確認に失敗：'+message], 'incomplete_tasks':1}
+        state.new_units=[];state.new_saved_keys=[];state.new_search=search
+        screen['status'].info('保存先の初期確認に失敗：'+message)
+        return search
+    log('保存先確認OK。新しい検索を開始しました。')
     web=getattr(state,'shared_web',None) or PublicWeb();web.audit=audit
     web.address_points=getattr(db,'address_points',None)
     web.http_cache.clear();web.failed_detail_urls.clear();web.unavailable_hosts.clear();web.claimed_ids=set()
@@ -4412,7 +4423,12 @@ def search_all(db,conditions,screen,state=None):
     audit.add('map','data_ready','INFO',{'confirmed_units':len(units),'colored_points':sum(has_point(r) for r in units.values()),'render_deferred_until_saved_data_load':False})
     screen['status'].info(f'検索終了｜処理 {final_processed}件｜保存 {len(saved)}件｜エラー {final_errors}件｜スキップ {skipped}件')
     audit.add('search','finish','INFO',{'status':search['status'],'summary':search['summary']})
-    audit.persist(db,force=True)
+    try:
+        audit.persist(db,force=True)
+    except Exception as exc:
+        diagnostic_error=type(exc).__name__+': '+str(exc)
+        search['summary']['diagnostic_storage_error']=diagnostic_error
+        search['summary']['issues']=list(search['summary'].get('issues') or [])+['詳細ログの保存に失敗：'+diagnostic_error]
     search['summary']['diagnostics']={'search_id':audit.search_id,'events':audit.count,'persisted_events':audit.persisted_events,
                                      'persisted_failures':audit.persisted_failures,'pending_failures':len(audit.pending_failures)}
     search['finished_at']=utc_now()
@@ -5380,8 +5396,22 @@ class SearchJob:
         screen={k:Display() for k in ('bar','status','log')}
         try: search_all(db,conditions,screen,self.state)
         except Exception as exc:
-            self.audit.add('search',diagnosis_code(str(exc)),'ERROR',{'message':str(exc) if isinstance(exc,AppError) else type(exc).__name__,'traceback':traceback.format_exc()})
-            self.state.new_search={'status':'failed','conditions':conditions,'summary':{'issues':[str(exc) if isinstance(exc,AppError) else '検索処理エラー（'+type(exc).__name__+'）'],'saved':len(self.state.new_saved_keys),'confirmed':len(self.state.new_units)}}
+            full_traceback=traceback.format_exc()
+            frames=traceback.extract_tb(exc.__traceback__)
+            at=next((f for f in reversed(frames) if f.filename.endswith('.py')),frames[-1] if frames else None)
+            location=(at.name+':'+str(at.lineno)) if at else 'unknown'
+            message=str(exc) if isinstance(exc,AppError) else type(exc).__name__+': '+str(exc)
+            reason='検索処理が異常終了｜発生箇所 '+location+': '+message
+            self.audit.add('search',diagnosis_code(message),'ERROR',{
+                'message':message,'exception_type':type(exc).__name__,
+                'exception_location':location,'traceback':full_traceback})
+            self.state.new_search={'status':'failed','conditions':conditions,'summary':{
+                'issues':[reason], 'exception_type':type(exc).__name__,
+                'exception_location':location,'saved':len(self.state.new_saved_keys),
+                'confirmed':len(self.state.new_units),
+                'processed':int((self.state.live_metrics or {}).get('processed',0)),
+                'errors':int((self.state.live_metrics or {}).get('errors',0)),
+                'already_acquired':int((self.state.live_metrics or {}).get('skipped',0))}}
         finally:
             try:self.audit.persist(db,force=True)
             except Exception:pass
@@ -5711,25 +5741,72 @@ def reconcile_automatic_task_progress(summary, old_plan, new_plan, just_complete
     return next_index
 
 
+def _diagnostic_event_key(event):
+    return (str(event.get('search_id') or ''),str(event.get('seq') or ''),
+            str(event.get('stage') or ''),str(event.get('code') or ''))
+
+
+def _diagnostic_fetch_page(db,params,requested=200):
+    """Read small PostgREST pages; a transient 5xx lowers payload, not data fidelity."""
+    limits=list(dict.fromkeys((requested,max(50,requested//2),25)))
+    latest=None
+    for attempt,limit in enumerate(limits):
+        current=dict(params,limit=limit)
+        try:
+            rows=db.call('GET',SEARCH_TABLE,current)
+            if not isinstance(rows,list):raise AppError('Supabase error-page response is not a list')
+            return rows,limit
+        except AppError as exc:
+            latest=exc
+            if not re.search(r'HTTP 5\d\d',str(exc)) or attempt==len(limits)-1:raise
+            time.sleep(.35*(attempt+1))
+    raise latest
+
+
 def load_persisted_error_events_fast(db):
-    """Load current per-error rows first so a usable CSV becomes available quickly."""
+    """Read one error record per event, using keyset pagination and bounded payloads."""
     events=[];seen=set();last_id=''
     while True:
-        params={'namespace':'eq.'+db.namespace,'status':'eq.diagnostic_error','select':'id,summary','order':'id.asc','limit':1000}
+        params={'namespace':'eq.'+db.namespace,'status':'eq.diagnostic_error',
+                'select':'id,summary','order':'id.asc'}
         if last_id:params['id']='gt.'+last_id
-        rows=db.call('GET',SEARCH_TABLE,params)
-        if not isinstance(rows,list):raise AppError('保存済み取得エラーを読み取れません。')
+        rows,limit=_diagnostic_fetch_page(db,params)
         if not rows:break
         for row in rows:
             event=(row.get('summary') or {}).get('event')
             if not isinstance(event,dict) or not diagnostic_failure_event(event):continue
-            key=(str(event.get('search_id') or ''),str(event.get('seq') or ''),str(event.get('stage') or ''),str(event.get('code') or ''))
+            key=_diagnostic_event_key(event)
             if key in seen:continue
             seen.add(key);events.append(event)
         new_last=str(rows[-1].get('id') or '')
-        if not new_last or new_last==last_id:break
+        if not new_last or new_last<=last_id:
+            raise AppError('Supabase error CSV pagination cursor did not advance')
         last_id=new_last
-        if len(rows)<1000:break
+        if len(rows)<limit:break
+    events.sort(key=lambda e:(str(e.get('time') or ''),str(e.get('search_id') or ''),int(e.get('seq') or 0)))
+    return events
+
+
+def load_legacy_diagnostic_error_events(db,current_events):
+    """Backfill older chunk-only diagnostics without reloading the new per-error rows."""
+    events=list(current_events);seen={_diagnostic_event_key(e) for e in events};last_id=''
+    while True:
+        params={'namespace':'eq.'+db.namespace,'status':'eq.diagnostic_log',
+                'select':'id,summary','order':'id.asc'}
+        if last_id:params['id']='gt.'+last_id
+        rows,limit=_diagnostic_fetch_page(db,params,requested=100)
+        if not rows:break
+        for row in rows:
+            for event in ((row.get('summary') or {}).get('events') or []):
+                if not diagnostic_failure_event(event):continue
+                key=_diagnostic_event_key(event)
+                if key in seen:continue
+                seen.add(key);events.append(event)
+        new_last=str(rows[-1].get('id') or '')
+        if not new_last or new_last<=last_id:
+            raise AppError('Supabase historic error CSV pagination cursor did not advance')
+        last_id=new_last
+        if len(rows)<limit:break
     events.sort(key=lambda e:(str(e.get('time') or ''),str(e.get('search_id') or ''),int(e.get('seq') or 0)))
     return events
 
@@ -5738,11 +5815,14 @@ class AutomaticFailureExport:
     """Refresh the unified error CSV in the background; the UI never waits for preparation."""
     def __init__(self,db):
         self.db=db;self.lock=threading.RLock();self.running=False;self.loaded=False;self.error='';self.phase='idle'
-        self.rows=[];self.csv=csv_bytes_from_rows([]);self.updated_at=None;self.updated_monotonic=0.;self.thread=None
+        self.rows=[];self.csv=csv_bytes_from_rows([]);self.updated_at=None;self.updated_monotonic=0.;self.last_attempt_monotonic=0.;self.thread=None
     def refresh(self,max_age=60):
         with self.lock:
             if self.running:return
-            if self.loaded and time.monotonic()-self.updated_monotonic<max_age:return
+            now=time.monotonic()
+            # Do not hammer a failing Supabase endpoint on every Streamlit rerun.
+            if self.last_attempt_monotonic and now-self.last_attempt_monotonic<max_age:return
+            self.last_attempt_monotonic=now
             self.running=True;self.error='';self.phase='current_errors'
             self.thread=threading.Thread(target=self._run,daemon=True,name='housing-error-export')
             self.thread.start()
@@ -5755,7 +5835,7 @@ class AutomaticFailureExport:
                 self.updated_monotonic=time.monotonic();self.loaded=True;self.error='';self.phase='historical_backfill'
             # Older builds stored errors only inside diagnostic-log chunks. Merge those
             # after the current per-error rows are already downloadable.
-            events=load_diagnostic_failures_compat(self.db)
+            events=load_legacy_diagnostic_error_events(self.db,fast_events)
             rows=acquisition_failure_rows(events)
             with self.lock:
                 self.rows=rows;self.csv=csv_bytes_from_rows(rows);self.updated_at=utc_now()
@@ -5906,7 +5986,11 @@ class AutomaticCollection:
                     self.summary.pop('next_run_at',None)
                     if status=='failed' or incomplete:
                         self.settings['enabled']=False;self.stop_event.set()
-                        self.error='今回の町の全ページ確認を完了できませんでした。原因を確認して同じ町から再開してください。'
+                        last_issues=stats.get('issues') or []
+                        if status=='failed':
+                            self.error='検索処理が失敗しました。'+(str(last_issues[-1])[:320] if last_issues else '詳細ログの例外発生箇所を確認してください。')
+                        else:
+                            self.error='今回の町の全ページ確認を完了できませんでした。原因を確認して同じ町から再開してください。'
                     self.message='取得に失敗したため自動収集を中止しました。' if status=='failed' or incomplete else '取得・保存処理を中止しました。' if status=='cancelled' else '保存完了。次の町へ進みます。'
                 self.persist()
         except Exception as exc:
@@ -6114,12 +6198,15 @@ def automatic_collection_panel():
             st.caption('詳細ログは収集開始後に自動で表示されます。')
 
     try:
-        error_job=get_automatic_failure_export(max_age=120,refresh=not busy);failure=error_job.snapshot()
+        error_job=get_automatic_failure_export(max_age=900,refresh=not busy);failure=error_job.snapshot()
+        if st.button('エラーCSVを更新',key='automatic_refresh_error_csv',disabled=busy or error_job.running):
+            error_job.refresh(max_age=0)
+            st.rerun()
         if failure['loaded']:
             st.download_button(f"全取得エラーCSV（1エラー1行・{len(failure['rows'])}行）",
                                failure['csv'],'sumai_all_acquisition_errors.csv','text/csv',
                                key='automatic_all_errors_csv',on_click='ignore',use_container_width=True)
-            status='過去ログも裏で統合中' if failure['running'] and failure.get('phase')=='historical_backfill' else '裏で最新化中' if failure['running'] else '最新'
+            status='過去ログの統合が未完了' if failure.get('phase')=='partial' else '過去ログも裏で統合中' if failure['running'] and failure.get('phase')=='historical_backfill' else '裏で最新化中' if failure['running'] else '最新'
             st.caption(f"エラーCSV：{status}｜最終同期 {acquisition_time_jst(failure.get('updated_at'))}｜同じ物件で複数エラーがあれば複数行です。")
         else:
             st.download_button('全取得エラーCSV',b'','sumai_all_acquisition_errors.csv','text/csv',
