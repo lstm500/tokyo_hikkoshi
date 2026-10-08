@@ -38,7 +38,7 @@ import streamlit as st
 from streamlit_folium import st_folium
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v63"
+BUILD = "REBUILD-01-v64"
 PROVIDER_OPTIONS = ("スマイティ","HOMES","SUUMO","カナリー","アットホーム","CHINTAI","Comfy","アパマンショップ")
 PROVIDER_CANONICAL = {"HOMES":"HOME’S","HOME’S":"HOME’S","スマイティ":"スマイティ","SUUMO":"SUUMO","カナリー":"カナリー",
                       "アットホーム":"アットホーム","CHINTAI":"CHINTAI","Comfy":"Comfy","アパマンショップ":"アパマンショップ"}
@@ -107,8 +107,11 @@ CROWD = {
     '田園都市線':(138,'池尻大橋 → 渋谷','7:50〜8:50'),
 }
 BANDS = (100000,125000,150000,175000,200000,225000,250000,275000,300000,350000,400000)
-COLORS = ("#3346a8","#2468c4","#168fcb","#12aeb0","#159b70","#5eab39",
-          "#a4b72b","#d3b524","#e79820","#e66c24","#dc422c","#bd1829")
+# High-contrast cool-to-warm rent scale: lower rents are blue, middle rents move through
+# cyan/green/yellow, and higher rents become orange/red. Each adjacent band deliberately
+# changes hue enough to stay distinguishable on the grayscale base map.
+COLORS = ("#173B8F","#1565C0","#1588D0","#12B8C4","#008E78","#2FA84F",
+          "#7CB342","#B7C62B","#E1B51E","#F28C28","#E84A2F","#A9152A")
 RENT_BAND_LABELS = (f'{BANDS[0]/10000:g}万円以下',) + tuple(
     f'{lower/10000:g}〜{upper/10000:g}万円' for lower,upper in zip(BANDS,BANDS[1:])
 ) + (f'{BANDS[-1]/10000:g}万円超',)
