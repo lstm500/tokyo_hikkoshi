@@ -38,7 +38,7 @@ import streamlit as st
 from streamlit_folium import st_folium
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v68"
+BUILD = "REBUILD-01-v69"
 PROVIDER_OPTIONS = ("スマイティ","HOMES","SUUMO","カナリー","アットホーム","CHINTAI","Comfy","アパマンショップ")
 PROVIDER_CANONICAL = {"HOMES":"HOME’S","HOME’S":"HOME’S","スマイティ":"スマイティ","SUUMO":"SUUMO","カナリー":"カナリー",
                       "アットホーム":"アットホーム","CHINTAI":"CHINTAI","Comfy":"Comfy","アパマンショップ":"アパマンショップ"}
@@ -764,6 +764,38 @@ class Database:
         unique=list({r['key']:r for r in out}.values())
         self.last_load_diagnostic.update(before_key_merge=len(out),key_duplicates=len(out)-len(unique),returned=len(unique))
         return unique
+
+    def load_units_since(self,since,layouts=None,cancel_event=None):
+        """Load listing rows written/updated since a saved-data refresh started.
+
+        save_units updates SEARCH_TABLE.started_at on every listing upsert.  A short
+        catch-up pass therefore captures listings committed while the full saved-data
+        scan or address preparation was running, without rereading the whole inventory.
+        """
+        if not since:return []
+        out=[];offset=0
+        while True:
+            if cancel_event is not None and cancel_event.is_set():raise SearchCancelled()
+            rows=self.call('GET',SEARCH_TABLE,{'namespace':'eq.'+self.namespace,'select':'summary,conditions,started_at',
+                'status':'eq.rental_listing','started_at':'gte.'+str(since),'order':'id.asc','limit':1000,'offset':offset})
+            if not isinstance(rows,list):raise AppError('最新の保存物件を再確認できません。')
+            if not rows:break
+            for item in rows:
+                meta=item.get('conditions') or {}
+                if int(meta.get('schema') or 0) not in (4,5,6):continue
+                raw=(item.get('summary') or {}).get('listing')
+                compact=compact_saved_listing(raw if isinstance(raw,dict) else {})
+                if not compact:continue
+                if layouts is not None and compact['layout'] not in layouts:continue
+                key=compact_listing_key(compact)
+                out.append({**compact,'key':key,'title':compact['address'],'rent':compact['rent'],'layout':compact['layout'],'address':compact['address'],
+                            'fetched_at':compact.get('fetched_at'),'fees':0,'loaded_from_compact_storage':True})
+            if len(rows)<1000:break
+            offset+=len(rows)
+        represented={hashlib.sha256(json.dumps({k:r[k] for k in ('rent','layout','address')},ensure_ascii=False,sort_keys=True,separators=(',',':')).encode()).hexdigest() for r in out if r.get('property_id')}
+        out=[r for r in out if r.get('property_id') or r['key'] not in represented]
+        return list({r['key']:r for r in out}.values())
+
     def save_address_points(self,points):
         """Persist address -> coordinate mappings so saved-listing loads do not geocode again."""
         if not isinstance(points,dict) or not points:return 0
@@ -3754,7 +3786,8 @@ class SavedLoadJob:
     def __init__(self,db,bounds,cache=None):
         self.db=db;self.bounds=bounds;self.token=hashlib.sha256(os.urandom(32)).hexdigest();self.server_key=manual_registry_key(db)
         self.lock=threading.RLock();self.cancel_event=threading.Event();self.rows={};self.cache={}  # Session points lack timestamps; reuse only the TTL-controlled server cache.
-        self.phase='database';self.finished=False;self.error='';self.complete_db=False;self.pages=0;self.total_addresses=0;self.done_addresses=0;self.placed=0;self.persistent_cache_hits=0;self.geocoded_addresses=0;self.diagnostic={};self.started=time.monotonic();self.ended=None
+        self.phase='database';self.finished=False;self.error='';self.complete_db=False;self.pages=0;self.total_addresses=0;self.done_addresses=0;self.placed=0;self.persistent_cache_hits=0;self.geocoded_addresses=0;self.diagnostic={};self.started=time.monotonic();self.started_at_utc=utc_now();self.ended=None
+        self.catchup_rounds=0;self.catchup_rows=0;self.catchup_changes=0;self.latest_checked_at=None
         self.thread=threading.Thread(target=self.run,daemon=True,name='housing-saved-loader')
     def snapshot(self):
         with self.lock:
@@ -3762,7 +3795,8 @@ class SavedLoadJob:
             return {'token':self.token,'phase':self.phase,'finished':self.finished,'error':self.error,'complete_db':self.complete_db,
                 'rows':len(self.rows),'pages':self.pages,'addresses':self.total_addresses,'done_addresses':self.done_addresses,'placed':self.placed,
                 'persistent_cache_hits':self.persistent_cache_hits,'geocoded_addresses':self.geocoded_addresses,
-                'elapsed':round(end-self.started,1),'stopping':self.cancel_event.is_set()}
+                'catchup_rounds':self.catchup_rounds,'catchup_rows':self.catchup_rows,'catchup_changes':self.catchup_changes,
+                'latest_checked_at':self.latest_checked_at,'elapsed':round(end-self.started,1),'stopping':self.cancel_event.is_set()}
     def export(self):
         with self.lock:return [dict(r) for r in self.rows.values()],dict(self.cache),dict(self.diagnostic)
     def request_stop(self):self.cancel_event.set()
@@ -3775,9 +3809,16 @@ class SavedLoadJob:
                     if point:self.cache[row['address']]=point
                     self.rows[row['key']]=hydrated_listing(row,point)
                 self.pages+=1;self.placed=sum(has_point(r) for r in self.rows.values());self.diagnostic=diag
+        def row_signature(row):
+            return (row.get('property_id'),row.get('rent'),row.get('layout'),row.get('address'),row.get('fetched_at'))
+        def remove_legacy_duplicates(rows):
+            rows=list(rows)
+            represented={hashlib.sha256(json.dumps({k:r[k] for k in ('rent','layout','address')},ensure_ascii=False,sort_keys=True,separators=(',',':')).encode()).hexdigest() for r in rows if r.get('property_id')}
+            rows=[r for r in rows if r.get('property_id') or compact_listing_key(r) not in represented]
+            return {compact_listing_key(r):r for r in rows if compact_listing_key(r)}
         try:
             stored=self.db.load_units(None,on_progress=page,cancel_event=self.cancel_event)
-            addresses=list(dict.fromkeys(r['address'] for r in stored));by_address={a:[] for a in addresses}
+            addresses=list(dict.fromkeys(r['address'] for r in stored));known_addresses=set(addresses);by_address={a:[] for a in addresses}
             # Persistent cache is loaded in one paged DB pass.  This avoids repeating
             # GSI address searches on every click after the first successful placement.
             persistent={}
@@ -3808,6 +3849,61 @@ class SavedLoadJob:
                     with self.lock:self.diagnostic['persistent_address_cache_saved']=len(newly_geocoded)
                 except AppError as exc:
                     with self.lock:self.diagnostic['persistent_address_cache_save_error']=str(exc)
+
+            # Refresh barrier: listings can be committed while the full DB scan and
+            # address preparation are running. Query only rows upserted since this job
+            # started and merge them before declaring the load complete. Repeat briefly
+            # so writes that land during the first catch-up are also visible.
+            with self.lock:self.phase='refreshing'
+            for _ in range(3):
+                web.check_cancel()
+                delta=self.db.load_units_since(self.started_at_utc,cancel_event=self.cancel_event)
+                with self.lock:
+                    self.catchup_rounds+=1;self.catchup_rows=max(self.catchup_rows,len(delta))
+                    before={k:row_signature(v) for k,v in self.rows.items()}
+                if delta:
+                    delta_addresses=list(dict.fromkeys(r['address'] for r in delta if r.get('address')))
+                    new_addresses=[a for a in delta_addresses if a not in known_addresses]
+                    persistent_delta={}
+                    if new_addresses:
+                        try:persistent_delta=self.db.load_address_points(new_addresses,self.cancel_event)
+                        except AppError as exc:
+                            with self.lock:self.diagnostic['catchup_address_cache_load_error']=str(exc)
+                        for address,point in persistent_delta.items():
+                            self.cache[address]=point;remember_saved_position(web.address_points,address,point)
+                        unresolved=[]
+                        for address in new_addresses:
+                            point=self.cache.get(address) or cached_saved_position(web.address_points,address)
+                            if point:
+                                self.cache[address]=point
+                                with self.lock:self.done_addresses+=1
+                            else:
+                                representative=next((r for r in delta if r.get('address')==address),None)
+                                if representative:unresolved.append(representative)
+                        with self.lock:self.total_addresses+=len(new_addresses)
+                        catchup_geocoded={}
+                        def catchup_positioned(address,point,error):
+                            with self.lock:
+                                self.done_addresses+=1;self.cache[address]=point
+                                if point and address not in persistent_delta:catchup_geocoded[address]=point;self.geocoded_addresses+=1
+                        if unresolved:hydrate_saved_units(unresolved,self.bounds,self.cache,web,catchup_positioned)
+                        if catchup_geocoded:
+                            try:self.db.save_address_points(catchup_geocoded)
+                            except AppError as exc:
+                                with self.lock:self.diagnostic['catchup_address_cache_save_error']=str(exc)
+                        known_addresses.update(new_addresses)
+                    hydrated_delta=[hydrated_listing(r,self.cache.get(r['address']) or cached_saved_position(web.address_points,r['address'])) for r in delta]
+                    with self.lock:
+                        for row in hydrated_delta:self.rows[row['key']]=row
+                        self.rows=remove_legacy_duplicates(self.rows.values())
+                        self.placed=sum(has_point(r) for r in self.rows.values())
+                        self.total_addresses=len({r.get('address') for r in self.rows.values() if r.get('address')})
+                        self.done_addresses=max(self.done_addresses,self.total_addresses)
+                with self.lock:
+                    after={k:row_signature(v) for k,v in self.rows.items()}
+                    changed=sum(before.get(k)!=v for k,v in after.items())+sum(k not in after for k in before)
+                    self.catchup_changes+=changed;self.latest_checked_at=utc_now()
+                if not delta or changed==0:break
             with self.lock:self.phase='complete'
         except SearchCancelled:
             with self.lock:self.phase='stopped'
@@ -3816,7 +3912,8 @@ class SavedLoadJob:
         finally:
             with self.lock:
                 self.diagnostic.update(geocoded_total=self.placed,returned=len(self.rows),database_complete=self.complete_db,
-                                       persistent_address_cache_hits=self.persistent_cache_hits,newly_geocoded_addresses=self.geocoded_addresses)
+                                       persistent_address_cache_hits=self.persistent_cache_hits,newly_geocoded_addresses=self.geocoded_addresses,
+                                       catchup_rounds=self.catchup_rounds,catchup_rows=self.catchup_rows,catchup_changes=self.catchup_changes,latest_checked_at=self.latest_checked_at)
                 self.ended=time.monotonic();self.finished=True
 
 
@@ -3842,6 +3939,7 @@ def start_saved_load(bounds,cache=None,db=None):
     st.session_state.saved_load_token=job.token;st.session_state.saved_load_key=key
     st.session_state.pop('saved_load_export',None)
     st.session_state.pop('saved_load_applied_token',None)
+    st.session_state.pop('new_notice',None)
     return job
 
 
@@ -3878,9 +3976,12 @@ def saved_load_progress():
             st.rerun()
 
     if snap['phase']=='database':
-        st.info(f"保存データ読み込み中｜{snap['rows']}件・{snap['pages']}ページ｜経過 {snap['elapsed']}秒")
+        st.info(f"DB確認中｜読み込み候補 {snap['rows']}件・{snap['pages']}ページ｜経過 {snap['elapsed']}秒")
+    elif snap['phase']=='refreshing':
+        st.info(f"最新保存分を再確認中｜保存データ {snap['rows']}件｜地図準備 {snap['done_addresses']}/{snap['addresses']}住所｜配置 {snap['placed']}件｜差分反映 {snap['catchup_changes']}件｜経過 {snap['elapsed']}秒")
     elif snap['finished'] and snap['phase']=='complete':
-        st.success(f"読み込み完了｜保存データ {snap['rows']}件｜地図準備 {snap['done_addresses']}/{snap['addresses']}住所｜配置 {snap['placed']}件｜住所キャッシュ {snap['persistent_cache_hits']}件｜所要 {snap['elapsed']}秒")
+        checked=('｜最新確認 '+acquisition_time_jst(snap['latest_checked_at'])) if snap.get('latest_checked_at') else ''
+        st.success(f"読み込み完了｜保存データ {snap['rows']}件｜地図準備 {snap['done_addresses']}/{snap['addresses']}住所｜配置 {snap['placed']}件｜住所キャッシュ {snap['persistent_cache_hits']}件｜差分反映 {snap['catchup_changes']}件{checked}｜所要 {snap['elapsed']}秒")
     elif snap['phase']=='failed':
         st.error(f"読み込み停止｜保存データ {snap['rows']}件｜地図準備 {snap['done_addresses']}/{snap['addresses']}住所｜配置 {snap['placed']}件｜所要 {snap['elapsed']}秒")
     elif snap['phase']=='stopped':
@@ -3890,7 +3991,7 @@ def saved_load_progress():
     if snap['error']:st.error(snap['error'])
     if snap['phase']=='stopped':st.caption('中止しました。読み込み済みの物件は保持しています。')
     if searching:st.caption('物件検索が終わると読み込み済みデータを地図へ反映できます。')
-    elif snap['finished'] and snap['phase']=='complete':st.caption('読み込み完了後、自動的に地図へ反映します。')
+    elif snap['finished'] and snap['phase']=='complete':st.caption('読み込み終了直前に、処理中にSupabaseへ追加・更新された保存物件を再確認してから地図へ反映しています。収集が続いている場合は、下の読込ボタンをもう一度押すとその時点の最新状態へ更新できます。')
     else:st.caption('地図操作は継続できます。読み込み途中でも下のボタンで現在までの物件を地図へ反映できます。')
     if not applied and st.button('読み込んだ物件を地図へ反映',key='apply_saved_load',disabled=not snap['rows'] or searching):
         if apply_saved_load(job):
@@ -4549,8 +4650,8 @@ def main():
     with tabs[1]:
         automatic_collection_panel()
         st.subheader('Supabaseに保存した物件')
-        st.caption('保存物件をまとめて読み込みます。範囲外の物件も保持し、地図を動かすと表示できます。地図操作中の自動読み込みは行いません。')
-        if st.button('保存物件をすべて読み込む',key='new_load',use_container_width=True,disabled=bool(active_job() and not active_job().snapshot()['finished'])):
+        st.caption('Supabaseの保存物件を最新状態で読み込みます。読み込み中に自動収集で追加・更新された物件も、完了直前に差分を再確認して反映します。範囲外の物件も保持します。')
+        if st.button('最新の保存物件を読み込む・反映',key='new_load',use_container_width=True,disabled=bool(active_job() and not active_job().snapshot()['finished'])):
             try:start_saved_load(bounds,state.get('address_point_cache'))
             except AppError as exc:st.error(str(exc))
         saved_load_progress()
