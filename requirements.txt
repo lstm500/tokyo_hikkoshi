@@ -3,3 +3,6 @@ folium==0.18.0
 streamlit-folium==0.24.0
 requests==2.32.5
 beautifulsoup4==4.13.5
+numpy>=1.26,<3
+Pillow>=10,<12
+selenium>=4.25,<5
