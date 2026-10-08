@@ -38,7 +38,7 @@ import streamlit as st
 from streamlit_folium import st_folium
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v71"
+BUILD = "REBUILD-01-v74"
 PROVIDER_OPTIONS = ("スマイティ","HOMES","SUUMO","カナリー","アットホーム","CHINTAI","Comfy","アパマンショップ")
 PROVIDER_CANONICAL = {"HOMES":"HOME’S","HOME’S":"HOME’S","スマイティ":"スマイティ","SUUMO":"SUUMO","カナリー":"カナリー",
                       "アットホーム":"アットホーム","CHINTAI":"CHINTAI","Comfy":"Comfy","アパマンショップ":"アパマンショップ"}
@@ -2049,13 +2049,16 @@ def homes_collect(web,region,bounds,munis,emit):
                         emit('rejected',1);return 0
                     except (AppError,ValueError,TypeError) as exc:
                         trace(web,'listing_failed',{'provider':'HOME’S','url':url,'decision':'failed','failed_stage':'detail.request_or_parse','category':'acquisition_failure','reason':str(exc),'exception_type':type(exc).__name__,'observed':getattr(exc,'diagnostic',{}),'expected':'物件詳細と必要項目を取得','evidence':list(getattr(web.local,'listing_evidence',[]))},'ERROR','rejection')
-                        emit('issue','HOMES詳細確認｜'+str(exc));trace(web,'detail_optional_error',{'url':url,'message':str(exc)},'WARNING','collector');return 0
+                        emit('rejected',1);emit('issue','HOMES詳細確認｜'+str(exc));trace(web,'detail_optional_error',{'url':url,'message':str(exc)},'WARNING','collector');return 0
                 finally:web.detail_slots.release()
 
-            for _,_,error in bounded_results(list(enumerate(detail_urls,1)),detail_work,workers=DETAIL_PAGE_WORKERS,stop_event=web.cancel_event):
+            for item,_,error in bounded_results(list(enumerate(detail_urls,1)),detail_work,workers=DETAIL_PAGE_WORKERS,stop_event=web.cancel_event):
                 if error:
-                    trace(web,'detail_optional_error',{'provider':'HOME’S','exception_type':type(error).__name__,'message':'並列詳細処理で予期しない例外'},'WARNING','collector')
-                    emit('issue','HOMES詳細確認｜'+type(error).__name__)
+                    url=item[1] if isinstance(item,tuple) and len(item)>1 else ''
+                    trace(web,'listing_failed',{'provider':'HOME\u2019S','url':url,'decision':'failed','failed_stage':'detail.worker',
+                        'category':'acquisition_failure','reason':'parallel detail worker exception','exception_type':type(error).__name__,
+                        'observed':{},'expected':'listing detail processing completes','evidence':[]},'ERROR','rejection')
+                    emit('rejected',1);emit('issue','HOMES detail worker | '+type(error).__name__)
             next_url=generic_next_page(soup,reply.url,'HOME’S')
             current_url=next_url
         if not found:trace(web,'empty',{'provider':'HOME’S','region':region.get('label'),'group':list(layouts),'reason':'条件一覧に候補なし'},stage='collector')
@@ -2613,7 +2616,7 @@ def suumo_collect(web,region,bounds,munis,emit):
                         if len(skip_examples)<3:skip_examples.append({'url':url,'property_id':property_id,'last_success_at':obtained})
                         emit('skipped',1);continue
                     page_candidates.append(url)
-            emit('candidate',len(page_candidates))
+            emit('candidate',len(page_candidates)+page_skipped)
 
             scope=dict(getattr(DIAG_CONTEXT,'scope',{}))
             def detail_work(item):
@@ -2656,10 +2659,15 @@ def suumo_collect(web,region,bounds,munis,emit):
                     row['address_source']=location['location_method']
                     emit('unit',row)
                 except (AppError,ValueError,TypeError) as exc:
-                    trace(web,'listing_failed',{'provider':'SUUMO','url':url,'decision':'failed','failed_stage':'detail.request_or_parse','category':'acquisition_failure','reason':str(exc),'exception_type':type(exc).__name__,'observed':getattr(exc,'diagnostic',{}),'expected':'物件詳細と必要項目を取得','evidence':list(getattr(web.local,'listing_evidence',[]))},'ERROR','rejection');emit('issue','SUUMO詳細確認｜'+str(exc));trace(web,'detail_optional_error',{'url':url,'message':str(exc)},'WARNING','collector')
+                    trace(web,'listing_failed',{'provider':'SUUMO','url':url,'decision':'failed','failed_stage':'detail.request_or_parse','category':'acquisition_failure','reason':str(exc),'exception_type':type(exc).__name__,'observed':getattr(exc,'diagnostic',{}),'expected':'物件詳細と必要項目を取得','evidence':list(getattr(web.local,'listing_evidence',[]))},'ERROR','rejection');emit('rejected',1);emit('issue','SUUMO詳細確認｜'+str(exc));trace(web,'detail_optional_error',{'url':url,'message':str(exc)},'WARNING','collector')
 
-            for _,_,error in bounded_results(list(enumerate(page_candidates,1)),detail_work,workers=DETAIL_PAGE_WORKERS,stop_event=web.cancel_event):
-                if error:raise error
+            for item,_,error in bounded_results(list(enumerate(page_candidates,1)),detail_work,workers=DETAIL_PAGE_WORKERS,stop_event=web.cancel_event):
+                if error:
+                    url=item[1] if isinstance(item,tuple) and len(item)>1 else ''
+                    trace(web,'listing_failed',{'provider':'SUUMO','url':url,'decision':'failed','failed_stage':'detail.worker',
+                        'category':'acquisition_failure','reason':'parallel detail worker exception','exception_type':type(error).__name__,
+                        'observed':{},'expected':'listing detail processing completes','evidence':[]},'ERROR','rejection')
+                    emit('rejected',1);emit('issue','SUUMO detail worker | '+type(error).__name__)
 
             next_url=_suumo_next_url(soup,reply.url,filter_params)
             trace(web,'page_end',{'provider':'SUUMO','group':list(layouts),'page':page_number,'buildings':len(buildings),
@@ -3042,16 +3050,19 @@ def public_portal_collect(web,region,bounds,munis,emit,provider):
             except Exception as exc:
                 trace(web,'detail_optional_error',{'provider':provider,'url':url,'exception_type':type(exc).__name__,'message':str(exc) if isinstance(exc,AppError) else '詳細追加確認失敗'},'WARNING','collector')
                 trace(web,'listing_failed',{'provider':provider,'url':url,'decision':'failed','failed_stage':'detail.request_or_parse','category':'acquisition_failure','reason':str(exc),'exception_type':type(exc).__name__,'observed':getattr(exc,'diagnostic',{}),'expected':'物件詳細と必要項目を取得','evidence':list(getattr(web.local,'listing_evidence',[]))},'ERROR','rejection')
-                emit('issue',provider+'｜'+(str(exc) if isinstance(exc,AppError) else '詳細ページを確認できません。'));return 0
+                emit('rejected',1);emit('issue',provider+'｜'+(str(exc) if isinstance(exc,AppError) else '詳細ページを確認できません。'));return 0
             if row:emit('unit',row);return 1
             emit('rejected',1);return 0
         finally:web.detail_slots.release()
 
     accepted=0
-    for _,value,error in bounded_results(list(enumerate(links,1)),detail_work,workers=DETAIL_PAGE_WORKERS,stop_event=web.cancel_event):
+    for item,value,error in bounded_results(list(enumerate(links,1)),detail_work,workers=DETAIL_PAGE_WORKERS,stop_event=web.cancel_event):
         if error:
-            trace(web,'detail_optional_error',{'provider':provider,'exception_type':type(error).__name__,'message':'並列詳細処理で予期しない例外'},'WARNING','collector')
-            emit('issue',provider+'｜'+type(error).__name__)
+            url=item[1] if isinstance(item,tuple) and len(item)>1 else ''
+            trace(web,'listing_failed',{'provider':provider,'url':url,'decision':'failed','failed_stage':'detail.worker',
+                'category':'acquisition_failure','reason':'parallel detail worker exception','exception_type':type(error).__name__,
+                'observed':{},'expected':'listing detail processing completes','evidence':[]},'ERROR','rejection')
+            emit('rejected',1);emit('issue',provider+' detail worker | '+type(error).__name__)
         elif value:accepted+=int(value)
     trace(web,'provider_collect_finish',{'provider':provider,'region':region['label'],'layout':requested,'detail_links':len(links),'accepted':accepted,'detail_workers':DETAIL_PAGE_WORKERS},stage='collector')
 
@@ -3174,7 +3185,7 @@ def search_all(db,conditions,screen,state=None):
             conditions['auto_task_label']=jobs[index][0]['label']+'｜'+jobs[index][1]
             jobs=[jobs[index]]
         db.job_new_keys=set()
-        q=queue.Queue();active={};done=0;candidate=detail=rejected=skipped=incomplete=0;save_buffer={};last_flush=time.monotonic()
+        q=queue.Queue();active={};done=0;candidate=detail=rejected=skipped=incomplete=issue_events=0;save_buffer={};last_flush=time.monotonic()
         def work(index,region,provider):
             if web.cancel_event.is_set():return
             DIAG_CONTEXT.audit=audit;DIAG_CONTEXT.scope={'task':index,'region':region['label'],'town':region['town'],'municipality_code':region['code'],'provider':provider}
@@ -3221,6 +3232,7 @@ def search_all(db,conditions,screen,state=None):
                     elif kind=='skipped': skipped+=int(value)
                     elif kind=='incomplete': incomplete+=int(value)
                     elif kind=='issue':
+                        issue_events+=1
                         issues.append(label+'｜'+str(value));log(issues[-1])
                     elif kind=='unit':
                         identity=compact_listing_key(value) or value['key'];value=dict(value,key=identity)
@@ -3228,11 +3240,17 @@ def search_all(db,conditions,screen,state=None):
                         batch.append(units[identity])
                 for row in batch:
                     key=compact_listing_key(row);save_buffer[key]=newest_observation(save_buffer.get(key),row)
-                batch=list(save_buffer.values()) if save_buffer and (len(save_buffer)>=100 or time.monotonic()-last_flush>=3 or web.cancel_event.is_set() or (len(ready)==len(pending) and next_job==len(jobs))) else []
+                # Persist accepted units promptly.  Detail workers can spend time on map/GSI
+                # resolution, so waiting for 100 rows/3 seconds made the UI look as though
+                # completed properties were not being saved.  This changes only Supabase
+                # batching, not source-site request frequency.
+                batch=list(save_buffer.values()) if save_buffer and (len(save_buffer)>=25 or time.monotonic()-last_flush>=1 or web.cancel_event.is_set() or (len(ready)==len(pending) and next_job==len(jobs))) else []
                 if batch:
                     save_buffer.clear();last_flush=time.monotonic()
                     state.new_units=list(units.values())
-                    screen['status'].info(f'検索実行中｜確認した{len(batch)}件をSupabaseへ保存しています')
+                    errors_now=rejected
+                    processed_now=len(saved)+errors_now
+                    screen['status'].info(f'検索実行中｜処理 {processed_now}件｜保存 {len(saved)}件｜エラー {errors_now}件｜スキップ {skipped}件')
                     try:
                         for offset in range(0,len(batch),200):
                             chunk=batch[offset:offset+200];saved.update(db.save_units(chunk));state.new_last_saved_at=utc_now()
@@ -3253,19 +3271,23 @@ def search_all(db,conditions,screen,state=None):
                         except SearchCancelled:pass
                     log(f'{done}/{len(jobs)}完了｜'+jobs[index][0]['label']+'｜'+jobs[index][1])
                 fill_jobs()
-                screen['bar'].progress(.2+.75*done/max(1,len(jobs)),text=f'物件確認 {done}/{len(jobs)}タスク｜保存確認 {len(saved)}件')
-                screen['status'].info(f'検索実行中｜{done}/{len(jobs)}タスク完了｜候補 {candidate}｜詳細 {detail}｜除外 {rejected}｜取得済みスキップ {skipped}｜保存確認 {len(saved)}件｜経過 {int(time.monotonic()-started)}秒\n\n'+'\n\n'.join(active.values()))
+                errors_now=rejected
+                processed_now=len(saved)+errors_now
+                metrics=f'処理 {processed_now}件｜保存 {len(saved)}件｜エラー {errors_now}件｜スキップ {skipped}件'
+                screen['bar'].progress(.2+.75*done/max(1,len(jobs)),text=metrics)
+                screen['status'].info('検索実行中｜'+metrics)
         search['status']='cancelled' if web.cancel_event.is_set() else 'partial' if issues else 'completed'
         search['summary']={'confirmed':len(units),'saved':len(saved),'candidate':candidate,'detail':detail,'rejected':rejected,'already_acquired':skipped,'incomplete_tasks':incomplete,
+                           'processed':len(saved)+rejected,'errors':rejected,
                            'retained_with_missing_fields':sum(bool(r.get('missing_fields')) for r in units.values()),'price_unknown':sum(not r.get('rent') for r in units.values()),'issues':issues[-100:],'elapsed':round(time.monotonic()-started,3),'tasks':len(jobs)}
     except SearchCancelled:
         search['status']='cancelled'
-        search['summary']={'confirmed':len(units),'saved':len(saved),'issues':issues,'elapsed':round(time.monotonic()-started,3)}
+        search['summary']={'confirmed':len(units),'saved':len(saved),'processed':len(saved)+rejected,'errors':rejected,'already_acquired':skipped,'issues':issues,'elapsed':round(time.monotonic()-started,3)}
     except Exception as exc:
         audit.add('search',diagnosis_code(str(exc)),'ERROR',{'stage':'search_all','exception_type':type(exc).__name__,
             'message':str(exc) if isinstance(exc,AppError) else f'検索エラー（{type(exc).__name__}）','traceback':traceback.format_exc()})
         search['status']='failed';issues.append(str(exc) if isinstance(exc,AppError) else f'検索エラー（{type(exc).__name__}）')
-        search['summary']={'confirmed':len(units),'saved':len(saved),'issues':issues,'elapsed':round(time.monotonic()-started,3)}
+        search['summary']={'confirmed':len(units),'saved':len(saved),'processed':len(saved)+rejected,'errors':rejected,'already_acquired':skipped,'issues':issues,'elapsed':round(time.monotonic()-started,3)}
     # On a consumer exception the executor has joined its workers. Preserve all
     # accepted rows still in the queue before final persistence, including stop.
     if q is not None:
@@ -3275,6 +3297,12 @@ def search_all(db,conditions,screen,state=None):
             if kind=='unit':
                 identity=compact_listing_key(value) or value['key'];value=dict(value,key=identity)
                 units[identity]=merge_listing(units.get(identity),value)
+            elif kind=='detail':detail+=int(value)
+            elif kind=='rejected':rejected+=int(value)
+            elif kind=='skipped':skipped+=int(value)
+            elif kind=='issue':
+                issue_events+=1
+                issues.append(str(value))
     # Workers have finished and the event queue is drained before this final save.
     # Cancellation only stops acquisition; database writes remain enabled.
     remaining=[r for r in units.values() if compact_listing_key(r) not in saved]
@@ -3297,11 +3325,21 @@ def search_all(db,conditions,screen,state=None):
                 'pending_ids':len(acquisition_pending),'message':str(exc) if isinstance(exc,AppError) else type(exc).__name__})
             issues.append('最終保存での取得済みID保存失敗：'+(str(exc) if isinstance(exc,AppError) else type(exc).__name__))
     unsaved=sum(compact_listing_key(r) not in saved for r in units.values())
-    search['summary'].update(confirmed=len(units),elapsed=round(time.monotonic()-started,3),new_saved=len(saved & getattr(db,'job_new_keys',set())),updated_saved=len(saved-getattr(db,'job_new_keys',set())),processed=search['summary'].get('detail',0)+search['summary'].get('already_acquired',0),last_saved_at=getattr(state,'new_last_saved_at',None),saved=len(saved),unsaved=unsaved,acquisition_ids_pending=len(acquisition_pending),issues=issues[-100:])
+    final_errors=rejected+unsaved
+    final_processed=len(saved)+final_errors
+    search['summary'].update(confirmed=len(units),elapsed=round(time.monotonic()-started,3),new_saved=len(saved & getattr(db,'job_new_keys',set())),updated_saved=len(saved-getattr(db,'job_new_keys',set())),processed=final_processed,errors=final_errors,candidate=len(saved)+final_errors+skipped,discovered_candidate=candidate,already_acquired=skipped,rejected=rejected,detail=detail,last_saved_at=getattr(state,'new_last_saved_at',None),saved=len(saved),unsaved=unsaved,acquisition_ids_pending=len(acquisition_pending),issues=issues[-100:])
     if unsaved:
         audit.add('database','unsaved_listings','ERROR',{'stage':'stop.final_save' if web.cancel_event.is_set() else 'search.final_save','unsaved':unsaved,'retained_in_server_memory':True})
+        for row in units.values():
+            key=compact_listing_key(row)
+            if key in saved:continue
+            audit.add('database','listing_failed','ERROR',{
+                'provider':row.get('provider'),'url':row.get('listing_url') or row.get('url') or '',
+                'property_id':row.get('property_id'),'decision':'failed','failed_stage':'database.final_save',
+                'category':'save_failure','reason':'Supabaseへの保存を最終再試行後も確認できない',
+                'observed':{'listing_key':key},'expected':'Supabase保存確認','evidence':[]})
     audit.add('map','data_ready','INFO',{'confirmed_units':len(units),'colored_points':sum(has_point(r) for r in units.values()),'render_deferred_until_saved_data_load':False})
-    screen['status'].info('検索が終了しました。詳細作業ログをSupabaseへ保存しています。')
+    screen['status'].info(f'検索終了｜処理 {final_processed}件｜保存 {len(saved)}件｜エラー {final_errors}件｜スキップ {skipped}件')
     audit.add('search','finish','INFO',{'status':search['status'],'summary':search['summary']})
     audit.persist(db,force=True)
     search['summary']['diagnostics']={'search_id':audit.search_id,'events':audit.count,'persisted_events':audit.persisted_events,
@@ -3549,6 +3587,30 @@ def acquisition_failure_rows(events):
     return rows
 
 
+
+def candidate_failure_rows(events):
+    """One terminal row per failed listing candidate; this count matches the UI listing-error count."""
+    latest={}
+    for e in events:
+        if e.get('code') not in ('listing_rejected','listing_failed'):continue
+        details=e.get('details') if isinstance(e.get('details'),dict) else {}
+        context=e.get('context') if isinstance(e.get('context'),dict) else {}
+        url=context.get('listing_url') or details.get('url') or details.get('listing_url') or ''
+        search_id=str(e.get('search_id') or '')
+        if not url:continue
+        key=(search_id,url)
+        latest[key]={
+            '時刻UTC':e.get('time'),'検索ID':search_id,'取得元':context.get('provider') or details.get('provider'),
+            '地域':context.get('region'),'町名':context.get('town'),'物件URL':url,
+            '処理結果':'エラー','失敗工程':details.get('failed_stage') or e.get('stage'),
+            '分類':details.get('category'),'エラーコード':e.get('code'),
+            '理由':details.get('reason') or details.get('message') or e.get('observed') or '',
+            '取得値':json.dumps(details.get('observed'),ensure_ascii=False,separators=(',',':')),
+            '期待値':json.dumps(details.get('expected'),ensure_ascii=False,separators=(',',':')),
+            '根拠':json.dumps(details.get('evidence') or [],ensure_ascii=False,separators=(',',':')),
+        }
+    return list(latest.values())
+
 def csv_bytes_from_rows(rows,fieldnames=None):
     output=io.StringIO()
     fields=fieldnames or (list(rows[0]) if rows else ['時刻UTC','検索ID','通番','取得元','物件URL','工程','エラーコード','理由'])
@@ -3604,14 +3666,17 @@ def diagnostic_downloads(events,prefix='current'):
         export={'key':export_key,'txt':diagnostic_report(events),'json':json.dumps({'schema':1,'events':events},ensure_ascii=False,separators=(',',':')).encode('utf-8')}
         export['decisions']=exclusion_rows(events)
         export['failures']=acquisition_failure_rows(events)
+        export['candidate_failures']=candidate_failure_rows(events)
+        export['candidate_failures_csv']=csv_bytes_from_rows(export['candidate_failures'])
         export['reasons_csv']=csv_bytes_from_rows(export['decisions']) if export['decisions'] else b''
         export['failures_csv']=csv_bytes_from_rows(export['failures'])
         export['preview']=export['txt'].decode('utf-8-sig').split('詳細イベント')[0];st.session_state[prefix+'_log_export']=export
     st.download_button('詳細作業ログ・改善案をTXTでダウンロード',export['txt'],'sumai_work_log.txt','text/plain',key=prefix+'_txt',on_click='ignore')
     st.download_button('解析用の詳細ログをJSONでダウンロード',export['json'],
                        'sumai_work_log.json','application/json',key=prefix+'_json',on_click='ignore')
-    failures=export['failures'];decisions=export['decisions']
-    st.download_button(f"全エラーイベントをCSVでダウンロード（{len(failures)}件）",export['failures_csv'],'sumai_acquisition_failures.csv','text/csv',key=prefix+'_failures',on_click='ignore')
+    failures=export['failures'];candidate_failures=export['candidate_failures'];decisions=export['decisions']
+    st.download_button(f"物件ごとのエラーCSV（{len(candidate_failures)}件）",export['candidate_failures_csv'],'sumai_listing_errors.csv','text/csv',key=prefix+'_candidate_failures',on_click='ignore')
+    st.download_button(f"技術エラー詳細CSV（{len(failures)}イベント）",export['failures_csv'],'sumai_acquisition_failure_events.csv','text/csv',key=prefix+'_failures',on_click='ignore')
     if decisions:
         st.download_button('物件ごとの最終除外・取得失敗理由をCSVでダウンロード',export['reasons_csv'],'sumai_exclusion_reasons.csv','text/csv',key=prefix+'_reasons',on_click='ignore')
     with st.expander('作業ログの原因別集計と改善案'):
@@ -4099,22 +4164,19 @@ def saved_load_progress():
             st.session_state.saved_load_applied_token=job.token
             st.rerun()
 
-    db_records=snap.get('raw_records') or snap.get('accepted_records') or snap['rows']
     if snap['phase']=='database':
-        st.info(f"DB確認中｜Supabase保存レコード {db_records}件・{snap['pages']}ページ｜読込キー {snap['rows']}件｜経過 {snap['elapsed']}秒")
+        st.info(f"保存物件を読み込み中｜{snap['pages']}ページ確認｜経過 {snap['elapsed']}秒")
     elif snap['phase']=='refreshing':
-        st.info(f"最新保存分を再確認中｜地図表示物件 {snap['rows']}件｜地図準備 {snap['done_addresses']}/{snap['addresses']}住所｜配置 {snap['placed']}件｜差分反映 {snap['catchup_changes']}件｜経過 {snap['elapsed']}秒")
+        st.info(f"最新の保存分を確認中｜現在 {snap['rows']}物件｜経過 {snap['elapsed']}秒")
     elif snap['finished'] and snap['phase']=='complete':
         checked=('｜最新確認 '+acquisition_time_jst(snap['latest_checked_at'])) if snap.get('latest_checked_at') else ''
-        st.success(f"読み込み完了｜地図表示物件 {snap['rows']}件｜地図準備 {snap['done_addresses']}/{snap['addresses']}住所｜配置 {snap['placed']}件｜住所キャッシュ {snap['persistent_cache_hits']}件｜差分反映 {snap['catchup_changes']}件{checked}｜所要 {snap['elapsed']}秒")
-        if snap.get('raw_records'):
-            st.caption(f"Supabase保存レコード {snap['raw_records']}件｜物件ID確認済み {snap['property_id_records']}件｜旧形式IDなし {snap['legacy_records']}件。旧形式のうち、ID確認済みデータと家賃・間取り・住所が一致する {snap['legacy_shadowed']}件は二重表示候補として地図から除外し、一致しない {snap['legacy_unmatched']}件は表示しています。")
+        st.success(f"読み込み完了｜保存物件 {snap['rows']}件｜地図準備完了{checked}｜所要 {snap['elapsed']}秒")
     elif snap['phase']=='failed':
-        st.error(f"読み込み停止｜DB保存レコード {db_records}件｜地図表示物件 {snap['rows']}件｜地図準備 {snap['done_addresses']}/{snap['addresses']}住所｜配置 {snap['placed']}件｜所要 {snap['elapsed']}秒")
+        st.error(f"読み込み停止｜確認済み {snap['rows']}物件｜所要 {snap['elapsed']}秒")
     elif snap['phase']=='stopped':
-        st.info(f"読み込みを中止しました｜DB保存レコード {db_records}件｜地図表示物件 {snap['rows']}件｜地図準備 {snap['done_addresses']}/{snap['addresses']}住所｜配置 {snap['placed']}件｜所要 {snap['elapsed']}秒")
+        st.info(f"読み込みを中止しました｜確認済み {snap['rows']}物件｜所要 {snap['elapsed']}秒")
     else:
-        st.info(f"地図表示物件 {snap['rows']}件｜地図準備 {snap['done_addresses']}/{snap['addresses']}住所｜配置 {snap['placed']}件｜住所キャッシュ {snap['persistent_cache_hits']}件｜経過 {snap['elapsed']}秒")
+        st.info(f"地図準備中｜保存物件 {snap['rows']}件｜経過 {snap['elapsed']}秒")
     if snap['error']:st.error(snap['error'])
     if snap['phase']=='stopped':st.caption('中止しました。読み込み済みの物件は保持しています。')
     if searching:st.caption('物件検索が終わると読み込み済みデータを地図へ反映できます。')
@@ -4130,22 +4192,16 @@ def saved_load_progress():
     export=st.session_state.get('saved_load_export')
     if export and export['token']==job.token:
         st.download_button(f"地図表示対象 {export['count']}件のCSV",export['csv'],'sumai_saved_units.csv','text/csv',key='download_saved_load_csv',on_click='ignore')
-    if snap['finished'] and snap['phase']=='complete' and st.button('Supabase保存レコードの内訳CSVを準備',key='prepare_saved_record_audit'):
-        audit_rows=job.export_storage_record_audit()
-        st.session_state.saved_record_audit_export={'token':job.token,'count':len(audit_rows),'csv':csv_bytes_from_rows(audit_rows)}
-    audit_export=st.session_state.get('saved_record_audit_export')
-    if audit_export and audit_export['token']==job.token:
-        st.download_button(f"Supabase保存レコード内訳 {audit_export['count']}件のCSV",audit_export['csv'],'sumai_saved_record_breakdown.csv','text/csv',key='download_saved_record_audit',on_click='ignore')
 
 
 def capture_viewport():
     data=st.session_state.get('new_map',{})
     bounds=viewport_bounds(data)
     if bounds:
+        # Keep only the search bounds.  Feeding the browser's center/zoom straight back
+        # into st_folium on every move caused repeated setView operations and visible
+        # snap/jank while dragging or zooming a map with thousands of markers.
         st.session_state.new_bounds=bounds
-        st.session_state.new_view_center=bounds_center(bounds)
-        try: st.session_state.new_view_zoom=int(data.get('zoom') or 15)
-        except (TypeError,ValueError): pass
     else:
         st.session_state.new_bounds=None
 
@@ -4425,9 +4481,15 @@ def capture_map_fragment():
 @st.fragment
 def interactive_rental_map(pins,cells,facilities):
     state=st.session_state
-    st_folium(rental_map([],DEFAULT_CENTER,1500,[],[]),key='new_map',height=480,use_container_width=True,
-        returned_objects=['bounds','zoom'],center=state.get('new_view_center',DEFAULT_CENTER),
-        zoom=state.get('new_view_zoom',15),feature_group_to_add=rental_features(pins,cells,facilities),on_change=capture_map_fragment)
+    # Only the initial mount receives an explicit center/zoom.  After Leaflet is live,
+    # the browser owns its viewport; Python records only the bounds needed for search.
+    # This prevents a pan/zoom -> fragment rerun -> setView feedback loop.
+    kwargs=dict(key='new_map',height=480,use_container_width=True,returned_objects=['bounds'],
+                feature_group_to_add=rental_features(pins,cells,facilities),on_change=capture_map_fragment)
+    if not state.get('new_map'):
+        kwargs['center']=state.get('new_view_center',DEFAULT_CENTER)
+        kwargs['zoom']=state.get('new_view_zoom',15)
+    st_folium(rental_map([],DEFAULT_CENTER,1500,[],[]),**kwargs)
     if state.pop('map_initial_bounds_ready',False):
         st.rerun()
 
@@ -4487,7 +4549,7 @@ class AutomaticCollection:
                     self.summary['last_summary']=result.get('summary',{})
                     self.summary['saved_observations']=int(self.summary.get('saved_observations',0))+len(snap['saved'])
                     stats=result.get('summary',{})
-                    for name,source in (('new_saved_observations','new_saved'),('updated_saved_observations','updated_saved'),('failed_save_observations','unsaved'),('processed_observations','processed'),('detail_observations','detail'),('skipped_observations','already_acquired'),('rejected_observations','rejected')):
+                    for name,source in (('new_saved_observations','new_saved'),('updated_saved_observations','updated_saved'),('failed_save_observations','unsaved'),('processed_observations','processed'),('error_observations','errors'),('detail_observations','detail'),('skipped_observations','already_acquired'),('rejected_observations','rejected')):
                         self.summary[name]=int(self.summary.get(name,0))+int(stats.get(source,0))
                     self.summary['statistics_started_at']=self.summary.get('statistics_started_at') or self.summary['last_started_at']
                     self.summary['collection_seconds']=float(self.summary.get('collection_seconds',0))+float(stats.get('elapsed',0))
@@ -4631,15 +4693,11 @@ def automatic_collection_panel():
         except AppError as exc:st.error('実行の停止は要求しましたが、停止設定の保存に失敗しました：'+str(exc))
     if snap:
         summary=snap['summary'];st.write(snap['message']);st.progress(min(1.,max(0.,snap['progress'])))
-        st.caption('対象区：'+TOKYO_WARDS[snap['settings']['ward_code']]+'｜町名指定：'+str(len(snap['settings'].get('town_codes',[])))+'町（0なら区全体）')
-        st.caption(f"完了した収集 {summary.get('completed_runs',0)}回｜延べ保存確認 {summary.get('saved_observations',0)}件｜次の町 {int(summary.get('next_task_index',0))+1}/{summary.get('total_tasks','未判定')}")
-        if summary.get('statistics_started_at'):
-            seconds=max(1,float(summary.get('collection_seconds',0)));processed=int(summary.get('processed_observations',0));rate=processed*3600/seconds
-            st.caption(f"v58集計：新規保存 {summary.get('new_saved_observations',0)}件｜更新 {summary.get('updated_saved_observations',0)}件｜未保存 {summary.get('failed_save_observations',0)}件｜詳細確認 {summary.get('detail_observations',0)}件｜取得済みスキップ {summary.get('skipped_observations',0)}件｜除外 {summary.get('rejected_observations',0)}件")
-            st.caption(f"集計開始 {acquisition_time_jst(summary['statistics_started_at'])}｜処理速度 {rate:.0f}件/時（取得済みスキップを含む）｜8時間換算 {rate*8:.0f}件・達成保証ではありません")
-        st.caption('最終終了：'+acquisition_time_jst(summary.get('last_finished_at')))
-        st.caption('前回の取得済みIDスキップ：'+str(summary.get('last_summary',{}).get('already_acquired',0))+'件')
-        if summary.get('last_task'):st.caption('前回の町：'+summary['last_task']+'｜結果：'+str(summary.get('last_status','')))
+        cumulative_processed=int(summary.get('processed_observations',0))
+        cumulative_saved=int(summary.get('saved_observations',0))
+        cumulative_errors=int(summary.get('error_observations',0))
+        cumulative_skipped=int(summary.get('skipped_observations',0))
+        st.caption(f'累計｜処理 {cumulative_processed}件｜保存 {cumulative_saved}件｜エラー {cumulative_errors}件｜スキップ {cumulative_skipped}件')
         for issue in summary.get('last_summary',{}).get('issues',[])[:4]:st.error(issue)
         if snap['error']:st.error(snap['error'])
     if st.session_state.get('automatic_settings_error'):st.error(st.session_state.automatic_settings_error)
@@ -4651,7 +4709,7 @@ def automatic_collection_panel():
     if st.session_state.get('automatic_log_events'):
         diagnostic_downloads(st.session_state.automatic_log_events,'automatic')
         st.caption('このログは現在または直近の町の詳細ログです。エラー自体は町をまたいでSupabaseへ都度保存します。')
-    if st.button('Supabaseに保存済みの全取得エラーを準備・更新',key='automatic_all_failures_prepare'):
+    if st.button('全取得エラーCSVを準備・更新',key='automatic_all_failures_prepare'):
         try:
             with st.spinner('全検索・全町の保存済みエラーを読み込んでいます'):
                 # A cached automatic-collection controller can survive a Streamlit hot reload and
@@ -4662,14 +4720,15 @@ def automatic_collection_panel():
                 # controller may have been created by an older build and kept alive by
                 # st.cache_resource across deploys.
                 error_db=Database()
-                events=error_db.load_diagnostic_failures();rows=acquisition_failure_rows(events)
-                st.session_state.all_acquisition_failures={'rows':rows,'csv':csv_bytes_from_rows(rows),'prepared_at':utc_now()}
+                events=error_db.load_diagnostic_failures();rows=acquisition_failure_rows(events);candidate_rows=candidate_failure_rows(events)
+                st.session_state.all_acquisition_failures={'rows':rows,'csv':csv_bytes_from_rows(rows),'candidate_rows':candidate_rows,'candidate_csv':csv_bytes_from_rows(candidate_rows),'prepared_at':utc_now()}
         except AppError as exc:st.error(str(exc))
         except Exception as exc:st.error('保存済み取得エラーの読み込みに失敗しました：'+type(exc).__name__)
     all_failures=st.session_state.get('all_acquisition_failures')
-    if all_failures:
-        st.caption(f"Supabaseへ都度保存済みの取得エラー {len(all_failures['rows'])}件｜準備日時 {acquisition_time_jst(all_failures['prepared_at'])}")
-        st.download_button('全検索・全町の取得エラーCSVをダウンロード',all_failures['csv'],'sumai_all_acquisition_failures.csv','text/csv',key='automatic_all_failures_csv',on_click='ignore')
+    if all_failures is not None:
+        st.caption(f"物件エラー {len(all_failures.get('candidate_rows',[]))}件｜技術エラー詳細 {len(all_failures['rows'])}イベント｜準備日時 {acquisition_time_jst(all_failures['prepared_at'])}")
+        st.download_button('全検索・全町の物件エラーCSVをダウンロード',all_failures.get('candidate_csv',csv_bytes_from_rows([])),'sumai_all_listing_errors.csv','text/csv',key='automatic_all_listing_errors_csv',on_click='ignore')
+        st.download_button('全検索・全町の技術エラー詳細CSVをダウンロード',all_failures['csv'],'sumai_all_acquisition_failure_events.csv','text/csv',key='automatic_all_failures_csv',on_click='ignore')
         with st.expander('保存済み取得エラーの最新100件'):
             st.dataframe(all_failures['rows'][-100:],hide_index=True)
     st.caption('物件ID・取得成功日時は再取得の管理情報として保存します。詳細住所と募集データの保存に成功した物件だけが取得済みになります。')
@@ -4773,12 +4832,13 @@ def main():
         if result:
             summary=result['summary'];saved=summary.get('saved',0);confirmed=summary.get('confirmed',0)
             if result.get('conditions',{}).get('mode')=='published_map_position_repair':st.info(f"位置の再確認：{summary.get('position_attempted',0)}件｜位置改善 {summary.get('position_updated',0)}件｜未確認 {summary.get('position_pending',0)}件｜全募集を保持")
-            if result['status']=='completed': st.success(f'検索完了｜取得 {confirmed}件・保存確認 {saved}件')
-            elif result['status']=='cancelled': st.info(f'検索を中断しました｜取得 {confirmed}件・保存確認 {saved}件を保持しています。')
-            elif result['status']=='partial': st.error(f'検索終了｜取得 {confirmed}件・保存確認 {saved}件。一部の取得・保存に失敗しました。')
-            else: st.error('検索を完了できませんでした。以下の原因を確認してください。')
+            processed=int(summary.get('processed',0));errors=int(summary.get('errors',0));skipped=int(summary.get('already_acquired',0))
+            metrics=f'処理 {processed}件｜保存 {saved}件｜エラー {errors}件｜スキップ {skipped}件'
+            if result['status']=='completed': st.success('検索完了｜'+metrics)
+            elif result['status']=='cancelled': st.info('検索中断｜'+metrics)
+            elif result['status']=='partial': st.error('検索終了｜'+metrics)
+            else: st.error('検索失敗｜'+metrics)
             for issue in summary.get('issues',[])[:8]: st.write('・'+issue)
-            if summary.get('elapsed') is not None: st.caption(f"所要 {summary['elapsed']}秒｜詳細確認 {summary.get('detail',0)}件｜除外 {summary.get('rejected',0)}件｜取得済みスキップ {summary.get('already_acquired',0)}件")
             if result.get('conditions',{}).get('regions'):
                 with st.expander('今回検索した地名・丁目'):
                     for label in result['conditions']['regions']: st.write(label)
@@ -4800,7 +4860,7 @@ def main():
     with tabs[1]:
         automatic_collection_panel()
         st.subheader('Supabaseに保存した物件')
-        st.caption('Supabaseの保存物件を最新状態で読み込みます。読み込み中に自動収集で追加・更新された物件も、完了直前に差分を再確認して反映します。範囲外の物件も保持します。')
+        st.caption('Supabaseの保存物件を最新状態で読み込みます。読み込み中に自動収集で追加・更新された物件も、完了直前に再確認して反映します。重複する過去形式の保存行は1物件として扱います。')
         if st.button('最新の保存物件を読み込む・反映',key='new_load',use_container_width=True,disabled=bool(active_job() and not active_job().snapshot()['finished'])):
             try:start_saved_load(bounds,state.get('address_point_cache'))
             except AppError as exc:st.error(str(exc))
