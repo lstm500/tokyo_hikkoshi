@@ -38,7 +38,7 @@ import streamlit as st
 from streamlit_folium import st_folium
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v60"
+BUILD = "REBUILD-01-v61"
 PROVIDER_OPTIONS = ("スマイティ","HOMES","SUUMO","カナリー","アットホーム","CHINTAI","Comfy","アパマンショップ")
 PROVIDER_CANONICAL = {"HOMES":"HOME’S","HOME’S":"HOME’S","スマイティ":"スマイティ","SUUMO":"SUUMO","カナリー":"カナリー",
                       "アットホーム":"アットホーム","CHINTAI":"CHINTAI","Comfy":"Comfy","アパマンショップ":"アパマンショップ"}
@@ -4037,6 +4037,8 @@ def main():
         facilities=[f for f in state.new_facilities if bounds and in_rectangle((f['lat'],f['lng']),bounds)]
         # Leaflet clips points to its viewport. Keeping every loaded point in the layer
         # lets a pan reveal previously off-screen properties without a full app rerun.
+        legend=''.join(f'<span style="display:inline-block;margin:4px 10px 4px 0;color:#203f39;font-size:12px"><b style="color:{color}">■</b> {label}</span>' for color,label in zip(COLORS,RENT_BAND_LABELS))
+        st.markdown(legend,unsafe_allow_html=True)
         interactive_rental_map(map_units,cells,facilities)
         if st.button('現在の範囲の件数・一覧を更新',key='refresh_viewport_summary'):
             st.rerun()
@@ -4083,8 +4085,6 @@ def main():
             if result.get('conditions',{}).get('regions'):
                 with st.expander('今回検索した地名・丁目'):
                     for label in result['conditions']['regions']: st.write(label)
-        legend=''.join(f'<span style="display:inline-block;margin:4px 10px 4px 0;color:#203f39;font-size:12px"><b style="color:{color}">■</b> {label}</span>' for color,label in zip(COLORS,RENT_BAND_LABELS))
-        st.markdown(legend,unsafe_allow_html=True)
         st.caption('色分けは家賃＋管理費・共益費の月額です。各境界額は低い側の帯に含みます。1募集につき1点を、その募集の家賃帯で表示します。町丁目や区画の平均・中央値へまとめません。町丁目の位置しか分からない点は破線で表示します。同じ位置の募集は重なります。')
         if state.get('new_map_loaded'):display_diagnostic_downloads(display_report)
         c1,c2,c3=st.columns(3)
