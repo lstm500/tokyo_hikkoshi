@@ -38,7 +38,7 @@ import streamlit as st
 from streamlit_folium import st_folium
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v87"
+BUILD = "REBUILD-01-v88"
 
 # ============================================================================
 # NON-NEGOTIABLE SUUMO ADDRESS POLICY -- DO NOT DELETE OR WEAKEN
@@ -51,9 +51,15 @@ BUILD = "REBUILD-01-v87"
 #    point belongs to the requested search scope; they are not address input.
 # 5) A saved acquisition ID whose linked saved address is only town/chome-level
 #    MUST NOT suppress re-fetch.  It remains a re-acquisition target.
+# 6) Missing room-marker/map-image metadata, GSI residential-tile failure, or a
+#    first-pass detailed-address miss MUST NOT immediately reject the listing.
+#    The app must continue through the property-specific kankyo page, published
+#    Google-map center hints, and then independent building-identity corroboration.
+# 7) Independent corroboration may use building name / age / layout / floor area,
+#    but MUST NOT use the SUUMO textual address as a query, hint, or validator.
 # These rules are part of the application specification. Future edits must keep them.
 SUUMO_TEXT_ADDRESS_FORBIDDEN = True
-SUUMO_MAP_ONLY_ADDRESS_POLICY = 'map_coordinate_only_v1'
+SUUMO_MAP_ONLY_ADDRESS_POLICY = 'map_coordinate_plus_identity_corroboration_v2'
 
 PROVIDER_OPTIONS = ("スマイティ","HOMES","SUUMO","カナリー","アットホーム","CHINTAI","Comfy","アパマンショップ")
 PROVIDER_CANONICAL = {"HOMES":"HOME’S","HOME’S":"HOME’S","スマイティ":"スマイティ","SUUMO":"SUUMO","カナリー":"カナリー",
@@ -1278,7 +1284,7 @@ class PublicWeb:
             error=AppError(host+'：取得経路の待機中です（直前の403・429等）。設定した全経路の待機が終わってから再検索してください。');error.diagnostic={'skipped_routes':skipped};raise error
         return last
     def _fetch_uncached(self,url,method='GET',**kwargs):
-        allowed=tuple(RENTAL_HOSTS)+('mreversegeocoder.gsi.go.jp','msearch.gsi.go.jp','maps.gsi.go.jp','cyberjapandata.gsi.go.jp','japanese-addresses-v2.geoloniamaps.com','geolonia.github.io','img01.suumo.com','img02.suumo.com','maps.googleapis.com','maps.google.com')
+        allowed=tuple(RENTAL_HOSTS)+('mreversegeocoder.gsi.go.jp','msearch.gsi.go.jp','maps.gsi.go.jp','cyberjapandata.gsi.go.jp','japanese-addresses-v2.geoloniamaps.com','geolonia.github.io','img01.suumo.com','img02.suumo.com','maps.googleapis.com','maps.google.com','html.duckduckgo.com','www.google.com','search.yahoo.co.jp','myhome.nifty.com','www.mansion-review.jp','www.e-room.co','www.housecom.jp','vidax-gotanda.jp')
         u=urlparse(url)
         if u.scheme!='https' or u.hostname not in allowed or u.username or u.password: raise AppError('取得先が不正です。')
         if method=='GET' and not kwargs.get('params') and url in self.http_cache:
@@ -1563,9 +1569,41 @@ def _map_point_to_residential_address(web,point,munis,max_distance_m=90,expected
             if not town or not block or not base:continue
             dist=meters(point,(lat2,lng2))
             candidates.append((dist,code,town,block,base,lat2,lng2,props))
-    if tile_errors:
-        trace(web,'map_address_unresolved',{'point':list(point),'failed_stage':'address.tiles','reason':'必要な住所タイルの取得に失敗し、最近傍住所を比較できない','tile_errors':tile_errors,'feature_count':feature_count,'requested_tiles':tiles,'candidate_count':len(candidates)},'WARNING','location')
-        return None
+    if tile_errors and candidates:
+        # A neighboring tile failure must not discard valid detailed-address points
+        # already obtained from the other required tiles. Keep the candidates and
+        # record the partial failure for diagnostics.
+        trace(web,'address_tiles_partial_failure',{'point':list(point),'tile_errors':tile_errors,'feature_count':feature_count,'requested_tiles':tiles,'candidate_count':len(candidates),'decision':'continue_with_available_candidates'},'WARNING','address.tiles')
+    elif tile_errors and not candidates:
+        # Retry only failed residential tiles once. PublicWeb remembers failed URLs,
+        # so clear that short-lived memo before this controlled single retry.
+        retry_errors=[]
+        for item in list(tile_errors):
+            tile=tuple(item.get('tile') or ())
+            if len(tile)!=2:continue
+            url=f'https://cyberjapandata.gsi.go.jp/xyz/experimental_jhj/18/{tile[0]}/{tile[1]}.geojson'
+            with web.cache_lock:web.failed_detail_urls.pop(url,None)
+            try:features=_jhj_tile(web,*tile,18)
+            except Exception as exc:
+                retry_errors.append({'tile':list(tile),'error':str(exc),'exception_type':type(exc).__name__});continue
+            feature_count+=len(features)
+            for feature in features:
+                if not isinstance(feature,dict):continue
+                geo=feature.get('geometry') or {};coords=geo.get('coordinates')
+                if geo.get('type')!='Point' or not isinstance(coords,(list,tuple)) or len(coords)<2:continue
+                try:lng2,lat2=float(coords[0]),float(coords[1])
+                except (ValueError,TypeError):continue
+                props=feature.get('properties') or {}
+                code=_property_value(props,('市区町村コード','市町村コード','municipality_code','muniCd'),('市区町村コード','市町村コード'))
+                if len(code)>5 and code[:5] in munis:code=code[:5]
+                town=_property_value(props,('町又は字の名称','町字名','町名'),('町又は字','町字'))
+                town=re.sub(r'[-－](\d+)$',r'\1丁目',town)
+                block=_property_value(props,('街区符号','街区'),('街区符号',))
+                base=_property_value(props,('基礎番号','住居番号'),('基礎番号',))
+                if not town or not block or not base:continue
+                candidates.append((meters(point,(lat2,lng2)),code,town,block,base,lat2,lng2,props))
+        trace(web,'address_tiles_retry',{'point':list(point),'initial_tile_errors':tile_errors,'remaining_errors':retry_errors,'candidate_count':len(candidates)},'INFO' if candidates else 'WARNING','address.tiles')
+        tile_errors=retry_errors
     if not candidates:
         trace(web,'map_address_unresolved',{'point':list(point),'reason':'GSI住居表示住所の候補なし','tile_errors':tile_errors,'feature_count':feature_count,'requested_tiles':tiles,'maximum_distance_m':max_distance_m},'WARNING','location')
         return None
@@ -2478,19 +2516,30 @@ def suumo_group_params(prepared,layouts,page=1):
     return params
 
 
+def _clean_suumo_building_name(value):
+    text=normal(value)
+    if not text:return ''
+    text=re.sub(r'^【?SUUMO】?\s*','',text,flags=re.I)
+    # Strip agent / station / address-like suffixes; never keep a textual address here.
+    for sep in ('／',' | ',' - ','｜'):
+        if sep in text:text=text.split(sep,1)[0].strip()
+    text=re.sub(r'\s*[（(](?:[^)）]*(?:駅|都|道|府|県|区|市|町|村)[^)）]*)[)）]\s*$','',text)
+    text=re.sub(r'\s+\d{2,4}号室\s*$','',text)
+    return text[:120]
+
+
 def suumo_detail_fields(soup):
-    """Read current SUUMO detail fields without relying on the list address."""
+    """Read SUUMO identity/spec fields while deliberately excluding textual address."""
     visible=' '.join(soup.stripped_strings);structured=json_listing_fields(soup)
     # HARD RULE -- DO NOT REMOVE: SUUMO textual address is deliberately not read.
-    # Location/address acquisition uses only this listing's published property map.
+    # Location/address acquisition uses only this listing's published property map,
+    # then (only on fallback) independent sources queried by non-address identity.
     address=''
     raw_layout=structured.get('layout') or generic_labeled(soup,('間取り','間取'))
     if not raw_layout:
         raw_layout=regex_after_label(visible,('間取り','間取'),r'(?:ワンルーム|\d+(?:S?LDK|S?DK|SK|LK|K|L|R))')
     raw_rent=structured.get('rent') or generic_labeled(soup,('賃料','家賃'))
     if not raw_rent:
-        # Current SUUMO detail pages show "17.7万円 管理費・共益費: 20000円"
-        # above the specification table, so there may be no 賃料 th/dt cell.
         m=re.search(r'(?<![\d.])(\d+(?:\.\d+)?)\s*万円\s*管理費(?:・共益費)?',visible)
         if m:raw_rent=m.group(1)+'万円'
     if not raw_rent:
@@ -2499,9 +2548,23 @@ def suumo_detail_fields(soup):
     raw_age=structured.get('age') or generic_labeled(soup,('築年数','築年月','築年'))
     if not raw_age:
         raw_age=regex_after_label(visible,('築年数','築年月','築年'),r'(?:新築|築\s*\d{1,3}年|(?:19|20)\d{2}年\s*\d{1,2}月)')
+    raw_area=structured.get('area') or generic_labeled(soup,('専有面積','面積'))
+    if not raw_area:
+        raw_area=regex_after_label(visible,('専有面積','面積'),r'\d+(?:\.\d+)?\s*(?:m2|㎡|平米)')
+    name_candidates=[]
+    h1=soup.find('h1')
+    if h1:name_candidates.append(h1.get_text(' ',strip=True))
+    og=soup.find('meta',attrs={'property':'og:title'})
+    if og and og.get('content'):name_candidates.append(og.get('content'))
+    if soup.title and soup.title.string:name_candidates.append(soup.title.string)
+    building_name=''
+    for candidate in name_candidates:
+        cleaned=_clean_suumo_building_name(candidate)
+        if cleaned and not re.search(r'(?:東京都|神奈川県|埼玉県|千葉県).*(?:区|市).*(?:丁目|\d[-－])',cleaned):
+            building_name=cleaned;break
     return {'visible':visible,'address':normal(address),'raw_layout':normal(raw_layout),'raw_rent':normal(raw_rent),
-            'building_type':normal(building_type),'raw_age':normal(raw_age),'structured':structured}
-
+            'building_type':normal(building_type),'raw_age':normal(raw_age),'raw_area':normal(raw_area),
+            'building_name':normal(building_name),'structured':structured}
 
 def _suumo_next_url(soup,response_url,filter_params):
     """Follow SUUMO's current path pagination (pnz12.html etc.) and preserve filters."""
@@ -2602,60 +2665,265 @@ def _suumo_room_marker_points(web,soup,map_url):
     return None,{'script_found':bool(nodes)}
 
 
-def suumo_location_from_kankyo_image(web,detail_soup,detail_url,bounds,munis,expected_towns=None,region_code=None):
-    """Resolve SUUMO's published room marker, with canonical BC fallback and cache."""
-    jnc=suumo_jnc_key(detail_url)
-    cache_key='jnc:'+jnc if jnc else 'detail:'+detail_url
+_JP_DIGIT_TRANS=str.maketrans('０１２３４５６７８９－ー−','0123456789---')
+_EXTERNAL_IDENTITY_HOSTS=('myhome.nifty.com','www.mansion-review.jp','www.e-room.co','www.housecom.jp','vidax-gotanda.jp')
+
+
+def _normalize_japanese_address(value):
+    text=normal(value).translate(_JP_DIGIT_TRANS).replace(' ','').replace('　','')
+    text=text.replace('番地','番').replace('番の','番')
+    text=re.sub(r'(\d+)番号(\d+)号',r'\1番\2号',text)
+    text=re.sub(r'(\d+)番(\d+)号',r'\1-\2',text)
+    text=re.sub(r'(\d+)番$',r'\1番',text)
+    return text
+
+
+def _detailed_address(value):
+    text=_normalize_japanese_address(value)
+    return bool(text and re.search(r'(?:丁目|大字|字).{0,30}\d+(?:番|-|－)\d+(?:号)?$',text))
+
+
+def _extract_detailed_addresses(text):
+    if not text:return []
+    compact=unicodedata.normalize('NFKC',str(text)).replace('\u3000',' ')
+    # Tokyo-focused because the automatic collector currently operates on Tokyo wards.
+    # Require chome + block + base/house number so town-only strings never pass.
+    pattern=re.compile(r'東京都\s*[^\s,、。|<>]{1,16}区\s*[^\s,、。|<>]{1,24}?(?:\d+丁目|[一二三四五六七八九十]+丁目)\s*\d+\s*(?:番(?:地)?\s*\d+\s*号?|-\s*\d+)(?!\d)')
+    out=[]
+    for m in pattern.finditer(compact):
+        addr=_normalize_japanese_address(m.group(0))
+        if _detailed_address(addr) and addr not in out:out.append(addr)
+    return out
+
+
+def _suumo_map_center_points(soup,map_url):
+    """Coordinates published by the property-specific kankyo Google map, not listing text."""
+    chunks=[str(soup)]
+    for tag in soup.select('a[href],iframe[src],img[src],script'):
+        for attr in ('href','src'):
+            if tag.get(attr):chunks.append(html.unescape(str(tag.get(attr))))
+        if tag.name=='script':chunks.append(tag.get_text('',strip=False) or '')
+    blob=' '.join(chunks)
+    points=[]
+    patterns=(
+        (r'[?&](?:ll|center)=\s*(3[4-7]\.\d+)\s*[,%2C]+\s*(1(?:3[89]|40)\.\d+)','google_ll'),
+        (r'@\s*(3[4-7]\.\d+)\s*,\s*(1(?:3[89]|40)\.\d+)(?:,|%2C)','google_at'),
+        (r'[?&]q=\s*(3[4-7]\.\d+)\s*[,%2C]+\s*(1(?:3[89]|40)\.\d+)','google_q'),
+    )
+    for pattern,method in patterns:
+        for m in re.finditer(pattern,blob,re.I):
+            try:p=(float(m.group(1)),float(m.group(2)),method)
+            except (ValueError,TypeError):continue
+            if has_point({'latitude':p[0],'longitude':p[1]}) and p not in points:points.append(p)
+    # Prefer a coordinate repeated by more than one Google-map link. If there is
+    # only one distinct coordinate, it is still a usable published map center hint.
+    counts={}
+    for lat,lng,method in points:
+        key=(round(lat,6),round(lng,6));counts[key]=counts.get(key,0)+1
+    if not counts:return None,{'map_url':map_url,'points':[]}
+    ranked=sorted(counts.items(),key=lambda kv:(-kv[1],kv[0]))
+    best,count=ranked[0]
+    if len(ranked)>1 and ranked[0][1]==ranked[1][1] and meters(best,ranked[1][0])>80:
+        return None,{'map_url':map_url,'points':points,'reason':'multiple_map_centers_not_unique'}
+    return best,{'map_url':map_url,'points':points,'occurrences':count,'distinct':len(ranked)}
+
+
+def _identity_year_month(raw_age):
+    text=normal(raw_age)
+    m=re.search(r'((?:19|20)\d{2})年\s*(\d{1,2})月',text)
+    return (int(m.group(1)),int(m.group(2))) if m else None
+
+
+def _identity_area(raw_area):
+    m=re.search(r'(\d+(?:\.\d+)?)',normal(raw_area))
+    return float(m.group(1)) if m else None
+
+
+def _external_result_links(soup,base_url):
+    links=[]
+    for a in soup.select('a[href]'):
+        raw=html.unescape(str(a.get('href') or ''));target=urljoin(base_url,raw)
+        u=urlparse(target)
+        # DuckDuckGo wraps links in uddg; Google often wraps them in /url?q=.
+        q=parse_qs(u.query)
+        for key in ('uddg','q','url'):
+            candidate=(q.get(key) or [''])[0]
+            if candidate.startswith('https://'):target=candidate;u=urlparse(target);break
+        if u.scheme=='https' and u.hostname in _EXTERNAL_IDENTITY_HOSTS and target not in links:links.append(target)
+    return links
+
+
+def _identity_match_score(text,identity):
+    normalized=normal(text);score=0;evidence=[]
+    name=normal(identity.get('building_name'))
+    if name and name in normalized:score+=4;evidence.append('building_name')
+    ym=_identity_year_month(identity.get('raw_age'))
+    if ym and (f'{ym[0]}年{ym[1]}月' in normalized or f'{ym[0]}/{ym[1]:02d}' in normalized):score+=2;evidence.append('built_ym')
+    layout=parsed_layout(identity.get('raw_layout'))
+    if layout and layout in normalized:score+=1;evidence.append('layout')
+    area=_identity_area(identity.get('raw_area'))
+    if area is not None and (f'{area:g}㎡' in normalized or f'{area:g}m2' in normalized.lower() or f'{area:g}平米' in normalized):score+=2;evidence.append('area')
+    return score,evidence
+
+
+def _gsi_validate_external_address(web,address,munis,region_code=None):
+    try:data=web.fetch('https://msearch.gsi.go.jp/address-search/AddressSearch',params={'q':address}).json()
+    except Exception as exc:
+        trace(web,'external_address_gsi_failed',{'address':address,'exception_type':type(exc).__name__,'reason':str(exc)},'WARNING','address.fallback');return None
+    if not isinstance(data,list):return None
+    for feature in data[:5]:
+        if not isinstance(feature,dict):continue
+        props=feature.get('properties') or {};geo=feature.get('geometry') or {};coords=geo.get('coordinates')
+        title=_normalize_japanese_address(props.get('title') or address)
+        if not _detailed_address(title) or not isinstance(coords,(list,tuple)) or len(coords)<2:continue
+        try:lng,lat=float(coords[0]),float(coords[1])
+        except (ValueError,TypeError):continue
+        official=reverse(web,(lat,lng),munis,force=True)
+        if region_code and official and official.get('code')!=str(region_code):continue
+        return {'address':title,'reference_point':[lat,lng],'official_region':official,'verification':'external_identity_plus_gsi_address_search'}
+    return None
+
+
+def _cross_source_address_from_identity(web,identity,map_point,munis,region_code=None):
+    """Fallback for SUUMO map/GSI failures. Never uses SUUMO textual address."""
+    name=normal(identity.get('building_name'))
+    if len(name)<3:return None
+    query='"'+name+'"'
+    ym=_identity_year_month(identity.get('raw_age'))
+    if ym:query+=f' {ym[0]}年{ym[1]}月'
+    layout=parsed_layout(identity.get('raw_layout'))
+    if layout:query+=' '+layout
+    search_urls=(
+        'https://html.duckduckgo.com/html/?q='+quote(query),
+        'https://www.google.com/search?q='+quote(query),
+        'https://search.yahoo.co.jp/search?p='+quote(query),
+    )
+    result_links=[];search_errors=[]
+    for search_url in search_urls:
+        try:
+            reply=web.fetch(search_url);soup=BeautifulSoup(reply.text,'html.parser')
+            result_links.extend(x for x in _external_result_links(soup,reply.url) if x not in result_links)
+        except Exception as exc:search_errors.append({'url':search_url,'exception_type':type(exc).__name__,'reason':str(exc)})
+        if len(result_links)>=8:break
+    candidates={}
+    for target in result_links[:8]:
+        try:
+            if not web.permitted(target):continue
+            reply=web.fetch(target);soup=BeautifulSoup(reply.text,'html.parser');text=' '.join(soup.stripped_strings)
+        except Exception as exc:
+            trace(web,'external_identity_page_failed',{'url':target,'exception_type':type(exc).__name__,'reason':str(exc)},'WARNING','address.fallback');continue
+        score,evidence=_identity_match_score(text,identity)
+        if score<5 or 'building_name' not in evidence:continue
+        host=urlparse(target).hostname or ''
+        for address in _extract_detailed_addresses(text):
+            key=_normalize_japanese_address(address)
+            row=candidates.setdefault(key,{'address':key,'hosts':set(),'score':0,'evidence':set(),'urls':[]})
+            row['hosts'].add(host);row['score']=max(row['score'],score);row['evidence'].update(evidence);row['urls'].append(target)
+    ranked=sorted(candidates.values(),key=lambda r:(len(r['hosts']),r['score']),reverse=True)
+    for row in ranked:
+        # Two independent hosts are preferred; a single host needs the strongest
+        # identity match (name + build month + area/layout) before acceptance.
+        if len(row['hosts'])<2 and row['score']<8:continue
+        validated=_gsi_validate_external_address(web,row['address'],munis,region_code)
+        if not validated:continue
+        ref=tuple(validated['reference_point']);distance=meters(map_point,ref) if map_point else None
+        if distance is not None and distance>2000:continue
+        validated.update(distance_m=distance if distance is not None else 0,
+                         external_hosts=sorted(row['hosts']),external_urls=row['urls'][:4],
+                         identity_evidence=sorted(row['evidence']))
+        trace(web,'external_identity_address_ok',{'building_name':name,'address':validated['address'],'map_point':list(map_point) if map_point else None,'address_point':validated['reference_point'],'distance_m':round(distance,1) if distance is not None else None,'hosts':validated['external_hosts'],'identity_evidence':validated['identity_evidence']},stage='address.fallback')
+        return validated
+    trace(web,'external_identity_address_unresolved',{'building_name':name,'search_errors':search_errors,'result_links':result_links[:8],'candidate_count':len(candidates),'reason':'独立ソースで詳細住所を十分に照合できない'},'WARNING','address.fallback')
+    return None
+
+
+def suumo_location_from_kankyo_image(web,detail_soup,detail_url,bounds,munis,expected_towns=None,region_code=None,identity=None):
+    """Resolve SUUMO map position then infer address, with identity-only fallback."""
+    identity=dict(identity or {})
+    jnc=suumo_jnc_key(detail_url);bc=suumo_bc_id(detail_url)
+    cache_key=('bc:'+bc) if bc else ('jnc:'+jnc if jnc else 'detail:'+detail_url)
     with web.cache_lock:cached=getattr(web,'suumo_location_cache',{}).get(cache_key)
     if cached:
-        address=normal(cached.get('inferred_address'))
-        if not expected_towns or any(town_matches(t,address) for t in expected_towns):
-            trace(web,'suumo_location_cache_hit',{'detail_url':detail_url,'cache_key':cache_key,'address':address},stage='location')
-            return dict(cached)
+        trace(web,'suumo_location_cache_hit',{'detail_url':detail_url,'cache_key':cache_key,'address':cached.get('inferred_address','')},stage='location')
+        return dict(cached)
     targets=suumo_kankyo_urls(detail_soup,detail_url)
     if not targets:raise AppError('SUUMOの地図・周辺環境URLを確認できません。')
-    fetched=[];lat=lng=None;method='';source='';failures=[]
-    # First prefer dynamic room-marker JSON on every published candidate URL.
+    fetched=[];lat=lng=None;method='';source='';failures=[];position_kind=''
+    # 1) Exact published room marker.
     for number,target in enumerate(targets,1):
         web.check_cancel()
-        if not web.permitted(target):
-            failures.append({'url':target,'reason':'robots_not_permitted'});continue
+        if not web.permitted(target):failures.append({'url':target,'reason':'robots_not_permitted'});continue
         try:reply=web.fetch(target)
-        except AppError as exc:
-            failures.append({'url':target,'reason':str(exc)});continue
+        except AppError as exc:failures.append({'url':target,'reason':str(exc)});continue
         soup=BeautifulSoup(reply.text,'html.parser');fetched.append((target,soup))
         point,meta=_suumo_room_marker_points(web,soup,target)
         if point:
-            lat,lng=point;source=target;method='SUUMO地図・周辺環境の物件マーカー座標→GSI住居表示住所推定'
+            lat,lng=point;source=target;position_kind='room_marker';method='SUUMO地図・周辺環境の物件マーカー座標→詳細住所推定'
             if number>1:trace(web,'suumo_map_fallback_success',{'detail_url':detail_url,'map_url':target,'attempt':number,'attempted_urls':targets[:number]},stage='location')
             break
         failures.append({'url':target,'reason':'room_marker_not_unique_or_missing','meta':meta})
-    # Only if no dynamic marker exists, retain the verified georeferenced-image fallback.
+    # 2) Georeferenced static map image pin.
     if lat is None:
         for target,soup in fetched:
             candidates=map_image_candidates(web,soup,target);distinct={p[:2] for p in candidates if p[3]>=5}
             if len(distinct)==1:
-                lat,lng=next(iter(distinct));source=target;method='SUUMO地図画像ピン認識→GSI住居表示住所推定';break
-        if lat is None:
-            trace(web,'suumo_marker_unresolved',{'detail_url':detail_url,'candidate_map_urls':targets,'failures':failures,
-                  'reason':'公開された地図候補からtype=roomの一意な物件マーカーを取得できない'},'WARNING','location');return None
+                lat,lng=next(iter(distinct));source=target;position_kind='image_pin';method='SUUMO地図画像ピン認識→詳細住所推定';break
+    # 3) Published Google-map center. This fixes listings with no js-gmapData and no
+    # unique static-image pin; it is a hint, not proof of the exact building position.
+    if lat is None:
+        center_candidates=[]
+        for target,soup in fetched:
+            point,meta=_suumo_map_center_points(soup,target)
+            if point:center_candidates.append((point,target,meta))
+            else:failures.append({'url':target,'reason':'map_center_missing_or_ambiguous','meta':meta})
+        unique={x[0] for x in center_candidates}
+        if len(unique)==1:
+            (lat,lng),source,meta=center_candidates[0];position_kind='map_center';method='SUUMO地図・周辺環境のGoogle地図中心座標→詳細住所照合'
+            trace(web,'suumo_map_center_fallback',{'detail_url':detail_url,'map_url':source,'point':[lat,lng],'meta':meta},stage='location')
+        elif len(unique)>1:
+            # Prefer a center repeated across multiple property-specific map pages.
+            counts={}
+            for point,target,meta in center_candidates:counts[point]=counts.get(point,0)+1
+            ranked=sorted(counts.items(),key=lambda kv:(-kv[1],kv[0]))
+            if len(ranked)==1 or ranked[0][1]>ranked[1][1]:
+                (lat,lng),_=ranked[0];source=next(t for p,t,m in center_candidates if p==(lat,lng));position_kind='map_center';method='SUUMO地図・周辺環境のGoogle地図中心座標→詳細住所照合'
+    if lat is None:
+        trace(web,'suumo_marker_unresolved',{'detail_url':detail_url,'candidate_map_urls':targets,'failures':failures,
+              'reason':'物件マーカー・地図画像ピン・Google地図中心座標のいずれも取得できない'},'WARNING','location');return None
     if not in_rectangle((lat,lng),bounds):
-        trace(web,'published_point_outside_bounds',{'map_url':source,'point':[lat,lng],'bounds':list(bounds),
-              'retained':True,'reason':'検索範囲外でも住所推定・保存を継続'},stage='location')
-    inferred=map_point_to_residential_address(web,(lat,lng),munis,expected_code=region_code,expected_towns=expected_towns)
+        trace(web,'published_point_outside_bounds',{'map_url':source,'point':[lat,lng],'bounds':list(bounds),'retained':True,'reason':'検索範囲外でも照合を継続'},stage='location')
+
+    # Exact marker/image pin may use the strict expected-town JHJ path. A map-center
+    # hint can be hundreds of metres off, so do not reject it merely because reverse
+    # geocoding returns another neighboring town; cross-source identity handles that.
+    strict_towns=expected_towns if position_kind in ('room_marker','image_pin') else None
+    inferred=map_point_to_residential_address(web,(lat,lng),munis,expected_code=region_code,expected_towns=strict_towns)
+    external=None
+    if not inferred:
+        external=_cross_source_address_from_identity(web,identity,(lat,lng),munis,region_code)
+        inferred=external
     if not inferred:return None
     address=inferred['address']
-    if expected_towns and not any(town_matches(t,address) for t in expected_towns):
-        trace(web,'map_address_difference',{'map_url':source,'map_derived_address':address,'expected_towns':list(expected_towns),'retained':False},'WARNING','location');return None
-    location={'latitude':lat,'longitude':lng,'location_method':method,
-              'map_address':address,'inferred_address':address,'address_match':'地図座標から詳細住所推定（実所在地未確認）',
-              'coordinate_precision':'listing_map','position_source_url':source,
-              'address_precision':'同一町丁目の最近傍住居表示住所・推定値',
-              'address_distance_m':round(inferred['distance_m'],2)}
+    if not _detailed_address(address):return None
+    external_used=bool(external)
+    location={'latitude':float(inferred.get('reference_point',[lat,lng])[0]) if external_used else lat,
+              'longitude':float(inferred.get('reference_point',[lat,lng])[1]) if external_used else lng,
+              'location_method':('SUUMO物件固有地図→建物名・築年月・間取り/面積を独立ソース照合→GSI住所確認' if external_used else method),
+              'map_address':address,'inferred_address':address,
+              'address_match':('独立ソースで建物同一性を照合しGSIで番地確認' if external_used else '地図座標から番地・住居番号相当まで推定'),
+              'coordinate_precision':'building' if external_used else 'listing_map',
+              'position_source_url':source,
+              'address_precision':('独立複数ソース照合＋GSI住所検索' if external_used else 'GSI住居表示・街区符号/基礎番号'),
+              'address_distance_m':round(float(inferred.get('distance_m') or 0),2),
+              'suumo_map_hint_latitude':lat,'suumo_map_hint_longitude':lng,
+              'suumo_map_position_kind':position_kind}
+    if external_used:
+        location['address_identity_sources']=external.get('external_hosts',[])
+        location['address_identity_evidence']=external.get('identity_evidence',[])
     with web.cache_lock:
         if len(web.suumo_location_cache)>=12000:web.suumo_location_cache.pop(next(iter(web.suumo_location_cache)))
         web.suumo_location_cache[cache_key]=dict(location)
-    trace(web,'location_ok',{'source':'SUUMO物件地図マーカー','map_derived_address':address,'location':location},stage='location')
+    trace(web,'location_ok',{'source':'SUUMO物件固有地図','map_hint':[lat,lng],'map_derived_address':address,'external_identity_used':external_used,'location':location},stage='location')
     return location
 
 def suumo_collect(web,region,bounds,munis,emit):
@@ -2738,12 +3006,12 @@ def suumo_collect(web,region,bounds,munis,emit):
                     if not rent:
                         reject_listing(web,'SUUMO',url,'detail.rent','missing_data','家賃を読み取れない',{'raw':fields['raw_rent'],'parsed':rent},'家賃（円）>0');emit('rejected',1);trace(web,'parse',{'url':url,'missing':'detail_rent','visible_head':fields['visible'][:400]},'WARNING');return
 
-                    try:location=suumo_location_from_kankyo_image(web,detail,url,bounds,munis,collection_towns,region.get('code'))
+                    try:location=suumo_location_from_kankyo_image(web,detail,url,bounds,munis,collection_towns,region.get('code'),fields)
                     except AppError as exc:
                         location=None;trace(web,'location_pending',{'url':url,'message':str(exc),'source':'SUUMO地図・周辺環境の物件マーカー'},'WARNING','location')
                     address=location.get('inferred_address','') if location else ''
                     if not address:
-                        reject_listing(web,'SUUMO',url,'map.address_inference','location_failure','物件位置から詳細住所を推定できない',location,'同一町丁目の90m以内に番地を持つ住所候補');emit('rejected',1);trace(web,'location_pending',{'url':url,'reason':'物件地図から詳細住所を推定できないため保存しない','source':'SUUMO地図・周辺環境の物件マーカー'},'WARNING','location');return
+                        reject_listing(web,'SUUMO',url,'map.address_inference','location_failure','物件固有地図・GSI住居表示・独立ソース照合の全経路で詳細住所を確定できない',location,'地図座標または建物同一性の独立照合から番地・住居番号相当まで確認');emit('rejected',1);trace(web,'location_pending',{'url':url,'reason':'物件固有地図→GSI→独立ソース照合まで実施したが詳細住所を確定できないため保存しない','source':'SUUMO地図・周辺環境の物件マーカー'},'WARNING','location');return
 
                     # Rent, layout, inferred address and acquisition time survive Database.save_units().
                     row=partial_listing('SUUMO',url,'SUUMO掲載募集',address,layout,rent,None,None,region,bounds,location,None,age,ym,'')
