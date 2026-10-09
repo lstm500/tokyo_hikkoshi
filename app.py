@@ -39,7 +39,7 @@ import streamlit as st
 from streamlit_folium import st_folium
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v102"
+BUILD = "REBUILD-01-v103"
 
 # ============================================================================
 # NON-NEGOTIABLE SUUMO ADDRESS POLICY -- DO NOT DELETE OR WEAKEN
@@ -929,8 +929,8 @@ class Database:
         saved=set();items=list(unique.items());self.last_save_stats={'new':0,'updated':0,'failed':0}
         if not hasattr(self,'job_new_keys'):self.job_new_keys=set()
         if not hasattr(self,'covered_acquisitions'):self.covered_acquisitions={}
-        for offset in range(0,len(items),200):
-            batch=items[offset:offset+200]
+        for offset in range(0,len(items),60):
+            batch=items[offset:offset+60]
             unknown=[key for key,compact in batch if not compact.get('fetched_at')]
             if unknown:
                 previous=self.call('GET',SEARCH_TABLE,{'namespace':'eq.'+self.namespace,'status':'eq.rental_listing',
@@ -976,77 +976,67 @@ class Database:
         if not {r['id'] for r in payload}<=returned:raise AppError('物件IDの取得済み管理情報を保存できません。')
 
     def load_recent_acquisition_ids(self):
-        """Load recent SUUMO acquisition IDs, but re-fetch chome-only saved rows.
+        """Indexed, bounded ledger reads; never scan all saved listings for addresses.
 
-        Performance rule: this runs in the search worker, never in the Streamlit UI
-        thread, and is cached for 15 minutes.  It uses one keyset scan of saved
-        listings rather than one query per property.
+        IDs without linked saved listing are deliberately re-fetched. Town-only
+        saved addresses are likewise re-fetched, never skipped by ledger alone.
         """
         cached=getattr(self,'acquisition_cache',None)
-        if cached is not None and time.monotonic()-getattr(self,'acquisition_cache_at',0)<900:return cached
-        ledger={};listing_key_by_property={};last_acquired_id='';cutoff=acquisition_cutoff().isoformat(timespec='seconds');pages=0;raw=0
+        if cached is not None and time.monotonic()-getattr(self,'acquisition_cache_at',0)<900:
+            return cached
+        ledger={};last_id='';pages=0;raw=0
+        cutoff=acquisition_cutoff().isoformat(timespec='seconds')
         while True:
-            params={'namespace':'eq.'+self.namespace,'status':'eq.rental_acquisition',
-                'finished_at':'gte.'+cutoff,'and':'(id.gte.acquired.,id.lt.acquired/)',
-                'select':'id,conditions,summary,finished_at','order':'id.asc','limit':200}
-            if last_acquired_id:params['id']='gt.'+last_acquired_id
-            rows=self.call('GET',SEARCH_TABLE,params)
-            if not isinstance(rows,list):raise AppError('過去3か月の取得済み物件IDを確認できません。')
-            pages+=1;raw+=len(rows)
-            for row in rows:
-                conditions=row.get('conditions') or {};summary=row.get('summary') or {}
-                property_id=conditions.get('property_id');stamp=summary.get('last_success_at') or row.get('finished_at')
-                if not property_id or not re.fullmatch(r'SUUMO:(?:bc|jnc):\d+',str(property_id)):continue
-                if not recent_acquisition(stamp):continue
-                previous=ledger.get(property_id)
-                if previous is None or str(stamp)>str(previous):
-                    ledger[property_id]=stamp;listing_key_by_property[property_id]=normal(summary.get('listing_key'))
-            if not rows:break
-            last=str(rows[-1].get('id') or '')
-            if not last or last<=last_acquired_id:raise AppError('取得履歴のページ位置を確認できません。')
-            last_acquired_id=last
-            if len(rows)<200:break
-
-        # Only quality-check IDs that actually have a linked listing key.  One scan
-        # builds key->address for all current saved listings and stays off the UI thread.
-        wanted={k for k in listing_key_by_property.values() if k};addresses={};addresses_by_property={};last_id='';listing_pages=0
-        # Scan saved listings once.  This also covers old acquisition-ledger rows that
-        # predate listing_key: property_id in the saved listing is used as the join key.
-        while ledger:
-            params={'namespace':'eq.'+self.namespace,'status':'eq.rental_listing','and':'(id.gte.listing.,id.lt.listing/)','select':'id,summary','order':'id.asc','limit':200}
+            params={'namespace':'eq.'+self.namespace,
+                    'and':'(id.gte.acquired.,id.lt.acquired/)',
+                    'select':'id,conditions,summary,finished_at',
+                    'order':'id.asc','limit':100}
             if last_id:params['id']='gt.'+last_id
             rows=self.call('GET',SEARCH_TABLE,params)
-            if not isinstance(rows,list):raise AppError('取得済み物件の住所品質を確認できません。')
-            listing_pages+=1
-            if not rows:break
-            for item in rows:
-                rid=str(item.get('id') or '')
-                if not rid.startswith('listing.'):continue
-                key=rid.removeprefix('listing.')
-                listing=((item.get('summary') or {}).get('listing') or {})
-                if not isinstance(listing,dict):continue
-                address=normal(listing.get('address') or listing.get('inferred_address'))
-                if key in wanted:addresses[key]=address
-                pid=normal(listing.get('property_id'))
-                if re.fullmatch(r'SUUMO:(?:bc|jnc):\d+',pid):addresses_by_property[pid]=address
+            if not isinstance(rows,list):raise AppError('取得済み物件IDを確認できません。')
+            pages+=1;raw+=len(rows)
+            for row in rows:
+                if not str(row.get('id') or '').startswith('acquired.'):continue
+                cond=row.get('conditions') or {}; summary=row.get('summary') or {}
+                pid=normal(cond.get('property_id'))
+                stamp=summary.get('last_success_at') or row.get('finished_at')
+                if not re.fullmatch(r'SUUMO:(?:bc|jnc):\d+',pid):continue
+                if not recent_acquisition(stamp) or str(stamp)<cutoff:continue
+                key=normal(summary.get('listing_key'))
+                if key and re.fullmatch(r'[0-9a-f]{64}',key):
+                    ledger[pid]=(stamp,key)
+            if len(rows)<100:break
             new_last=str(rows[-1].get('id') or '')
-            if not new_last or new_last==last_id:break
+            if not new_last or new_last<=last_id:raise AppError('取得済みIDのページ送りが停止しました。')
             last_id=new_last
-            if len(rows)<200:break
-
+        keys=sorted({key for _,key in ledger.values()})
+        addresses={};address_requests=0
+        for offset in range(0,len(keys),60):
+            batch=keys[offset:offset+60]
+            # PostgREST `in` on primary key (namespace,id), no status JSON scan.
+            lookup='in.('+','.join('listing.'+key for key in batch)+')'
+            rows=self.call('GET',SEARCH_TABLE,{
+                'namespace':'eq.'+self.namespace,'id':lookup,
+                'select':'id,summary','limit':60})
+            address_requests+=1
+            if not isinstance(rows,list):raise AppError('保存物件の住所品質を確認できません。')
+            for item in rows:
+                key=str(item.get('id') or '').removeprefix('listing.')
+                listing=((item.get('summary') or {}).get('listing') or {})
+                if isinstance(listing,dict):
+                    addresses[key]=normal(listing.get('address') or listing.get('inferred_address'))
         out={};requeued_incomplete=0;requeued_missing=0
-        for property_id,stamp in ledger.items():
-            key=listing_key_by_property.get(property_id)
-            address=addresses.get(key) if key else None
-            if address is None:address=addresses_by_property.get(property_id)
-            # Acquisition ID alone is never enough: no saved listing or a town/chome-
-            # only saved address means this property is a re-acquisition target.
-            if address is None:requeued_missing+=1;continue
-            if saved_address_requires_reacquisition(address):
+        for pid,(stamp,key) in ledger.items():
+            addr=addresses.get(key)
+            if addr is None:requeued_missing+=1;continue
+            if saved_address_requires_reacquisition(addr):
                 requeued_incomplete+=1;continue
-            out[property_id]=stamp
-        self.last_acquisition_load_stats={'pages':pages,'raw_records':raw,'recent_ids':len(out),'full_listing_scan':bool(wanted),
-            'listing_pages':listing_pages,'requeued_incomplete_address':requeued_incomplete,'requeued_missing_listing':requeued_missing}
+            out[pid]=stamp
+        self.last_acquisition_load_stats={
+            'pages':pages,'raw_records':raw,'recent_ids':len(out),
+            'full_listing_scan':False,'address_lookup_batches':address_requests,
+            'requeued_incomplete_address':requeued_incomplete,
+            'requeued_missing_listing':requeued_missing}
         self.acquisition_cache=out;self.acquisition_cache_at=time.monotonic()
         return out
 
@@ -1174,24 +1164,25 @@ class Database:
         return saved
 
     def load_address_points(self,addresses,cancel_event=None):
-        """Load persistent address coordinates in pages and return only requested addresses."""
+        """Look up address point keys by indexed primary key, without full-table scans."""
         wanted={saved_address_point_key(a):normal(a) for a in addresses if saved_address_point_key(a)}
         if not wanted:return {}
-        out={};offset=0
-        while True:
+        out={}
+        keys=list(wanted)
+        for offset in range(0,len(keys),75):
             if cancel_event is not None and cancel_event.is_set():raise SearchCancelled()
-            rows=self.call('GET',PLACE_TABLE,{'namespace':'eq.'+self.namespace,'kind':'eq.'+ADDRESS_POINT_KIND,
-                'select':'key,title,latitude,longitude','order':'key.asc','limit':1000,'offset':offset})
+            batch=keys[offset:offset+75]
+            rows=self.call('GET',PLACE_TABLE,{
+                'namespace':'eq.'+self.namespace,
+                'key':'in.('+','.join(batch)+')',
+                'select':'key,latitude,longitude','limit':75})
             if not isinstance(rows,list):raise AppError('住所座標キャッシュを読み取れません。')
             for row in rows:
-                key=str(row.get('key') or '')
-                address=wanted.get(key)
+                address=wanted.get(str(row.get('key') or ''))
                 if not address:continue
                 try:point=(float(row['latitude']),float(row['longitude']),address)
                 except (KeyError,ValueError,TypeError):continue
                 if has_point({'latitude':point[0],'longitude':point[1]}):out[address]=point
-            if len(out)>=len(wanted) or len(rows)<1000:break
-            offset+=len(rows)
         return out
 
     def save_places(self,rows,kind):
@@ -4498,8 +4489,8 @@ def search_all(db,conditions,screen,state=None):
     remaining=[r for r in units.values() if compact_listing_key(r) not in saved]
     if remaining or acquisition_pending:
         screen['status'].info('最終保存中｜取得済みデータの保存を確認しています')
-    for offset in range(0,len(remaining),200):
-        chunk=remaining[offset:offset+200]
+    for offset in range(0,len(remaining),60):
+        chunk=remaining[offset:offset+60]
         try:
             saved.update(db.save_units(chunk));state.new_last_saved_at=utc_now()
             for row in chunk:
@@ -5922,7 +5913,11 @@ def _diagnostic_fetch_page(db,params,requested=200):
             return rows,limit
         except AppError as exc:
             latest=exc
-            if not re.search(r'HTTP 5\d\d',str(exc)) or attempt==len(limits)-1:raise
+            diagnostic=getattr(exc,'diagnostic',{}) or {}
+            status=diagnostic.get('status')
+            code=diagnostic.get('code')
+            transient=(status in (500,502,503,504) or code=='57014' or bool(re.search(r'HTTP 5\d\d',str(exc))))
+            if not transient or attempt==len(limits)-1:raise
             time.sleep(.35*(attempt+1))
     raise latest
 
@@ -5932,6 +5927,7 @@ def load_persisted_error_events_fast(db):
     events=[];seen=set();last_id=''
     while True:
         params={'namespace':'eq.'+db.namespace,'status':'eq.diagnostic_error',
+                'and':'(id.gte.failure.,id.lt.failure/)',
                 'select':'id,summary','order':'id.asc'}
         if last_id:params['id']='gt.'+last_id
         rows,limit=_diagnostic_fetch_page(db,params)
@@ -6597,8 +6593,10 @@ def automatic_collection_panel():
     automatic_log_download_panel(controller,busy,summary if snap else st.session_state.get('automatic_saved_summary',{}))
 
     try:
-        error_job=get_automatic_failure_export(max_age=900,refresh=not busy);failure=error_job.snapshot()
-        if st.button('エラーCSVを更新',key='automatic_refresh_error_csv',disabled=busy or error_job.running):
+        # Full historical errors are queried only when explicitly requested.
+        # This avoids competing 25k+ JSON rows with the primary collection job.
+        error_job=get_automatic_failure_export(max_age=900,refresh=False);failure=error_job.snapshot()
+        if st.button('エラーCSVを手動更新（過去全件）',key='automatic_refresh_error_csv',disabled=busy or error_job.running):
             error_job.refresh(max_age=0)
             st.rerun()
         if failure['loaded']:
@@ -6610,7 +6608,7 @@ def automatic_collection_panel():
         else:
             st.download_button('全取得エラーCSV',b'','sumai_all_acquisition_errors.csv','text/csv',
                                key='automatic_all_errors_csv_wait',disabled=True,use_container_width=True)
-            st.caption('収集中は取得処理を優先します。エラーCSVは停止・完了後に裏で自動読込します。操作は不要です。')
+            st.caption('大量の履歴照会は自動実行しません。収集停止後に「エラーCSVを手動更新（過去全件）」を押してください。')
         if failure['error']:st.error('エラーCSVの自動更新に失敗しました：'+failure['error'])
     except Exception as exc:
         st.error('エラーCSVを出力できませんでした：'+(str(exc) if isinstance(exc,AppError) else type(exc).__name__))
