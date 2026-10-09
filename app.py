@@ -39,7 +39,7 @@ import streamlit as st
 from streamlit_folium import st_folium
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v121"
+BUILD = "REBUILD-01-v122"
 
 # ============================================================================
 # NON-NEGOTIABLE SUUMO ADDRESS POLICY -- DO NOT DELETE OR WEAKEN
@@ -6290,57 +6290,42 @@ def apply_saved_load(job):
     state.new_search=None;state.new_map_loaded=True;state.new_load_diagnostic=diag;state.pop('new_job_token',None)
     try:st.query_params['saved_map']='1'
     except (AttributeError,TypeError,ValueError):pass
-    positioned=sum(has_point(r) for r in rows);positions=unique_map_position_count(rows)
-    dots=visible_colored_dot_count(rows)
-    state.new_notice=f"地図の〇 {dots}個｜保存物件 {len(rows)}件｜座標あり {positioned}件｜位置未確認 {sum(not has_point(r) for r in rows)}件。"
+    # Individual saved listings are for the list/CSV only.  The map uses the
+    # independently persisted town averages, so do not do O(n) dot counting.
+    state.new_notice=f'一覧読込完了：{len(rows):,}件'
     return True
 
 
 @st.fragment(run_every='8s')
 def saved_load_progress():
+    """Compact progress for the optional listing/CSV view, NOT the map."""
     job=active_saved_load()
     if not job:return
     snap=job.snapshot();searching=manual_search_running()
     applied=st.session_state.get('saved_load_applied_token')==job.token
-
-    # A completed saved-data load must transition to the map automatically.  In v61
-    # the worker could already be complete (e.g. 735/735 addresses) while the fragment
-    # continued to show an ever-increasing elapsed timer and waited for another button.
     if snap['finished'] and snap['phase']=='complete' and not applied and not searching:
         if apply_saved_load(job):
             st.session_state.saved_load_applied_token=job.token
             st.rerun()
-
-    if snap['phase']=='database':
-        st.info(f"初回全件読込中｜{snap['pages']}回通信｜{snap['raw_records']}行取得｜経過 {snap['elapsed']}秒｜最終進捗から{snap['idle_seconds']}秒")
-    elif snap['phase']=='delta':
-        st.info(f"差分読込中｜前回の保存物件{snap['rows']}件を保持｜変更分を確認中｜経過 {snap['elapsed']}秒")
-    elif snap['phase']=='refreshing':
-        st.info(f"最新の保存分を確認中｜地図の〇 {snap['visible_colored_dots']}個｜保存物件 {snap['rows']}件｜座標あり {snap['placed']}件｜経過 {snap['elapsed']}秒")
-    elif snap['finished'] and snap['phase']=='complete':
-        checked=('｜最新確認 '+acquisition_time_jst(snap['latest_checked_at'])) if snap.get('latest_checked_at') else ''
-        st.success(f"読み込み完了｜地図の〇 {snap['visible_colored_dots']}個｜保存物件 {snap['rows']}件｜座標あり {snap['placed']}件｜地図準備完了{checked}｜所要 {snap['elapsed']}秒")
+    if snap['phase'] in ('database','delta','refreshing'):
+        st.caption(f"一覧読込中：{snap['rows']:,}件｜{snap['elapsed']}秒")
+    elif snap['phase']=='complete':
+        st.caption(f"読込完了：{snap['rows']:,}件")
     elif snap['phase']=='failed':
-        st.error(f"読み込み停止｜確認済み {snap['rows']}物件｜所要 {snap['elapsed']}秒")
+        st.error(f"一覧の読込失敗：{snap['rows']:,}件まで確認")
     elif snap['phase']=='stopped':
-        st.info(f"読み込みを中止しました｜確認済み {snap['rows']}物件｜所要 {snap['elapsed']}秒")
+        st.caption(f"読込停止：{snap['rows']:,}件まで確認")
     else:
-        st.info(f"地図準備中｜地図の〇 {snap['visible_colored_dots']}個｜保存物件 {snap['rows']}件｜座標あり {snap['placed']}件｜経過 {snap['elapsed']}秒")
-    if snap['error']:st.error(snap['error'])
-    if snap['phase']=='stopped':st.caption('中止しました。読み込み済みの物件は保持しています。')
-    if searching:st.caption('物件検索が終わると読み込み済みデータを地図へ反映できます。')
-    elif snap['finished'] and snap['phase']=='complete':st.caption('読み込み終了直前に、処理中にSupabaseへ追加・更新された保存物件を再確認してから地図へ反映しています。収集が続いている場合は、下の読込ボタンをもう一度押すとその時点の最新状態へ更新できます。')
-    else:st.caption('地図操作は継続できます。読み込み途中でも下のボタンで現在までの物件を地図へ反映できます。')
-    if not applied and st.button('読み込んだ物件を地図へ反映',key='apply_saved_load',disabled=not snap['rows'] or searching):
-        if apply_saved_load(job):
-            if snap['finished'] and snap['phase']=='complete':st.session_state.saved_load_applied_token=job.token
-            st.rerun()
-    if not snap['finished'] and st.button('読み込み・地図準備を中止（読み込み済みを保持）',key='stop_saved_load',disabled=snap['stopping']):job.request_stop()
-    if st.button('地図表示対象の物件CSVを準備',key='prepare_saved_load_csv',disabled=not snap['rows']):
-        rows,_,_=job.export();st.session_state.saved_load_export={'token':job.token,'csv':csv_bytes(rows),'count':len(rows)}
-    export=st.session_state.get('saved_load_export')
-    if export and export['token']==job.token:
-        st.download_button(f"地図表示対象 {export['count']}件のCSV",export['csv'],'sumai_saved_units.csv','text/csv',key='download_saved_load_csv',on_click='ignore')
+        st.caption(f"一覧を準備中：{snap['rows']:,}件｜{snap['elapsed']}秒")
+    if snap.get('error'):st.error(snap['error'])
+    if not applied and snap['rows'] and not searching:
+        if st.button('途中までの物件を一覧に表示',key='apply_saved_load'):
+            if apply_saved_load(job):
+                if snap['finished'] and snap['phase']=='complete':
+                    st.session_state.saved_load_applied_token=job.token
+                st.rerun()
+    if not snap['finished'] and st.button('読込を中止',key='stop_saved_load',disabled=snap['stopping']):
+        job.request_stop()
 
 
 def capture_viewport():
@@ -7701,32 +7686,32 @@ def automatic_collection_panel():
         if snap['error']:st.error(snap['error'])
     if st.session_state.get('automatic_settings_error'):st.error(st.session_state.automatic_settings_error)
 
-    st.markdown('#### ログ・エラー出力')
-    automatic_log_download_panel(controller,busy,summary if snap else st.session_state.get('automatic_saved_summary',{}))
+    if st.toggle('ログ・エラーの詳細を表示（不具合の調査用）',
+                 key='show_diagnostic_tools_v122',value=False):
+        st.markdown('##### ログ・エラーCSV')
+        automatic_log_download_panel(controller,busy,summary if snap else st.session_state.get('automatic_saved_summary',{}))
 
-    try:
-        # Full historical errors are queried only when explicitly requested.
-        # This avoids competing 25k+ JSON rows with the primary collection job.
-        error_job=get_automatic_failure_export(max_age=900,refresh=False);failure=error_job.snapshot()
-        if st.button('エラーCSVを手動更新（過去全件）',key='automatic_refresh_error_csv',disabled=busy or error_job.running):
-            error_job.refresh(max_age=0)
-            st.rerun()
-        if failure['loaded']:
-            st.download_button(f"全取得エラーCSV（1エラー1行・{failure['row_count']}行）",
-                               failure['csv'],'sumai_all_acquisition_errors.csv','text/csv',
-                               key='automatic_all_errors_csv',on_click='ignore',use_container_width=True)
-            status='過去ログの統合が未完了' if failure.get('phase')=='partial' else '過去ログも裏で統合中' if failure['running'] and failure.get('phase')=='historical_backfill' else '裏で最新化中' if failure['running'] else '最新'
-            st.caption(f"エラーCSV：{status}｜最終同期 {acquisition_time_jst(failure.get('updated_at'))}｜同じ物件で複数エラーがあれば複数行です。")
-        else:
-            st.download_button('全取得エラーCSV',b'','sumai_all_acquisition_errors.csv','text/csv',
-                               key='automatic_all_errors_csv_wait',disabled=True,use_container_width=True)
-            st.caption('大量の履歴照会は自動実行しません。収集停止後に「エラーCSVを手動更新（過去全件）」を押してください。')
-        if failure['error']:st.error('エラーCSVの自動更新に失敗しました：'+failure['error'])
-    except Exception as exc:
-        st.error('エラーCSVを出力できませんでした：'+(str(exc) if isinstance(exc,AppError) else type(exc).__name__))
-
-    st.caption('物件ID・取得成功日時は再取得の管理情報として保存します。詳細住所と募集データの保存に成功した物件だけが取得済みになります。')
-    st.caption('蓄積した物件は下の「最新の保存物件を読み込む・反映」で地図へ表示できます。収集中も地図の自動再描画は行いません。')
+        try:
+            # Full historical errors are queried only when explicitly requested.
+            # This avoids competing 25k+ JSON rows with the primary collection job.
+            error_job=get_automatic_failure_export(max_age=900,refresh=False);failure=error_job.snapshot()
+            if st.button('エラー履歴を取得する（時間がかかります）',key='automatic_refresh_error_csv',disabled=busy or error_job.running):
+                error_job.refresh(max_age=0)
+                st.rerun()
+            if failure['loaded']:
+                st.download_button(f"エラー履歴CSV（{failure['row_count']}行）",
+                                   failure['csv'],'sumai_all_acquisition_errors.csv','text/csv',
+                                   key='automatic_all_errors_csv',on_click='ignore',use_container_width=True)
+                status='過去ログの統合が未完了' if failure.get('phase')=='partial' else '過去ログも裏で統合中' if failure['running'] and failure.get('phase')=='historical_backfill' else '裏で最新化中' if failure['running'] else '最新'
+                st.caption(f"エラーCSV：{status}｜最終同期 {acquisition_time_jst(failure.get('updated_at'))}｜同じ物件で複数エラーがあれば複数行です。")
+            else:
+                st.download_button('全取得エラーCSV',b'','sumai_all_acquisition_errors.csv','text/csv',
+                                   key='automatic_all_errors_csv_wait',disabled=True,use_container_width=True)
+                st.caption('大量の履歴照会は自動実行しません。収集停止後に「エラーCSVを手動更新（過去全件）」を押してください。')
+            if failure['error']:st.error('エラーCSVの自動更新に失敗しました：'+failure['error'])
+        except Exception as exc:
+            st.error('エラーCSVを出力できませんでした：'+(str(exc) if isinstance(exc,AppError) else type(exc).__name__))
+    st.caption('保存物件の読み込みやCSV出力は、この下の『保存した物件』で操作できます。')
 
 
 # ==========================================================================
@@ -7822,6 +7807,14 @@ class TownSummaryWorker:
         self.db=db;self.lock=threading.RLock();self.running=False;self.progress=0;self.total_pages=None;self.total_records=None;self.scanned_records=0;self.page_size=300
         self.ready=False;self.summary=None;self.message='';self.error='';self.thread=None
         self.initialized=False
+        # Only one scan per server process, shared by all browser sessions.
+        # A usable saved summary stays visible during this refresh.
+        self._startup_scan_requested=False
+    def refresh_on_startup(self):
+        with self.lock:
+            if self._startup_scan_requested:return False
+            self._startup_scan_requested=True
+        return self.start()
     def initialize(self):
         with self.lock:
             if self.initialized:return
@@ -7928,14 +7921,15 @@ def town_summary_registry():
 
 
 def current_town_summary_worker():
-    jobs,lock=town_summary_registry();db=Database();key=manual_registry_key(db)+'|town-v116'
+    jobs,lock=town_summary_registry();db=Database();key=manual_registry_key(db)+'|town-v122'
     with lock:
         job=jobs.get(key)
         if job is None:
             job=TownSummaryWorker(db);jobs[key]=job
     job.initialize()
-    if not job.snapshot()['ready'] and not job.snapshot()['running'] and not job.snapshot()['error']:
-        job.start()
+    # Refresh even if yesterday's stored town summary is already ready.
+    # One background scan per backend worker, not on every Streamlit rerun.
+    job.refresh_on_startup()
     return job
 
 
@@ -8124,17 +8118,18 @@ def town_choropleth_status():
     if snap['running']:
         done=snap['progress'];total=snap.get('total_pages')
         if isinstance(total,int) and total>0:
-            st.caption(f"町丁目集計 {done}/{total}ページ（{min(100,100*done/total):.0f}%）")
+            st.caption(f"町丁目家賃 {done}/{total}ページ（{min(100,100*done/total):.0f}%）")
             st.progress(min(1.0,done/total))
         else:
-            st.caption(f"町丁目集計 {done}/-- ページ（総数取得不可）")
+            st.caption(f"町丁目家賃 {done}/--ページ")
     if busy:st.caption('境界データ読込中')
     if snap['error']:st.warning('平均家賃の集計：'+snap['error'])
     if error:st.warning('境界取得：'+error+'。不明な区域は塗りません。')
-    if ready and snap['ready']:
-        st.caption('集計完了')
-    if st.button('町丁目平均家賃を再集計',key='refresh_town_aggregate',disabled=snap['running']):
-        store.start();st.rerun(scope='fragment')
+    if snap['ready'] and not snap['running']:
+        updated=(snap.get('summary') or {}).get('updated_at')
+        st.caption('町丁目家賃：集計済み' + ('｜更新 '+acquisition_time_jst(updated) if updated else ''))
+    elif not snap['running'] and not snap['ready'] and not snap['error']:
+        st.caption('町丁目家賃：集計の開始待ち')
 
 
 @st.fragment
@@ -8174,7 +8169,7 @@ def interactive_town_choropleth(group,facilities):
     elif cached['ready']:
         st.caption(f"着色：{cached['colored_count']}町丁目")
     else:
-        st.caption('集計・境界の準備中。完了後に地図の色を更新')
+        st.caption('集計中。完了後に地図の色を更新')
     stations,wards=town_station_refs_v118()
     widget=town_component_v121()
     data=widget(center=list(cached['center']),zoom=14,geo=cached['geo'],
@@ -8308,67 +8303,77 @@ def main():
     with tabs[1]:
         if state.get('saved_map_restore_message'):st.caption(state.saved_map_restore_message)
         automatic_collection_panel()
-        st.subheader('Supabaseに保存した物件')
-        st.caption('Supabaseの保存物件を最新状態で読み込みます。読み込み中に自動収集で追加・更新された物件も、完了直前に再確認して反映します。重複する過去形式の保存行は1物件として扱います。')
-        if st.button('最新の保存物件を読み込む・反映',key='new_load',use_container_width=True,disabled=bool(active_job() and not active_job().snapshot()['finished'])):
+        st.subheader('保存した物件')
+        st.caption('地図は自動集計した町丁目の平均家賃を表示します。ここは個々の物件の確認・CSV出力用です。')
+        if st.button('保存物件の一覧を読み込む',key='new_load',use_container_width=True,
+                     disabled=bool(active_job() and not active_job().snapshot()['finished'])):
             try:start_saved_load(bounds,state.get('address_point_cache'))
             except AppError as exc:st.error(str(exc))
-        if st.button('全件を再取得して再構築（必要時のみ）',key='new_load_full',use_container_width=False,
-                     disabled=bool(active_saved_load() and not active_saved_load().snapshot()['finished'])):
-            try:start_saved_load(bounds,state.get('address_point_cache'),force_full=True)
-            except AppError as exc:st.error(str(exc))
-        st.caption('初回は全件、次回以降は同じサーバー内の保存済みデータを再利用し、更新分のみDBを読みます。サーバー再起動時は初回に戻ります。')
         saved_load_progress()
-        if state.get('new_notice'): st.success(state.new_notice)
-        st.caption('DBには家賃・間取り・種別・推定住所・取得日時を保存します。この画面の個別物件読込は一覧・CSV等の詳細確認用です。地図の着色は町丁目集計のみを使用します。')
-        if st.button('現在の物件データCSVを準備',key='mobile_prepare_units_csv'):
-            state['_mobile_units_export']={'key':(id(state.new_units),len(state.new_units)),
-                'bytes':csv_bytes(state.new_units)}
-        ready=state.get('_mobile_units_export')
-        if ready and ready.get('key')==(id(state.new_units),len(state.new_units)):
-            st.download_button('現在の物件データをCSVで保存',ready['bytes'],'sumai_rebuild_units.csv','text/csv',use_container_width=True,on_click='ignore')
-        upload=st.file_uploader('このアプリのCSVを追加する',type=['csv'])
-        if st.button('CSVの物件をSupabaseへ保存',disabled=upload is None or bool(active_job() and not active_job().snapshot()['finished']),key='new_import'):
-            try:
-                rows=read_csv(upload.getvalue());saved=Database().save_units(rows)
-                state.new_map_loaded=False;state.new_units=[];state.new_saved_keys=[]
-                state.new_notice=f'CSVから{len(saved)}件を保存しました。地図へ色付けする場合は保存データを読み込んでください。';st.rerun()
-            except AppError as exc: st.error(str(exc))
-        if st.button('画面上の未保存物件を再保存',key='new_retry_save',disabled=not state.new_units or bool(active_job() and not active_job().snapshot()['finished'])):
-            try:
-                saved=Database().save_units(state.new_units);state.new_saved_keys=list(set(state.new_saved_keys)|saved)
-                state.new_notice=f'{len(saved)}件の保存を確認しました。';st.rerun()
-            except AppError as exc: st.error(str(exc))
-        if st.button('検索履歴を読み込む',key='new_history_load'):
-            try: state.new_history=Database().history()
-            except AppError as exc: st.error(str(exc))
-        if state.get('new_history'):
-            st.dataframe([{'開始（UTC）':r['started_at'],'結果':r['status'],'表示範囲':str(r['conditions'].get('bounds','')),
-                           '保存確認':r['summary'].get('saved',0)} for r in state.new_history],hide_index=True)
-        if state.get('new_history'):
-            chosen=st.selectbox('作業ログを取り出す検索',state.new_history,format_func=lambda r:r['started_at']+'｜'+r['status'],key='diagnostic_history')
-            if st.button('選んだ検索の詳細作業ログを読み込む',key='diagnostic_load'):
-                try:
-                    state.saved_diagnostics=Database().load_diagnostics(chosen['id'])
-                    if not state.saved_diagnostics:st.info('この検索には保存された詳細ログがありません。v30以降で再検索してください。')
+        if state.get('new_notice'):st.caption(state.new_notice)
+        count=len(state.get('new_units') or [])
+        if count:
+            st.caption(f'一覧に読み込んだ物件：{count:,}件')
+            if st.button('一覧をCSVにする',key='mobile_prepare_units_csv'):
+                state['_mobile_units_export']={'key':(id(state.new_units),len(state.new_units)),
+                    'bytes':csv_bytes(state.new_units)}
+            ready=state.get('_mobile_units_export')
+            if ready and ready.get('key')==(id(state.new_units),len(state.new_units)):
+                st.download_button('CSVをダウンロード',ready['bytes'],'sumai_rebuild_units.csv',
+                                   'text/csv',use_container_width=True,on_click='ignore')
+        if st.toggle('その他の操作を表示（CSV取込・再読込・履歴）',
+                     key='show_saved_advanced_v122',value=False):
+            st.caption('通常は操作不要です。保存データの修復・CSV取込・過去ログを扱う場合に使用します。')
+            if st.button('保存物件を全件読み直す',key='new_load_full',use_container_width=False,
+                         disabled=bool(active_saved_load() and not active_saved_load().snapshot()['finished'])):
+                try:start_saved_load(bounds,state.get('address_point_cache'),force_full=True)
                 except AppError as exc:st.error(str(exc))
-        if state.get('saved_diagnostics'):diagnostic_downloads(state.saved_diagnostics,'saved')
-        with st.expander('前回のログと比較して改善を確認'):
-            baseline=st.file_uploader('前回の解析用JSONログを選択',type=['json'],key='diagnostic_baseline')
-            if baseline:
+            if st.button('町丁目の家賃集計をやり直す',key='refresh_town_aggregate',
+                         disabled=current_town_summary_worker().snapshot()['running']):
+                current_town_summary_worker().start()
+            st.caption('再読込は一覧の修復用です。地図の再集計は別処理です。')
+            upload=st.file_uploader('このアプリのCSVを追加する',type=['csv'])
+            if st.button('CSVの物件をSupabaseへ保存',disabled=upload is None or bool(active_job() and not active_job().snapshot()['finished']),key='new_import'):
                 try:
-                    old=json.loads(baseline.getvalue().decode('utf-8-sig')).get('events')
-                    if not isinstance(old,list) or not all(isinstance(e,dict) for e in old):raise ValueError()
-                    compare_target=st.radio('比較する今回のログ',['現在の検索','読み込んだ保存ログ'],key='diagnostic_compare_target')
-                    current=(active_job().audit.records() if active_job() else []) if compare_target=='現在の検索' else state.get('saved_diagnostics',[])
-                    if current:
-                        st.dataframe(compare_logs(old,current),hide_index=True)
-                        old_start=next((e.get('details',{}) for e in old if e.get('code')=='start'),{})
-                        new_start=next((e.get('details',{}) for e in current if e.get('code')=='start'),{})
-                        if old_start.get('bounds')!=new_start.get('bounds') or old_start.get('providers')!=new_start.get('providers'):st.info('表示範囲・取得元が異なります。差分だけで改善効果を判断できません。')
-                        st.caption('差分はログの観測件数です。精度は同じ物件の正解データとの照合で確認してください。')
-                    else:st.info('比較対象として現在の検索ログまたは保存ログを読み込んでください。')
-                except (ValueError,UnicodeError,AttributeError):st.error('このアプリからダウンロードした解析用JSONログを選択してください。')
+                    rows=read_csv(upload.getvalue());saved=Database().save_units(rows)
+                    state.new_map_loaded=False;state.new_units=[];state.new_saved_keys=[]
+                    state.new_notice=f'CSVから{len(saved)}件を保存しました。町丁目集計も更新します。';current_town_summary_worker().start();st.rerun()
+                except AppError as exc: st.error(str(exc))
+            if st.button('画面上の未保存物件を再保存',key='new_retry_save',disabled=not state.new_units or bool(active_job() and not active_job().snapshot()['finished'])):
+                try:
+                    saved=Database().save_units(state.new_units);state.new_saved_keys=list(set(state.new_saved_keys)|saved)
+                    state.new_notice=f'{len(saved)}件の保存を確認しました。';st.rerun()
+                except AppError as exc: st.error(str(exc))
+            if st.button('検索履歴を読み込む',key='new_history_load'):
+                try: state.new_history=Database().history()
+                except AppError as exc: st.error(str(exc))
+            if state.get('new_history'):
+                st.dataframe([{'開始（UTC）':r['started_at'],'結果':r['status'],'表示範囲':str(r['conditions'].get('bounds','')),
+                               '保存確認':r['summary'].get('saved',0)} for r in state.new_history],hide_index=True)
+            if state.get('new_history'):
+                chosen=st.selectbox('作業ログを取り出す検索',state.new_history,format_func=lambda r:r['started_at']+'｜'+r['status'],key='diagnostic_history')
+                if st.button('選んだ検索の詳細作業ログを読み込む',key='diagnostic_load'):
+                    try:
+                        state.saved_diagnostics=Database().load_diagnostics(chosen['id'])
+                        if not state.saved_diagnostics:st.info('この検索には保存された詳細ログがありません。v30以降で再検索してください。')
+                    except AppError as exc:st.error(str(exc))
+            if state.get('saved_diagnostics'):diagnostic_downloads(state.saved_diagnostics,'saved')
+            with st.expander('前回のログと比較して改善を確認'):
+                baseline=st.file_uploader('前回の解析用JSONログを選択',type=['json'],key='diagnostic_baseline')
+                if baseline:
+                    try:
+                        old=json.loads(baseline.getvalue().decode('utf-8-sig')).get('events')
+                        if not isinstance(old,list) or not all(isinstance(e,dict) for e in old):raise ValueError()
+                        compare_target=st.radio('比較する今回のログ',['現在の検索','読み込んだ保存ログ'],key='diagnostic_compare_target')
+                        current=(active_job().audit.records() if active_job() else []) if compare_target=='現在の検索' else state.get('saved_diagnostics',[])
+                        if current:
+                            st.dataframe(compare_logs(old,current),hide_index=True)
+                            old_start=next((e.get('details',{}) for e in old if e.get('code')=='start'),{})
+                            new_start=next((e.get('details',{}) for e in current if e.get('code')=='start'),{})
+                            if old_start.get('bounds')!=new_start.get('bounds') or old_start.get('providers')!=new_start.get('providers'):st.info('表示範囲・取得元が異なります。差分だけで改善効果を判断できません。')
+                            st.caption('差分はログの観測件数です。精度は同じ物件の正解データとの照合で確認してください。')
+                        else:st.info('比較対象として現在の検索ログまたは保存ログを読み込んでください。')
+                    except (ValueError,UnicodeError,AttributeError):st.error('このアプリからダウンロードした解析用JSONログを選択してください。')
     with tabs[2]:
         st.subheader('通勤の目安')
         options=physical_units([r for r in state.new_units if has_point(r) and r.get('coordinate_precision')!='town'])
