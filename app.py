@@ -39,7 +39,7 @@ import streamlit as st
 from streamlit_folium import st_folium
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v113"
+BUILD = "REBUILD-01-v114"
 
 # ============================================================================
 # NON-NEGOTIABLE SUUMO ADDRESS POLICY -- DO NOT DELETE OR WEAKEN
@@ -100,9 +100,11 @@ RENTAL_HOSTS = frozenset(PROVIDER_HOST.values())
 # Concurrency is increased across independent tasks/hosts only. Per-host request
 # spacing and in-flight limits remain conservative, so faster collection comes
 # from overlap, caching and fewer duplicate requests rather than hitting one site harder.
-SEARCH_TASK_WORKERS = 6
-DETAIL_WORKERS = 6
-DETAIL_PAGE_WORKERS = 4
+# Bound concurrent BeautifulSoup trees and HTTP responses on Streamlit Cloud.
+# Peak memory matters more than simultaneous SUUMO requests.
+SEARCH_TASK_WORKERS = 2
+DETAIL_WORKERS = 2
+DETAIL_PAGE_WORKERS = 2
 PER_HOST_SLOTS = 2
 PER_HOST_MIN_INTERVAL = 1.0
 ADDRESS_NEGATIVE_CACHE_SECONDS = 900
@@ -1108,7 +1110,7 @@ def remember_saved_position(memory,address,point):
     except (ValueError,TypeError):return
     with memory['lock']:
         points=memory['points']
-        if len(points)>=3000 and normal(address) not in points:points.pop(next(iter(points)))
+        if len(points)>=1200 and normal(address) not in points:points.pop(next(iter(points)))
         points[normal(address)]=(time.monotonic(),(float(lat),float(lng),str(title)))
 
 
@@ -2020,12 +2022,12 @@ class PublicWeb:
             response_bytes=len(result.content)
             if response_bytes<=160_000:
                 with self.cache_lock:
-                    if len(self.http_cache)>=32:
+                    if len(self.http_cache)>=8:
                         self.http_cache.pop(next(iter(self.http_cache)),None)
                     self.http_cache[key]=result
             if geo and response_bytes<=96_000:
                 with GEO_HTTP_LOCK:
-                    if len(GEO_HTTP_CACHE)>=64:
+                    if len(GEO_HTTP_CACHE)>=8:
                         GEO_HTTP_CACHE.pop(next(iter(GEO_HTTP_CACHE)),None)
                     GEO_HTTP_CACHE[key]=(time.monotonic(),result)
             flight.set_result(result);return result
@@ -2150,7 +2152,7 @@ def _property_value(props,exact=(),contains=()):
 def _cache_jhj_features(web,key,features,cached_at=None):
     with web.cache_lock:
         cache=web.jhj_tile_cache;times=web.jhj_tile_cached_at
-        if key not in cache and len(cache)>=48:
+        if key not in cache and len(cache)>=12:
             oldest=next(iter(cache));cache.pop(oldest,None);times.pop(oldest,None)
         cache[key]=features;times[key]=time.monotonic() if cached_at is None else cached_at
 
@@ -3887,7 +3889,7 @@ def suumo_location_from_kankyo_image(web,detail_soup,detail_url,bounds,munis,exp
         location['address_identity_sources']=external.get('external_hosts',[])
         location['address_identity_evidence']=external.get('identity_evidence',[])
     with web.cache_lock:
-        if len(web.suumo_location_cache)>=512:web.suumo_location_cache.pop(next(iter(web.suumo_location_cache)))
+        if len(web.suumo_location_cache)>=400:web.suumo_location_cache.pop(next(iter(web.suumo_location_cache)))
         web.suumo_location_cache[cache_key]=dict(location)
     trace(web,'location_ok',{'source':'SUUMO物件固有地図','map_hint':[lat,lng],'map_derived_address':address,'external_identity_used':external_used,'location':location},stage='location')
     return location
@@ -5611,8 +5613,11 @@ class IndividualRentPoints(MacroElement):
       if (!pane) return;
       if (map._sumaiRentalSVG) {
         var prior = map._sumaiRentalSVG;
-        map.off('moveend zoomend resize viewreset', prior.schedule);
-        if (prior.svg.parentNode) prior.svg.parentNode.removeChild(prior.svg);
+        if (typeof prior.cleanup === 'function') prior.cleanup();
+        else {
+          map.off('moveend zoomend resize viewreset', prior.schedule);
+          if (prior.svg.parentNode) prior.svg.parentNode.removeChild(prior.svg);
+        }
       }
       var ns = 'http://www.w3.org/2000/svg';
       var svg = document.createElementNS(ns,'svg');
@@ -5688,7 +5693,6 @@ class IndividualRentPoints(MacroElement):
         scheduled=true;
         requestAnimationFrame(paint);
       }
-      map._sumaiRentalSVG={svg:svg,schedule:schedule};
       map.on('moveend zoomend resize viewreset',schedule);
       map.whenReady(schedule);
       function svgResume() {
@@ -5698,10 +5702,15 @@ class IndividualRentPoints(MacroElement):
       }
       document.addEventListener('visibilitychange',svgResume);
       window.addEventListener('pageshow',svgResume);
-      map.on('unload',function () {
+      function cleanup(){
+        map.off('moveend zoomend resize viewreset',schedule);
+        map.off('unload',cleanup);
         document.removeEventListener('visibilitychange',svgResume);
         window.removeEventListener('pageshow',svgResume);
-      });
+        if (svg.parentNode) svg.parentNode.removeChild(svg);
+      }
+      map._sumaiRentalSVG={svg:svg,schedule:schedule,cleanup:cleanup};
+      map.on('unload',cleanup);
     })();
     {% endmacro %}""")
     def __init__(self,rows):
@@ -5714,11 +5723,28 @@ class IndividualRentPoints(MacroElement):
         self.payload=json.dumps(items,ensure_ascii=False,separators=(',',':')).replace('<','\\u003c').replace('>','\\u003e').replace('&','\\u0026')
 
 
+class ReplaceRentalFeatureLayer(MacroElement):
+    """Remove superseded Folium feature groups after mobile-map updates."""
+    _template=Template("""{% macro script(this, kwargs) %}
+    (function () {
+      var map = {{ this._parent._parent.get_name() }};
+      var group = {{ this._parent.get_name() }};
+      if (map._sumaiOldFeatureGroup && map._sumaiOldFeatureGroup !== group) {
+        map.removeLayer(map._sumaiOldFeatureGroup);
+      }
+      map._sumaiOldFeatureGroup = group;
+    })();
+    {% endmacro %}""")
+    def __init__(self):
+        super().__init__();self._name='ReplaceRentalFeatureLayer'
+
+
 def rental_features(rows,cells,facilities):
     m=folium.FeatureGroup(name='1募集1点・家賃帯')
     IndividualRentPoints(rows).add_to(m)
     for f in facilities:
         folium.CircleMarker((f['lat'],f['lng']),radius=6,color='#fff',fill=True,fill_color='#555555',fill_opacity=1,tooltip=html.escape(f['name'])).add_to(m)
+    ReplaceRentalFeatureLayer().add_to(m)
     return m
 
 
@@ -5996,6 +6022,11 @@ class SavedLoadJob:
                     self.rows[row['key']]=hydrated_listing(row,point)
                 self.pages+=1;self.placed=sum(has_point(r) for r in self.rows.values());self.diagnostic=diag
                 self.last_activity_at=time.monotonic()
+            pressure=cloud_memory_pressure()
+            if pressure and pressure['ratio']>=.80:
+                self.error=('メモリ保護により一時停止：'+str(pressure['used_mib'])+'/'+
+                            str(pressure['limit_mib'])+' MiB。読込済み物件は保持しています。')
+                self.cancel_event.set()
         def row_signature(row):
             return (row.get('property_id'),row.get('rent'),row.get('layout'),row.get('address'),listing_dwelling_type(row),row.get('fetched_at'))
         def remove_legacy_duplicates(rows):
@@ -6686,9 +6717,39 @@ def interactive_rental_map(pins,cells,facilities):
     # Leaflet already owns the marker canvas. A pan/zoom must not serialize and
     # resend the entire rental dataset to the mobile component. A full Python
     # rerun recreates the list and requests a new group if data changed.
-    signature=(BUILD,mobile_map_content_signature(pins,facilities))
+    window=state.get('new_bounds')
+    if window and len(window)==4:
+        south,west,north,east=map(float,window)
+        # Hysteresis: keep the old oversized window through ordinary touch pans.
+        # Recalculate only if the viewport approaches its edge or zooms out.
+        previous=state.get('_mobile_map_data_window')
+        if (previous and len(previous)==4 and
+            previous[0]+.002 <= south and previous[1]+.002 <= west and
+            north <= previous[2]-.002 and east <= previous[3]-.002):
+            view=previous
+        else:
+            lat_mid=(south+north)*.5;lng_mid=(west+east)*.5
+            center_lat=(math.floor(lat_mid/.015)+.5)*.015
+            center_lng=(math.floor(lng_mid/.015)+.5)*.015
+            dy=max(.022,north-south)*1.25
+            dx=max(.022,east-west)*1.25
+            view=(center_lat-dy,center_lng-dx,center_lat+dy,center_lng+dx)
+            state['_mobile_map_data_window']=view
+        visible=[r for r in pins if has_point(r) and
+                 view[0] <= float(r['latitude']) <= view[2] and
+                 view[1] <= float(r['longitude']) <= view[3]]
+        scope=tuple(round(x,5) for x in view)
+    else:
+        # On first mount, avoid sending all 12k points; the on_change callback
+        # will supply actual bounds immediately after Leaflet has initialized.
+        center=state.get('new_view_center',DEFAULT_CENTER)
+        lat,lng=center
+        visible=[r for r in pins if has_point(r) and
+                 abs(float(r['latitude'])-lat)<.025 and abs(float(r['longitude'])-lng)<.035]
+        scope=(round(lat,4),round(lng,4),'initial')
+    signature=(BUILD,scope,mobile_map_content_signature(visible,facilities))
     if not state.get('new_map_v112') or state.get('_mobile_map_payload_signature')!=signature:
-        kwargs['feature_group_to_add']=rental_features(pins,cells,facilities)
+        kwargs['feature_group_to_add']=rental_features(visible,cells,facilities)
         state['_mobile_map_payload_signature']=signature
     if not state.get('new_map_v112'):
         kwargs['center']=state.get('new_view_center',DEFAULT_CENTER)
@@ -6696,6 +6757,24 @@ def interactive_rental_map(pins,cells,facilities):
     st_folium(stable_mobile_base_map(BUILD),**kwargs)
     if state.pop('map_initial_bounds_ready',False):
         st.rerun()
+
+
+def cloud_memory_pressure():
+    """Read cgroup memory pressure without dependencies or sensitive information.
+
+    Return None if no meaningful container memory limit is available.  This does
+    not increase the limit; workers use it to stop *before* Streamlit is OOM-killed.
+    """
+    try:
+        with open('/sys/fs/cgroup/memory.max',encoding='ascii') as f:raw=f.read().strip()
+        if not raw.isdecimal():return None
+        limit=int(raw)
+        if not 0 < limit < 1<<46:return None
+        with open('/sys/fs/cgroup/memory.current',encoding='ascii') as f:used=int(f.read().strip())
+        return {'used_mib':round(used/(1024*1024)), 'limit_mib':round(limit/(1024*1024)),
+                'ratio':used/limit}
+    except (OSError,ValueError,ZeroDivisionError):
+        return None
 
 
 # Keep searches moving when one town has too many listings or stops making progress.
@@ -6898,7 +6977,7 @@ class AutomaticFailureExport:
     """Refresh the unified error CSV in the background; the UI never waits for preparation."""
     def __init__(self,db):
         self.db=db;self.lock=threading.RLock();self.running=False;self.loaded=False;self.error='';self.phase='idle'
-        self.rows=[];self.csv=csv_bytes_from_rows([]);self.updated_at=None;self.updated_monotonic=0.;self.last_attempt_monotonic=0.;self.thread=None
+        self.rows=[];self.row_count=0;self.csv=csv_bytes_from_rows([]);self.updated_at=None;self.updated_monotonic=0.;self.last_attempt_monotonic=0.;self.thread=None
     def refresh(self,max_age=60):
         with self.lock:
             if self.running:return
@@ -6914,14 +6993,14 @@ class AutomaticFailureExport:
             fast_events=load_persisted_error_events_fast(self.db)
             fast_rows=acquisition_failure_rows(fast_events)
             with self.lock:
-                self.rows=fast_rows;self.csv=csv_bytes_from_rows(fast_rows);self.updated_at=utc_now()
+                self.rows=[];self.row_count=len(fast_rows);self.csv=csv_bytes_from_rows(fast_rows);self.updated_at=utc_now()
                 self.updated_monotonic=time.monotonic();self.loaded=True;self.error='';self.phase='historical_backfill'
             # Older builds stored errors only inside diagnostic-log chunks. Merge those
             # after the current per-error rows are already downloadable.
             events=load_legacy_diagnostic_error_events(self.db,fast_events)
             rows=acquisition_failure_rows(events)
             with self.lock:
-                self.rows=rows;self.csv=csv_bytes_from_rows(rows);self.updated_at=utc_now()
+                self.rows=[];self.row_count=len(rows);self.csv=csv_bytes_from_rows(rows);self.updated_at=utc_now()
                 self.updated_monotonic=time.monotonic();self.loaded=True;self.error='';self.phase='complete'
         except Exception as exc:
             with self.lock:
@@ -6931,7 +7010,7 @@ class AutomaticFailureExport:
             with self.lock:self.running=False
     def snapshot(self):
         with self.lock:
-            return {'running':self.running,'loaded':self.loaded,'error':self.error,'phase':self.phase,'rows':list(self.rows),
+            return {'running':self.running,'loaded':self.loaded,'error':self.error,'phase':self.phase,'rows':[], 'row_count':self.row_count,
                     'csv':self.csv,'updated_at':self.updated_at}
 
 
@@ -7051,6 +7130,15 @@ class AutomaticCollection:
         try:
             self.ensure_plan()
             while not self.stop_event.is_set():
+                pressure=cloud_memory_pressure()
+                if pressure and pressure['ratio']>=.80:
+                    with self.lock:
+                        self.error=('サーバーメモリの使用率が80%に達したため、自動収集を一時停止しました。'+
+                                    '保存済み物件と未着手の町は保持しています。')
+                        self.settings['enabled']=False
+                    self.stop_event.set()
+                    self.persist_best_effort('memory_budget')
+                    break
                 with self.lock:
                     if self.stop_event.is_set():break
                     plan=automatic_task_plan(self.settings)
@@ -7089,6 +7177,14 @@ class AutomaticCollection:
                         if self.stop_event.is_set() or job.cancel_event.is_set():return
                         running_for=time.monotonic()-started_town
                         idle_for=time.monotonic()-job.state.last_activity_at
+                        memory=cloud_memory_pressure()
+                        if memory and memory['ratio']>=.80:
+                            timeout_reason.append('サーバーメモリ保護により中断（'+str(memory['used_mib'])+
+                                                  '/'+str(memory['limit_mib'])+' MiB）')
+                            self.error=timeout_reason[-1]+'。保存済み物件は保持しています。'
+                            self.stop_event.set()
+                            job.request_stop()
+                            return
                         if running_for>=AUTO_TOWN_MAX_SECONDS or idle_for>=AUTO_TOWN_IDLE_SECONDS:
                             reason=('町ごとの最大実行時間' if running_for>=AUTO_TOWN_MAX_SECONDS
                                     else '取得処理の進捗停止')
@@ -7160,6 +7256,22 @@ class AutomaticCollection:
                             self.message='一戸建て等の未確認ページを記録して、次の町へ進みます。'
                         else:
                             self.message='保存完了。次の町へ進みます。'
+                # The controller retains the last job for TXT/JSON diagnostics.
+                # Its thousands of temporary listing rows are already stored in
+                # Supabase and counted above, so release them before the next town.
+                try:
+                    with job.lock:
+                        job.state.new_units=[]
+                        job.state.new_saved_keys=[]
+                        job.state.new_regions=[]
+                        job.state.shared_web=None
+                except (AttributeError,TypeError):
+                    pass
+                self.shared_web.http_cache.clear()
+                self.shared_web.jhj_tile_cache.clear()
+                self.shared_web.jhj_tile_cached_at.clear()
+                self.shared_web.suumo_location_cache.clear()
+                del snap
                 if not self.persist_best_effort('after_town'):
                     # Without a confirmed progress checkpoint a subsequent town
                     # could be repeated on restart. Pause, retain all confirmed listings.
@@ -7503,6 +7615,9 @@ def automatic_log_download_panel(controller,busy,summary):
 @st.fragment(run_every='12s')
 def automatic_collection_panel():
     st.subheader('アプリ内の自動収集（SUUMO）')
+    memory=cloud_memory_pressure()
+    if memory:
+        st.caption(f"サーバーメモリ：{memory['used_mib']}/{memory['limit_mib']} MiB（{memory['ratio']:.0%}）。80%到達時は保存済み物件を保持して収集を停止します。")
     st.caption('画面を閉じてもサーバー稼働中は収集します。休止・再起動では止まり、次にアプリを開くと保存した設定・町の順番から再開します。')
     controller=get_automatic_collection();snap=controller.snapshot() if controller else None
     # Legacy per-error persistence bridge intentionally disabled. Historical
@@ -7579,7 +7694,7 @@ def automatic_collection_panel():
             error_job.refresh(max_age=0)
             st.rerun()
         if failure['loaded']:
-            st.download_button(f"全取得エラーCSV（1エラー1行・{len(failure['rows'])}行）",
+            st.download_button(f"全取得エラーCSV（1エラー1行・{failure['row_count']}行）",
                                failure['csv'],'sumai_all_acquisition_errors.csv','text/csv',
                                key='automatic_all_errors_csv',on_click='ignore',use_container_width=True)
             status='過去ログの統合が未完了' if failure.get('phase')=='partial' else '過去ログも裏で統合中' if failure['running'] and failure.get('phase')=='historical_backfill' else '裏で最新化中' if failure['running'] else '最新'
