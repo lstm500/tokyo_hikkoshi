@@ -40,7 +40,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v127-diagnostic"
+BUILD = "REBUILD-01-v128-diagnostic-ui"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -7417,48 +7417,101 @@ def _v127_file_inventory_slot():
     return {'job':None,'lock':threading.Lock()}
 
 
-def render_file_cache_inventory_v127():
-    with st.expander('実ファイルとページキャッシュの調査（読み取り専用）',expanded=False):
-        st.caption('稼働中のサーバー内を調査します。アプリのファイルやSupabaseのデータは変更しません。')
-        st.caption('Linuxのmincoreによる常駐ページ推定です。cgroupの inactive_file を個別ファイルへ厳密に帰属することはできません。')
-        slot=_v127_file_inventory_slot()
-        with slot['lock']:job=slot.get('job')
-        running=bool(job and job.thread and job.thread.is_alive())
-        if st.button('サーバー上の実ファイルを全件調査',key='v127_start_file_scan',disabled=running,use_container_width=True):
-            with slot['lock']:
-                old=slot.get('job')
-                if old and old.thread and old.thread.is_alive():st.warning('すでに調査中です')
-                else:
-                    job=_V127FileCacheInventory()
-                    slot['job']=job
-                    job.launch()
-                    running=True
-        if job:
-            snap=job.snapshot();p=snap['progress']
-            st.write('進行状況：'+str(p.get('phase'))+'｜調査 '+f'{p.get("files",0):,}'+' ファイル｜常駐推定 '+f'{p.get("resident_bytes",0)/1048576:,.1f}'+' MiB')
-            if running:st.caption('最大600秒間走査します。下の「進捗を更新」で進捗を確認してください。')
-            if st.button('調査の進捗を更新',key='v127_file_scan_refresh',disabled=not running):st.rerun()
-            if snap['error']:st.error('調査失敗：'+snap['error'])
-            elif snap['done']:
-                summary=snap.get('summary') or {}
-                st.caption('ファイル数 '+f'{summary.get("total_files",0):,}'+'｜走査打ち切り '+str(summary.get('truncation') or 'なし'))
-                if snap['txt_path'] and os.path.isfile(snap['txt_path']):
-                    with open(snap['txt_path'],'rb') as file:
-                        st.download_button('実ファイル調査TXTをダウンロード',file.read(),
-                            'sumai_real_file_memory_v127.txt','text/plain',key='v127_probe_txt',use_container_width=True,on_click='ignore')
-                if snap['csv_path'] and os.path.isfile(snap['csv_path']):
-                    with open(snap['csv_path'],'rb') as file:
-                        st.download_button('全実ファイル明細CSV.gzをダウンロード',file.read(),
-                            'sumai_real_file_memory_v127.csv.gz','application/gzip',key='v127_probe_csv',use_container_width=True,on_click='ignore')
-        st.caption('圧縮CSVは調査結果を配布しやすくするための形式で、元のファイルは圧縮しません。')
+@st.fragment(run_every="4s")
+def render_file_cache_inventory_v128():
+    """Always-visible, auto-refreshing, read-only file-cache investigation UI.
+
+    The investigation and both output controls stay in the Saved Data tab.
+    No separate expander or manual refresh is required. The v127 job cache is
+    deliberately reused across hot reloads so an ongoing scan is not lost.
+    """
+    st.markdown('#### 実ファイルとページキャッシュの調査')
+    st.caption('サーバー内に存在する実ファイルと、メモリに残っているページを調べます。元ファイルとSupabaseのデータは変更しません。')
+
+    slot=_v127_file_inventory_slot()
+    with slot['lock']:
+        job=slot.get('job')
+    snap=job.snapshot() if job else None
+    running=bool(job and job.thread and job.thread.is_alive() and not (snap or {}).get('done'))
+
+    label=('調査中（自動更新しています）' if running else
+           '実ファイルの調査を開始' if not job else '実ファイルを再調査する')
+    if st.button(label,key='v128_start_file_scan',disabled=running,
+                 type='primary' if not job else 'secondary',use_container_width=True):
+        with slot['lock']:
+            old=slot.get('job')
+            if old and old.thread and old.thread.is_alive():
+                job=old
+            else:
+                job=_V127FileCacheInventory()
+                slot['job']=job
+                job.launch()
+        snap=job.snapshot()
+        running=bool(job.thread and job.thread.is_alive() and not snap.get('done'))
+
+    if not job:
+        st.info('未調査です。「実ファイルの調査を開始」を押してください。完了すると下の2ファイルをダウンロードできます。')
+    else:
+        snap=snap or job.snapshot()
+        progress=snap.get('progress') or {}
+        count=int(progress.get('files') or 0)
+        resident=float(progress.get('resident_bytes') or 0)/1048576
+        elapsed=int(progress.get('elapsed_seconds') or 0)
+        if running:
+            st.info(f'調査中｜{count:,}ファイル確認｜常駐ページ推定 {resident:,.1f} MiB｜経過 {elapsed:,}秒。4秒ごとに自動更新します。')
+            st.caption('調査は最大10分です。進捗は取得できたファイル数を表示します（総ファイル数は調査完了まで未確定です）。')
+        elif snap.get('error'):
+            st.error('調査に失敗しました：'+str(snap['error']))
+            st.caption('上の「実ファイルを再調査する」からやり直せます。')
+        elif snap.get('done'):
+            summary=snap.get('summary') or {}
+            st.success('実ファイルの調査が完了しました。下のTXTとCSV.gzをダウンロードしてください。')
+            st.caption(f'確認 {int(summary.get("total_files") or 0):,}件｜'
+                       f'実サイズ合計 {float(summary.get("disk_size_bytes") or 0)/1048576:,.1f} MiB｜'
+                       f'常駐ページ推定 {float(summary.get("resident_page_bytes") or 0)/1048576:,.1f} MiB｜'
+                       f'所要 {float(summary.get("elapsed_seconds") or 0):,.1f}秒')
+            if summary.get('truncation'):
+                st.warning('調査は '+str(summary['truncation'])+' で打ち切られました。TXTに調査範囲・測定不能件数を記載しています。')
+            elif int(summary.get('unknown_files') or 0)>0:
+                st.caption('測定不能なファイル '+f'{int(summary["unknown_files"]):,}'+'件。詳細はTXTと全件CSV.gzをご確認ください。')
+        elif job.thread and not job.thread.is_alive():
+            st.error('調査スレッドが終了しましたが、完了結果を取得できませんでした。再調査してください。')
+        else:
+            st.info('調査開始の準備中です。4秒ごとに画面を自動更新します。')
+
+    st.markdown('**調査結果ファイル（2種類）**')
+    finished=bool(snap and snap.get('done') and not snap.get('error'))
+    txt=snap.get('txt_path') if finished else None
+    csv_gz=snap.get('csv_path') if finished else None
+    txt_ready=bool(txt and os.path.isfile(txt))
+    csv_ready=bool(csv_gz and os.path.isfile(csv_gz))
+    col1,col2=st.columns(2)
+    if txt_ready:
+        with open(txt,'rb') as stream:
+            col1.download_button('調査TXTをダウンロード',stream.read(),
+                'sumai_real_file_memory_v128.txt','text/plain',
+                key='v128_probe_txt',use_container_width=True,on_click='ignore')
+    else:
+        col1.button('調査TXTをダウンロード（完了待ち）',key='v128_probe_txt_wait',
+                    disabled=True,use_container_width=True)
+    if csv_ready:
+        with open(csv_gz,'rb') as stream:
+            col2.download_button('全件CSV.gzをダウンロード',stream.read(),
+                'sumai_real_file_memory_v128.csv.gz','application/gzip',
+                key='v128_probe_csv',use_container_width=True,on_click='ignore')
+    else:
+        col2.button('全件CSV.gzをダウンロード（完了待ち）',key='v128_probe_csv_wait',
+                    disabled=True,use_container_width=True)
+    if finished and not (txt_ready and csv_ready):
+        st.error('調査は終了しましたが結果ファイルが見つかりません。上の「実ファイルを再調査する」で再取得してください。')
+    st.caption('CSV.gzは診断結果の圧縮ファイルです。サーバー内の元ファイルは圧縮・削除しません。'
+               ' mincoreの常駐ページはinactive_fileと厳密に一致するものではありません。')
+
 
 def render_memory_diagnostic_v124():
     """Small opt-in expander; no sampling on every Streamlit fragment refresh."""
     with st.expander('メモリ診断（必要なときだけ）',expanded=False):
         st.caption('現在の内訳を記録してTXTを出力します。待機中・収集中など最大3回を比較できます。')
-        if st.button('ファイル関連メモリの回収を試す（調査中は無効）',key='v126_memory_reclaim',use_container_width=True,disabled=True):
-            result=_v126_reclaim_idle_cache('user-diagnostic',force=True)
-            st.caption('回収結果：'+result['status']+'｜全体 '+str(result.get('before_mib'))+' → '+str(result.get('after_mib'))+' MiB')
         if st.button('現在のメモリを記録',key='v124_memory_sample',use_container_width=True):
             try:
                 current=memory_diagnostic_v124()
@@ -7485,7 +7538,6 @@ def render_memory_diagnostic_v124():
                                'sumai_memory_diagnostic_v124.txt','text/plain',
                                key='v124_memory_download',use_container_width=True,on_click='ignore')
         st.caption('物件データ・秘密鍵・ファイル名・URLは出力しません。')
-    render_file_cache_inventory_v127()
 
 
 # Keep searches moving when one town has too many listings or stops making progress.
@@ -9230,8 +9282,9 @@ def main():
                             st.caption('差分はログの観測件数です。精度は同じ物件の正解データとの照合で確認してください。')
                         else:st.info('比較対象として現在の検索ログまたは保存ログを読み込んでください。')
                     except (ValueError,UnicodeError,AttributeError):st.error('このアプリからダウンロードした解析用JSONログを選択してください。')
-        # Diagnostics are occasional tools; keep routine SUUMO collection and
-        # saved-list access at the top of the Saved Data tab.
+        # Inventory controls and both downloads remain visible, independent of
+        # the optional memory-diagnostic expander.
+        render_file_cache_inventory_v128()
         render_memory_diagnostic_v124()
     with tabs[2]:
         st.subheader('通勤の目安')
