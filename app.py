@@ -40,7 +40,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v131"
+BUILD = "REBUILD-01-v132"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -1917,6 +1917,23 @@ class PublicWeb:
                         if self.prime_session(session,root,options,index+1):
                             headers=dict(options.get('headers',{}));headers['Referer']=root+'/';options['headers']=headers
                             trace(self,'session_retry',{'url':url,'route_number':index+1,'change':'same-route public entry cookies and actual Referer'},stage='transport');continue
+                    # An HTTP 429 from an independent building-identity search is
+                    # not a transient SUUMO error. Stop that host immediately. Do not
+                    # override Retry-After or switch identities/cookies to bypass it.
+                    if status==429 and host in ('www.google.com','search.yahoo.co.jp') and u.path=='/search':
+                        raw_retry=response.headers.get('Retry-After','')
+                        try:requested_wait=max(0.,float(raw_retry))
+                        except (ValueError,TypeError):
+                            try:requested_wait=max(0.,(parsedate_to_datetime(raw_retry)-datetime.now(timezone.utc)).total_seconds())
+                            except (ValueError,TypeError,OverflowError):requested_wait=0.
+                        pause_seconds=max(3600.,requested_wait)
+                        with self.cache_lock:
+                            breakers=getattr(self,'identity_search_429',None)
+                            if breakers is None:breakers={};self.identity_search_429=breakers
+                            breakers[host]=max(breakers.get(host,0.),time.monotonic()+pause_seconds)
+                        trace(self,'identity_search_rate_limited',{'host':host,'status':429,
+                            'next_stage':'authoritative_address_registry','pause_seconds':round(pause_seconds)},'WARNING','address.fallback')
+                        break
                     retry=status in (429,500,502,503,504)
                     if retry:
                         raw=response.headers.get('Retry-After','')
@@ -3659,7 +3676,7 @@ def _normalize_japanese_address(value):
 
 def _detailed_address(value):
     text=_normalize_japanese_address(value)
-    return bool(text and re.search(r'(?:丁目|大字|字).{0,30}\d+(?:番|-|－)\d+(?:号)?$',text))
+    return bool(text and re.search(r'(?:丁目|大字|字).{0,30}\d+(?:番|-|－)\d+(?:[-－]\d+)?(?:号)?$',text))
 
 
 def _extract_detailed_addresses(text):
@@ -3763,45 +3780,253 @@ def _gsi_validate_external_address(web,address,munis,region_code=None):
     return None
 
 
-def _cross_source_address_from_identity(web,identity,map_point,munis,region_code=None):
-    """Fallback for SUUMO map/GSI failures. Never uses SUUMO textual address."""
+# 2nd-stage fallback: the Digital Agency Address Base Registry, published as
+# Geolonia Japanese Addresses v2. Its records have block/house numbers AND
+# measured coordinates. No SUUMO text addresses or town centroids are inputs.
+# Source specification: https://github.com/geolonia/japanese-addresses-v2
+# Strict acceptance deliberately favors false negatives over wrong buildings.
+ADDRESS_REGISTRY_HOST = 'japanese-addresses-v2.geoloniamaps.com'
+ADDRESS_REGISTRY_MAX_TOWN_RANGE = 640_000
+ADDRESS_REGISTRY_MAX_DIST_M = 12.0
+ADDRESS_REGISTRY_MIN_GAP_M = 15.0
+
+
+def _registry_verified_point(web, map_point, munis, region_code=None, expected_towns=None):
+    """Official reverse town check; a map-center hint cannot identify a residence."""
+    if not map_point or not has_point({'latitude':map_point[0], 'longitude':map_point[1]}):return None
+    try:region=reverse(web,map_point,munis,force=True)
+    except (AppError,ValueError,TypeError) as exc:
+        trace(web,'registry_reverse_unavailable',{'reason':type(exc).__name__},'WARNING','address.stage2');return None
+    if not region or region.get('code') not in munis:return None
+    if region_code and str(region['code'])!=str(region_code):return None
+    bases=[town_base_name(t) for t in (expected_towns or ()) if normal(t)]
+    if bases and town_base_name(region.get('town','')) not in bases:return None
+    return region
+
+
+def _registry_manifest(web, region):
+    """Bounded manifest with town-specific byte ranges; no ward-wide file download."""
+    code=str(region['code'])
+    with web.cache_lock:
+        cache=getattr(web,'address_registry_manifest_cache',None)
+        if cache is None:cache={};web.address_registry_manifest_cache=cache
+        if code in cache:return cache[code]
+    _,pref,city=region['munis'][code]
+    if pref!='東京都' or not re.fullmatch(r'[^/]{1,24}区',city):return []
+    url='https://'+ADDRESS_REGISTRY_HOST+'/api/ja/'+quote(pref,safe='')+'/'+quote(city,safe='')+'.json'
+    try:
+        if not web.permitted(url):return []
+        reply=web.fetch(url)
+        if len(reply.content)>1_500_000:raise AppError('町域索引が上限を超えています。')
+        data=reply.json();towns=data.get('data') if isinstance(data,dict) else None
+        if not isinstance(towns,list) or len(towns)>5000:raise AppError('町域索引の形式が不正です。')
+    except (AppError,ValueError,TypeError) as exc:
+        trace(web,'registry_manifest_unavailable',{'city':city,'reason':str(exc)},'WARNING','address.stage2');return []
+    with web.cache_lock:
+        if len(cache)>=4:cache.pop(next(iter(cache)))
+        cache[code]=towns
+    return towns
+
+
+def _registry_range_text(web, region, offset, length):
+    """Download ONLY the town byte range. Never fetch/cache a complete ward TXT.
+
+    Streamed through the same app HTTP gate and read-only session. HTTP 206
+    with an exact matching Content-Range is mandatory: an ignored Range (200)
+    MUST be closed without downloading the response body.
+    """
+    if not isinstance(offset,int) or not isinstance(length,int) or offset<0 or not 0<length<=ADDRESS_REGISTRY_MAX_TOWN_RANGE:return None
+    pref,city=region['munis'][region['code']][1:3]
+    url='https://'+ADDRESS_REGISTRY_HOST+'/api/ja/'+quote(pref,safe='')+'/'+quote(city,safe='')+'-住居表示.txt'
+    try:
+        if not web.permitted(url):return None
+    except AppError as exc:
+        trace(web,'registry_range_not_permitted',{'reason':str(exc)},'WARNING','address.stage2');return None
+    upper=offset+length-1
+    # No proxy rotation, global cache operations or direct system-file operations.
+    response=None
+    try:
+        response=web.route_request(web.session(),'GET',url,{'headers':{
+            'Range':f'bytes={offset}-{upper}', 'Accept-Encoding':'identity'},'stream':True})
+        if response.status_code!=206:
+            trace(web,'registry_range_refused',{'status':response.status_code,'reason':'206_required'},'WARNING','address.stage2');return None
+        match=re.fullmatch(r'bytes\s+(\d+)-(\d+)/(?:\d+|\*)',response.headers.get('Content-Range','').strip(),re.I)
+        if not match or (int(match[1]),int(match[2]))!=(offset,upper):
+            trace(web,'registry_range_refused',{'status':206,'reason':'content_range_mismatch'},'WARNING','address.stage2');return None
+        payload=response.raw.read(length+1,decode_content=True)
+        if len(payload)!=length:
+            trace(web,'registry_range_refused',{'status':206,'reason':'byte_count_mismatch'},'WARNING','address.stage2');return None
+        return payload.decode('utf-8-sig')
+    except (requests.RequestException,AppError,UnicodeError,OSError,ValueError) as exc:
+        trace(web,'registry_range_failed',{'exception_type':type(exc).__name__},'WARNING','address.stage2');return None
+    finally:
+        if response is not None:response.close()
+
+
+def _registry_read_rows(text):
+    """Parse a v2 chome slice: prc_num1,prc_num2,prc_num3,lng,lat."""
+    if not isinstance(text,str) or not text:return []
+    rows=[]
+    for raw in csv.reader(io.StringIO(text)):
+        if len(raw)<5:continue
+        first,second,third=tuple(normal(v) for v in raw[:3])
+        if not first.isdecimal() or not second.isdecimal():continue
+        if third and not third.isdecimal():continue
+        if int(first)<=0 or int(second)<=0 or (third and int(third)<=0):continue
+        try:lng,lat=map(float,raw[-2:])
+        except (TypeError,ValueError):continue
+        if not has_point({'latitude':lat,'longitude':lng}):continue
+        pieces=[str(int(first)),str(int(second))]
+        if third:pieces.append(str(int(third)))
+        rows.append(('-'.join(pieces),(lat,lng)))
+        if len(rows)>18000:return []  # avoid unexpectedly huge payloads
+    return rows
+
+
+def _registry_precise_address_from_map(web,map_point,position_kind,munis,region_code=None,expected_towns=None):
+    """Stage 2: unique nearby official address, never a guessed block or town.
+
+    Reject map centers (not necessarily the building), cross-town candidates,
+    multiple near-neighbours and incomplete residential records. No candidate
+    is promoted merely because it shares a town with the SUUMO search scope.
+    """
+    if position_kind not in ('room_marker','image_pin'):
+        trace(web,'registry_no_exact_map_pin',{'kind':position_kind},'WARNING','address.stage2');return None
+    region=_registry_verified_point(web,map_point,munis,region_code,expected_towns)
+    if not region:return None
+    region=dict(region,munis=munis)
+    towns=_registry_manifest(web,region)
+    wanted=address_key(region['town'])
+    selected=[]
+    for entry in towns:
+        if not isinstance(entry,dict):continue
+        place=normal(entry.get('oaza_cho'))+normal(entry.get('chome'))
+        ranges=entry.get('csv_ranges') or {}
+        info=ranges.get('住居表示') if isinstance(ranges,dict) else None
+        if address_key(place)!=wanted or not isinstance(info,dict):continue
+        try:
+            offset=int(info['start']);size=int(info['length'])
+        except (ValueError,TypeError,KeyError):continue
+        if not (0<=offset and 0<size<=ADDRESS_REGISTRY_MAX_TOWN_RANGE):continue
+        selected.append((place,offset,size))
+    if len(selected)!=1:
+        trace(web,'registry_town_unresolved',{'town':region['town'],'matching_ranges':len(selected)},'WARNING','address.stage2');return None
+    place,offset,size=selected[0]
+    cache_key=(str(region['code']),offset,size)
+    with web.cache_lock:
+        cache=getattr(web,'address_registry_town_cache',None)
+        if cache is None:cache={};web.address_registry_town_cache=cache
+        locks=getattr(web,'address_registry_town_locks',None)
+        if locks is None:locks={};web.address_registry_town_locks=locks
+        # One app-local gate per ward/town, never a global / OS cache lock.
+        gate=locks.setdefault(cache_key,threading.Lock())
+    with gate:
+        with web.cache_lock:rows=cache.get(cache_key)
+        if rows is None:
+            raw=_registry_range_text(web,region,offset,size)
+            if raw is None:return None
+            rows=_registry_read_rows(raw)
+            if not rows:
+                trace(web,'registry_town_empty',{'town':place,'bytes':size},'WARNING','address.stage2');return None
+            with web.cache_lock:
+                if len(cache)>=4:cache.pop(next(iter(cache)))
+                cache[cache_key]=rows
+    # Keep at most four small town gates; in-flight ones may finish independently.
+    with web.cache_lock:
+        if len(locks)>8:
+            for old_key in list(locks):
+                if old_key!=cache_key and not locks[old_key].locked():
+                    locks.pop(old_key,None)
+                    if len(locks)<=8:break
+    candidates={}
+    for number,point in rows:
+        distance=meters(map_point,point)
+        if distance>50:continue
+        address=region['munis'][region['code']][1]+region['munis'][region['code']][2]+place+number
+        if not _detailed_address(address):continue
+        prior=candidates.get(address)
+        if prior is None or distance<prior[0]:candidates[address]=(distance,point)
+    ranked=sorted(((d,a,p) for a,(d,p) in candidates.items()),key=lambda x:x[0])
+    if not ranked:
+        trace(web,'registry_no_nearby_address',{'town':place,'records':len(rows)},'WARNING','address.stage2');return None
+    best_dist,address,address_point=ranked[0]
+    second=ranked[1][0] if len(ranked)>1 else float('inf')
+    if best_dist>ADDRESS_REGISTRY_MAX_DIST_M or second-best_dist<ADDRESS_REGISTRY_MIN_GAP_M:
+        trace(web,'registry_precision_rejected',{'town':place,'nearest_m':round(best_dist,2),
+              'runnerup_m':round(second,2) if math.isfinite(second) else None,
+              'max_m':ADDRESS_REGISTRY_MAX_DIST_M,'min_gap_m':ADDRESS_REGISTRY_MIN_GAP_M},'WARNING','address.stage2')
+        return None
+    result={'address':address,'reference_point':list(address_point),'distance_m':best_dist,
+            'official_region':{k:region[k] for k in ('code','pref','town','label')},
+            'verification':'digital_agency_address_registry_unique_point',
+            'registry_method':'Geolonia v2 / デジタル庁アドレス・ベース・レジストリ',
+            'registry_candidate_count':len(ranked), 'registry_gap_m':second-best_dist,
+            'registry_town':place}
+    trace(web,'registry_precise_address_ok',{'address':address,'map_pin':list(map_point),
+          'distance_m':round(best_dist,2),'runnerup_m':round(second,2) if math.isfinite(second) else None,
+          'town':place,'data':'digital_agency_address_registry'},stage='address.stage2')
+    return result
+
+
+def _cross_source_address_from_identity(web,identity,map_point,munis,region_code=None,
+                                        position_kind='',expected_towns=None):
+    """Two-stage address confirmation: independent identity then official registry.
+
+    Stage 1 uses Google/Yahoo search-result LINKS, never search snippets as proof.
+    A host that returns 429 is paused for one hour in THIS app controller, and
+    stage 2 can still run using independent official detailed point data.
+    Neither phase may use SUUMO's list/detail textual address.
+    """
     name=normal(identity.get('building_name'))
-    if len(name)<3:return None
     query='"'+name+'"'
     ym=_identity_year_month(identity.get('raw_age'))
     if ym:query+=f' {ym[0]}年{ym[1]}月'
     layout=parsed_layout(identity.get('raw_layout'))
     if layout:query+=' '+layout
-    search_urls=(
-        'https://html.duckduckgo.com/html/?q='+quote(query),
-        'https://www.google.com/search?q='+quote(query),
-        'https://search.yahoo.co.jp/search?p='+quote(query),
-    )
-    result_links=[];search_errors=[]
-    for search_url in search_urls:
-        try:
-            reply=web.fetch(search_url);soup=BeautifulSoup(reply.text,'html.parser')
-            result_links.extend(x for x in _external_result_links(soup,reply.url) if x not in result_links)
-        except Exception as exc:search_errors.append({'url':search_url,'exception_type':type(exc).__name__,'reason':str(exc)})
-        if len(result_links)>=8:break
+    blocked=False;result_links=[];search_errors=[]
+    if len(name)>=3:
+        search_urls=(
+            'https://www.google.com/search?q='+quote(query),
+            'https://search.yahoo.co.jp/search?p='+quote(query),
+        )
+        for search_url in search_urls:
+            host=urlparse(search_url).hostname
+            with web.cache_lock:
+                until=getattr(web,'identity_search_429',{}).get(host,0)
+            if time.monotonic()<until:
+                blocked=True
+                trace(web,'identity_search_skipped_429',{'host':host,'reason':'cooldown','next_stage':'address.stage2'},stage='address.fallback')
+                continue
+            try:
+                if not web.permitted(search_url):raise AppError('検索元のrobotsルールで取得できません。')
+                reply=web.fetch(search_url);soup=BeautifulSoup(reply.text,'html.parser')
+                result_links.extend(x for x in _external_result_links(soup,reply.url) if x not in result_links)
+            except AppError as exc:
+                status=(getattr(exc,'diagnostic',{}) or {}).get('status')
+                search_errors.append({'host':host,'status':status,'exception_type':type(exc).__name__,'reason':str(exc)})
+                if status==429:
+                    blocked=True
+                    with web.cache_lock:
+                        breakers=getattr(web,'identity_search_429',None)
+                        if breakers is None:breakers={};web.identity_search_429=breakers
+                        breakers[host]=max(breakers.get(host,0.),time.monotonic()+3600)
+            if len(result_links)>=8:break
     candidates={}
     for target in result_links[:8]:
         try:
             if not web.permitted(target):continue
-            reply=web.fetch(target);soup=BeautifulSoup(reply.text,'html.parser');text=' '.join(soup.stripped_strings)
-        except Exception as exc:
-            trace(web,'external_identity_page_failed',{'url':target,'exception_type':type(exc).__name__,'reason':str(exc)},'WARNING','address.fallback');continue
-        score,evidence=_identity_match_score(text,identity)
+            reply=web.fetch(target);soup=BeautifulSoup(reply.text,'html.parser');page_text=' '.join(soup.stripped_strings)
+        except AppError as exc:
+            trace(web,'external_identity_page_failed',{'url':target,'exception_type':type(exc).__name__},'WARNING','address.fallback');continue
+        score,evidence=_identity_match_score(page_text,identity)
         if score<5 or 'building_name' not in evidence:continue
         host=urlparse(target).hostname or ''
-        for address in _extract_detailed_addresses(text):
+        for address in _extract_detailed_addresses(page_text):
             key=_normalize_japanese_address(address)
             row=candidates.setdefault(key,{'address':key,'hosts':set(),'score':0,'evidence':set(),'urls':[]})
             row['hosts'].add(host);row['score']=max(row['score'],score);row['evidence'].update(evidence);row['urls'].append(target)
     ranked=sorted(candidates.values(),key=lambda r:(len(r['hosts']),r['score']),reverse=True)
     for row in ranked:
-        # Two independent hosts are preferred; a single host needs the strongest
-        # identity match (name + build month + area/layout) before acceptance.
         if len(row['hosts'])<2 and row['score']<8:continue
         validated=_gsi_validate_external_address(web,row['address'],munis,region_code)
         if not validated:continue
@@ -3809,10 +4034,21 @@ def _cross_source_address_from_identity(web,identity,map_point,munis,region_code
         if distance is not None and distance>2000:continue
         validated.update(distance_m=distance if distance is not None else 0,
                          external_hosts=sorted(row['hosts']),external_urls=row['urls'][:4],
-                         identity_evidence=sorted(row['evidence']))
-        trace(web,'external_identity_address_ok',{'building_name':name,'address':validated['address'],'map_point':list(map_point) if map_point else None,'address_point':validated['reference_point'],'distance_m':round(distance,1) if distance is not None else None,'hosts':validated['external_hosts'],'identity_evidence':validated['identity_evidence']},stage='address.fallback')
+                         identity_evidence=sorted(row['evidence']),stage='search_identity')
+        trace(web,'external_identity_address_ok',{'building_name':name,'address':validated['address'],
+            'distance_m':round(distance,1) if distance is not None else None,
+            'hosts':validated['external_hosts'],'identity_evidence':validated['identity_evidence']},stage='address.fallback')
         return validated
-    trace(web,'external_identity_address_unresolved',{'building_name':name,'search_errors':search_errors,'result_links':result_links[:8],'candidate_count':len(candidates),'reason':'独立ソースで詳細住所を十分に照合できない'},'WARNING','address.fallback')
+    trace(web,'address_stage2_start',{'reason':'search_429' if blocked else 'no_verified_identity',
+          'position_kind':position_kind,'primary_errors':search_errors,'search_result_links':len(result_links)},
+          stage='address.stage2')
+    registry=_registry_precise_address_from_map(web,map_point,position_kind,munis,region_code,expected_towns)
+    if registry:
+        registry['stage']='official_registry'
+        return registry
+    trace(web,'external_identity_address_unresolved',{'building_name':name,
+          'search_errors':search_errors,'result_links':result_links[:8],
+          'candidate_count':len(candidates),'stage2':'official_registry_unresolved'},'WARNING','address.fallback')
     return None
 
 
@@ -3879,7 +4115,8 @@ def suumo_location_from_kankyo_image(web,detail_soup,detail_url,bounds,munis,exp
     inferred=map_point_to_residential_address(web,(lat,lng),munis,expected_code=region_code,expected_towns=strict_towns)
     external=None
     if not inferred:
-        external=_cross_source_address_from_identity(web,identity,(lat,lng),munis,region_code)
+        external=_cross_source_address_from_identity(web,identity,(lat,lng),munis,region_code,
+                                                     position_kind=position_kind,expected_towns=expected_towns)
         inferred=external
     if not inferred:return None
     address=inferred['address']
@@ -3887,17 +4124,17 @@ def suumo_location_from_kankyo_image(web,detail_soup,detail_url,bounds,munis,exp
     external_used=bool(external)
     location={'latitude':float(inferred.get('reference_point',[lat,lng])[0]) if external_used else lat,
               'longitude':float(inferred.get('reference_point',[lat,lng])[1]) if external_used else lng,
-              'location_method':('SUUMO物件固有地図→建物名・築年月・間取り/面積を独立ソース照合→GSI住所確認' if external_used else method),
+              'location_method':(('SUUMO物件地図の正確なマーカー→デジタル庁住所基盤データ照合' if external.get('stage')=='official_registry' else 'SUUMO物件固有地図→建物名等を独立ソース照合→GSI住所確認') if external_used else method),
               'map_address':address,'inferred_address':address,
-              'address_match':('独立ソースで建物同一性を照合しGSIで番地確認' if external_used else '地図座標から番地・住居番号相当まで推定'),
+              'address_match':(('公式住所点との近接・一意性を確認（推定）' if external.get('stage')=='official_registry' else '独立ソースで建物同一性を照合しGSIで番地確認') if external_used else '地図座標から番地・住居番号相当まで推定'),
               'coordinate_precision':'building' if external_used else 'listing_map',
               'position_source_url':source,
-              'address_precision':('独立複数ソース照合＋GSI住所検索' if external_used else 'GSI住居表示・街区符号/基礎番号'),
+              'address_precision':(('住居表示住所の公式点・近接一意性（建物一致は推定）' if external.get('stage')=='official_registry' else '独立複数ソース照合＋GSI住所検索') if external_used else 'GSI住居表示・街区符号/基礎番号'),
               'address_distance_m':round(float(inferred.get('distance_m') or 0),2),
               'suumo_map_hint_latitude':lat,'suumo_map_hint_longitude':lng,
               'suumo_map_position_kind':position_kind}
     if external_used:
-        location['address_identity_sources']=external.get('external_hosts',[])
+        location['address_identity_sources']=external.get('external_hosts',[]) or ([ADDRESS_REGISTRY_HOST] if external.get('stage')=='official_registry' else [])
         location['address_identity_evidence']=external.get('identity_evidence',[])
     with web.cache_lock:
         if len(web.suumo_location_cache)>=400:web.suumo_location_cache.pop(next(iter(web.suumo_location_cache)))
@@ -9087,6 +9324,7 @@ analyze public.housing_searches_v1;'''
         st.caption(f'実行中の版：{BUILD}')
     with st.expander('取得・集計の範囲'):
         st.write('SUUMOのみで検索します。マンションは築15年以内、1LDK/2K/2DKまたは2LDK/3K/3DK。一戸建て・その他は築40年以内・50㎡以上を対象とします。住所は物件固有の地図の座標から推定します。')
+        st.caption('住所推定：SUUMOの物件地図→GSI住所点→建物名による独立照合。Google・Yahoo!で429等により住所を確認できない場合は、デジタル庁アドレス・ベース・レジストリ由来のGeolonia住所点で第2段階の照合を行います。正確な物件マーカーと近接・一意性が確認できなければ保存しません。出典：Geolonia japanese-addresses-v2／デジタル庁。')
         st.write('データベースへ保存する募集項目は家賃・間取り・種別（マンション／一戸建て）・詳細住所（推定）・データ取得日時です。取得日時はUTCで保存し、画面では日本時間で表示します。管理費・面積・築年数・画像・緯度経度・掲載URLは募集データとして保存しません。')
         st.write('募集情報は既存SupabaseのJSON保存領域へ保存するため、追加SQLは不要です。schema 4・5の保存データを読み込みます。旧データの取得日時は未記録と表示します。')
         st.write('SUUMOは物件固有地図の座標を起点に、国土地理院の住居表示住所データから詳細住所を推定します。一覧・詳細ページの所在地文字列から住所や位置を補完しません。')
