@@ -39,7 +39,7 @@ import streamlit as st
 from streamlit_folium import st_folium
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v108"
+BUILD = "REBUILD-01-v109"
 
 # ============================================================================
 # NON-NEGOTIABLE SUUMO ADDRESS POLICY -- DO NOT DELETE OR WEAKEN
@@ -5100,7 +5100,7 @@ class MapReferenceLabels(MacroElement):
         self.station_payload=json.dumps(stations,ensure_ascii=False,separators=(',',':')).replace('<','\u003c').replace('>','\u003e').replace('&','\u0026')
 
 class MobileScrollControl(MacroElement):
-    """On touch screens, allow normal page scrolling until map manipulation is requested."""
+    """Allow direct touch pan/pinch by default, with optional page-scroll mode."""
     _template=Template("""{% macro script(this, kwargs) %}
     (function () {
       if (!window.matchMedia || !window.matchMedia('(pointer:coarse)').matches) return;
@@ -5118,7 +5118,7 @@ class MobileScrollControl(MacroElement):
           map.getContainer().style.touchAction = 'pan-y';
         }
         if (button) {
-          button.textContent = manipulating ? 'ページをスクロール' : '地図を動かす';
+          button.textContent = manipulating ? 'ページをスクロール' : '地図を指で動かす';
           button.setAttribute('aria-pressed', manipulating ? 'true' : 'false');
         }
       }
@@ -5138,7 +5138,7 @@ class MobileScrollControl(MacroElement):
         return div;
       };
       touchControl.addTo(map);
-      setMode(false);
+      setMode(true);
     })();
     {% endmacro %}""")
     def __init__(self):
@@ -5264,6 +5264,17 @@ class IndividualRentPoints(MacroElement):
       map._sumaiRentalSVG={svg:svg,schedule:schedule};
       map.on('moveend zoomend resize viewreset',schedule);
       map.whenReady(schedule);
+      function svgResume() {
+        if (document.visibilityState && document.visibilityState !== 'visible') return;
+        if (map._loaded) map.invalidateSize({pan:false,animate:false});
+        schedule();
+      }
+      document.addEventListener('visibilitychange',svgResume);
+      window.addEventListener('pageshow',svgResume);
+      map.on('unload',function () {
+        document.removeEventListener('visibilitychange',svgResume);
+        window.removeEventListener('pageshow',svgResume);
+      });
     })();
     {% endmacro %}""")
     def __init__(self,rows):
@@ -5706,6 +5717,76 @@ def start_saved_load(bounds,cache=None,db=None,force_full=False):
     return job
 
 
+def restore_saved_display():
+    """Restore rendered saved units after mobile WebSocket/session reconnect.
+
+    The completed snapshot is server-local and contains only already-loaded rows
+    (no Supabase request). In-flight workers are reattached by the storage key.
+    After a process restart the snapshot disappears, so a tiny URL marker allows
+    a single asynchronous DB restoration instead of silently displaying nothing.
+    """
+    state=st.session_state
+    key=state.get('current_storage_key')
+    if not key or state.get('_saved_display_restore_checked')==key:
+        return
+    state['_saved_display_restore_checked']=key
+    # Do not overwrite explicit manual searches or already restored UI state.
+    if state.get('new_map_loaded'):
+        return
+    jobs,job_lock=saved_load_registry()
+    snapshots,snapshot_lock=saved_load_snapshot_registry()
+    with job_lock:
+        job=jobs.get(key)
+    with snapshot_lock:
+        published=snapshots.get(key)
+    if job is not None:
+        state.saved_load_key=key
+        state.saved_load_token=job.token
+    if isinstance(published,dict) and published.get('rows'):
+        # Reuse the complete address/coordinate mapping; no second geocoding.
+        state.new_units=list(published['rows'].values())
+        state.new_saved_keys=list(published['rows'])
+        state.address_point_cache=dict(published.get('cache') or {})
+        state.new_load_diagnostic=dict(published.get('diagnostic') or {})
+        state.new_map_loaded=True
+        state.pop('_mobile_map_payload_signature',None)
+        state.pop('new_map',None)
+        state.saved_map_restore_message='保存済み物件をサーバーの読込済みデータから復元しました。'
+        if job and job.snapshot().get('phase')=='complete':
+            state.saved_load_applied_token=job.token
+        return
+    if job is not None:
+        # A previous browser session may have left the worker loading the DB.
+        # Recover partial records as soon as possible without starting another job.
+        rows,cache,diag=job.export()
+        if rows:
+            state.new_units=rows
+            state.new_saved_keys=[r['key'] for r in rows]
+            state.address_point_cache=cache
+            state.new_load_diagnostic=diag
+            state.new_map_loaded=True
+            state.pop('_mobile_map_payload_signature',None)
+            state.pop('new_map',None)
+            state.saved_map_restore_message='前の画面で読み込み済みの物件を再表示しました。'
+            if job.snapshot().get('phase')=='complete':
+                state.saved_load_applied_token=job.token
+        return
+    # Streamlit Cloud process restarts clear cache_resource. In that case the
+    # browser URL remembers that saved data had been loaded, and a single DB
+    # worker reloads the persisted rows without requiring another tap.
+    try:
+        request_restore=str(st.query_params.get('saved_map',''))=='1'
+    except (AttributeError,TypeError,ValueError):
+        request_restore=False
+    if request_restore and not state.get('_saved_restore_db_started'):
+        state['_saved_restore_db_started']=True
+        try:
+            start_saved_load(state.get('new_bounds'),state.get('address_point_cache'))
+            state.saved_map_restore_message='サーバー再起動後のため、保存物件をバックグラウンドで復元しています。'
+        except AppError as exc:
+            state.saved_map_restore_message='自動復元に失敗しました。保存データの読込ボタンから再実行してください：'+str(exc)
+
+
 def manual_search_running():
     jobs,lock=job_registry();token=st.session_state.get('new_job_token');server_key=st.session_state.get('manual_server_key')
     with lock:
@@ -5719,6 +5800,8 @@ def apply_saved_load(job):
     rows,cache,diag=job.export();state=st.session_state
     state.address_point_cache=cache;state.new_units=rows;state.new_saved_keys=[r['key'] for r in rows]
     state.new_search=None;state.new_map_loaded=True;state.new_load_diagnostic=diag;state.pop('new_job_token',None)
+    try:st.query_params['saved_map']='1'
+    except (AttributeError,TypeError,ValueError):pass
     positioned=sum(has_point(r) for r in rows);positions=unique_map_position_count(rows)
     dots=visible_colored_dot_count(rows)
     state.new_notice=f"地図の〇 {dots}個｜保存物件 {len(rows)}件｜座標あり {positioned}件｜位置未確認 {sum(not has_point(r) for r in rows)}件。"
@@ -6990,6 +7073,7 @@ def main():
     preferences=state.get('new_preferences',{})
     try:state.current_storage_key=manual_registry_key(Database())
     except Exception:state.current_storage_key=None
+    restore_saved_display()
     tabs=st.tabs(['住まいを探す','保存データ','通勤・周辺施設','初期設定'])
     with tabs[0]:
         st.subheader('地図を動かして、探す地域を表示してください')
@@ -7112,6 +7196,7 @@ def main():
                 if state.get('_mobile_listing_table_ready')==table_token:
                     st.dataframe([{'物件ID':r.get('property_id','未記録'),'種別':'一戸建て' if listing_dwelling_type(r)=='house' else 'マンション','家賃（万円）':float(r['rent'])/10000 if r.get('rent') else None,'間取り':r.get('layout'),'住所（推定）':r.get('address'),'データ取得日時':acquisition_time_jst(r.get('fetched_at'))} for r in physical_units(rows)],hide_index=True)
     with tabs[1]:
+        if state.get('saved_map_restore_message'):st.caption(state.saved_map_restore_message)
         automatic_collection_panel()
         st.subheader('Supabaseに保存した物件')
         st.caption('Supabaseの保存物件を最新状態で読み込みます。読み込み中に自動収集で追加・更新された物件も、完了直前に再確認して反映します。重複する過去形式の保存行は1物件として扱います。')
