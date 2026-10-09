@@ -40,7 +40,7 @@ import streamlit as st
 from streamlit_folium import st_folium
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v123"
+BUILD = "REBUILD-01-v124"
 
 # ============================================================================
 # NON-NEGOTIABLE SUUMO ADDRESS POLICY -- DO NOT DELETE OR WEAKEN
@@ -6805,6 +6805,240 @@ def cloud_memory_pressure():
     except (OSError,ValueError,ZeroDivisionError):return None
 
 
+# v124: On-demand, bounded, private memory diagnosis. No subprocess, no DB read,
+# no names of files, addresses, URLs, CLI parameters, passwords or credentials.
+# The kernel 'file' counter includes tmpfs / shared memory and is NOT synonymous
+# with a set of text files or with fully reclaimable page cache.
+MEMORY_DIAGNOSTIC_FIELDS = (
+    'anon','file','kernel','kernel_stack','pagetables','sec_pagetables',
+    'percpu','sock','shmem','file_mapped','file_dirty','file_writeback',
+    'swapcached','anon_thp','file_thp','shmem_thp',
+    'inactive_anon','active_anon','inactive_file','active_file',
+    'unevictable','slab_reclaimable','slab_unreclaimable','slab',
+)
+
+
+def _v124_read_numeric(path, limit=32768):
+    try:
+        with open(path,'r',encoding='ascii',errors='replace') as handle:
+            return handle.read(limit)
+    except (OSError,UnicodeError):
+        return ''
+
+
+def _v124_parse_kv(text, kilobytes=False):
+    result={}
+    for line in text.splitlines():
+        fields=line.replace(':',' ').split()
+        if len(fields)<2:continue
+        try:value=int(fields[1])
+        except ValueError:continue
+        result[fields[0]]=value*(1024 if kilobytes else 1)
+    return result
+
+
+def _v124_process_category(pid):
+    comm=_v124_read_numeric('/proc/'+str(pid)+'/comm',256).strip().lower()
+    if ('chrome' in comm or 'chromium' in comm or 'browser' in comm):return 'Chromium/ブラウザー'
+    if 'python' in comm:return 'Python'
+    if 'streamlit' in comm:return 'Streamlit'
+    if not comm:return '不明'
+    return 'その他のプロセス'
+
+
+def _v124_process_rows():
+    """Read cgroup member processes without exposing process arguments."""
+    raw=_v124_read_numeric('/sys/fs/cgroup/cgroup.procs',32768)
+    pids=[]
+    for word in raw.split():
+        if word.isdecimal():pids.append(int(word))
+    pids=list(dict.fromkeys(pids+[os.getpid()]))[:256]
+    rows=[]
+    for pid in pids:
+        status=_v124_parse_kv(_v124_read_numeric('/proc/'+str(pid)+'/status',16384),kilobytes=True)
+        if not status:continue
+        rows.append({'pid':pid,'kind':_v124_process_category(pid),
+                     'rss':status.get('VmRSS',0),'anon':status.get('RssAnon',0),
+                     'file':status.get('RssFile',0),'shmem':status.get('RssShmem',0),
+                     'swap':status.get('VmSwap',0)})
+    rows.sort(key=lambda row:row['rss'],reverse=True)
+    # Only the largest ten PSS calls (can be slow on some Linux kernels).
+    for row in rows[:10]:
+        smaps=_v124_parse_kv(_v124_read_numeric('/proc/'+str(row['pid'])+'/smaps_rollup',8192),kilobytes=True)
+        row['pss']=smaps.get('Pss')
+        row['pss_anon']=smaps.get('Pss_Anon')
+        row['pss_file']=smaps.get('Pss_File')
+        row['pss_shmem']=smaps.get('Pss_Shmem')
+    return {'observed':len(rows),'truncated':len(pids)>=256,'top':rows[:10],
+            'rss_sum':sum(r['rss'] for r in rows)}
+
+
+def _v124_temp_folder_totals(path, max_entries=2500, depth=2):
+    """Read names only for classification, never retain or print them.
+
+    File sizes describe disk/tmpfs occupancy, NOT necessarily resident RAM.
+    Avoid symlinks and bounded traversal prevents pathological directories from
+    blocking the collection fragment.
+    """
+    categories={'町丁目境界DB':0,'町丁目集計DB':0,'アプリログ':0,
+                'その他のSQLite':0,'その他のファイル':0}
+    count=0;truncated=False;dirs=[(path,0)]
+    while dirs:
+        folder,level=dirs.pop()
+        try:
+            with os.scandir(folder) as iterator:
+                for entry in iterator:
+                    if count>=max_entries:truncated=True;break
+                    count+=1
+                    try:
+                        if entry.is_symlink():continue
+                        if entry.is_dir(follow_symlinks=False):
+                            if level<depth:dirs.append((entry.path,level+1))
+                            continue
+                        if not entry.is_file(follow_symlinks=False):continue
+                        size=entry.stat(follow_symlinks=False).st_size
+                        name=entry.name.lower()
+                        if name.startswith('sumai-town-boundary-v') or ('sumai-town-boundary-' in entry.path and name.endswith('.sqlite')):
+                            category='町丁目境界DB'
+                        elif 'sumai-town-agg-' in entry.path or name=='latest.sqlite':
+                            category='町丁目集計DB'
+                        elif name.startswith('sumai-log-'):
+                            category='アプリログ'
+                        elif name.endswith(('.sqlite','.sqlite-wal','.sqlite-shm','.db','.db-wal','.db-shm')):
+                            category='その他のSQLite'
+                        else:category='その他のファイル'
+                        categories[category]+=max(0,size)
+                    except OSError:continue
+        except OSError:pass
+        if truncated:break
+    return {'file_entries_scanned':count,'incomplete':truncated,'bytes':categories}
+
+
+def memory_diagnostic_v124():
+    """One tiny point-in-time snapshot. No network or Supabase operations."""
+    result={'timestamp_jst':datetime.now(timezone(timedelta(hours=9))).strftime('%Y-%m-%d %H:%M:%S JST'),
+            'build':BUILD}
+    root='/sys/fs/cgroup/'
+    stat=_v124_parse_kv(_v124_read_numeric(root+'memory.stat'))
+    result['cgroup']={
+        'current':_v124_parse_kv('current '+_v124_read_numeric(root+'memory.current').strip()).get('current'),
+        'max':_v124_parse_kv('max '+_v124_read_numeric(root+'memory.max').strip()).get('max'),
+        'swap_current':_v124_parse_kv('swap '+_v124_read_numeric(root+'memory.swap.current').strip()).get('swap'),
+        'events':_v124_parse_kv(_v124_read_numeric(root+'memory.events')),
+        'stat':{k:stat[k] for k in MEMORY_DIAGNOSTIC_FIELDS if k in stat},
+    }
+    result['processes']=_v124_process_rows()
+    result['temp']={
+        '/tmp':_v124_temp_folder_totals('/tmp'),
+        '/dev/shm':_v124_temp_folder_totals('/dev/shm',max_entries=1200),
+    }
+    try:
+        result['app_threads']=threading.active_count()
+    except RuntimeError:result['app_threads']=None
+    return result
+
+
+def format_memory_diagnostic_v124(samples):
+    mib=1024*1024
+    def n(x):return '取得不可' if x is None else f'{x/mib:,.1f} MiB'
+    out=['住まいコンパス｜サーバーメモリ診断',
+         '個人情報を含む物件・住所・ファイル名・URL・認証情報・コマンド引数は記録しません。',
+         '単位：MiB = 1,048,576 bytes。ファイル容量とメモリ常駐量は別の指標です。',
+         'cgroup の file には tmpfs/shmem などを含み、全額が解放可能なキャッシュとは限りません。',
+         'inactive_file は回収可能量の目安ですが、実際の解放可能量を保証しません。','']
+    for number,s in enumerate(samples,1):
+        cg=s['cgroup'];stat=cg['stat'];proc=s['processes']
+        out += [f'【測定 {number}/{len(samples)}】 {s["timestamp_jst"]} / {s["build"]}',
+                '■ メモリ：コンテナ全体',
+                '  使用中 '+n(cg['current'])+' / 上限 '+n(cg['max']),
+                '  スワップ '+n(cg['swap_current']),
+                '  内訳（Linux memory.stat）']
+        descriptions={
+            'anon':'匿名メモリ（Python等の主なヒープ）',
+            'file':'ファイル関連合計（tmpfs等を含む）',
+            'inactive_file':'非アクティブなファイルページ',
+            'active_file':'アクティブなファイルページ',
+            'shmem':'共有メモリ・tmpfs関連（fileと重複し得る）',
+            'file_mapped':'プロセスにマップされたファイル',
+            'file_dirty':'未書き込みのファイルページ',
+            'file_writeback':'書き込み待ちページ',
+            'slab_reclaimable':'回収可能とされるカーネルslab',
+            'slab_unreclaimable':'回収困難なカーネルslab',
+            'slab':'カーネルslab合計',
+            'kernel':'カーネル用メモリ',
+            'pagetables':'ページテーブル',
+            'kernel_stack':'カーネルスタック',
+            'sock':'ネットワークソケット',
+            'inactive_anon':'非アクティブな匿名ページ',
+            'active_anon':'アクティブな匿名ページ',
+            'unevictable':'退避できないページ',
+            'anon_thp':'匿名巨大ページ',
+            'file_thp':'ファイル巨大ページ',
+            'shmem_thp':'共有巨大ページ',
+            'swapcached':'スワップキャッシュ',
+            'percpu':'CPUごとのカーネルメモリ',
+            'sec_pagetables':'補助ページテーブル',
+        }
+        for key in MEMORY_DIAGNOSTIC_FIELDS:
+            if key in stat:out.append(f'    {descriptions.get(key,key)} [{key}]: {n(stat[key])}')
+        events=cg.get('events') or {}
+        if events:out.append('  メモリ制限イベント：'+', '.join(f'{k}={v}' for k,v in sorted(events.items())))
+        out += ['■ プロセス（cgroup所属：RSS合計は共有ページを重複計上する場合があります）',
+                f'  確認できたプロセス {proc["observed"]}件（上位10件）｜一覧取得制限 {"あり" if proc["truncated"] else "なし"}',
+                f'  RSS単純合計 {n(proc["rss_sum"])}']
+        for p in proc['top']:
+            line=(f'  PID {p["pid"]} / {p["kind"]} / RSS {n(p["rss"])} / '
+                  f'匿名 {n(p["anon"])} / ファイル {n(p["file"])} / '
+                  f'共有 {n(p["shmem"])} / swap {n(p["swap"])}')
+            if p.get('pss') is not None:
+                line+=f' / PSS {n(p["pss"])}'
+                if p.get('pss_anon') is not None:line+=f' / PSS匿名 {n(p["pss_anon"])}'
+                if p.get('pss_file') is not None:line+=f' / PSSファイル {n(p["pss_file"])}'
+            out.append(line)
+        out += [f'■ 一時ファイルの容量（RAM使用量ではありません）']
+        for folder,v in s['temp'].items():
+            out.append(f'  {folder}：{v["file_entries_scanned"]}件を調査'+('（件数上限につき一部のみ）' if v['incomplete'] else ''))
+            for key,size in v['bytes'].items():out.append(f'    {key}：{n(size)}')
+        out.append(f'  Pythonスレッド数：{s.get("app_threads") if s.get("app_threads") is not None else "取得不可"}')
+        out.append('')
+    if len(samples)>1:
+        a=samples[0]['cgroup'];b=samples[-1]['cgroup'];out+=['■ 最初と最後の変化']
+        for name,k in [('コンテナ使用量','current'),('匿名メモリ','anon'),('ファイル関連','file'),('共有メモリ','shmem'),('非アクティブファイル','inactive_file')]:
+            av=a.get(k) if k=='current' else a['stat'].get(k)
+            bv=b.get(k) if k=='current' else b['stat'].get(k)
+            if isinstance(av,int) and isinstance(bv,int):out.append(f'  {name}：{(bv-av)/mib:+,.1f} MiB')
+    return ('\n'.join(out)+'\n').encode('utf-8-sig')
+
+
+def render_memory_diagnostic_v124():
+    """Small opt-in expander; no sampling on every Streamlit fragment refresh."""
+    with st.expander('メモリ診断（必要なときだけ）',expanded=False):
+        st.caption('現在の内訳を記録してTXTを出力します。待機中・収集中など最大3回を比較できます。')
+        if st.button('現在のメモリを記録',key='v124_memory_sample',use_container_width=True):
+            try:
+                current=memory_diagnostic_v124()
+                old=st.session_state.get('_v124_memory_samples') or []
+                st.session_state['_v124_memory_samples']=(old+[current])[-3:]
+            except Exception:
+                st.error('計測できませんでした。サーバーの診断情報を取得できるか確認してください。')
+        history=st.session_state.get('_v124_memory_samples') or []
+        if history:
+            last=history[-1];cg=last['cgroup'];stat=cg['stat'];mb=1024*1024
+            def metric(v):return '—' if not isinstance(v,int) else f'{v/mb:,.0f} MiB'
+            a,b=st.columns(2)
+            a.metric('コンテナ',metric(cg['current']))
+            b.metric('匿名メモリ',metric(stat.get('anon')))
+            a,b=st.columns(2)
+            a.metric('ファイル関連',metric(stat.get('file')))
+            b.metric('うち共有メモリ',metric(stat.get('shmem')))
+            st.caption('記録 '+str(len(history))+'/3回｜直近 '+last['timestamp_jst']+'。ファイル関連には共有メモリ等も含みます。')
+            st.download_button('メモリ診断TXTをダウンロード',
+                               format_memory_diagnostic_v124(history),
+                               'sumai_memory_diagnostic_v124.txt','text/plain',
+                               key='v124_memory_download',use_container_width=True,on_click='ignore')
+        st.caption('物件データ・秘密鍵・ファイル名・URLは出力しません。')
+
+
 # Keep searches moving when one town has too many listings or stops making progress.
 # A skipped town is NEVER marked complete: it remains in incomplete_task_indices.
 AUTO_TOWN_IDLE_SECONDS = 180  # 3 minutes without actual collector events
@@ -7653,7 +7887,8 @@ def automatic_collection_panel():
     st.subheader('アプリ内の自動収集（SUUMO）')
     memory=cloud_memory_pressure()
     if memory:
-        st.caption(f"メモリ {memory['used_mib']}/{memory['limit_mib']} MiB（{memory['ratio']:.0%}）｜Python本体 {memory['rss_mib']} MiB｜ファイルキャッシュ {memory['cache_mib']} MiB。80%で収集停止。")
+        st.caption(f"メモリ {memory['used_mib']}/{memory['limit_mib']} MiB（{memory['ratio']:.0%}）｜Python本体 {memory['rss_mib']} MiB｜ファイル関連 {memory['cache_mib']} MiB。80%で収集停止。")
+    render_memory_diagnostic_v124()
     st.caption('画面を閉じてもサーバー稼働中は収集します。休止・再起動では止まり、次にアプリを開くと保存した設定・町の順番から再開します。')
     controller=get_automatic_collection();snap=controller.snapshot() if controller else None
     # Legacy per-error persistence bridge intentionally disabled. Historical
