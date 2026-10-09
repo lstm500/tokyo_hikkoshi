@@ -23,6 +23,7 @@ import re
 import shutil
 import statistics
 import tempfile
+import sqlite3
 import traceback
 import threading
 import time
@@ -39,7 +40,7 @@ import streamlit as st
 from streamlit_folium import st_folium
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v122"
+BUILD = "REBUILD-01-v123"
 
 # ============================================================================
 # NON-NEGOTIABLE SUUMO ADDRESS POLICY -- DO NOT DELETE OR WEAKEN
@@ -5064,6 +5065,14 @@ class AuditLog:
     def records(self):
         with self.lock:
             with open(self.path,encoding='utf-8') as f:return [json.loads(line) for line in f if line.strip()]
+    def release(self):
+        """Discard the local *obsolete* JSONL after DB summaries are persisted."""
+        with self.lock:
+            old_path=self.path
+            self.path=''
+            if old_path:
+                try:os.unlink(old_path)
+                except OSError:pass
     def _persist_failures(self,db):
         """Compatibility method: errors are saved in compact diagnostic_log chunks."""
         return
@@ -5904,12 +5913,11 @@ class SavedLoadJob:
         with self.lock:
             end=self.ended if self.ended is not None else time.monotonic();diag=dict(self.diagnostic or {})
             # Do not scan every saved listing on every 8-second UI poll.
-            if (self.phase!='database' and
-                (self.phase!=self._map_metrics_phase or len(self.rows)!=self._map_metrics_count or
-                 end-self._map_metrics_at>=30)):
-                self._map_metrics=(unique_map_position_count(self.rows.values()),
-                                   visible_colored_dot_count(self.rows.values()))
-                self._map_metrics_at=end;self._map_metrics_count=len(self.rows);self._map_metrics_phase=self.phase
+            # The choropleth is independent of listing coordinates; do not
+            # allocate large coordinate sets merely to update a progress label.
+            if self._map_metrics_count!=len(self.rows):
+                self._map_metrics=(0,0)
+                self._map_metrics_count=len(self.rows)
             unique_dots,colored_dots=self._map_metrics if self.phase!='database' else (0,0)
             return {'token':self.token,'phase':self.phase,'finished':self.finished,'error':self.error,'complete_db':self.complete_db,
                 'rows':len(self.rows),'pages':self.pages,'addresses':self.total_addresses,'done_addresses':self.done_addresses,'placed':self.placed,
@@ -6265,12 +6273,12 @@ def restore_saved_display():
     except (AttributeError,TypeError,ValueError):
         request_restore=False
     if request_restore and not state.get('_saved_restore_db_started'):
+        # The map now needs ONLY town summaries, not 12,000+ individual rows.
+        # Avoid 3 simultaneous copies (job, session, snapshot) at boot.
         state['_saved_restore_db_started']=True
-        try:
-            start_saved_load(state.get('new_bounds'),state.get('address_point_cache'))
-            state.saved_map_restore_message='サーバー再起動後のため、保存物件をバックグラウンドで復元しています。'
-        except AppError as exc:
-            state.saved_map_restore_message='自動復元に失敗しました。保存データの読込ボタンから再実行してください：'+str(exc)
+        state.saved_map_restore_message='地図は町丁目集計から表示します。個別物件は「保存物件の一覧を読み込む」で確認できます。'
+        try:st.query_params.pop('saved_map',None)
+        except (AttributeError,TypeError,ValueError):pass
 
 
 def manual_search_running():
@@ -6552,7 +6560,10 @@ def start_search(conditions):
         job=SearchJob(db,conditions);job.server_key=server_key;jobs[token]=job
         # Release finished jobs from other sessions after two hours.
         for key,value in list(jobs.items()):
-            if key!=token and value.finished and time.monotonic()-getattr(value,'created',time.monotonic())>7200: jobs.pop(key,None)
+            if key!=token and value.finished and time.monotonic()-getattr(value,'created',time.monotonic())>7200:
+                jobs.pop(key,None)
+                try:value.audit.release()
+                except (AttributeError,OSError):pass
         job.created=time.monotonic();job.thread.start()
     st.session_state.new_search=None
 
@@ -6763,21 +6774,35 @@ def interactive_rental_map(pins,cells,facilities):
 
 
 def cloud_memory_pressure():
-    """Read cgroup memory pressure without dependencies or sensitive information.
-
-    Return None if no meaningful container memory limit is available.  This does
-    not increase the limit; workers use it to stop *before* Streamlit is OOM-killed.
-    """
+    """cgroup-wide memory, reclaimable cache and current Python RSS in MiB."""
     try:
         with open('/sys/fs/cgroup/memory.max',encoding='ascii') as f:raw=f.read().strip()
         if not raw.isdecimal():return None
         limit=int(raw)
-        if not 0 < limit < 1<<46:return None
+        if not 0<limit<1<<46:return None
         with open('/sys/fs/cgroup/memory.current',encoding='ascii') as f:used=int(f.read().strip())
-        return {'used_mib':round(used/(1024*1024)), 'limit_mib':round(limit/(1024*1024)),
-                'ratio':used/limit}
-    except (OSError,ValueError,ZeroDivisionError):
-        return None
+        stats={}
+        try:
+            with open('/sys/fs/cgroup/memory.stat',encoding='ascii') as f:
+                for line in f:
+                    k,v=line.strip().split()
+                    if k in ('anon','file','inactive_file','slab_reclaimable'):stats[k]=int(v)
+        except (OSError,ValueError):pass
+        rss=0
+        try:
+            with open('/proc/self/status',encoding='ascii') as f:
+                for line in f:
+                    if line.startswith('VmRSS:'):
+                        rss=int(line.split()[1])*1024;break
+        except (OSError,ValueError):pass
+        mb=1024*1024
+        return {'used_mib':round(used/mb),'limit_mib':round(limit/mb),
+                'ratio':used/limit,'rss_mib':round(rss/mb),
+                'cache_mib':round(stats.get('file',0)/mb),
+                'inactive_mib':round(stats.get('inactive_file',0)/mb),
+                'anon_mib':round(stats.get('anon',0)/mb),
+                'effective_mib':round(max(0,used-stats.get('inactive_file',0))/mb)}
+    except (OSError,ValueError,ZeroDivisionError):return None
 
 
 # Keep searches moving when one town has too many listings or stops making progress.
@@ -7214,6 +7239,7 @@ class AutomaticCollection:
                     status='partial'
                 incomplete=bool(result.get('summary',{}).get('incomplete_tasks'))
                 with self.lock:
+                    previous_job=self.last_job
                     self.last_job=job;self.current=None;self.progress=1.;self.summary['last_finished_at']=utc_now();self.summary['last_status']=status
                     self.summary['current_status']='stopped';self.summary['last_task']=conditions.get('auto_task_label',self.summary.get('current_task_label','地域判定'))
                     # Keep a compact controller checkpoint, not full error details.
@@ -7270,10 +7296,17 @@ class AutomaticCollection:
                         job.state.shared_web=None
                 except (AttributeError,TypeError):
                     pass
+                # Keep only the latest town's full TXT/JSON file. Historical
+                # diagnostic summaries are already persisted in Supabase.
+                if previous_job is not None and previous_job is not job:
+                    try:previous_job.audit.release()
+                    except (AttributeError,OSError):pass
                 self.shared_web.http_cache.clear()
                 self.shared_web.jhj_tile_cache.clear()
                 self.shared_web.jhj_tile_cached_at.clear()
                 self.shared_web.suumo_location_cache.clear()
+                self.shared_web.address_result_cache.clear()
+                self.shared_web.failed_detail_urls.clear()
                 del snap
                 if not self.persist_best_effort('after_town'):
                     # Without a confirmed progress checkpoint a subsequent town
@@ -7620,7 +7653,7 @@ def automatic_collection_panel():
     st.subheader('アプリ内の自動収集（SUUMO）')
     memory=cloud_memory_pressure()
     if memory:
-        st.caption(f"サーバーメモリ：{memory['used_mib']}/{memory['limit_mib']} MiB（{memory['ratio']:.0%}）。80%到達時は保存済み物件を保持して収集を停止します。")
+        st.caption(f"メモリ {memory['used_mib']}/{memory['limit_mib']} MiB（{memory['ratio']:.0%}）｜Python本体 {memory['rss_mib']} MiB｜ファイルキャッシュ {memory['cache_mib']} MiB。80%で収集停止。")
     st.caption('画面を閉じてもサーバー稼働中は収集します。休止・再起動では止まり、次にアプリを開くと保存した設定・町の順番から再開します。')
     controller=get_automatic_collection();snap=controller.snapshot() if controller else None
     # Legacy per-error persistence bridge intentionally disabled. Historical
@@ -7797,6 +7830,49 @@ def town_aggregate_record(raw_rows):
             'examined':examined,'unmatched':examined-len(latest),'updated_at':utc_now()}
 
 
+def town_aggregate_streaming(raw_rows):
+    """Bounded-RAM town aggregation; duplicate listings are kept only on disk.
+
+    raw_rows is an iterator of (storage_id, listing JSON). SQLite's index
+    replaces the previous unbounded latest={...} Python dictionary. Older
+    timestamps cannot overwrite newer property_id observations.
+    """
+    with tempfile.TemporaryDirectory(prefix='sumai-town-agg-') as folder:
+        db=sqlite3.connect(os.path.join(folder,'latest.sqlite'),timeout=15)
+        try:
+            db.execute('PRAGMA journal_mode=OFF')
+            db.execute('PRAGMA temp_store=FILE')
+            db.execute('PRAGMA cache_size=-1024')
+            db.execute('CREATE TABLE latest (identity TEXT PRIMARY KEY, stamp TEXT NOT NULL, grp TEXT NOT NULL, town TEXT NOT NULL, rent INTEGER NOT NULL) WITHOUT ROWID')
+            examined=0
+            batch=[]
+            def flush():
+                if not batch:return
+                db.executemany("""INSERT INTO latest(identity,stamp,grp,town,rent)
+                    VALUES(?,?,?,?,?) ON CONFLICT(identity) DO UPDATE SET
+                    stamp=excluded.stamp,grp=excluded.grp,town=excluded.town,rent=excluded.rent
+                    WHERE excluded.stamp >= latest.stamp""",batch)
+                batch.clear()
+            for storage_id,listing in raw_rows:
+                examined+=1
+                compact=compact_saved_listing(listing)
+                if compact is None:continue
+                group=town_layout_group(compact);town=town_chome_key(compact['address'])
+                if not group or not town:continue
+                identity=compact.get('property_id') or 'legacy:'+str(storage_id)
+                batch.append((identity,compact.get('fetched_at') or '',group,town,int(compact['rent'])))
+                if len(batch)>=100:flush()
+            flush()
+            totals={group:{} for group in TOWN_GROUPS}
+            for grp,town,total,count in db.execute('SELECT grp,town,SUM(rent),COUNT(*) FROM latest GROUP BY grp,town'):
+                totals[grp][town]=[int(total),int(count)]
+            latest_count=int(db.execute('SELECT COUNT(*) FROM latest').fetchone()[0])
+            return {'schema':1,'groups':totals,'listing_count':latest_count,
+                    'examined':examined,'unmatched':examined-latest_count,'updated_at':utc_now()}
+        finally:
+            db.close()
+
+
 class TownSummaryWorker:
     """A single namespace worker builds a compact snapshot and persists it once.
 
@@ -7804,7 +7880,7 @@ class TownSummaryWorker:
     keeps writing normal source listings; a user can refresh the area snapshot.
     """
     def __init__(self,db):
-        self.db=db;self.lock=threading.RLock();self.running=False;self.progress=0;self.total_pages=None;self.total_records=None;self.scanned_records=0;self.page_size=300
+        self.db=db;self.lock=threading.RLock();self.running=False;self.progress=0;self.total_pages=None;self.total_records=None;self.scanned_records=0;self.page_size=160
         self.ready=False;self.summary=None;self.message='';self.error='';self.thread=None
         self.initialized=False
         # Only one scan per server process, shared by all browser sessions.
@@ -7830,7 +7906,7 @@ class TownSummaryWorker:
     def start(self):
         with self.lock:
             if self.running:return False
-            self.running=True;self.progress=0;self.total_pages=None;self.total_records=None;self.scanned_records=0;self.page_size=300;self.error='';self.message='町丁目の家賃を裏で集計中'
+            self.running=True;self.progress=0;self.total_pages=None;self.total_records=None;self.scanned_records=0;self.page_size=160;self.error='';self.message='町丁目の家賃を裏で集計中'
             self.thread=threading.Thread(target=self.run,daemon=True,name='town-rent-aggregate')
             self.thread.start();return True
     def count_source_records(self):
@@ -7852,51 +7928,57 @@ class TownSummaryWorker:
 
     def run(self):
         try:
-            rows=[];last_id='';page=0;page_size=300;started=utc_now()
+            last_id='';page=0;page_size=160;started=utc_now()
             total=self.count_source_records()
             with self.lock:
                 self.total_records=total
                 self.total_pages=math.ceil(total/page_size) if total is not None else None
-            # Use index (namespace,id), not a full diagnostic/search-log scan.
-            # Keep only compact fields in memory; no latitude, longitude or HTML.
-            while True:
-                if cloud_memory_pressure() and (cloud_memory_pressure() or {}).get('ratio',0)>.82:
-                    raise AppError('サーバーメモリ保護により町丁目集計を中断しました。')
-                params={'namespace':'eq.'+self.db.namespace,'select':'id,summary',
-                    'status':'eq.rental_listing','and':'(id.gte.listing.,id.lt.listing/)',
-                    'order':'id.asc','limit':page_size}
-                if last_id:params['id']='gt.'+last_id
+            # Each Supabase page is released immediately after normalizing its
+            # listings into a bounded SQLite spill file. No full Python row list.
+            def source_rows():
+                nonlocal last_id,page,page_size
                 while True:
-                    try:
-                        got=self.db.call('GET',SEARCH_TABLE,params)
-                        break
-                    except AppError as exc:
-                        diag=getattr(exc,'diagnostic',{}) or {}
-                        if (diag.get('code')=='57014' or diag.get('status') in (500,502,503,504)) and page_size>50:
-                            page_size=max(50,page_size//2)
-                            params['limit']=page_size
-                            with self.lock:
-                                self.page_size=page_size
-                                if self.total_records is not None:
-                                    remaining=max(0,self.total_records-self.scanned_records)
-                                    self.total_pages=self.progress+math.ceil(remaining/page_size)
-                            continue
-                        raise
-                if not isinstance(got,list):raise AppError('募集データの応答形式が不正です。')
-                if not got:break
-                for item in got:
-                    body=(item.get('summary') or {}).get('listing')
-                    if isinstance(body,dict):rows.append((item.get('id'),body))
-                next_id=str(got[-1].get('id') or '')
-                if not next_id or next_id<=last_id:raise AppError('町丁目集計のページ位置が進みません。')
-                last_id=next_id;page+=1
-                with self.lock:
-                    self.progress=page;self.scanned_records+=len(got);self.page_size=page_size
-                    if self.total_records is not None:
-                        self.total_pages=page+math.ceil(max(0,self.total_records-self.scanned_records)/page_size)
-                    self.message=f'集計元を確認中：{page}ページ'
-                if len(got)<page_size:break
-            summary=town_aggregate_record(rows)
+                    pressure=cloud_memory_pressure()
+                    if pressure and pressure.get('ratio',0)>.82:
+                        raise AppError('サーバーメモリ保護により町丁目集計を中断しました。')
+                    params={'namespace':'eq.'+self.db.namespace,'select':'id,summary',
+                        'status':'eq.rental_listing','and':'(id.gte.listing.,id.lt.listing/)',
+                        'order':'id.asc','limit':page_size}
+                    if last_id:params['id']='gt.'+last_id
+                    while True:
+                        try:
+                            got=self.db.call('GET',SEARCH_TABLE,params)
+                            break
+                        except AppError as exc:
+                            diag=getattr(exc,'diagnostic',{}) or {}
+                            if (diag.get('code')=='57014' or diag.get('status') in (500,502,503,504)) and page_size>40:
+                                page_size=max(40,page_size//2)
+                                params['limit']=page_size
+                                with self.lock:
+                                    self.page_size=page_size
+                                    if self.total_records is not None:
+                                        remaining=max(0,self.total_records-self.scanned_records)
+                                        self.total_pages=self.progress+math.ceil(remaining/page_size)
+                                continue
+                            raise
+                    if not isinstance(got,list):raise AppError('募集データの応答形式が不正です。')
+                    if not got:break
+                    next_id=str(got[-1].get('id') or '')
+                    if not next_id or next_id<=last_id:raise AppError('町丁目集計のページ位置が進みません。')
+                    for item in got:
+                        body=(item.get('summary') or {}).get('listing')
+                        if isinstance(body,dict):yield item.get('id'),body
+                    count=len(got)
+                    last_id=next_id;page+=1
+                    with self.lock:
+                        self.progress=page;self.scanned_records+=count;self.page_size=page_size
+                        if self.total_records is not None:
+                            self.total_pages=page+math.ceil(max(0,self.total_records-self.scanned_records)/page_size)
+                        self.message=f'集計中 {page}ページ'
+                    # Do not keep response pages alive after each yield cycle.
+                    got=None
+                    if count<page_size:break
+            summary=town_aggregate_streaming(source_rows())
             summary['started_at']=started
             # Persist the new snapshot only after the FULL scan succeeds.
             # Never overwrite a usable snapshot on partial/failed collection.
@@ -7921,7 +8003,7 @@ def town_summary_registry():
 
 
 def current_town_summary_worker():
-    jobs,lock=town_summary_registry();db=Database();key=manual_registry_key(db)+'|town-v122'
+    jobs,lock=town_summary_registry();db=Database();key=manual_registry_key(db)+'|town-v123'
     with lock:
         job=jobs.get(key)
         if job is None:
@@ -7963,10 +8045,61 @@ def town_boundary_geometry(geom):
     return None
 
 
+def iter_town_geojson_file(path):
+    """Parse a feature collection incrementally; never decode the 36MB JSON as one string."""
+    decoder=json.JSONDecoder()
+    with open(path,'r',encoding='utf-8-sig') as stream:
+        buffer=stream.read(131072)
+        while True:
+            m=re.search(r'"features"\s*:\s*\[',buffer)
+            if m:buffer=buffer[m.end():];break
+            if len(buffer)>1024*1024:raise ValueError('GeoJSON features配列が見つかりません。')
+            part=stream.read(131072)
+            if not part:raise ValueError('GeoJSON features配列が見つかりません。')
+            buffer+=part
+        while True:
+            buffer=buffer.lstrip(' \r\n\t,')
+            if buffer.startswith(']'):break
+            if not buffer:
+                part=stream.read(131072)
+                if not part:raise ValueError('GeoJSONが途中で終了しました。')
+                buffer=part;continue
+            try:item,end=decoder.raw_decode(buffer)
+            except json.JSONDecodeError:
+                if len(buffer)>8*1024*1024:raise ValueError('1区域の境界データが大きすぎます。')
+                part=stream.read(131072)
+                if not part:raise ValueError('GeoJSONの境界データが不完全です。')
+                buffer+=part;continue
+            buffer=buffer[end:]
+            if isinstance(item,dict):yield item
+
+
+class TownBoundaryStore:
+    """Tiny in-memory handle for a disk-backed read-only SQLite polygon index."""
+    def __init__(self,path):self.path=path
+    def iter_visible(self,bounds,interested):
+        if not interested:return
+        conn=sqlite3.connect('file:'+quote(self.path,safe='/')+'?mode=ro',uri=True,timeout=10)
+        try:
+            conn.execute('PRAGMA cache_size=-512')
+            if bounds and len(bounds)==4:
+                south,west,north,east=map(float,bounds)
+                cursor=conn.execute("""SELECT town,poly FROM areas WHERE
+                    south<=? AND north>=? AND west<=? AND east>=?""",(north,south,east,west))
+            else:
+                cursor=conn.execute('SELECT town,poly FROM areas')
+            for town,raw in cursor:
+                if town in interested:
+                    try:yield town,json.loads(raw)
+                    except (ValueError,TypeError):continue
+        finally:conn.close()
+
+
 class TownBoundaryWorker:
     def __init__(self):
         self.lock=threading.Lock();self.started=False;self.running=False
-        self.features={};self.ready=False;self.error=''
+        self.features=None;self.ready=False;self.error=''
+        self.cache_path=os.path.join(tempfile.gettempdir(),'sumai-town-boundary-v123.sqlite')
     def start(self):
         with self.lock:
             if self.started:return
@@ -7974,53 +8107,73 @@ class TownBoundaryWorker:
         threading.Thread(target=self.run,daemon=True,name='town-boundaries').start()
     def run(self):
         try:
-            # Bounded download (disk-backed) and incremental JSON feature parsing.
-            raw=None;last_exception=None
-            for source_url in (TOWN_GEOJSON_URL,TOWN_GEOJSON_BACKUP):
+            # Persistent within the running container; no full-geometry dict.
+            if os.path.isfile(self.cache_path) and os.path.getsize(self.cache_path)>8192:
                 try:
-                    with tempfile.TemporaryFile(mode='w+b') as handle:
-                        size=0
+                    with sqlite3.connect(self.cache_path) as conn:
+                        verified=conn.execute("SELECT COUNT(*) FROM areas").fetchone()[0]
+                    if verified>0:
+                        with self.lock:
+                            self.features=TownBoundaryStore(self.cache_path)
+                            self.ready=True;self.error=''
+                        return
+                except (sqlite3.DatabaseError,OSError):
+                    # A half-written file must be rebuilt, not reused.
+                    pass
+            with tempfile.TemporaryDirectory(prefix='sumai-town-boundary-') as folder:
+                source=os.path.join(folder,'source.geojson')
+                last_exception=None
+                downloaded=False
+                for source_url in (TOWN_GEOJSON_URL,TOWN_GEOJSON_BACKUP):
+                    try:
                         with requests.get(source_url,timeout=(6,25),stream=True,
                                           headers={'User-Agent':'SumaiCompassTownMap/1.0'}) as response:
                             response.raise_for_status()
-                            for chunk in response.iter_content(65536):
-                                size+=len(chunk)
-                                if size>TOWN_GEOMETRY_LIMIT:raise ValueError('境界ファイルが上限を超えました。')
-                                handle.write(chunk)
-                        handle.seek(0);raw=handle.read().decode('utf-8-sig')
-                    break
-                except (requests.RequestException,OSError,UnicodeError,ValueError) as exc:
-                    last_exception=exc
-            if raw is None:raise ValueError('町丁目境界を取得できません：'+str(last_exception))
-            marker=re.search(r'"features"\s*:\s*\[',raw)
-            if marker is None:raise ValueError('町丁目境界のGeoJSONを解釈できません。')
-            decoder=json.JSONDecoder();pos=marker.end();total={}
-            while pos<len(raw):
-                while pos<len(raw) and raw[pos] in ' \r\n\t,':pos+=1
-                if pos>=len(raw) or raw[pos]==']':break
-                item,pos=decoder.raw_decode(raw,pos)
-                props=item.get('properties') or {}
-                fullname=str(props.get('fullname') or '')
-                # '東京都/豊島区/池袋二丁目'; key normalization handles kanji numerals.
-                key=town_chome_key(fullname.replace('/',''))
-                if key is None:continue
-                geometry=town_boundary_geometry(item.get('geometry'))
-                if geometry is None:continue
-                # Preserve disjoint census subareas by collecting geometries.
-                total.setdefault(key,[]).append(geometry)
-            if not total:raise ValueError('東京23区の町丁目境界が見つかりません。')
-            compact={}
-            for key,shapes in total.items():
-                polys=[]
-                for shape in shapes:
-                    if shape['type']=='Polygon':polys.append(shape['coordinates'])
-                    else:polys.extend(shape['coordinates'])
-                all_points=[p for polygon in polys for ring in polygon for p in ring]
-                if not all_points:continue
-                compact[key]={'type':'MultiPolygon','coordinates':polys,
-                              'bbox':(min(p[1] for p in all_points),min(p[0] for p in all_points),
-                                      max(p[1] for p in all_points),max(p[0] for p in all_points))}
-            with self.lock:self.features=compact;self.ready=True;self.error=''
+                            size=0
+                            with open(source,'wb') as handle:
+                                for chunk in response.iter_content(65536):
+                                    if not chunk:continue
+                                    size+=len(chunk)
+                                    if size>TOWN_GEOMETRY_LIMIT:raise ValueError('境界ファイルが上限を超えました。')
+                                    handle.write(chunk)
+                        downloaded=True;break
+                    except (requests.RequestException,OSError,UnicodeError,ValueError) as exc:
+                        last_exception=exc
+                if not downloaded:raise ValueError('町丁目境界を取得できません：'+str(last_exception))
+                target=os.path.join(folder,'areas.sqlite')
+                conn=sqlite3.connect(target,timeout=20)
+                try:
+                    conn.execute('PRAGMA journal_mode=OFF')
+                    conn.execute('PRAGMA synchronous=OFF')
+                    conn.execute('PRAGMA temp_store=FILE')
+                    conn.execute('PRAGMA cache_size=-1024')
+                    conn.execute("""CREATE TABLE areas(town TEXT NOT NULL, south REAL,west REAL,north REAL,east REAL,poly TEXT NOT NULL)""")
+                    batch=[]
+                    for item in iter_town_geojson_file(source):
+                        props=item.get('properties') or {}
+                        key=town_chome_key(str(props.get('fullname') or '').replace('/',''))
+                        if key is None:continue
+                        geometry=town_boundary_geometry(item.get('geometry'))
+                        if geometry is None:continue
+                        polys=geometry['coordinates'] if geometry['type']=='MultiPolygon' else [geometry['coordinates']]
+                        all_points=[p for poly in polys for ring in poly for p in ring]
+                        if not all_points:continue
+                        batch.append((key,min(p[1] for p in all_points),min(p[0] for p in all_points),
+                                      max(p[1] for p in all_points),max(p[0] for p in all_points),
+                                      json.dumps(polys,ensure_ascii=False,separators=(',',':'))))
+                        if len(batch)>=70:
+                            conn.executemany('INSERT INTO areas VALUES(?,?,?,?,?,?)',batch)
+                            batch.clear()
+                    if batch:conn.executemany('INSERT INTO areas VALUES(?,?,?,?,?,?)',batch)
+                    count=conn.execute('SELECT COUNT(*) FROM areas').fetchone()[0]
+                    if not count:raise ValueError('東京23区の町丁目境界が見つかりません。')
+                    conn.execute('CREATE INDEX areas_bbox ON areas(south,north,west,east)')
+                    conn.commit()
+                finally:conn.close()
+                os.replace(target,self.cache_path)
+            with self.lock:
+                self.features=TownBoundaryStore(self.cache_path)
+                self.ready=True;self.error=''
         except Exception as exc:
             with self.lock:self.error=str(exc)
         finally:
@@ -8035,27 +8188,34 @@ def town_boundary_registry():
 
 
 def town_colored_shapes(groups,group,features,bounds,max_features=700):
-    """Only simplified GEO polygons and town-level summaries reach Leaflet."""
+    """Draw only viewport polygons; the Tokyo-wide border set remains on disk."""
     counts=(groups or {}).get(group,{})
-    found=[]
-    for key,area in features.items():
+    found={}
+    if hasattr(features,'iter_visible'):
+        it=features.iter_visible(bounds,counts)
+    else:
+        def old_iter():
+            for key,area in (features or {}).items():
+                bbox=area['bbox']
+                if bounds and (bbox[0]>bounds[2] or bbox[2]<bounds[0] or bbox[1]>bounds[3] or bbox[3]<bounds[1]):continue
+                yield key,area['coordinates']
+        it=old_iter()
+    for key,polygons in it:
         record=counts.get(key)
         if not record or not record[1]:continue
-        sb=area['bbox']
-        if bounds and (sb[0]>bounds[2] or sb[2]<bounds[0] or sb[1]>bounds[3] or sb[3]<bounds[1]):continue
-        rent_total,count=record
-        avg=rent_total/count
-        found.append((key,area,avg,count))
-    # At wide zooms prioritize higher sample count; other areas are available on zoom-in.
-    found.sort(key=lambda x:(-x[3],x[0]))
-    limited=len(found)>max_features
-    selected=found[:max_features]
-    collection={'type':'FeatureCollection','features':[
-        {'type':'Feature','geometry':{'type':'MultiPolygon','coordinates':shape['coordinates']},
-         'properties':{'name':key.replace('|',' '),'avg':round(avg),
-                       'price_label':f'{avg/10000:.1f}万円','count_label':f'{cnt}件',
-                       'color':town_rent_gradient(avg)}}
-        for key,shape,avg,cnt in selected]}
+        if key not in found:found[key]=[]
+        found[key].extend(polygons)
+    selected=sorted(found,key=lambda x:(-counts[x][1],x))
+    limited=len(selected)>max_features
+    selected=selected[:max_features]
+    collection={'type':'FeatureCollection','features':[]}
+    for key in selected:
+        total,count=counts[key]
+        avg=total/count
+        collection['features'].append({'type':'Feature','geometry':{'type':'MultiPolygon','coordinates':found[key]},
+            'properties':{'name':key.replace('|',' '),'avg':round(avg),
+                          'price_label':f'{avg/10000:.1f}万円','count_label':f'{count}件',
+                          'color':town_rent_gradient(avg)}})
     return collection,limited,len(found)
 
 
