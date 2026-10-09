@@ -39,7 +39,7 @@ import streamlit as st
 from streamlit_folium import st_folium
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v114"
+BUILD = "REBUILD-01-v115"
 
 # ============================================================================
 # NON-NEGOTIABLE SUUMO ADDRESS POLICY -- DO NOT DELETE OR WEAKEN
@@ -6676,25 +6676,24 @@ def capture_map_fragment():
     if not had_bounds and st.session_state.get('new_bounds'):
         st.session_state['map_initial_bounds_ready']=True
 
-def capture_map_fragment_v112():
-    """Bridge the fresh map widget into existing search-bounds state without rewriting search logic."""
-    current=st.session_state.get('new_map_v112')
-    if isinstance(current,dict):
-        st.session_state['new_map']=current
-    capture_map_fragment()
+def capture_map_fragment_v115():
+    """Copy real browser bounds when the mounted Folium map reports them.
 
-@st.cache_resource(show_spinner=False)
-def stable_mobile_base_map(build_version):
-    """Keep Folium's JS IDs stable across all map fragments and button reruns."""
-    return rental_map([],DEFAULT_CENTER,1500,[],[])
+    Never force a full rerun from a map callback: doing so during initial
+    mounting previously unmounted the iframe before Leaflet had initialized.
+    """
+    current=st.session_state.get('new_map_v115_'+str(st.session_state.get('_v115_map_reset_count',0)))
+    if not isinstance(current,dict):
+        return
+    bounds=viewport_bounds(current)
+    if bounds:
+        st.session_state['new_bounds']=bounds
+        st.session_state['new_map']=current
+        st.session_state['new_view_center']=bounds_center(bounds)
 
 
 def mobile_map_content_signature(rows,facilities):
-    """Re-send property layer only when visible dataset content actually changes.
-
-    Avoid Python's id(rows): each Streamlit rerun creates a new list even if the
-    same properties are displayed, unnecessarily uploading all map points.
-    """
+    """Hash compact visible points without retaining a second listing copy."""
     digest=hashlib.blake2s(digest_size=12)
     for r in rows:
         if not has_point(r):continue
@@ -6708,20 +6707,16 @@ def mobile_map_content_signature(rows,facilities):
 
 @st.fragment
 def interactive_rental_map(pins,cells,facilities):
+    """Reliable map mount: base map and rental data are rendered atomically.
+
+    Do not share one mutable Folium.Map through cache_resource across Streamlit
+    sessions. Do not insert dynamic feature_group_to_add into a map whose JS
+    instance may have been disposed by an Android browser's tab suspension.
+    """
     state=st.session_state
-    # Only the initial mount receives an explicit center/zoom.  After Leaflet is live,
-    # the browser owns its viewport; Python records only the bounds needed for search.
-    # This prevents a pan/zoom -> fragment rerun -> setView feedback loop.
-    kwargs=dict(key='new_map_v112',height=480,use_container_width=True,returned_objects=['bounds'],
-                on_change=capture_map_fragment_v112)
-    # Leaflet already owns the marker canvas. A pan/zoom must not serialize and
-    # resend the entire rental dataset to the mobile component. A full Python
-    # rerun recreates the list and requests a new group if data changed.
     window=state.get('new_bounds')
     if window and len(window)==4:
         south,west,north,east=map(float,window)
-        # Hysteresis: keep the old oversized window through ordinary touch pans.
-        # Recalculate only if the viewport approaches its edge or zooms out.
         previous=state.get('_mobile_map_data_window')
         if (previous and len(previous)==4 and
             previous[0]+.002 <= south and previous[1]+.002 <= west and
@@ -6739,23 +6734,42 @@ def interactive_rental_map(pins,cells,facilities):
                  view[0] <= float(r['latitude']) <= view[2] and
                  view[1] <= float(r['longitude']) <= view[3]]
         scope=tuple(round(x,5) for x in view)
+        center=bounds_center(window)
     else:
-        # On first mount, avoid sending all 12k points; the on_change callback
-        # will supply actual bounds immediately after Leaflet has initialized.
         center=state.get('new_view_center',DEFAULT_CENTER)
         lat,lng=center
         visible=[r for r in pins if has_point(r) and
                  abs(float(r['latitude'])-lat)<.025 and abs(float(r['longitude'])-lng)<.035]
         scope=(round(lat,4),round(lng,4),'initial')
+
     signature=(BUILD,scope,mobile_map_content_signature(visible,facilities))
-    if not state.get('new_map_v112') or state.get('_mobile_map_payload_signature')!=signature:
-        kwargs['feature_group_to_add']=rental_features(visible,cells,facilities)
-        state['_mobile_map_payload_signature']=signature
-    if not state.get('new_map_v112'):
-        kwargs['center']=state.get('new_view_center',DEFAULT_CENTER)
-        kwargs['zoom']=state.get('new_view_zoom',15)
-    st_folium(stable_mobile_base_map(BUILD),**kwargs)
-    if state.pop('map_initial_bounds_ready',False):
+    # One bounded Folium object per session. On changes replace it in full; the
+    # base tile layer cannot be left uninitialized while dynamic SVG loads.
+    cached=state.get('_v115_map_snapshot')
+    if not isinstance(cached,dict) or cached.get('signature')!=signature:
+        m=rental_map(visible,center,1500,cells,facilities)
+        state['_v115_map_snapshot']={'signature':signature,'map':m}
+    else:
+        m=cached['map']
+    # Always provide the full, complete map. The component no longer depends on
+    # feature_group_to_add or the on_change -> forced st.rerun feedback loop.
+    data=st_folium(m,key='new_map_v115_'+str(state.get('_v115_map_reset_count',0)),height=480,use_container_width=True,
+                   returned_objects=['bounds'],on_change=capture_map_fragment_v115)
+    # Capture a new browser viewport even if a component callback is delayed.
+    if isinstance(data,dict):
+        current_bounds=viewport_bounds(data)
+        if current_bounds:
+            state['new_bounds']=current_bounds
+            state['new_view_center']=bounds_center(current_bounds)
+            state['new_map']=data
+    # Reset button is deliberately outside the map iframe; it remains available
+    # even if the iframe fails to initialize after a mobile-tab restore.
+    if st.button('地図が表示されない場合は再初期化',key='reset_mobile_map_v115'):
+        state.pop('_v115_map_snapshot',None)
+        state.pop('_mobile_map_data_window',None)
+        state.pop('new_map',None)
+        # Keep last valid viewport for the initial zoom after re-mounting.
+        state['_v115_map_reset_count']=int(state.get('_v115_map_reset_count',0))+1
         st.rerun()
 
 
