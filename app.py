@@ -39,7 +39,7 @@ import streamlit as st
 from streamlit_folium import st_folium
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v109"
+BUILD = "REBUILD-01-v110"
 
 # ============================================================================
 # NON-NEGOTIABLE SUUMO ADDRESS POLICY -- DO NOT DELETE OR WEAKEN
@@ -4388,6 +4388,9 @@ def search_all(db,conditions,screen,state=None):
             DIAG_CONTEXT.audit=audit;DIAG_CONTEXT.scope={'task':index,'region':region['label'],'town':region['town'],'municipality_code':region['code'],'provider':provider}
             def emit(kind,value):
                 if kind!='unit':web.check_cancel()
+                if kind in ('message','unit','skipped','detail','rejected','candidate','incomplete','issue'):
+                    state.last_activity_at=time.monotonic()
+                    if kind=='message':state.last_collection_stage=str(value)[:170]
                 # Numeric progress counters are already preserved in page_end/final summaries.
                 # Avoid two diagnostic events per acquired-ID skip; large runs otherwise spend
                 # substantial time serializing logs rather than collecting data.
@@ -5899,7 +5902,7 @@ def remember_search():
 
 class WorkerState:
     def __init__(self):
-        self.new_units=[];self.new_search=None;self.new_saved_keys=[];self.new_regions=[];self.live_metrics={'processed':0,'saved':0,'errors':0,'skipped':0}
+        self.new_units=[];self.new_search=None;self.new_saved_keys=[];self.new_regions=[];self.live_metrics={'processed':0,'saved':0,'errors':0,'skipped':0};self.last_activity_at=time.monotonic();self.last_collection_stage='検索の準備中'
 
 class SearchJob:
     def __init__(self,db,conditions):
@@ -5944,7 +5947,9 @@ class SearchJob:
         with self.lock:
             return dict(progress=self.progress,message=self.message,log=self.text,finished=self.finished,stopping=getattr(self,'cancel_event',threading.Event()).is_set(),
                         updated_at=getattr(self,'updated_at',None),last_saved_at=getattr(self.state,'new_last_saved_at',None),units=list(self.state.new_units),saved=list(self.state.new_saved_keys),
-                        live_metrics=dict(getattr(self.state,'live_metrics',{}) or {}),result=self.state.new_search)
+                        live_metrics=dict(getattr(self.state,'live_metrics',{}) or {}),result=self.state.new_search,
+                        idle_seconds=max(0,int(time.monotonic()-getattr(self.state,'last_activity_at',time.monotonic()))),
+                        collection_stage=str(getattr(self.state,'last_collection_stage','')))
 
 class PositionRepairJob(SearchJob):
     def __init__(self,db,rows,bounds,saved):
@@ -6231,6 +6236,11 @@ def interactive_rental_map(pins,cells,facilities):
         st.rerun()
 
 
+# Keep searches moving when one town has too many listings or stops making progress.
+# A skipped town is NEVER marked complete: it remains in incomplete_task_indices.
+AUTO_TOWN_IDLE_SECONDS = 180  # 3 minutes without actual collector events
+AUTO_TOWN_MAX_SECONDS = 600   # 10 minutes total per town, independent of screen status
+
 AUTO_COLLECTION_ID='automatic.collection.settings'
 
 def normalized_automatic_task_label(value):
@@ -6301,36 +6311,46 @@ def advance_automatic_task(summary,index,total,success):
 
 
 def reconcile_automatic_task_progress(summary, old_plan, new_plan, just_completed_label=None):
-    """Preserve completed provider/town tasks when HOME'S disappears or returns.
+    """Transfer completed, attempted and incomplete jobs by town/provider label.
 
-    Task indices are positions in an *interleaved provider list*, not stable town
-    identities.  Reusing a numeric index after a 403 can run the wrong town;
-    resetting it to zero discards successfully completed SUUMO work.  Always
-    transfer progress by full, provider-qualified task labels instead.
+    Numeric task indices cannot be reused if source/region plans change. Pending
+    incomplete work must survive rebuilding the plan after a server restart.
     """
     old_labels=list(summary.get('task_labels') or [task['label'] for task in old_plan])
-    raw_completed=summary.get('cycle_completed_indices')
-    if raw_completed is None:
-        # Compatibility with older settings that stored only the next index.
-        raw_completed=list(range(max(0,int(summary.get('next_task_index',0) or 0))))
-    completed_labels={normalized_automatic_task_label(old_labels[int(i)]) for i in raw_completed
-                      if str(i).isdigit() and 0<=int(i)<len(old_labels)}
+    def old_labels_for(field, fallback=()):
+        return {normalized_automatic_task_label(old_labels[int(i)])
+                for i in summary.get(field, fallback)
+                if str(i).isdigit() and 0<=int(i)<len(old_labels)}
+    previous_done=summary.get('cycle_completed_indices')
+    if previous_done is None:
+        previous_done=list(range(max(0,int(summary.get('next_task_index',0) or 0))))
+    completed_labels=old_labels_for('cycle_completed_indices',previous_done)
+    attempted_labels=old_labels_for('cycle_attempted_indices')|completed_labels
+    incomplete_labels=old_labels_for('incomplete_task_indices')
     if just_completed_label:
         completed_labels.add(normalized_automatic_task_label(just_completed_label))
+        attempted_labels.add(normalized_automatic_task_label(just_completed_label))
     new_labels=[normalized_automatic_task_label(task['label']) for task in new_plan]
-    completed=[i for i,label in enumerate(new_labels) if label in completed_labels]
+    complete=[i for i,label in enumerate(new_labels) if label in completed_labels]
+    attempted=[i for i,label in enumerate(new_labels) if label in attempted_labels]
+    incomplete=[i for i,label in enumerate(new_labels) if label in incomplete_labels and i not in complete]
     summary['task_labels']=new_labels
     summary['total_tasks']=len(new_labels)
-    summary['cycle_completed_indices']=completed
-    if new_labels and len(completed)==len(new_labels):
+    summary['cycle_completed_indices']=complete
+    summary['cycle_attempted_indices']=attempted
+    summary['incomplete_task_indices']=incomplete
+    if new_labels and len(complete)==len(new_labels):
         if not summary.get('cycle_reset_pending'):
             summary['last_cycle_completed_at']=utc_now()
         summary['cycle_reset_pending']=True
         next_index=0
     else:
         summary.pop('cycle_reset_pending',None)
-        completed_set=set(completed)
-        next_index=next((i for i in range(len(new_labels)) if i not in completed_set),0)
+        attempted_set=set(attempted)
+        # First finish never-attempted towns; then revisit the incomplete ones.
+        next_index=next((i for i in range(len(new_labels)) if i not in attempted_set),None)
+        if next_index is None:
+            next_index=next((i for i in incomplete),0)
     summary['next_task_index']=next_index
     summary['current_task_index']=next_index
     summary['current_task_label']=new_labels[next_index] if new_labels else ''
@@ -6480,6 +6500,16 @@ class AutomaticCollection:
         settings.pop('homes_disabled_at',None)
         validate_automatic_settings(settings);validate_automatic_summary(summary or {})
         self.db=db;self.settings=dict(settings);self.settings['interval_minutes']=0;self.summary=dict(summary or {});self.summary.pop('next_run_at',None);self.build=BUILD
+        # Only a *new* controller reaches here. A persisted 'running' checkpoint
+        # without a live worker means the server died in the middle of the town.
+        # Do not pretend that the incomplete town was fully searched.
+        if self.summary.get('current_status')=='running' and self.summary.get('task_labels'):
+            labels=list(self.summary['task_labels'])
+            index=int(self.summary.get('current_task_index',self.summary.get('next_task_index',0)) or 0)%len(labels)
+            advance_automatic_task(self.summary,index,len(labels),False)
+            self.summary['last_interrupted_town']=labels[index]
+            self.summary['last_interrupted_at']=utc_now()
+            self.summary['current_status']='interrupted'
         self.lock=threading.RLock();self.io_lock=threading.Lock();self.stop_event=threading.Event()
         self.request_starts={};self.shared_web=PublicWeb();self.shared_web.cancel_event=self.stop_event
         self.last_job=None;self.current=None;self.message='検索候補の町名を確認しています';self.progress=0.;self.error=''
@@ -6491,8 +6521,6 @@ class AutomaticCollection:
                 if plan:
                     if self.summary.get('task_labels')!=[p['label'] for p in plan]:
                         reconcile_automatic_task_progress(self.summary,[],plan)
-                        self.summary.pop('cycle_attempted_indices',None)
-                        self.summary.pop('incomplete_task_indices',None)
                     else:
                         self.summary['total_tasks']=len(plan)
                     return plan
@@ -6507,8 +6535,6 @@ class AutomaticCollection:
             if not plan:raise AppError('自動収集する町が見つかりません。')
             if self.summary.get('task_labels')!=[p['label'] for p in plan]:
                 reconcile_automatic_task_progress(self.summary,[],plan)
-                self.summary.pop('cycle_attempted_indices',None)
-                self.summary.pop('incomplete_task_indices',None)
             else:
                 self.summary['total_tasks']=len(plan)
             if 'cycle_completed_indices' not in self.summary:
@@ -6590,8 +6616,42 @@ class AutomaticCollection:
                     if hasattr(job,'state'):job.state.request_starts=self.request_starts;job.state.shared_web=self.shared_web
                     self.current=job
                 self.persist_best_effort('before_town')
-                job.run(self.db,conditions)
-                snap=job.snapshot();result=snap.get('result') or {};status=result.get('status','failed');incomplete=bool(result.get('summary',{}).get('incomplete_tasks'))
+                # The collector may legitimately have many pages. Time out a *town*,
+                # not the whole collection; the saved rows remain safely in Supabase.
+                job.state.last_activity_at=time.monotonic()
+                started_town=time.monotonic()
+                watchdog_finished=threading.Event()
+                timeout_reason=[]
+                def watch_town():
+                    while not watchdog_finished.wait(1):
+                        if self.stop_event.is_set() or job.cancel_event.is_set():return
+                        running_for=time.monotonic()-started_town
+                        idle_for=time.monotonic()-job.state.last_activity_at
+                        if running_for>=AUTO_TOWN_MAX_SECONDS or idle_for>=AUTO_TOWN_IDLE_SECONDS:
+                            reason=('町ごとの最大実行時間' if running_for>=AUTO_TOWN_MAX_SECONDS
+                                    else '取得処理の進捗停止')
+                            timeout_reason.append(reason+f'（実行{int(running_for)}秒・無進捗{int(idle_for)}秒）')
+                            job.audit.add('automatic','town_timeout','WARNING',
+                                          {'town':conditions['auto_task_label'],'reason':reason,
+                                           'running_seconds':int(running_for),'idle_seconds':int(idle_for),
+                                           'decision':'retry_later_not_completed'})
+                            job.request_stop()
+                            return
+                watcher=threading.Thread(target=watch_town,daemon=True,name='housing-town-watchdog')
+                watcher.start()
+                try:
+                    job.run(self.db,conditions)
+                finally:
+                    watchdog_finished.set()
+                    watcher.join(timeout=2)
+                snap=job.snapshot();result=snap.get('result') or {};status=result.get('status','failed')
+                if timeout_reason and not self.stop_event.is_set() and status!='failed':
+                    result['status']='partial'
+                    stats=result.setdefault('summary',{})
+                    stats['incomplete_tasks']=max(1,int(stats.get('incomplete_tasks') or 0))
+                    stats['issues']=list(stats.get('issues') or [])+[timeout_reason[0]+'。未確認として次の町へ進みます。']
+                    status='partial'
+                incomplete=bool(result.get('summary',{}).get('incomplete_tasks'))
                 with self.lock:
                     self.last_job=job;self.current=None;self.progress=1.;self.summary['last_finished_at']=utc_now();self.summary['last_status']=status
                     self.summary['current_status']='stopped';self.summary['last_task']=conditions.get('auto_task_label',self.summary.get('current_task_label','地域判定'))
@@ -6629,6 +6689,11 @@ class AutomaticCollection:
                             self.settings['enabled']=False;self.stop_event.set()
                             self.error='未確認の町が'+str(len(self.summary.get('incomplete_task_indices',[])))+'件残っています。取得できた町は保持し、次回は未確認の町から再開します。'
                             self.message='他の町の確認を終えました。未確認の町は再試行待ちです。'
+                        elif outcome=='cycle_complete':
+                            # A complete pass is finite; do not automatically rescan
+                            # every town while the mobile screen is in the background.
+                            self.settings['enabled']=False;self.stop_event.set()
+                            self.message='全町の確認が完了しました。収集を終了します。再取得は開始ボタンから行えます。'
                         elif not success:
                             self.message='一戸建て等の未確認ページを記録して、次の町へ進みます。'
                         else:
@@ -6689,8 +6754,6 @@ def get_automatic_collection():
             if new_plan and (old_plan!=new_plan or
                              summary.get('task_labels')!=[task['label'] for task in new_plan]):
                 reconcile_automatic_task_progress(summary,old_plan,new_plan)
-                summary.pop('cycle_attempted_indices',None)
-                summary.pop('incomplete_task_indices',None)
             fresh_db=Database()
             fresh_db.web_config=rental_network_settings()
             fresh=AutomaticCollection(fresh_db,new_settings,summary)
@@ -6764,9 +6827,17 @@ def start_automatic_collection(ward_code,interval_minutes=0,town_codes=None):
                     sorted(prior.get('town_codes',[]))==settings['town_codes'])
         summary=dict(previous_summary) if same_scope else {}
         if same_scope:
-            summary.pop('cycle_attempted_indices',None)
+            # Preserve attempted/failed markers so a restart does not hammer the
+            # same incomplete town when other towns were never attempted.
+            labels=list(summary.get('task_labels') or [])
+            attempted={int(i) for i in (summary.get('cycle_attempted_indices') or []) if str(i).isdigit()}
+            remaining=[i for i in range(len(labels)) if i not in attempted]
             pending=[int(i) for i in (summary.get('incomplete_task_indices') or []) if str(i).isdigit()]
-            if pending:summary['next_task_index']=min(pending)
+            if remaining:summary['next_task_index']=remaining[0]
+            elif pending:
+                # Starting a new pass gives unresolved towns another attempt.
+                summary['cycle_attempted_indices']=list(summary.get('cycle_completed_indices') or [])
+                summary['next_task_index']=min(pending)
         for item in ('auto_regions','auto_munis'):
             if same_scope and prior.get(item):settings[item]=prior[item]
         controller=AutomaticCollection(db,settings,summary)
@@ -7001,6 +7072,12 @@ def automatic_collection_panel():
         summary=snap['summary'];st.write(snap['message']);st.progress(min(1.,max(0.,snap['progress'])))
         current=snap.get('current') or {};live=snapshot_count_metrics(current)
         if current:st.caption(f"現在｜処理 {int(live.get('processed',0))}件｜保存 {int(live.get('saved',0))}件｜エラー {int(live.get('errors',0))}件｜スキップ {int(live.get('skipped',0))}件")
+        if current and busy:
+            st.caption('処理工程：'+str(current.get('collection_stage') or '確認中')+
+                       '｜取得処理の最終進捗 '+str(int(current.get('idle_seconds') or 0))+'秒前')
+        if (snap.get('summary') or {}).get('last_interrupted_town'):
+            st.caption('前回のサーバー中断：'+str(snap['summary']['last_interrupted_town'])+
+                       '（未確認として保持し、別の町を優先します）')
         cumulative_processed=int(summary.get('processed_observations',0))
         cumulative_saved=int(summary.get('saved_observations',0))
         cumulative_errors=int(summary.get('error_observations',0))
