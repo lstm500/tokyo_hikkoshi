@@ -39,7 +39,7 @@ import streamlit as st
 from streamlit_folium import st_folium
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v106"
+BUILD = "REBUILD-01-v107"
 
 # ============================================================================
 # NON-NEGOTIABLE SUUMO ADDRESS POLICY -- DO NOT DELETE OR WEAKEN
@@ -4993,7 +4993,7 @@ DISPLAY_REASONS={
  'building':'1募集を掲載地図等から取得した座標の1点として表示'}
 
 
-def display_pipeline(units,bounds,load=None):
+def display_pipeline(units,bounds,load=None,include_records=False):
     """All layouts and all prices, one point per listing; no spatial or price aggregation."""
     rows=[];records=[];points=[];counts={k:0 for k in DISPLAY_REASONS}
     for r in units:
@@ -5006,7 +5006,7 @@ def display_pipeline(units,bounds,load=None):
                 points.append((r['latitude'],r['longitude']))
                 reason='unpriced' if not r.get('rent') else 'town' if r.get('coordinate_precision')=='town' else 'address' if r.get('coordinate_precision')=='address' else 'building'
         counts[reason]+=1
-        records.append({'key':r.get('key'),'title':r.get('title'),'provider':r.get('provider'),'listing_url':r.get('listing_url'),
+        if include_records:records.append({'key':r.get('key'),'title':r.get('title'),'provider':r.get('provider'),'listing_url':r.get('listing_url'),
             'layout':r.get('layout'),'dwelling_type':listing_dwelling_type(r),'rent':r.get('rent'),'fees':r.get('fees'),'monthly':monthly_price(r) if r.get('rent') else None,
             'region':r.get('region_label') or r.get('address'),'latitude':r.get('latitude'),'longitude':r.get('longitude'),
             'coordinate_precision':r.get('coordinate_precision'),'location_method':r.get('location_method'),'inferred_address':r.get('inferred_address'),'position_source_url':r.get('position_source_url'),
@@ -5024,19 +5024,28 @@ def display_pipeline(units,bounds,load=None):
     return rows,rows,[],report
 
 
-def display_diagnostic_downloads(report):
+def display_diagnostic_downloads(report,units=None,bounds=None,load=None):
     stages=report['stages'];mapping=report['map']
     st.caption(f"地図の〇 {mapping['colored_unique_positions']}個｜読み込んだ募集 {stages['loaded']}件｜現在の範囲 {stages['in_bounds']}件｜座標あり {mapping['markers_total']}件｜位置未確認 {mapping['unconfirmed_positions']}件")
     st.caption(f"地図の〇＝家賃色を付けて地図上で区別できる座標位置。完全に同じ座標へ重なる募集は1個として数えます。家賃帯対象 {mapping['colored_points']}件｜家賃未確認 {mapping['gray_points']}件｜重なり {mapping['overlapping_points']}件。")
     with st.expander('表示が少ない原因・全募集の診断ログ'):
         st.dataframe([{'理由':DISPLAY_REASONS[k],'募集件数':v} for k,v in report['reason_counts'].items()],hide_index=True)
-        text=['住まいコンパス 1募集1点の表示診断',json.dumps({k:v for k,v in report.items() if k!='records'},ensure_ascii=False,indent=2),'募集ごとの判定：']
-        text.extend(json.dumps(r,ensure_ascii=False) for r in report['records'])
-        st.download_button('表示原因ログをTXTでダウンロード','\n'.join(text).encode('utf-8-sig'),'sumai_display_log.txt','text/plain',key='display_txt',on_click='ignore')
-        st.download_button('表示原因ログをJSONでダウンロード',json.dumps(report,ensure_ascii=False,indent=2).encode('utf-8'),'sumai_display_log.json','application/json',key='display_json',on_click='ignore')
-        output=io.StringIO();writer=csv.DictWriter(output,fieldnames=list(report['records'][0]) if report['records'] else ['key','reason']);writer.writeheader();writer.writerows(report['records'])
-        st.download_button('全募集の表示判定をCSVでダウンロード',output.getvalue().encode('utf-8-sig'),'sumai_display_decisions.csv','text/csv',key='display_csv',on_click='ignore')
+        token=(id(units),len(units or []),tuple(bounds or ()))
+        if st.button('表示診断ログを準備',key='prepare_display_diagnostics'):
+            complete=display_pipeline(units or [],bounds,load,include_records=True)[3]
+            lines=['住まいコンパス 1募集1点の表示診断',json.dumps({k:v for k,v in complete.items() if k!='records'},ensure_ascii=False,indent=2),'募集ごとの判定：']
+            lines.extend(json.dumps(r,ensure_ascii=False) for r in complete['records'])
+            output=io.StringIO();writer=csv.DictWriter(output,fieldnames=list(complete['records'][0]) if complete['records'] else ['key','reason']);writer.writeheader();writer.writerows(complete['records'])
+            st.session_state['_mobile_diag_export']={'token':token,'txt':'\n'.join(lines).encode('utf-8-sig'),
+                'json':json.dumps(complete,ensure_ascii=False,indent=2).encode('utf-8'),
+                'csv':output.getvalue().encode('utf-8-sig')}
+        export=st.session_state.get('_mobile_diag_export')
+        if export and export.get('token')==token:
+            st.download_button('表示原因ログをTXTでダウンロード',export['txt'],'sumai_display_log.txt','text/plain',key='display_txt',on_click='ignore')
+            st.download_button('表示原因ログをJSONでダウンロード',export['json'],'sumai_display_log.json','application/json',key='display_json',on_click='ignore')
+            st.download_button('全募集の表示判定をCSVでダウンロード',export['csv'],'sumai_display_decisions.csv','text/csv',key='display_csv',on_click='ignore')
         for advice in report['improvements']:st.write('・'+advice)
+
 
 
 def rent_color(price):
@@ -5090,6 +5099,52 @@ class MapReferenceLabels(MacroElement):
         self.ward_payload=json.dumps(wards,ensure_ascii=False,separators=(',',':')).replace('<','\u003c').replace('>','\u003e').replace('&','\u0026')
         self.station_payload=json.dumps(stations,ensure_ascii=False,separators=(',',':')).replace('<','\u003c').replace('>','\u003e').replace('&','\u0026')
 
+class MobileScrollControl(MacroElement):
+    """On touch screens, allow normal page scrolling until map manipulation is requested."""
+    _template=Template("""{% macro script(this, kwargs) %}
+    (function () {
+      if (!window.matchMedia || !window.matchMedia('(pointer:coarse)').matches) return;
+      var map = {{ this._parent.get_name() }};
+      var manipulating = false, button;
+      function setMode(manipulate) {
+        manipulating = manipulate;
+        if (manipulating) {
+          map.dragging.enable();
+          if (map.touchZoom) map.touchZoom.enable();
+          map.getContainer().style.touchAction = 'none';
+        } else {
+          map.dragging.disable();
+          if (map.touchZoom) map.touchZoom.disable();
+          map.getContainer().style.touchAction = 'pan-y';
+        }
+        if (button) {
+          button.textContent = manipulating ? 'ページをスクロール' : '地図を動かす';
+          button.setAttribute('aria-pressed', manipulating ? 'true' : 'false');
+        }
+      }
+      var touchControl = L.control({position:'topright'});
+      touchControl.onAdd = function () {
+        var div = L.DomUtil.create('div','leaflet-bar');
+        div.style.cssText = 'background:white;border-radius:7px;overflow:hidden;box-shadow:0 1px 5px #777;';
+        button = L.DomUtil.create('button','',div);
+        button.type = 'button';
+        button.style.cssText = 'min-height:40px;padding:4px 10px;border:0;background:white;color:#203f39;font-size:13px;font-weight:600;';
+        L.DomEvent.disableClickPropagation(div);
+        L.DomEvent.disableScrollPropagation(div);
+        L.DomEvent.on(button,'click',function (e) {
+          L.DomEvent.stop(e);
+          setMode(!manipulating);
+        });
+        return div;
+      };
+      touchControl.addTo(map);
+      setMode(false);
+    })();
+    {% endmacro %}""")
+    def __init__(self):
+        super().__init__();self._name='MobileScrollControl'
+
+
 def rental_map(rows,center,radius,cells,facilities):
     m=folium.Map(location=center,zoom_start=15,tiles=None,control_scale=True,prefer_canvas=True)
     folium.map.CustomPane('monotoneBase',z_index=200,pointer_events=False).add_to(m)
@@ -5101,6 +5156,7 @@ def rental_map(rows,center,radius,cells,facilities):
     # underlying roads, station names and ward geography stay legible even in dense areas.
     folium.map.CustomPane('referenceLabelPane',z_index=625,pointer_events=False).add_to(m)
     MapReferenceLabels().add_to(m)
+    MobileScrollControl().add_to(m)
     rental_features(rows,cells,facilities).add_to(m)
     return m
 
@@ -5112,30 +5168,107 @@ def listing_card(r,persisted):
 
 
 class IndividualRentPoints(MacroElement):
-    """One Canvas renderer; one noninteractive colored point per acquired listing."""
+    """One lightweight HTML canvas for all rental dots, not 12k Leaflet layers.
+
+    Viewport filtering and drawing stay in the browser.  Panning never asks Python
+    to rebuild individual markers; no aggregation or loss of listing positions.
+    """
     _template=Template("""{% macro script(this, kwargs) %}
-    var {{ this.get_name() }}_data = {{ this.payload }};
-    var {{ this.get_name() }}_map = {{ this._parent._parent.get_name() }};
-    var {{ this.get_name() }}_renderer = {{ this.get_name() }}_map._individualRentCanvas;
-    if (!{{ this.get_name() }}_renderer) {
-        {{ this.get_name() }}_renderer = L.canvas({padding:0.3,pane:'rentIndividualPane'});
-        {{ this.get_name() }}_map._individualRentCanvas = {{ this.get_name() }}_renderer;
-    }
-    {{ this.get_name() }}_data.forEach(function(item) {
-        L.circleMarker([item.lat,item.lng],{renderer:{{ this.get_name() }}_renderer,
-            radius:5.8,color:'#ffffff',weight:item.approx?1.35:0.75,opacity:0.62,interactive:false,
-            dashArray:item.approx?'2,2':null,fill:true,fillColor:item.color,fillOpacity:0.70})
-        .addTo({{ this._parent.get_name() }});
-    });
+    (function () {
+      var map = {{ this._parent._parent.get_name() }};
+      var data = {{ this.payload }};
+      // Dynamic map refresh replaces the old overlay, never stacks 12k layers.
+      if (map._sumaiRentalCanvas) {
+        var prior = map._sumaiRentalCanvas;
+        map.off('move zoom resize viewreset', prior.schedule);
+        if (prior.canvas.parentNode) prior.canvas.parentNode.removeChild(prior.canvas);
+      }
+      var canvas = L.DomUtil.create('canvas', 'sumai-rent-canvas', map.getPane('rentIndividualPane'));
+      canvas.style.cssText = 'position:absolute;pointer-events:none;';
+      canvas.setAttribute('aria-hidden', 'true');
+      var ctx = canvas.getContext('2d', {alpha:true, desynchronized:true});
+      if (!ctx) return;
+      var grid = Object.create(null);
+      var CELL = 0.01;
+      for (var i = 0; i < data.length; i++) {
+        var d = data[i];
+        var key = Math.floor(d[0] / CELL) + ':' + Math.floor(d[1] / CELL);
+        if (!grid[key]) grid[key] = [];
+        grid[key].push(d);
+      }
+      var scheduled = false, lastDraw = 0, delayTimer = null;
+      function paint() {
+        scheduled = false;
+        if (!map || !canvas.isConnected) return;
+        var size = map.getSize();
+        if (!size.x || !size.y) return;
+        var scale = Math.min(2, window.devicePixelRatio || 1);
+        var w = Math.round(size.x * scale), h = Math.round(size.y * scale);
+        if (canvas.width !== w || canvas.height !== h) {
+          canvas.width = w; canvas.height = h;
+          canvas.style.width = size.x + 'px'; canvas.style.height = size.y + 'px';
+        }
+        L.DomUtil.setPosition(canvas, map.containerPointToLayerPoint([0, 0]));
+        ctx.setTransform(scale, 0, 0, scale, 0, 0);
+        ctx.clearRect(0, 0, size.x, size.y);
+        var bounds = map.getBounds().pad(0.04);
+        var south = Math.floor(bounds.getSouth() / CELL), north = Math.floor(bounds.getNorth() / CELL);
+        var west = Math.floor(bounds.getWest() / CELL), east = Math.floor(bounds.getEast() / CELL);
+        var cells = (north - south + 1) * (east - west + 1);
+        var visible = [];
+        if (cells > 0 && cells <= 3000) {
+          for (var lat = south; lat <= north; lat++) {
+            for (var lng = west; lng <= east; lng++) {
+              var bucket = grid[lat + ':' + lng];
+              if (bucket) for (var j = 0; j < bucket.length; j++) visible.push(bucket[j]);
+            }
+          }
+        } else {
+          visible = data;
+        }
+        for (var k = 0; k < visible.length; k++) {
+          var d = visible[k];
+          if (d[0] < bounds.getSouth() || d[0] > bounds.getNorth() ||
+              d[1] < bounds.getWest() || d[1] > bounds.getEast()) continue;
+          var point = map.latLngToContainerPoint([d[0], d[1]]);
+          ctx.beginPath();
+          ctx.arc(point.x, point.y, 5.8, 0, 2 * Math.PI);
+          ctx.fillStyle = d[2];
+          ctx.globalAlpha = 0.70;
+          ctx.fill();
+          ctx.globalAlpha = 0.62;
+          ctx.strokeStyle = '#ffffff';
+          ctx.lineWidth = d[3] ? 1.35 : 0.75;
+          ctx.setLineDash(d[3] ? [2, 2] : []);
+          ctx.stroke();
+        }
+        ctx.setLineDash([]);ctx.globalAlpha = 1;
+        lastDraw = Date.now();
+      }
+      function schedule() {
+        if (scheduled || !canvas.isConnected) return;
+        // At most about 15 redraws/second while dragging; no Streamlit events.
+        var remaining = 66 - (Date.now() - lastDraw);
+        scheduled = true;
+        if (remaining > 0) {
+          delayTimer = setTimeout(function () { delayTimer = null; requestAnimationFrame(paint); }, remaining);
+        } else {
+          requestAnimationFrame(paint);
+        }
+      }
+      map._sumaiRentalCanvas = {canvas:canvas, schedule:schedule};
+      map.on('move zoom resize viewreset', schedule);
+      map.whenReady(schedule);
+    })();
     {% endmacro %}""")
     def __init__(self,rows):
-        super().__init__();self._name='IndividualRentPoints';self.items=[]
+        super().__init__();self._name='IndividualRentPoints';items=[]
         for r in rows:
             if not has_point(r):continue
-            self.items.append({'key':r['key'],'lat':r['latitude'],'lng':r['longitude'],
-                'color':rent_color(monthly_price(r)) if r.get('rent') else '#777777',
-                'approx':r.get('coordinate_precision') in ('town','address')})
-        self.payload=json.dumps(self.items,ensure_ascii=False,separators=(',',':')).replace('<','\\u003c').replace('>','\\u003e').replace('&','\\u0026')
+            items.append([float(r['latitude']),float(r['longitude']),
+                rent_color(monthly_price(r)) if r.get('rent') else '#777777',
+                r.get('coordinate_precision') in ('town','address')])
+        self.payload=json.dumps(items,ensure_ascii=False,separators=(',',':')).replace('<','\u003c').replace('>','\u003e').replace('&','\u0026')
 
 
 def rental_features(rows,cells,facilities):
@@ -5587,7 +5720,7 @@ def apply_saved_load(job):
     return True
 
 
-@st.fragment(run_every='4s')
+@st.fragment(run_every='8s')
 def saved_load_progress():
     job=active_saved_load()
     if not job:return
@@ -5882,7 +6015,7 @@ def snapshot_count_metrics(snapshot):
     return {'processed':saved+errors,'saved':saved,'errors':errors,'skipped':skipped}
 
 
-@st.fragment(run_every='2s')
+@st.fragment(run_every='6s')
 def background_progress():
     """Render live worker progress and buttons inside the fragment-owned container."""
     job=active_job()
@@ -5934,7 +6067,7 @@ def background_progress():
     render()
 
 
-@st.fragment(run_every='10s')
+@st.fragment(run_every='20s')
 def background_status():
     """Render current-search diagnostics with download buttons always available."""
     job=active_job()
@@ -5971,7 +6104,14 @@ def interactive_rental_map(pins,cells,facilities):
     # the browser owns its viewport; Python records only the bounds needed for search.
     # This prevents a pan/zoom -> fragment rerun -> setView feedback loop.
     kwargs=dict(key='new_map',height=480,use_container_width=True,returned_objects=['bounds'],
-                feature_group_to_add=rental_features(pins,cells,facilities),on_change=capture_map_fragment)
+                on_change=capture_map_fragment)
+    # Leaflet already owns the marker canvas. A pan/zoom must not serialize and
+    # resend the entire rental dataset to the mobile component. A full Python
+    # rerun recreates the list and requests a new group if data changed.
+    signature=(id(pins),len(pins),id(facilities),len(facilities))
+    if not state.get('new_map') or state.get('_mobile_map_payload_signature')!=signature:
+        kwargs['feature_group_to_add']=rental_features(pins,cells,facilities)
+        state['_mobile_map_payload_signature']=signature
     if not state.get('new_map'):
         kwargs['center']=state.get('new_view_center',DEFAULT_CENTER)
         kwargs['zoom']=state.get('new_view_zoom',15)
@@ -6715,7 +6855,7 @@ def automatic_log_download_panel(controller,busy,summary):
             st.caption('保存済みログは復元済みです。停止後の再起動でも再取得できます。')
 
 
-@st.fragment(run_every='8s')
+@st.fragment(run_every='12s')
 def automatic_collection_panel():
     st.subheader('アプリ内の自動収集（SUUMO）')
     st.caption('画面を閉じてもサーバー稼働中は収集します。休止・再起動では止まり、次にアプリを開くと保存した設定・町の順番から再開します。')
@@ -6920,7 +7060,7 @@ def main():
                 with st.expander('今回検索した地名・丁目'):
                     for label in result['conditions']['regions']: st.write(label)
         st.caption('KPIは地図の〇の数です。家賃色を付けて地図上で区別できる座標位置を1個として数え、同一座標への重なりで水増ししません。保存物件件数とは別です。')
-        if state.get('new_map_loaded'):display_diagnostic_downloads(display_report)
+        if state.get('new_map_loaded'):display_diagnostic_downloads(display_report,map_units,bounds,state.get('new_load_diagnostic'))
         c1,c2,c3,c4=st.columns(4)
         c1.metric('地図の〇（KPI）',display_report['map']['colored_unique_positions'])
         c2.metric('現在の範囲の募集',len(rows))
@@ -6930,11 +7070,19 @@ def main():
         elif not rows:st.info('この表示範囲に配置できる保存データがありません。')
         if rows:
             with st.expander('募集を1件ずつ確認'):
-                chosen=st.selectbox('確認する募集',rows,format_func=lambda r:(r.get('title') or '')+'｜'+str(r.get('layout') or '間取り未確認')+'｜'+(f"{monthly_price(r)/10000:g}万円" if r.get('rent') else '家賃未確認')+'｜'+r['key'][:8],key='individual_listing')
-                st.markdown(listing_card(chosen,chosen['key'] in state.new_saved_keys),unsafe_allow_html=True)
+                listing_token=(id(state.new_units),len(state.new_units),selected_group)
+                if st.button('募集一覧を準備',key='mobile_prepare_listing_select'):
+                    state['_mobile_listing_select_ready']=listing_token
+                if state.get('_mobile_listing_select_ready')==listing_token:
+                    chosen=st.selectbox('確認する募集',rows,format_func=lambda r:(r.get('title') or '')+'｜'+str(r.get('layout') or '間取り未確認')+'｜'+(f"{monthly_price(r)/10000:g}万円" if r.get('rent') else '家賃未確認')+'｜'+r['key'][:8],key='individual_listing')
+                    st.markdown(listing_card(chosen,chosen['key'] in state.new_saved_keys),unsafe_allow_html=True)
         if rows:
             with st.expander('取得できた情報をすべて表で見る（未確認も保持）'):
-                st.dataframe([{'物件ID':r.get('property_id','未記録'),'種別':'一戸建て' if listing_dwelling_type(r)=='house' else 'マンション','家賃（万円）':float(r['rent'])/10000 if r.get('rent') else None,'間取り':r.get('layout'),'住所（推定）':r.get('address'),'データ取得日時':acquisition_time_jst(r.get('fetched_at'))} for r in physical_units(rows)],hide_index=True)
+                table_token=(id(state.new_units),len(state.new_units),selected_group)
+                if st.button('募集データの表を準備',key='mobile_prepare_listing_table'):
+                    state['_mobile_listing_table_ready']=table_token
+                if state.get('_mobile_listing_table_ready')==table_token:
+                    st.dataframe([{'物件ID':r.get('property_id','未記録'),'種別':'一戸建て' if listing_dwelling_type(r)=='house' else 'マンション','家賃（万円）':float(r['rent'])/10000 if r.get('rent') else None,'間取り':r.get('layout'),'住所（推定）':r.get('address'),'データ取得日時':acquisition_time_jst(r.get('fetched_at'))} for r in physical_units(rows)],hide_index=True)
     with tabs[1]:
         automatic_collection_panel()
         st.subheader('Supabaseに保存した物件')
@@ -6950,7 +7098,12 @@ def main():
         saved_load_progress()
         if state.get('new_notice'): st.success(state.new_notice)
         st.caption('DBには家賃・間取り・種別（マンション／一戸建て）・詳細住所（推定）・データ取得日時を保存します。読み込み時に住所を一時的に座標化して地図へ色付けし、その座標は保存しません。')
-        st.download_button('現在の物件データをCSVで保存',csv_bytes(state.new_units),'sumai_rebuild_units.csv','text/csv',use_container_width=True)
+        if st.button('現在の物件データCSVを準備',key='mobile_prepare_units_csv'):
+            state['_mobile_units_export']={'key':(id(state.new_units),len(state.new_units)),
+                'bytes':csv_bytes(state.new_units)}
+        ready=state.get('_mobile_units_export')
+        if ready and ready.get('key')==(id(state.new_units),len(state.new_units)):
+            st.download_button('現在の物件データをCSVで保存',ready['bytes'],'sumai_rebuild_units.csv','text/csv',use_container_width=True,on_click='ignore')
         upload=st.file_uploader('このアプリのCSVを追加する',type=['csv'])
         if st.button('CSVの物件をSupabaseへ保存',disabled=upload is None or bool(active_job() and not active_job().snapshot()['finished']),key='new_import'):
             try:
