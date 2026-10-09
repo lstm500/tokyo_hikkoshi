@@ -39,7 +39,7 @@ import streamlit as st
 from streamlit_folium import st_folium
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v104"
+BUILD = "REBUILD-01-v106"
 
 # ============================================================================
 # NON-NEGOTIABLE SUUMO ADDRESS POLICY -- DO NOT DELETE OR WEAKEN
@@ -294,6 +294,8 @@ COLORS = ("#17357A","#0067D9","#00A9D6","#00A870","#E8B900","#F39A1F",
 RENT_BAND_LABELS = (f'{BANDS[0]/10000:g}万円以下',) + tuple(
     f'{lower/10000:g}〜{upper/10000:g}万円' for lower,upper in zip(BANDS,BANDS[1:])
 ) + (f'{BANDS[-1]/10000:g}万円超',)
+DB_MAINTENANCE_SQL = '-- v105: one-time removal of OLD error and diagnostic records only.\n-- Stop automatic collection before running. Change the namespace only if\n-- SUPABASE_NAMESPACE in Streamlit Secrets is not "sumai-compass".\n-- 1) Inspect counts first:\nSELECT status, count(*) AS stored_rows\nFROM public.housing_searches_v1\nWHERE namespace = \'sumai-compass\'\nGROUP BY status\nORDER BY stored_rows DESC;\n\n-- 2) Discard only historical diagnostic/error records.\n--    No rental_listing, rental_acquisition or automatic_collection_settings rows are removed.\nDELETE FROM public.housing_searches_v1\nWHERE namespace = \'sumai-compass\'\n  AND status IN (\'diagnostic_error\', \'diagnostic_log\');\n\n-- 3) Refresh planner statistics; physical disk space is normally reclaimed\n--    for reuse by autovacuum, not immediately returned to the operating system.\nANALYZE public.housing_searches_v1;\n\n-- 4) Verify no diagnostic records remain:\nSELECT status, count(*) AS remaining_rows\nFROM public.housing_searches_v1\nWHERE namespace = \'sumai-compass\'\nGROUP BY status\nORDER BY remaining_rows DESC;\n'
+
 SQL = '''-- 新しいアプリ専用。既存の物件・ジョブ・テーブルは削除しません。
 create table if not exists public.housing_units_v1 (
  namespace text not null, key text not null, title text not null,
@@ -843,6 +845,13 @@ class Database:
             # All write requests use idempotent on_conflict semantics. Retry only
             # transient server faults; never retry a 401/403, SQL error or malformed data.
             if response.status_code not in (500,502,503,504) or attempt==2:break
+            # SQLSTATE 57014 is a deterministic DB statement timeout. Sending
+            # the exact same query another two times increases I/O pressure.
+            try:
+                db_error=response.json() if response.content else {}
+            except (ValueError,TypeError):
+                db_error={}
+            if isinstance(db_error,dict) and str(db_error.get('code') or '')=='57014':break
             time.sleep(.5*(attempt+1))
         if getattr(self,'audit',None) and not getattr(self,'_saving_audit',False):
             self.audit.add('database','db_response','INFO' if 200<=response.status_code<300 else 'ERROR',{'method':method,'table':table,'status':response.status_code,'bytes':len(response.content)})
@@ -1058,7 +1067,7 @@ class Database:
         listings: the diagnostic explicitly reports how many legacy rows are shadowed by an
         ID-backed row, while unmatched legacy rows remain visible.
         """
-        out=[];last_id=''
+        out=[];last_id='';page_limit=500
         self.last_load_diagnostic={'time':utc_now(),'bounds':list(bounds) if bounds else None,'layouts':list(layouts) if layouts is not None else None,
                                    'pages':[],'excluded':{'invalid':0,'layout':0,'legacy_schema':0},'raw_records':0,'accepted_records':0,
                                    'property_id_records':0,'legacy_records':0,'legacy_shadowed':0,'legacy_unmatched':0,
@@ -1066,9 +1075,19 @@ class Database:
         while True:
             if cancel_event is not None and cancel_event.is_set():raise SearchCancelled()
             params={'namespace':'eq.'+self.namespace,'select':'id,summary,conditions','status':'eq.rental_listing',
-                    'and':'(id.gte.listing.,id.lt.listing/)','order':'id.asc','limit':250}
+                    'and':'(id.gte.listing.,id.lt.listing/)','order':'id.asc','limit':page_limit}
             if last_id:params['id']='gt.'+last_id
-            rows=self.call('GET',SEARCH_TABLE,params)
+            while True:
+                try:
+                    rows=self.call('GET',SEARCH_TABLE,params)
+                    break
+                except AppError as exc:
+                    diag=getattr(exc,'diagnostic',{}) or {}
+                    if (diag.get('code')=='57014' or diag.get('status') in (500,502,503,504)) and page_limit>50:
+                        page_limit=max(50,page_limit//2)
+                        params['limit']=page_limit
+                        continue
+                    raise
             if not isinstance(rows,list):raise AppError('保存した募集情報を読み取れません。')
             self.last_load_diagnostic['pages'].append({'table':SEARCH_TABLE,'after_id':last_id or None,'returned':len(rows),'server_filters':['namespace','rental_listing']})
             self.last_load_diagnostic['raw_records']+=len(rows)
@@ -1090,7 +1109,7 @@ class Database:
             new_last=str(rows[-1].get('id') or '')
             if not new_last or new_last==last_id:raise AppError('保存データのページ位置を確定できません。')
             last_id=new_last
-            if len(rows)<250:break
+            if len(rows)<page_limit:break
         property_rows=[r for r in out if r.get('property_id')]
         legacy_rows=[r for r in out if not r.get('property_id')]
         represented={hashlib.sha256(json.dumps(listing_identity_payload(r),ensure_ascii=False,sort_keys=True,separators=(',',':')).encode()).hexdigest() for r in property_rows}
@@ -1181,13 +1200,13 @@ class Database:
         if not wanted:return {}
         out={}
         keys=list(wanted)
-        for offset in range(0,len(keys),75):
+        for offset in range(0,len(keys),125):
             if cancel_event is not None and cancel_event.is_set():raise SearchCancelled()
-            batch=keys[offset:offset+75]
+            batch=keys[offset:offset+125]
             rows=self.call('GET',PLACE_TABLE,{
                 'namespace':'eq.'+self.namespace,
                 'key':'in.('+','.join(batch)+')',
-                'select':'key,latitude,longitude','limit':75})
+                'select':'key,latitude,longitude','limit':125})
             if not isinstance(rows,list):raise AppError('住所座標キャッシュを読み取れません。')
             for row in rows:
                 address=wanted.get(str(row.get('key') or ''))
@@ -4565,6 +4584,8 @@ def search_all(db,conditions,screen,state=None):
     search['finished_at']=utc_now()
     try:
         stored_search=dict(search)
+        stored_search['summary']=dict(search.get('summary') or {})
+        stored_search['summary']['issues']=list((stored_search['summary'].get('issues') or [])[-8:])
         stored_search['conditions']={k:v for k,v in search.get('conditions',{}).items()
             if k in ('bounds','providers','mode','ward_code','town_codes','auto_task_index',
                      'auto_task_label','auto_task_identity','region_source','providers_after_fallback')}
@@ -4674,6 +4695,9 @@ class AuditLog:
         self.storage_error=None;self.search_id=hashlib.sha256(os.urandom(32)).hexdigest();self.secrets=tuple(str(v) for v in secrets if v)
         self.search_mode=conditions.get('mode');self.ward_code=conditions.get('ward_code');self.town_codes=list(conditions.get('town_codes') or [])
         self.pending_failures=[];self.persisted_failures=0;self.failure_storage_error=None
+        self._persisted_fault_samples=0
+        self._persisted_db_fault_samples=0
+        self._persisted_start=False
         self.add('search','start','INFO',{'build':BUILD,'bounds':conditions.get('bounds'),'providers':conditions.get('providers'),'filters':{'structure':None,'max_age':None,'layouts':list(LAYOUTS),'suumo':{'mansion':{'max_age':15,'layout_groups':[list(x) for x in SUUMO_LAYOUT_GROUPS]},'house':{'max_age':40,'min_area_sqm':50}}},'property_limit':None})
     def clean(self,value):
         if isinstance(value,dict):return {str(k):('[REDACTED]' if re.search(r'^(?:key|apikey|api_key|token|access_token|authorization|cookie|password|secret|SUPABASE_.*KEY)$',str(k),re.I) else self.clean(v)) for k,v in value.items()}
@@ -4695,7 +4719,8 @@ class AuditLog:
                                  context=context,details=details or {},observed=cause,improvement=advice,
                                  _search_mode=self.search_mode,_ward_code=self.ward_code,_town_codes=self.town_codes))
             with open(self.path,'a',encoding='utf-8') as f:f.write(json.dumps(event,ensure_ascii=False,allow_nan=False)+'\n')
-            if diagnostic_failure_event(event):self.pending_failures.append(event)
+            # Full event detail is already written to local JSONL; don't retain
+            # a second in-memory array for the disabled legacy per-error writer.
     def records(self):
         with self.lock:
             with open(self.path,encoding='utf-8') as f:return [json.loads(line) for line in f if line.strip()]
@@ -4705,8 +4730,9 @@ class AuditLog:
     def persist(self,db,force=False):
         """Save only essential events in compact chunks; verbose logs remain local.
 
-        One diagnostic_log row now holds up to 150 important events. Unlike older
-        versions we do NOT write a second diagnostic_error row for each failure.
+        At most 32 representative non-DB failures and eight DB failures per
+        search (plus start/finish) are persisted. Unlike older versions we do NOT save a separate error row
+        for each failure. The complete TXT/JSON log is local to the live job.
         Old per-error records remain readable; new errors can be restored from
         the same diagnostic_log rows used by historical CSV export.
         """
@@ -4723,9 +4749,21 @@ class AuditLog:
                         if not line:break
                         examined+=1
                         event=json.loads(line)
-                        if (diagnostic_failure_event(event) or
-                            (event.get('stage')=='search' and event.get('code') in ('start','finish')) or
-                            (event.get('stage')=='database' and event.get('level') in ('ERROR','WARNING'))):
+                        # Save 32 other failures and reserve eight slots for late
+                        # database failures (e.g. 57014). Keep the full local log.
+                        is_start=(event.get('stage')=='search' and event.get('code')=='start')
+                        is_finish=(event.get('stage')=='search' and event.get('code')=='finish')
+                        is_fault=diagnostic_failure_event(event)
+                        db_fault=(is_fault and event.get('stage')=='database')
+                        if is_start and not self._persisted_start:
+                            selected.append(event)
+                        elif is_finish:
+                            selected.append(event)
+                        elif db_fault and (self._persisted_db_fault_samples +
+                                sum(e.get('stage')=='database' and diagnostic_failure_event(e) for e in selected))<8:
+                            selected.append(event)
+                        elif is_fault and not db_fault and (self._persisted_fault_samples +
+                                sum(e.get('stage')!='database' and diagnostic_failure_event(e) for e in selected))<32:
                             selected.append(event)
                     end=file.tell()
             if not examined:
@@ -4746,7 +4784,14 @@ class AuditLog:
                     db._saving_audit=False
                 self.chunk+=1
                 self.persisted_events+=len(selected)
-                self.persisted_failures+=sum(bool(diagnostic_failure_event(e)) for e in selected)
+                new_faults=sum(bool(diagnostic_failure_event(e)) for e in selected)
+                self.persisted_failures+=new_faults
+                self._persisted_db_fault_samples+=sum(
+                    e.get('stage')=='database' and diagnostic_failure_event(e) for e in selected)
+                self._persisted_fault_samples+=sum(
+                    e.get('stage')!='database' and diagnostic_failure_event(e) for e in selected)
+                self._persisted_start=self._persisted_start or any(
+                    e.get('stage')=='search' and e.get('code')=='start' for e in selected)
                 with self.lock:
                     persisted_seq={int(e.get('seq',-1)) for e in selected}
                     self.pending_failures=[e for e in self.pending_failures if int(e.get('seq',-1)) not in persisted_seq]
@@ -5226,10 +5271,22 @@ def hydrate_saved_units(rows,bounds,cache=None,web=None,notify=None):
     return [hydrated_listing(row,cache.get(row.get('address'))) for row in rows],cache
 
 
+@st.cache_resource
+def saved_load_snapshot_registry():
+    # Per-server snapshot, immutable after publication; no Supabase secret stored.
+    return {},threading.RLock()
+
+
 class SavedLoadJob:
     """DB rows become available independently of geocoding; no Streamlit in worker."""
-    def __init__(self,db,bounds,cache=None):
+    def __init__(self,db,bounds,cache=None,force_full=False):
         self.db=db;self.bounds=bounds;self.token=hashlib.sha256(os.urandom(32)).hexdigest();self.server_key=manual_registry_key(db)
+        snapshots,snapshot_lock=saved_load_snapshot_registry()
+        with snapshot_lock:
+            baseline=snapshots.get(self.server_key)
+        self.baseline=None if force_full or not isinstance(baseline,dict) or baseline.get('build')!=BUILD else baseline
+        self.mode='delta' if self.baseline is not None else 'full'
+        self.last_activity_at=time.monotonic()
         self.lock=threading.RLock();self.cancel_event=threading.Event();self.rows={};self.cache={}  # Session points lack timestamps; reuse only the TTL-controlled server cache.
         self.phase='database';self.finished=False;self.error='';self.complete_db=False;self.pages=0;self.total_addresses=0;self.done_addresses=0;self.placed=0;self.persistent_cache_hits=0;self.geocoded_addresses=0;self.diagnostic={};self.started=time.monotonic();self.started_at_utc=utc_now();self.ended=None
         self.catchup_rounds=0;self.catchup_rows=0;self.catchup_changes=0;self.latest_checked_at=None;self.storage_record_audit=[]
@@ -5239,19 +5296,103 @@ class SavedLoadJob:
             end=self.ended if self.ended is not None else time.monotonic();diag=dict(self.diagnostic or {})
             return {'token':self.token,'phase':self.phase,'finished':self.finished,'error':self.error,'complete_db':self.complete_db,
                 'rows':len(self.rows),'pages':self.pages,'addresses':self.total_addresses,'done_addresses':self.done_addresses,'placed':self.placed,
-                'unique_positions':unique_map_position_count(self.rows.values()),
-                'visible_colored_dots':visible_colored_dot_count(self.rows.values()),
+                'unique_positions':(unique_map_position_count(self.rows.values()) if self.phase!='database' else 0),
+                'visible_colored_dots':(visible_colored_dot_count(self.rows.values()) if self.phase!='database' else 0),
                 'raw_records':int(diag.get('raw_records') or 0),'accepted_records':int(diag.get('accepted_records') or 0),
                 'property_id_records':int(diag.get('property_id_records') or 0),'legacy_records':int(diag.get('legacy_records') or 0),
                 'legacy_shadowed':int(diag.get('legacy_shadowed') or 0),'legacy_unmatched':int(diag.get('legacy_unmatched') or 0),
                 'persistent_cache_hits':self.persistent_cache_hits,'geocoded_addresses':self.geocoded_addresses,
                 'catchup_rounds':self.catchup_rounds,'catchup_rows':self.catchup_rows,'catchup_changes':self.catchup_changes,
-                'latest_checked_at':self.latest_checked_at,'elapsed':round(end-self.started,1),'stopping':self.cancel_event.is_set()}
+                'latest_checked_at':self.latest_checked_at,'elapsed':round(end-self.started,1),'stopping':self.cancel_event.is_set(),
+                'mode':self.mode,'idle_seconds':round(time.monotonic()-self.last_activity_at,1)}
     def export(self):
         with self.lock:return [dict(r) for r in self.rows.values()],dict(self.cache),dict(self.diagnostic)
     def export_storage_record_audit(self):
         with self.lock:return [dict(r) for r in self.storage_record_audit]
     def request_stop(self):self.cancel_event.set()
+    def run_delta(self,web):
+        previous=self.baseline
+        with self.lock:
+            self.phase='delta'
+            self.rows={key:dict(row) for key,row in previous['rows'].items()}
+            self.cache=dict(previous['cache'])
+            self.storage_record_audit=list(previous.get('audit') or [])
+            self.diagnostic=dict(previous.get('diagnostic') or {})
+            self.complete_db=True
+            self.total_addresses=len({r.get('address') for r in self.rows.values() if r.get('address')})
+            self.placed=sum(has_point(r) for r in self.rows.values())
+        seen_audit={r.get('Supabase行ID') for r in self.storage_record_audit}
+        old_keys=set(self.rows)
+        marker=previous['as_of']
+        # Overlap catches writes racing with the previous snapshot publication.
+        dt=datetime.fromisoformat(marker.replace('Z','+00:00'))-timedelta(seconds=15)
+        since=dt.isoformat(timespec='seconds')
+        new_addresses=set()
+        delta_seen=set()
+        for step in range(2):
+            web.check_cancel()
+            changed=self.db.load_units_since(since if step==0 else self.started_at_utc,cancel_event=self.cancel_event)
+            self.last_activity_at=time.monotonic()
+            delta_seen.update(str(r.get('storage_id') or '') for r in changed)
+            with self.lock:
+                self.catchup_rounds+=1
+                self.catchup_rows+=len(changed)
+            if not changed and step==0:
+                break
+            for r in changed:
+                address=r.get('address') or ''
+                if address and address not in self.cache:new_addresses.add(address)
+                point=self.cache.get(address) or cached_saved_position(web.address_points,address)
+                hydrated=hydrated_listing(r,point)
+                with self.lock:
+                    self.rows[r['key']]=hydrated
+                rid=r.get('storage_id')
+                if rid and rid not in seen_audit:
+                    self.storage_record_audit.append({'Supabase行ID':rid,'物件ID':r.get('property_id') or '',
+                        '家賃':r.get('rent'),'間取り':r.get('layout'),'住所':address,
+                        '取得日時':r.get('fetched_at') or '',
+                        '分類':'incremental'})
+                    seen_audit.add(rid)
+            with self.lock:
+                self.catchup_changes=len(set(self.rows)-old_keys)
+        if new_addresses:
+            for address in new_addresses:
+                remembered=self.cache.get(address) or cached_saved_position(web.address_points,address)
+                if remembered:self.cache[address]=remembered
+            missing=[a for a in new_addresses if not self.cache.get(a)]
+            points=self.db.load_address_points(missing,self.cancel_event) if missing else {}
+            self.cache.update(points)
+            missing=[a for a in missing if a not in points]
+            if missing:
+                representatives={}
+                for r in self.rows.values():
+                    if r.get('address') in missing and r['address'] not in representatives:
+                        representatives[r['address']]=r
+                newly_found={}
+                def found(address,point,error):
+                    self.last_activity_at=time.monotonic()
+                    self.done_addresses+=1
+                    if point:newly_found[address]=point
+                hydrate_saved_units(list(representatives.values()),self.bounds,self.cache,web,found)
+                if newly_found:
+                    try:self.db.save_address_points(newly_found)
+                    except AppError as exc:self.diagnostic['delta_cache_save_error']=str(exc)
+            with self.lock:
+                self.persistent_cache_hits=len(points)
+                for key,r in list(self.rows.items()):
+                    if r.get('address') in new_addresses:
+                        self.rows[key]=hydrated_listing(r,self.cache.get(r['address']))
+        # Previous legacy rows can be shadowed by newer ID-backed observations.
+        represented={hashlib.sha256(json.dumps(listing_identity_payload(r),ensure_ascii=False,sort_keys=True,separators=(',',':')).encode()).hexdigest() for r in self.rows.values() if r.get('property_id')}
+        with self.lock:
+            self.rows={key:r for key,r in self.rows.items() if r.get('property_id') or compact_listing_key(r) not in represented}
+            self.placed=sum(has_point(r) for r in self.rows.values())
+            self.total_addresses=len({r.get('address') for r in self.rows.values() if r.get('address')})
+            self.done_addresses=self.total_addresses
+            self.latest_checked_at=utc_now()
+            self.diagnostic.update(load_mode='incremental',delta_rows=len(delta_seen),returned=len(self.rows))
+            self.phase='complete'
+
     def run(self):
         web=PublicWeb();web.cancel_event=self.cancel_event;web.address_points=getattr(self.db,'address_points',None)
         def page(rows,diag):
@@ -5261,6 +5402,7 @@ class SavedLoadJob:
                     if point:self.cache[row['address']]=point
                     self.rows[row['key']]=hydrated_listing(row,point)
                 self.pages+=1;self.placed=sum(has_point(r) for r in self.rows.values());self.diagnostic=diag
+                self.last_activity_at=time.monotonic()
         def row_signature(row):
             return (row.get('property_id'),row.get('rent'),row.get('layout'),row.get('address'),listing_dwelling_type(row),row.get('fetched_at'))
         def remove_legacy_duplicates(rows):
@@ -5269,6 +5411,9 @@ class SavedLoadJob:
             rows=[r for r in rows if r.get('property_id') or compact_listing_key(r) not in represented]
             return {compact_listing_key(r):r for r in rows if compact_listing_key(r)}
         try:
+            if self.baseline is not None:
+                self.run_delta(web)
+                return
             stored=self.db.load_units(None,on_progress=page,cancel_event=self.cancel_event)
             with self.lock:
                 self.diagnostic=dict(getattr(self.db,'last_load_diagnostic',self.diagnostic) or self.diagnostic)
@@ -5278,7 +5423,11 @@ class SavedLoadJob:
             # Persistent cache is loaded in one paged DB pass.  This avoids repeating
             # GSI address searches on every click after the first successful placement.
             persistent={}
-            try:persistent=self.db.load_address_points(addresses,self.cancel_event)
+            for address in addresses:
+                hit=self.cache.get(address) or cached_saved_position(web.address_points,address)
+                if hit:self.cache[address]=hit
+            needs_lookup=[address for address in addresses if address not in self.cache]
+            try:persistent=self.db.load_address_points(needs_lookup,self.cancel_event)
             except AppError as exc:
                 with self.lock:self.diagnostic['persistent_address_cache_load_error']=str(exc)
             for address,point in persistent.items():
@@ -5378,6 +5527,13 @@ class SavedLoadJob:
         except Exception as exc:
             with self.lock:self.error=str(exc) if isinstance(exc,AppError) else '読み込みエラー（'+type(exc).__name__+'）';self.phase='failed'
         finally:
+            if self.phase=='complete' and not self.cancel_event.is_set():
+                snapshots,snapshot_lock=saved_load_snapshot_registry()
+                with self.lock:
+                    published={'build':BUILD,'as_of':self.started_at_utc,
+                        'rows':dict(self.rows),'cache':dict(self.cache),
+                        'audit':list(self.storage_record_audit),'diagnostic':dict(self.diagnostic)}
+                with snapshot_lock:snapshots[self.server_key]=published
             with self.lock:
                 self.diagnostic.update(geocoded_total=self.placed,returned=len(self.rows),database_complete=self.complete_db,
                                        persistent_address_cache_hits=self.persistent_cache_hits,newly_geocoded_addresses=self.geocoded_addresses,
@@ -5397,13 +5553,13 @@ def active_saved_load():
         return job if job and job.token==token and current_key==key else None
 
 
-def start_saved_load(bounds,cache=None,db=None):
+def start_saved_load(bounds,cache=None,db=None,force_full=False):
     db=db or Database();key=manual_registry_key(db);jobs,lock=saved_load_registry()
     with lock:
         current=jobs.get(key)
         if current and not current.snapshot()['finished']:job=current
         else:
-            job=SavedLoadJob(db,bounds,cache);jobs[key]=job;job.thread.start()
+            job=SavedLoadJob(db,bounds,cache,force_full=force_full);jobs[key]=job;job.thread.start()
     st.session_state.saved_load_token=job.token;st.session_state.saved_load_key=key
     st.session_state.pop('saved_load_export',None)
     st.session_state.pop('saved_record_audit_export',None)
@@ -5431,7 +5587,7 @@ def apply_saved_load(job):
     return True
 
 
-@st.fragment(run_every='2s')
+@st.fragment(run_every='4s')
 def saved_load_progress():
     job=active_saved_load()
     if not job:return
@@ -5447,7 +5603,9 @@ def saved_load_progress():
             st.rerun()
 
     if snap['phase']=='database':
-        st.info(f"保存物件を読み込み中｜{snap['pages']}ページ確認｜経過 {snap['elapsed']}秒")
+        st.info(f"初回全件読込中｜{snap['pages']}回通信｜{snap['raw_records']}行取得｜経過 {snap['elapsed']}秒｜最終進捗から{snap['idle_seconds']}秒")
+    elif snap['phase']=='delta':
+        st.info(f"差分読込中｜前回の保存物件{snap['rows']}件を保持｜変更分を確認中｜経過 {snap['elapsed']}秒")
     elif snap['phase']=='refreshing':
         st.info(f"最新の保存分を確認中｜地図の〇 {snap['visible_colored_dots']}個｜保存物件 {snap['rows']}件｜座標あり {snap['placed']}件｜経過 {snap['elapsed']}秒")
     elif snap['finished'] and snap['phase']=='complete':
@@ -6186,7 +6344,10 @@ class AutomaticCollection:
                 with self.lock:
                     self.last_job=job;self.current=None;self.progress=1.;self.summary['last_finished_at']=utc_now();self.summary['last_status']=status
                     self.summary['current_status']='stopped';self.summary['last_task']=conditions.get('auto_task_label',self.summary.get('current_task_label','地域判定'))
-                    self.summary['last_summary']=result.get('summary',{})
+                    # Keep a compact controller checkpoint, not full error details.
+                    self.summary['last_summary']=dict(result.get('summary',{}) or {})
+                    self.summary['last_summary']['issues']=list((
+                        self.summary['last_summary'].get('issues') or [])[-5:])
                     self.summary['saved_observations']=int(self.summary.get('saved_observations',0))+len(snap['saved'])
                     stats=result.get('summary',{})
                     for name,source in (('new_saved_observations','new_saved'),('updated_saved_observations','updated_saved'),('failed_save_observations','unsaved'),('processed_observations','processed'),('error_observations','errors'),('detail_observations','detail'),('skipped_observations','already_acquired'),('rejected_observations','rejected')):
@@ -6559,13 +6720,8 @@ def automatic_collection_panel():
     st.subheader('アプリ内の自動収集（SUUMO）')
     st.caption('画面を閉じてもサーバー稼働中は収集します。休止・再起動では止まり、次にアプリを開くと保存した設定・町の順番から再開します。')
     controller=get_automatic_collection();snap=controller.snapshot() if controller else None
-    if controller:
-        try:
-            bridged=persist_cached_controller_failures(controller)
-            if bridged:st.session_state['_compat_failures_last_saved']=bridged
-            st.session_state.pop('_compat_failures_error',None)
-        except Exception as exc:
-            st.session_state['_compat_failures_error']=str(exc) if isinstance(exc,AppError) else type(exc).__name__
+    # Legacy per-error persistence bridge intentionally disabled. Historical
+    # diagnostics can now be discarded without being written back on UI reruns.
     busy=bool(snap and snap['running'])
     st.caption('画面コード版 '+BUILD+'｜自動収集処理版 '+str(snap.get('build') or 'なし' if snap else 'なし'))
     if controller and getattr(controller,'build',None)!=BUILD and busy:
@@ -6786,6 +6942,11 @@ def main():
         if st.button('最新の保存物件を読み込む・反映',key='new_load',use_container_width=True,disabled=bool(active_job() and not active_job().snapshot()['finished'])):
             try:start_saved_load(bounds,state.get('address_point_cache'))
             except AppError as exc:st.error(str(exc))
+        if st.button('全件を再取得して再構築（必要時のみ）',key='new_load_full',use_container_width=False,
+                     disabled=bool(active_saved_load() and not active_saved_load().snapshot()['finished'])):
+            try:start_saved_load(bounds,state.get('address_point_cache'),force_full=True)
+            except AppError as exc:st.error(str(exc))
+        st.caption('初回は全件、次回以降は同じサーバー内の保存済みデータを再利用し、更新分のみDBを読みます。サーバー再起動時は初回に戻ります。')
         saved_load_progress()
         if state.get('new_notice'): st.success(state.new_notice)
         st.caption('DBには家賃・間取り・種別（マンション／一戸建て）・詳細住所（推定）・データ取得日時を保存します。読み込み時に住所を一時的に座標化して地図へ色付けし、その座標は保存しません。')
@@ -6870,6 +7031,12 @@ def main():
         st.caption('OpenStreetMapに登録された施設。登録漏れや位置の誤差がある場合があります。')
     with tabs[3]:
         st.subheader('新しいアプリの初期設定')
+        with st.expander('既存DBの整理（過去エラーのみ削除・物件は保持）',expanded=False):
+            st.warning('自動収集を停止したうえで、保存領域名をSecretsと照合してください。実行すると過去のエラーログと診断ログが削除され、復元できません。募集情報・取得済みID・町の進捗は削除しません。')
+            st.caption('以下は既定値 SUPABASE_NAMESPACE = sumai-compass 用です。別の値なら SQL 内の namespace を置換してください。')
+            st.code(DB_MAINTENANCE_SQL,language='sql')
+            st.download_button('既存エラーログ整理SQL',DB_MAINTENANCE_SQL,
+                               'supabase_cleanup_ver105.sql','text/plain')
         st.write('1．SupabaseのSQL Editorに、以下のSQLを貼り付けてRunを押してください。')
         st.code(SQL,language='sql')
         st.download_button('セットアップSQLをダウンロード',SQL,'supabase_rebuild_01.sql','text/plain')
