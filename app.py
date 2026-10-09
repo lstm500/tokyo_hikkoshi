@@ -39,7 +39,7 @@ import streamlit as st
 from streamlit_folium import st_folium
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v115"
+BUILD = "REBUILD-01-v116"
 
 # ============================================================================
 # NON-NEGOTIABLE SUUMO ADDRESS POLICY -- DO NOT DELETE OR WEAKEN
@@ -7724,6 +7724,357 @@ def automatic_collection_panel():
     st.caption('物件ID・取得成功日時は再取得の管理情報として保存します。詳細住所と募集データの保存に成功した物件だけが取得済みになります。')
     st.caption('蓄積した物件は下の「最新の保存物件を読み込む・反映」で地図へ表示できます。収集中も地図の自動再描画は行いません。')
 
+
+# ==========================================================================
+# V116: SMALL-AREA CHOROPLETH. The browser receives AREA SUMMARIES ONLY.
+# The original unit records and SUUMO collection logic are unchanged.
+# Geometry: 2015 e-Stat small-area outlines, simplified by frogcat.
+# Source: https://github.com/frogcat/japan-small-area (see its LICENSE).
+# ==========================================================================
+TOWN_SUMMARY_ID = 'map.town.average.v116'
+TOWN_GEOJSON_URL = 'https://frogcat.github.io/japan-small-area/13.json'
+TOWN_GEOJSON_BACKUP = 'https://raw.githubusercontent.com/frogcat/japan-small-area/master/docs/13.json'
+TOWN_GEOMETRY_LIMIT = 36 * 1024 * 1024
+TOWN_GROUPS = ('group1','group2','house')
+TOWN_GRADIENT = ((219,239,250),(148,202,232),(74,136,183),(231,151,148),(164,51,75),(54,12,34))
+
+
+def town_chome_key(text):
+    """Canonical ward/chome only. Never fabricate a polygon from an address."""
+    value=address_key(text).replace(' ','').replace('　','').replace('東京都/','').replace('東京都','')
+    wards=tuple(TOKYO_WARDS.values())
+    ward=next((w for w in wards if w in value),None)
+    if ward is None:return None
+    rest=value.split(ward,1)[1].lstrip('/・,、 ')
+    # Chome may be shown as 池袋2丁目, 池袋２丁目, 池袋二丁目, etc.
+    match=re.match(r'^([^/]+?\d{1,2}丁目)',rest)
+    if match:return ward+'|'+match.group(1)
+    # For a town without chome, accept only an explicit town name without an
+    # additional building number. A street address with no chome is ambiguous.
+    if re.fullmatch(r'[^/\d\-－番地号]{2,30}',rest):return ward+'|'+rest
+    return None
+
+
+def town_layout_group(row):
+    if listing_dwelling_type(row)=='house':return 'house'
+    layout=parsed_layout(row.get('layout'))
+    if layout in DISPLAY_LAYOUT_GROUPS['group1']:return 'group1'
+    if layout in DISPLAY_LAYOUT_GROUPS['group2']:return 'group2'
+    return None
+
+
+def town_rent_gradient(price):
+    """Continuous pale blue -> dark burgundy gradient. Clip 8-45 man yen."""
+    value=max(0.,min(1.,(float(price)-80000.)/370000.))*(len(TOWN_GRADIENT)-1)
+    lo=min(len(TOWN_GRADIENT)-2,int(value));fraction=value-lo
+    rgb=tuple(round(a+(b-a)*fraction) for a,b in zip(TOWN_GRADIENT[lo],TOWN_GRADIENT[lo+1]))
+    return '#'+''.join(f'{c:02x}' for c in rgb)
+
+
+def town_aggregate_record(raw_rows):
+    """Pure, deterministic summary. Rows are (storage_id, compact listing)."""
+    latest={}
+    examined=0
+    for storage_id,listing in raw_rows:
+        examined+=1
+        compact=compact_saved_listing(listing)
+        if compact is None:continue
+        group=town_layout_group(compact);town=town_chome_key(compact['address'])
+        if not group or not town:continue
+        identity=compact.get('property_id') or 'legacy:'+str(storage_id)
+        stamp=compact.get('fetched_at') or ''
+        if identity not in latest or latest[identity][0]<=stamp:
+            latest[identity]=(stamp,group,town,compact['rent'])
+    totals={group:{} for group in TOWN_GROUPS}
+    for _,group,town,rent in latest.values():
+        node=totals[group].setdefault(town,[0,0]);node[0]+=int(rent);node[1]+=1
+    return {'schema':1,'groups':totals,'listing_count':len(latest),
+            'examined':examined,'unmatched':examined-len(latest),'updated_at':utc_now()}
+
+
+class TownSummaryWorker:
+    """A single namespace worker builds a compact snapshot and persists it once.
+
+    While the map is browsed, no individual listing GET occurs. Auto collection
+    keeps writing normal source listings; a user can refresh the area snapshot.
+    """
+    def __init__(self,db):
+        self.db=db;self.lock=threading.RLock();self.running=False;self.progress=0
+        self.ready=False;self.summary=None;self.message='';self.error='';self.thread=None
+        self.initialized=False
+    def initialize(self):
+        with self.lock:
+            if self.initialized:return
+            self.initialized=True
+        try:
+            records=self.db.call('GET',SEARCH_TABLE,{'namespace':'eq.'+self.db.namespace,
+                'id':'eq.'+TOWN_SUMMARY_ID,'select':'summary','limit':1})
+            summary=(records[0].get('summary') if records else None) if isinstance(records,list) else None
+            if isinstance(summary,dict) and summary.get('schema')==1 and isinstance(summary.get('groups'),dict):
+                with self.lock:self.summary=summary;self.ready=True
+        except Exception as exc:
+            with self.lock:self.error='町丁目集計の保存データを確認できません: '+str(exc)
+    def start(self):
+        with self.lock:
+            if self.running:return False
+            self.running=True;self.progress=0;self.error='';self.message='町丁目の家賃を裏で集計中'
+            self.thread=threading.Thread(target=self.run,daemon=True,name='town-rent-aggregate')
+            self.thread.start();return True
+    def run(self):
+        try:
+            rows=[];last_id='';page=0;page_size=300;started=utc_now()
+            # Use index (namespace,id), not a full diagnostic/search-log scan.
+            # Keep only compact fields in memory; no latitude, longitude or HTML.
+            while True:
+                if cloud_memory_pressure() and (cloud_memory_pressure() or {}).get('ratio',0)>.82:
+                    raise AppError('サーバーメモリ保護により町丁目集計を中断しました。')
+                params={'namespace':'eq.'+self.db.namespace,'select':'id,summary',
+                    'status':'eq.rental_listing','and':'(id.gte.listing.,id.lt.listing/)',
+                    'order':'id.asc','limit':page_size}
+                if last_id:params['id']='gt.'+last_id
+                while True:
+                    try:
+                        got=self.db.call('GET',SEARCH_TABLE,params)
+                        break
+                    except AppError as exc:
+                        diag=getattr(exc,'diagnostic',{}) or {}
+                        if (diag.get('code')=='57014' or diag.get('status') in (500,502,503,504)) and page_size>50:
+                            page_size=max(50,page_size//2)
+                            params['limit']=page_size
+                            continue
+                        raise
+                if not isinstance(got,list):raise AppError('募集データの応答形式が不正です。')
+                if not got:break
+                for item in got:
+                    body=(item.get('summary') or {}).get('listing')
+                    if isinstance(body,dict):rows.append((item.get('id'),body))
+                next_id=str(got[-1].get('id') or '')
+                if not next_id or next_id<=last_id:raise AppError('町丁目集計のページ位置が進みません。')
+                last_id=next_id;page+=1
+                with self.lock:self.progress=page;self.message=f'集計元を確認中：{page}ページ'
+                if len(got)<page_size:break
+            summary=town_aggregate_record(rows)
+            summary['started_at']=started
+            # Persist the new snapshot only after the FULL scan succeeds.
+            # Never overwrite a usable snapshot on partial/failed collection.
+            self.db.save_search({'id':TOWN_SUMMARY_ID,'status':'town_rent_summary',
+                'started_at':summary['updated_at'],'finished_at':summary['updated_at'],
+                'conditions':{'schema':1,'source':'rental_listing'},'summary':summary})
+            with self.lock:self.summary=summary;self.ready=True;self.message='集計完了';self.error=''
+        except Exception as exc:
+            with self.lock:self.error=str(exc);self.message='集計を更新できませんでした。以前の集計は保持します。'
+        finally:
+            with self.lock:self.running=False
+    def snapshot(self):
+        with self.lock:return {'summary':self.summary,'ready':self.ready,'running':self.running,
+                               'progress':self.progress,'message':self.message,'error':self.error}
+
+
+@st.cache_resource
+def town_summary_registry():
+    return {},threading.RLock()
+
+
+def current_town_summary_worker():
+    jobs,lock=town_summary_registry();db=Database();key=manual_registry_key(db)+'|town-v116'
+    with lock:
+        job=jobs.get(key)
+        if job is None:
+            job=TownSummaryWorker(db);jobs[key]=job
+    job.initialize()
+    if not job.snapshot()['ready'] and not job.snapshot()['running'] and not job.snapshot()['error']:
+        job.start()
+    return job
+
+
+def _town_ring_simplify(ring,step=0.00015):
+    """Compact ring for mobile: coarse quantization removes neighboring duplicates."""
+    out=[];prev=None
+    for p in ring:
+        if not isinstance(p,(list,tuple)) or len(p)<2:continue
+        q=(round(float(p[0])/step)*step,round(float(p[1])/step)*step)
+        if q!=prev:out.append([round(q[0],6),round(q[1],6)]);prev=q
+    if len(out)>130:
+        stride=math.ceil(len(out)/125);out=out[::stride]
+    if len(out)<3:return []
+    if out[0]!=out[-1]:out.append(out[0])
+    return out if len(out)>=4 else []
+
+
+def town_boundary_geometry(geom):
+    if not isinstance(geom,dict):return None
+    kind=geom.get('type');coords=geom.get('coordinates') or []
+    def polygon(poly):
+        rings=[_town_ring_simplify(ring) for ring in poly]
+        return [r for r in rings if r]
+    if kind=='Polygon':
+        rings=polygon(coords)
+        return {'type':'Polygon','coordinates':rings} if rings else None
+    if kind=='MultiPolygon':
+        polys=[polygon(p) for p in coords]
+        polys=[p for p in polys if p]
+        return {'type':'MultiPolygon','coordinates':polys} if polys else None
+    return None
+
+
+class TownBoundaryWorker:
+    def __init__(self):
+        self.lock=threading.Lock();self.started=False;self.running=False
+        self.features={};self.ready=False;self.error=''
+    def start(self):
+        with self.lock:
+            if self.started:return
+            self.started=True;self.running=True
+        threading.Thread(target=self.run,daemon=True,name='town-boundaries').start()
+    def run(self):
+        try:
+            # Bounded download (disk-backed) and incremental JSON feature parsing.
+            raw=None;last_exception=None
+            for source_url in (TOWN_GEOJSON_URL,TOWN_GEOJSON_BACKUP):
+                try:
+                    with tempfile.TemporaryFile(mode='w+b') as handle:
+                        size=0
+                        with requests.get(source_url,timeout=(6,25),stream=True,
+                                          headers={'User-Agent':'SumaiCompassTownMap/1.0'}) as response:
+                            response.raise_for_status()
+                            for chunk in response.iter_content(65536):
+                                size+=len(chunk)
+                                if size>TOWN_GEOMETRY_LIMIT:raise ValueError('境界ファイルが上限を超えました。')
+                                handle.write(chunk)
+                        handle.seek(0);raw=handle.read().decode('utf-8-sig')
+                    break
+                except (requests.RequestException,OSError,UnicodeError,ValueError) as exc:
+                    last_exception=exc
+            if raw is None:raise ValueError('町丁目境界を取得できません：'+str(last_exception))
+            marker=re.search(r'"features"\s*:\s*\[',raw)
+            if marker is None:raise ValueError('町丁目境界のGeoJSONを解釈できません。')
+            decoder=json.JSONDecoder();pos=marker.end();total={}
+            while pos<len(raw):
+                while pos<len(raw) and raw[pos] in ' \r\n\t,':pos+=1
+                if pos>=len(raw) or raw[pos]==']':break
+                item,pos=decoder.raw_decode(raw,pos)
+                props=item.get('properties') or {}
+                fullname=str(props.get('fullname') or '')
+                # '東京都/豊島区/池袋二丁目'; key normalization handles kanji numerals.
+                key=town_chome_key(fullname.replace('/',''))
+                if key is None:continue
+                geometry=town_boundary_geometry(item.get('geometry'))
+                if geometry is None:continue
+                # Preserve disjoint census subareas by collecting geometries.
+                total.setdefault(key,[]).append(geometry)
+            if not total:raise ValueError('東京23区の町丁目境界が見つかりません。')
+            compact={}
+            for key,shapes in total.items():
+                polys=[]
+                for shape in shapes:
+                    if shape['type']=='Polygon':polys.append(shape['coordinates'])
+                    else:polys.extend(shape['coordinates'])
+                all_points=[p for polygon in polys for ring in polygon for p in ring]
+                if not all_points:continue
+                compact[key]={'type':'MultiPolygon','coordinates':polys,
+                              'bbox':(min(p[1] for p in all_points),min(p[0] for p in all_points),
+                                      max(p[1] for p in all_points),max(p[0] for p in all_points))}
+            with self.lock:self.features=compact;self.ready=True;self.error=''
+        except Exception as exc:
+            with self.lock:self.error=str(exc)
+        finally:
+            with self.lock:self.running=False
+    def snapshot(self):
+        with self.lock:return self.features,self.ready,self.running,self.error
+
+
+@st.cache_resource
+def town_boundary_registry():
+    return TownBoundaryWorker()
+
+
+def town_colored_shapes(groups,group,features,bounds,max_features=700):
+    """Only simplified GEO polygons and town-level summaries reach Leaflet."""
+    counts=(groups or {}).get(group,{})
+    found=[]
+    for key,area in features.items():
+        record=counts.get(key)
+        if not record or not record[1]:continue
+        sb=area['bbox']
+        if bounds and (sb[0]>bounds[2] or sb[2]<bounds[0] or sb[1]>bounds[3] or sb[3]<bounds[1]):continue
+        rent_total,count=record
+        avg=rent_total/count
+        found.append((key,area,avg,count))
+    # At wide zooms prioritize higher sample count; other areas are available on zoom-in.
+    found.sort(key=lambda x:(-x[3],x[0]))
+    limited=len(found)>max_features
+    selected=found[:max_features]
+    collection={'type':'FeatureCollection','features':[
+        {'type':'Feature','geometry':{'type':'MultiPolygon','coordinates':shape['coordinates']},
+         'properties':{'name':key.replace('|',' '),'avg':round(avg),
+                       'price_label':f'{avg/10000:.1f}万円','count_label':f'{cnt}件',
+                       'color':town_rent_gradient(avg)}}
+        for key,shape,avg,cnt in selected]}
+    return collection,limited,len(found)
+
+
+@st.fragment(run_every='12s')
+def interactive_town_choropleth(group,facilities):
+    state=st.session_state
+    store=current_town_summary_worker();snap=store.snapshot()
+    # After an automatic collection run ends, refresh the precomputed snapshot ONCE.
+    # Do not rebuild at every listing save; that would recreate DB contention.
+    automatic=get_automatic_collection()
+    automatic_running=bool(automatic and automatic.snapshot().get('running'))
+    if state.get('_v116_was_collecting') and not automatic_running and not snap['running']:
+        store.start();snap=store.snapshot()
+    state['_v116_was_collecting']=automatic_running
+    boundaries=town_boundary_registry();boundaries.start()
+    shapes,ready,busy,error=boundaries.snapshot()
+    if snap['running']:st.caption(f"町丁目家賃の事前集計中｜{snap['progress']}ページ｜地図は操作できます")
+    if snap['error']:st.warning('町丁目集計：'+snap['error'])
+    if busy:st.caption('町丁目の境界を裏で準備しています。')
+    if error:st.warning('町丁目境界の取得に失敗しました：'+error+'。架空の区域は塗りません。')
+    if st.button('町丁目平均家賃を更新',key='refresh_town_aggregate',disabled=snap['running']):
+        store.start();st.rerun()
+    bounds=state.get('new_bounds')
+    center=bounds_center(bounds) if bounds else state.get('new_view_center',DEFAULT_CENTER)
+    if bounds and len(bounds)==4:
+        south,west,north,east=map(float,bounds)
+        # Cover the currently visible map plus a margin to avoid load on every pan.
+        lat_pad=max(.008,(north-south)*.5);lng_pad=max(.008,(east-west)*.5)
+        window=(south-lat_pad,west-lng_pad,north+lat_pad,east+lng_pad)
+    else:
+        window=(center[0]-.035,center[1]-.045,center[0]+.035,center[1]+.045)
+    grouped=(snap['summary'] or {}).get('groups') or {}
+    geo,limited,count=town_colored_shapes(grouped,group,shapes if ready else {},window)
+    if limited:st.caption('広域表示のため上位700町丁目を描画しています。拡大すると他の町丁目も表示されます。')
+    elif ready and snap['ready']:st.caption(f'集計済みの区域 {count}町丁目｜最終集計 {acquisition_time_jst(snap["summary"].get("updated_at"))}')
+    if not snap['ready']:st.caption('初回の家賃集計が完了すると町丁目の色が付きます。物件単位の点は表示しません。')
+    signature=(group,tuple(round(v,4) for v in window),
+               (snap['summary'] or {}).get('updated_at'),len(geo['features']),ready,BUILD)
+    cached=state.get('_v116_choropleth_map')
+    if not isinstance(cached,dict) or cached.get('signature')!=signature:
+        # No individual listing is materialized or sent to the map.
+        m=rental_map([],center,1500,[],facilities)
+        if geo['features']:
+            layer=folium.GeoJson(geo,name='町丁目平均家賃',smooth_factor=1.6,
+                style_function=lambda f:{'fillColor':f['properties']['color'],
+                    'color':'#56616a','weight':0.8,'fillOpacity':0.58},
+                highlight_function=lambda f:{'color':'#22313f','weight':1.8,'fillOpacity':0.75})
+            folium.GeoJsonTooltip(fields=['name','price_label','count_label'],
+                aliases=['町丁目','平均家賃','募集件数'],labels=True,sticky=True).add_to(layer)
+            layer.add_to(m)
+        state['_v116_choropleth_map']={'signature':signature,'map':m}
+    else:m=cached['map']
+    data=st_folium(m,key='new_map_v116_'+str(state.get('_v116_reset_count',0)),
+                   height=480,use_container_width=True,returned_objects=['bounds'],
+                   on_change=capture_map_fragment_v115)
+    if isinstance(data,dict):
+        current=viewport_bounds(data)
+        if current:
+            state['new_bounds']=current;state['new_view_center']=bounds_center(current);state['new_map']=data
+    if st.button('地図が表示されない場合は再初期化',key='reset_v116_map'):
+        state.pop('_v116_choropleth_map',None)
+        state['_v116_reset_count']=int(state.get('_v116_reset_count',0))+1
+        st.rerun()
+
+
 def main():
     st.set_page_config(page_title='住まいコンパス｜新しい住まいを探す',page_icon='🏡',layout='wide',initial_sidebar_state='collapsed')
     st.markdown(CSS,unsafe_allow_html=True)
@@ -7742,13 +8093,14 @@ def main():
     preferences=state.get('new_preferences',{})
     try:state.current_storage_key=manual_registry_key(Database())
     except Exception:state.current_storage_key=None
-    restore_saved_display()
+    # Choropleth display does not auto-restore thousands of old per-listing points.
+    # The Saved Data tab can still load them explicitly for detailed export.
     tabs=st.tabs(['住まいを探す','保存データ','通勤・周辺施設','初期設定'])
     with tabs[0]:
         st.subheader('地図を動かして、探す地域を表示してください')
         st.caption('地図に見えている四角い範囲が検索対象です。駅名の選択や取得件数の上限はありません。')
-        st.caption('駅名は拡大すると周辺駅まで表示されます。重なる駅名は自動で間引き、物件の点より上に表示します。')
-        st.caption('検索中の取得済み物件は「取得済みデータを地図へ反映」で表示できます。進捗と中断ボタンは地図のすぐ下に表示します。')
+        st.caption('駅名は拡大すると周辺駅まで表示されます。重なる駅名は自動で間引きます。')
+        st.caption('保存物件は裏側で町丁目ごとに集計します。検索・保存は従来どおり継続し、地図は集計済みの区域だけを表示します。')
         st.caption('保存する募集データは家賃・間取り・種別（マンション／一戸建て）・詳細住所（推定）・データ取得日時です。地図画像や緯度経度は保存しません。')
         selected_group=state.get('layout_display_group','group1')
         if selected_group not in ('group1','group2','house'):selected_group='group1';state.layout_display_group='group1'
@@ -7760,43 +8112,20 @@ def main():
         if g3.button('一戸建て',key='layout_group_house',type='primary' if selected_group=='house' else 'secondary',use_container_width=True):
             if state.layout_display_group!='house':state.layout_display_group='house';st.rerun()
         selected_group=state.get('layout_display_group','group1')
-        selected_layouts=set(DISPLAY_LAYOUT_GROUPS[selected_group]) if selected_group in DISPLAY_LAYOUT_GROUPS else set()
         display_label={'group1':'1LDK・2K・2DK','group2':'2LDK・3K・3DK','house':'一戸建て'}[selected_group]
-        st.caption('表示中：'+display_label+'。保存データ自体は変更せず、地図・件数・一覧だけを切り替えます。')
+        st.caption('表示中：'+display_label+'。物件は町丁目ごとに事前集計し、地図には区域の平均家賃のみ渡します。')
         bounds=state.get('new_bounds')
         center=bounds_center(bounds) if bounds else state.get('new_view_center',DEFAULT_CENTER)
         radius=bounds_radius(bounds) if bounds else 1500
-        if state.get('new_map_loaded'):
-            if selected_group=='house':map_units=[r for r in state.new_units if listing_dwelling_type(r)=='house']
-            else:map_units=[r for r in state.new_units if listing_dwelling_type(r)!='house' and parsed_layout(r.get('layout')) in selected_layouts]
-        else:map_units=[]
-        rows,pins,cells,display_report=display_pipeline(map_units,bounds,state.get('new_load_diagnostic'))
-        job=active_job()
-        if job:
-            map_signature=(tuple(bounds) if bounds else None,len(map_units),tuple(display_report['stages'].values()),tuple(display_report['map'].values()))
-            if state.get('diagnostic_map_signature')!=map_signature:
-                state.diagnostic_map_signature=map_signature
-                job.audit.add('map','render','INFO',{'bounds':bounds,'loaded_units':len(map_units),'aggregation':False,'monthly_limit':None,'renderer':'Canvas','display_stages':display_report['stages'],'display_reasons':display_report['reason_counts'],'display_map':display_report['map']})
         facilities=[f for f in state.new_facilities if bounds and in_rectangle((f['lat'],f['lng']),bounds)]
-        # Leaflet clips points to its viewport. Keeping every loaded point in the layer
-        # lets a pan reveal previously off-screen properties without a full app rerun.
-        def legend_chip(color,label,emphasis=False):
-            return (f'<span style="display:inline-flex;align-items:center;gap:5px;padding:3px 7px;'
-                    f'border-radius:999px;border:{"1.5px" if emphasis else "1px"} solid #c7cec9;'
-                    f'background:#ffffff;color:#203b38;font-size:12px;font-weight:{700 if emphasis else 500}">'
-                    f'<i style="display:inline-block;width:11px;height:11px;border-radius:50%;background:{color};'
-                    f'border:1px solid #ffffff;box-shadow:0 0 0 1px #6f7773"></i>{label}</span>')
-        legend=(
-            '<div style="display:flex;flex-wrap:wrap;gap:5px 7px;margin:2px 0 5px">'+
-            ''.join(legend_chip(color,label,True) for color,label in zip(COLORS[:5],RENT_BAND_LABELS[:5]))+
-            '</div><div style="display:flex;flex-wrap:wrap;gap:5px 7px;margin:0 0 8px">'+
-            ''.join(legend_chip(color,label,False) for color,label in zip(COLORS[5:],RENT_BAND_LABELS[5:]))+
-            '</div>')
-        st.markdown(legend,unsafe_allow_html=True)
-        interactive_rental_map(map_units,cells,facilities)
-        if st.button('現在の範囲の件数・一覧を更新',key='refresh_viewport_summary'):
-            st.rerun()
-        st.caption('地図を動かすと読み込み済みの物件を表示します。下の件数・一覧は「現在の範囲の件数・一覧を更新」で更新できます。')
+        # Pale blue -> burgundy: continuous town-average price instead of listing dots.
+        st.markdown('<div style="font-size:13px;margin:3px 0 4px">町丁目別・平均家賃（万円）</div>'
+            '<div style="height:13px;border-radius:5px;background:linear-gradient(90deg,'
+            '#dbef fa,#94cae8,#4a88b7,#e79794,#a4334b,#360c22)"'.replace('#dbef fa','#dbeffa')+
+            '></div><div style="display:flex;justify-content:space-between;font-size:11px">'
+            '<span>8万円以下・薄い青</span><span>45万円以上・濃い赤黒</span></div>',unsafe_allow_html=True)
+        interactive_town_choropleth(selected_group,facilities)
+        st.caption('実際の町丁目境界だけを着色します。物件0件・未照合の区域は地図の下地色です。境界：2015年e-Stat由来（frogcat加工）。現在の町丁目と一部異なる場合があります。')
         # Fragment owns its widget container directly, including partial reruns.
         background_progress()
         # Initial component defaults are not real viewport bounds. Only the browser callback makes the search ready.
@@ -7841,30 +8170,7 @@ def main():
             if result.get('conditions',{}).get('regions'):
                 with st.expander('今回検索した地名・丁目'):
                     for label in result['conditions']['regions']: st.write(label)
-        st.caption('KPIは地図の〇の数です。家賃色を付けて地図上で区別できる座標位置を1個として数え、同一座標への重なりで水増ししません。保存物件件数とは別です。')
-        if state.get('new_map_loaded'):display_diagnostic_downloads(display_report,map_units,bounds,state.get('new_load_diagnostic'))
-        c1,c2,c3,c4=st.columns(4)
-        c1.metric('地図の〇（KPI）',display_report['map']['colored_unique_positions'])
-        c2.metric('現在の範囲の募集',len(rows))
-        c3.metric('家賃帯のある募集',display_report['map']['colored_points'])
-        c4.metric('位置未確認の募集',display_report['map']['unconfirmed_positions'])
-        if not state.get('new_map_loaded'):st.info('取得済みデータは「地図へ反映」で表示します。保存データは「保存データ」から読み込めます。')
-        elif not rows:st.info('この表示範囲に配置できる保存データがありません。')
-        if rows:
-            with st.expander('募集を1件ずつ確認'):
-                listing_token=(id(state.new_units),len(state.new_units),selected_group)
-                if st.button('募集一覧を準備',key='mobile_prepare_listing_select'):
-                    state['_mobile_listing_select_ready']=listing_token
-                if state.get('_mobile_listing_select_ready')==listing_token:
-                    chosen=st.selectbox('確認する募集',rows,format_func=lambda r:(r.get('title') or '')+'｜'+str(r.get('layout') or '間取り未確認')+'｜'+(f"{monthly_price(r)/10000:g}万円" if r.get('rent') else '家賃未確認')+'｜'+r['key'][:8],key='individual_listing')
-                    st.markdown(listing_card(chosen,chosen['key'] in state.new_saved_keys),unsafe_allow_html=True)
-        if rows:
-            with st.expander('取得できた情報をすべて表で見る（未確認も保持）'):
-                table_token=(id(state.new_units),len(state.new_units),selected_group)
-                if st.button('募集データの表を準備',key='mobile_prepare_listing_table'):
-                    state['_mobile_listing_table_ready']=table_token
-                if state.get('_mobile_listing_table_ready')==table_token:
-                    st.dataframe([{'物件ID':r.get('property_id','未記録'),'種別':'一戸建て' if listing_dwelling_type(r)=='house' else 'マンション','家賃（万円）':float(r['rent'])/10000 if r.get('rent') else None,'間取り':r.get('layout'),'住所（推定）':r.get('address'),'データ取得日時':acquisition_time_jst(r.get('fetched_at'))} for r in physical_units(rows)],hide_index=True)
+        st.caption('町丁目別の集計対象は保存済みの募集データです。件数と平均家賃は区・町丁目単位で集計します。')
     with tabs[1]:
         if state.get('saved_map_restore_message'):st.caption(state.saved_map_restore_message)
         automatic_collection_panel()
@@ -7880,7 +8186,7 @@ def main():
         st.caption('初回は全件、次回以降は同じサーバー内の保存済みデータを再利用し、更新分のみDBを読みます。サーバー再起動時は初回に戻ります。')
         saved_load_progress()
         if state.get('new_notice'): st.success(state.new_notice)
-        st.caption('DBには家賃・間取り・種別（マンション／一戸建て）・詳細住所（推定）・データ取得日時を保存します。読み込み時に住所を一時的に座標化して地図へ色付けし、その座標は保存しません。')
+        st.caption('DBには家賃・間取り・種別・推定住所・取得日時を保存します。この画面の個別物件読込は一覧・CSV等の詳細確認用です。地図の着色は町丁目集計のみを使用します。')
         if st.button('現在の物件データCSVを準備',key='mobile_prepare_units_csv'):
             state['_mobile_units_export']={'key':(id(state.new_units),len(state.new_units)),
                 'bytes':csv_bytes(state.new_units)}
