@@ -39,7 +39,7 @@ import streamlit as st
 from streamlit_folium import st_folium
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v112"
+BUILD = "REBUILD-01-v113"
 
 # ============================================================================
 # NON-NEGOTIABLE SUUMO ADDRESS POLICY -- DO NOT DELETE OR WEAKEN
@@ -1108,7 +1108,7 @@ def remember_saved_position(memory,address,point):
     except (ValueError,TypeError):return
     with memory['lock']:
         points=memory['points']
-        if len(points)>=12000 and normal(address) not in points:points.pop(next(iter(points)))
+        if len(points)>=3000 and normal(address) not in points:points.pop(next(iter(points)))
         points[normal(address)]=(time.monotonic(),(float(lat),float(lng),str(title)))
 
 
@@ -1437,14 +1437,9 @@ class Database:
         display_rows=property_rows+unmatched
         unique=list({r['key']:r for r in display_rows}.values())
         shadowed_storage_ids={r.get('storage_id') for r in shadowed}
+        # Full per-record audit duplicates the entire listing table in RAM.
+        # Record-level export is prepared lazily from the already loaded rows.
         self.last_load_record_audit=[]
-        for r in out:
-            if r.get('property_id'):classification='物件ID確認済み・地図表示対象'
-            elif r.get('storage_id') in shadowed_storage_ids:classification='旧形式IDなし・ID確認済みデータと家賃/間取り/住所一致・二重表示候補'
-            else:classification='旧形式IDなし・独立レコード・地図表示対象'
-            self.last_load_record_audit.append({'Supabase行ID':r.get('storage_id'),'物件ID':r.get('property_id') or '',
-                '家賃':r.get('rent'),'間取り':r.get('layout'),'住所':r.get('address'),'取得日時':r.get('fetched_at') or '',
-                '分類':classification})
         self.last_load_diagnostic.update(property_id_records=len(property_rows),legacy_records=len(legacy_rows),legacy_shadowed=len(shadowed),
                                          legacy_unmatched=len(unmatched),before_key_merge=len(display_rows),key_duplicates=len(display_rows)-len(unique),returned=len(unique))
         return unique
@@ -1982,7 +1977,9 @@ class PublicWeb:
                     browser_exc.diagnostic=diagnostic;self.homes_browser_error=str(browser_exc)
                     raise browser_exc from None
             message=f'{u.hostname}：HTTP {exc.response.status_code}（公開ページの取得失敗）。'
-            if method=='GET' and not kwargs.get('params'):self.failed_detail_urls[url]=message
+            if method=='GET' and not kwargs.get('params'):
+                if len(self.failed_detail_urls)>=256:self.failed_detail_urls.pop(next(iter(self.failed_detail_urls)),None)
+                self.failed_detail_urls[url]=message
             error=AppError(message);error.diagnostic={**self.response_info(exc.response),'status':exc.response.status_code}
             if u.hostname=='cyberjapandata.gsi.go.jp' and u.path.startswith('/xyz/experimental_jhj/') and exc.response.status_code==404:
                 code=re.search(r'<Code>([^<]+)</Code>',exc.response.text[:4096])
@@ -1994,7 +1991,8 @@ class PublicWeb:
             error=AppError(f'{u.hostname}：接続できません（DNS・ネットワーク・接続先を確認）。');error.diagnostic={'exception_type':type(exc).__name__,'reason':'接続経路の通信失敗'};raise error from None
         except requests.RequestException: raise AppError(f'{u.hostname}：通信処理に失敗しました。') from None
         response.encoding='utf-8' if 'gsi.go.jp' in u.hostname else response_encoding(response)
-        if method=='GET' and not kwargs.get('params') and '/chintai/' in u.path:self.http_cache[url]=response
+        # Do not store this full response under a second URL key. fetch() owns
+        # a single bounded cache, preventing duplicate in-memory HTML documents.
         return response
     def fetch(self,url,method='GET',**kwargs):
         self.check_cancel()
@@ -2015,10 +2013,20 @@ class PublicWeb:
             return flight.result()
         try:
             result=self._fetch_uncached(url,method,**kwargs)
-            with self.cache_lock:self.http_cache[key]=result
-            if geo:
+            # Retain only small, recent responses. A Response includes headers,
+            # decoded body and transport metadata; thousands of these exhaust RAM.
+            # In-flight deduplication still serves simultaneous callers regardless
+            # of cache retention. Never truncate the response returned to parsers.
+            response_bytes=len(result.content)
+            if response_bytes<=160_000:
+                with self.cache_lock:
+                    if len(self.http_cache)>=32:
+                        self.http_cache.pop(next(iter(self.http_cache)),None)
+                    self.http_cache[key]=result
+            if geo and response_bytes<=96_000:
                 with GEO_HTTP_LOCK:
-                    if len(GEO_HTTP_CACHE)>12000:GEO_HTTP_CACHE.clear()
+                    if len(GEO_HTTP_CACHE)>=64:
+                        GEO_HTTP_CACHE.pop(next(iter(GEO_HTTP_CACHE)),None)
                     GEO_HTTP_CACHE[key]=(time.monotonic(),result)
             flight.set_result(result);return result
         except BaseException as exc:
@@ -2142,7 +2150,7 @@ def _property_value(props,exact=(),contains=()):
 def _cache_jhj_features(web,key,features,cached_at=None):
     with web.cache_lock:
         cache=web.jhj_tile_cache;times=web.jhj_tile_cached_at
-        if key not in cache and len(cache)>=512:
+        if key not in cache and len(cache)>=48:
             oldest=next(iter(cache));cache.pop(oldest,None);times.pop(oldest,None)
         cache[key]=features;times[key]=time.monotonic() if cached_at is None else cached_at
 
@@ -2169,7 +2177,7 @@ def _jhj_tile(web,x,y,z=18):
         if diagnostic.get('status')==404 and diagnostic.get('server_error_code')=='NoSuchKey':
             _cache_jhj_features(web,key,[])
             with GEO_HTTP_LOCK:
-                if len(GEO_EMPTY_ADDRESS_TILES)>12000:GEO_EMPTY_ADDRESS_TILES.clear()
+                if len(GEO_EMPTY_ADDRESS_TILES)>1000:GEO_EMPTY_ADDRESS_TILES.clear()
                 GEO_EMPTY_ADDRESS_TILES[key]=time.monotonic()
             trace(web,'address_tile_empty',{'url':url,'tile':list(key),'status':404,'server_error_code':'NoSuchKey','reason':'この住所タイルのオブジェクトが存在しないため空タイルとして扱う'},stage='address.tiles')
             return []
@@ -2194,7 +2202,7 @@ def map_point_to_residential_address(web,point,munis,max_distance_m=90,expected_
     if result and reference:remember_saved_position(web.address_points,result['address'],(*reference,result['address']))
     with web.cache_lock:
         cache=web.address_result_cache
-        if len(cache)>=12000:cache.pop(next(iter(cache)))
+        if len(cache)>=768:cache.pop(next(iter(cache)))
         cache[key]=(time.monotonic(),dict(result) if result else None)
     return result
 
@@ -3879,7 +3887,7 @@ def suumo_location_from_kankyo_image(web,detail_soup,detail_url,bounds,munis,exp
         location['address_identity_sources']=external.get('external_hosts',[])
         location['address_identity_evidence']=external.get('identity_evidence',[])
     with web.cache_lock:
-        if len(web.suumo_location_cache)>=12000:web.suumo_location_cache.pop(next(iter(web.suumo_location_cache)))
+        if len(web.suumo_location_cache)>=512:web.suumo_location_cache.pop(next(iter(web.suumo_location_cache)))
         web.suumo_location_cache[cache_key]=dict(location)
     trace(web,'location_ok',{'source':'SUUMO物件固有地図','map_hint':[lat,lng],'map_derived_address':address,'external_identity_used':external_used,'location':location},stage='location')
     return location
@@ -4317,7 +4325,9 @@ def provider_region_request(web,provider,region,munis,requested):
 
     else:raise AppError(provider+'の検索方式がありません。')
 
-    with web.provider_lock:web.provider_cache[cache_key]=dict(request)
+    with web.provider_lock:
+        if len(web.provider_cache)>=96:web.provider_cache.pop(next(iter(web.provider_cache)))
+        web.provider_cache[cache_key]=dict(request)
     trace(web,'provider_region_discovered',{'provider':provider,'region':region.get('label'),'city':city,'town':town,'request':request},stage='search_conditions')
     return request
 
@@ -4479,7 +4489,9 @@ def public_portal_collect(web,region,bounds,munis,emit,provider):
             trace(web,'page_end',{'provider':provider,'region':region['label'],'page':page,'new_candidates':len(found),'next_url':next_url},stage='pagination')
             if not next_url:break
             current=next_url;page+=1
-        with web.provider_lock:web.provider_cache[cache_key]=list(links)
+        with web.provider_lock:
+            if len(web.provider_cache)>=96:web.provider_cache.pop(next(iter(web.provider_cache)))
+            web.provider_cache[cache_key]=list(links)
     if not links:
         raise AppError(provider+'で'+region['label']+'の募集詳細URLを公開一覧から確認できません。')
 
@@ -5832,7 +5844,9 @@ def hydrate_saved_units(rows,bounds,cache=None,web=None,notify=None):
         if address is None:continue
         cache[address]=point if not error else None
         if notify:notify(address,cache[address],error)
-    return [hydrated_listing(row,cache.get(row.get('address'))) for row in rows],cache
+    # The callers already update their own rows in notify(); avoid building
+    # another 12,000 full dictionaries solely to discard the returned list.
+    return rows,cache
 
 
 @st.cache_resource
@@ -5854,14 +5868,23 @@ class SavedLoadJob:
         self.lock=threading.RLock();self.cancel_event=threading.Event();self.rows={};self.cache={}  # Session points lack timestamps; reuse only the TTL-controlled server cache.
         self.phase='database';self.finished=False;self.error='';self.complete_db=False;self.pages=0;self.total_addresses=0;self.done_addresses=0;self.placed=0;self.persistent_cache_hits=0;self.geocoded_addresses=0;self.diagnostic={};self.started=time.monotonic();self.started_at_utc=utc_now();self.ended=None
         self.catchup_rounds=0;self.catchup_rows=0;self.catchup_changes=0;self.latest_checked_at=None;self.storage_record_audit=[]
+        self._map_metrics=(0,0);self._map_metrics_at=0.;self._map_metrics_count=-1;self._map_metrics_phase=''
         self.thread=threading.Thread(target=self.run,daemon=True,name='housing-saved-loader')
     def snapshot(self):
         with self.lock:
             end=self.ended if self.ended is not None else time.monotonic();diag=dict(self.diagnostic or {})
+            # Do not scan every saved listing on every 8-second UI poll.
+            if (self.phase!='database' and
+                (self.phase!=self._map_metrics_phase or len(self.rows)!=self._map_metrics_count or
+                 end-self._map_metrics_at>=30)):
+                self._map_metrics=(unique_map_position_count(self.rows.values()),
+                                   visible_colored_dot_count(self.rows.values()))
+                self._map_metrics_at=end;self._map_metrics_count=len(self.rows);self._map_metrics_phase=self.phase
+            unique_dots,colored_dots=self._map_metrics if self.phase!='database' else (0,0)
             return {'token':self.token,'phase':self.phase,'finished':self.finished,'error':self.error,'complete_db':self.complete_db,
                 'rows':len(self.rows),'pages':self.pages,'addresses':self.total_addresses,'done_addresses':self.done_addresses,'placed':self.placed,
-                'unique_positions':(unique_map_position_count(self.rows.values()) if self.phase!='database' else 0),
-                'visible_colored_dots':(visible_colored_dot_count(self.rows.values()) if self.phase!='database' else 0),
+                'unique_positions':unique_dots,
+                'visible_colored_dots':colored_dots,
                 'raw_records':int(diag.get('raw_records') or 0),'accepted_records':int(diag.get('accepted_records') or 0),
                 'property_id_records':int(diag.get('property_id_records') or 0),'legacy_records':int(diag.get('legacy_records') or 0),
                 'legacy_shadowed':int(diag.get('legacy_shadowed') or 0),'legacy_unmatched':int(diag.get('legacy_unmatched') or 0),
@@ -5870,22 +5893,33 @@ class SavedLoadJob:
                 'latest_checked_at':self.latest_checked_at,'elapsed':round(end-self.started,1),'stopping':self.cancel_event.is_set(),
                 'mode':self.mode,'idle_seconds':round(time.monotonic()-self.last_activity_at,1)}
     def export(self):
-        with self.lock:return [dict(r) for r in self.rows.values()],dict(self.cache),dict(self.diagnostic)
+        # Row dictionaries are snapshots: callers receive an outer list only.
+        # The processing worker always replaces rows rather than modifying them
+        # in place, and map display treats each row as read-only.
+        with self.lock:return list(self.rows.values()),dict(self.cache),dict(self.diagnostic)
     def export_storage_record_audit(self):
-        with self.lock:return [dict(r) for r in self.storage_record_audit]
+        # Build diagnostic rows only when explicitly requested.
+        with self.lock:
+            return [{'Supabase行ID':r.get('storage_id'),'物件ID':r.get('property_id') or '',
+                     '家賃':r.get('rent'),'間取り':r.get('layout'),
+                     '住所':r.get('address'),'取得日時':r.get('fetched_at') or '',
+                     '分類':'物件ID確認済み・地図表示対象' if r.get('property_id') else '旧形式IDなし・地図表示対象'}
+                    for r in self.rows.values()]
     def request_stop(self):self.cancel_event.set()
     def run_delta(self,web):
         previous=self.baseline
         with self.lock:
             self.phase='delta'
-            self.rows={key:dict(row) for key,row in previous['rows'].items()}
+            # Rows are immutable snapshots: share the individual row dictionaries,
+            # and copy only the map index that will receive delta replacements.
+            self.rows=dict(previous['rows'])
             self.cache=dict(previous['cache'])
-            self.storage_record_audit=list(previous.get('audit') or [])
+            self.storage_record_audit=[]
             self.diagnostic=dict(previous.get('diagnostic') or {})
             self.complete_db=True
             self.total_addresses=len({r.get('address') for r in self.rows.values() if r.get('address')})
             self.placed=sum(has_point(r) for r in self.rows.values())
-        seen_audit={r.get('Supabase行ID') for r in self.storage_record_audit}
+        seen_audit={str(r.get('storage_id')) for r in self.rows.values() if r.get('storage_id')}
         old_keys=set(self.rows)
         marker=previous['as_of']
         # Overlap catches writes racing with the previous snapshot publication.
@@ -5911,12 +5945,7 @@ class SavedLoadJob:
                 with self.lock:
                     self.rows[r['key']]=hydrated
                 rid=r.get('storage_id')
-                if rid and rid not in seen_audit:
-                    self.storage_record_audit.append({'Supabase行ID':rid,'物件ID':r.get('property_id') or '',
-                        '家賃':r.get('rent'),'間取り':r.get('layout'),'住所':address,
-                        '取得日時':r.get('fetched_at') or '',
-                        '分類':'incremental'})
-                    seen_audit.add(rid)
+                if rid:seen_audit.add(rid)
             with self.lock:
                 self.catchup_changes=len(set(self.rows)-old_keys)
         if new_addresses:
@@ -5976,13 +6005,19 @@ class SavedLoadJob:
             return {compact_listing_key(r):r for r in rows if compact_listing_key(r)}
         try:
             if self.baseline is not None:
-                self.run_delta(web)
+                try:
+                    self.run_delta(web)
+                finally:
+                    # Release the previous complete snapshot as soon as the delta
+                    # job has copied its outer indexes. The registry keeps only
+                    # the newest published snapshot.
+                    self.baseline=None
                 return
             stored=self.db.load_units(None,on_progress=page,cancel_event=self.cancel_event)
             with self.lock:
                 self.diagnostic=dict(getattr(self.db,'last_load_diagnostic',self.diagnostic) or self.diagnostic)
-                self.storage_record_audit=[dict(r) for r in getattr(self.db,'last_load_record_audit',[]) if isinstance(r,dict)]
-                known_storage_ids={str(r.get('Supabase行ID') or '') for r in self.storage_record_audit if r.get('Supabase行ID')}
+                self.storage_record_audit=[]
+                known_storage_ids={str(r.get('storage_id')) for r in stored if r.get('storage_id')}
             addresses=list(dict.fromkeys(r['address'] for r in stored));known_addresses=set(addresses);by_address={a:[] for a in addresses}
             # Persistent cache is loaded in one paged DB pass.  This avoids repeating
             # GSI address searches on every click after the first successful placement.
@@ -6038,10 +6073,8 @@ class SavedLoadJob:
                             self.diagnostic['accepted_records']=int(self.diagnostic.get('accepted_records') or 0)+len(new_storage)
                             self.diagnostic['property_id_records']=int(self.diagnostic.get('property_id_records') or 0)+sum(bool(r.get('property_id')) for r in new_storage)
                             self.diagnostic['legacy_records']=int(self.diagnostic.get('legacy_records') or 0)+sum(not bool(r.get('property_id')) for r in new_storage)
-                            for r in new_storage:
-                                self.storage_record_audit.append({'Supabase行ID':r.get('storage_id'),'物件ID':r.get('property_id') or '',
-                                    '家賃':r.get('rent'),'間取り':r.get('layout'),'住所':r.get('address'),'取得日時':r.get('fetched_at') or '',
-                                    '分類':'物件ID確認済み・地図表示対象' if r.get('property_id') else '旧形式IDなし・最新差分'})
+                            # No duplicate per-record audit dictionaries in RAM.
+                            pass
                         known_storage_ids.update(str(r.get('storage_id')) for r in new_storage)
                     delta_addresses=list(dict.fromkeys(r['address'] for r in delta if r.get('address')))
                     new_addresses=[a for a in delta_addresses if a not in known_addresses]
@@ -6094,9 +6127,12 @@ class SavedLoadJob:
             if self.phase=='complete' and not self.cancel_event.is_set():
                 snapshots,snapshot_lock=saved_load_snapshot_registry()
                 with self.lock:
+                    # Publish references to finished immutable dictionaries, not
+                    # additional 12k-record copies. Delta jobs copy only the outer
+                    # index before making changes; this snapshot remains unchanged.
                     published={'build':BUILD,'as_of':self.started_at_utc,
-                        'rows':dict(self.rows),'cache':dict(self.cache),
-                        'audit':list(self.storage_record_audit),'diagnostic':dict(self.diagnostic)}
+                        'rows':self.rows,'cache':self.cache,
+                        'diagnostic':dict(self.diagnostic)}
                 with snapshot_lock:snapshots[self.server_key]=published
             with self.lock:
                 self.diagnostic.update(geocoded_total=self.placed,returned=len(self.rows),database_complete=self.complete_db,
@@ -6213,6 +6249,8 @@ def manual_search_running():
 def apply_saved_load(job):
     if active_saved_load() is not job or manual_search_running():return False
     rows,cache,diag=job.export();state=st.session_state
+    for stale in ('_mobile_units_export','_mobile_diag_export','saved_load_export','saved_record_audit_export','_mobile_listing_select_ready','_mobile_listing_table_ready'):
+        state.pop(stale,None)
     state.address_point_cache=cache;state.new_units=rows;state.new_saved_keys=[r['key'] for r in rows]
     state.new_search=None;state.new_map_loaded=True;state.new_load_diagnostic=diag;state.pop('new_job_token',None)
     try:st.query_params['saved_map']='1'
@@ -6582,10 +6620,15 @@ def background_status():
     try:
         cache=st.session_state.get('diagnostic_export_cache')
         cache_key=(job.audit.search_id,int(job.audit.count))
-        if not isinstance(cache,dict) or cache.get('key')!=cache_key:
+        if st.button('詳細ログを更新してTXT・JSONを準備',key='prepare_current_log'):
             cache={'key':cache_key,'events':job.audit.records(),'prepared_at':utc_now()}
             st.session_state.diagnostic_export_cache=cache
-        diagnostic_downloads(cache.get('events') or [],'current')
+        if isinstance(cache,dict) and cache.get('events'):
+            diagnostic_downloads(cache['events'],'current')
+        else:
+            c1,c2=st.columns(2)
+            with c1:st.download_button('詳細ログ TXT',b'','sumai_work_log.txt','text/plain',key='current_txt_pending',disabled=True)
+            with c2:st.download_button('詳細ログ JSON',b'','sumai_work_log.json','application/json',key='current_json_pending',disabled=True)
     except Exception as exc:
         st.error('詳細ログを出力できませんでした：'+type(exc).__name__)
     if job.audit.failure_storage_error:
@@ -7412,13 +7455,14 @@ def automatic_log_download_panel(controller,busy,summary):
         try:
             cache=st.session_state.get('automatic_log_cache')
             search_id=log_job.audit.search_id;now=time.monotonic()
-            stale=(not isinstance(cache,dict) or cache.get('search_id')!=search_id or
-                   int(cache.get('count',-1))!=int(log_job.audit.count) and not busy or
-                   busy and now-float(cache.get('at',0) or 0)>=60)
-            if stale:
-                cache={'search_id':search_id,'count':int(log_job.audit.count),'at':now,'events':log_job.audit.records()}
+            # Do not parse and JSON-serialize every historical event on each
+            # Streamlit fragment poll. Prepare the full TXT/JSON only on demand.
+            if st.button('詳細ログを更新してTXT・JSONを準備',key='prepare_automatic_log'):
+                cache={'search_id':search_id,'count':int(log_job.audit.count),'at':now,
+                       'events':log_job.audit.records()}
                 st.session_state.automatic_log_cache=cache
-            events=cache.get('events') or [];source='サーバーの作業ログ'
+            if isinstance(cache,dict) and cache.get('search_id')==search_id:
+                events=cache.get('events') or [];source='サーバーの作業ログ'
         except Exception as exc:
             st.warning('現在の作業ログを開けません：'+type(exc).__name__)
     if not events:
