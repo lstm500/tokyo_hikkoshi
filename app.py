@@ -39,7 +39,7 @@ import streamlit as st
 from streamlit_folium import st_folium
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v110"
+BUILD = "REBUILD-01-v111"
 
 # ============================================================================
 # NON-NEGOTIABLE SUUMO ADDRESS POLICY -- DO NOT DELETE OR WEAKEN
@@ -258,6 +258,325 @@ STATIONS = {
     "松戸":(35.7847,139.9007), "柏":(35.8622,139.9711), "二子玉川":(35.6117,139.6267),
     "溝の口":(35.5998,139.6115), "南浦和":(35.8476,139.6690),
 }
+
+# Expanded, offline station label reference set (not used for travel-time estimates).
+# Source: select766/tokyo-train-time-map/data/station_locations.csv (MIT License).
+# https://github.com/select766/tokyo-train-time-map
+# Open-but-unbuilt planned stations are intentionally excluded. No runtime HTTP/DB read.
+STATION_MAP_POINTS = {
+    '一之江': (35.685940, 139.882890),
+    '三ノ輪': (35.729285, 139.791165),
+    '三田': (35.647875, 139.749480),
+    '三越前': (35.684930, 139.773080),
+    '上野': (35.711835, 139.775625),
+    '上野広小路': (35.707770, 139.773000),
+    '上野御徒町': (35.707960, 139.773065),
+    '両国': (35.695755, 139.793350),
+    '中井': (35.713865, 139.686310),
+    '中延': (35.605175, 139.713590),
+    '中目黒': (35.644105, 139.698835),
+    '中野': (35.705555, 139.666085),
+    '中野坂上': (35.697085, 139.682205),
+    '中野富士見町': (35.690820, 139.668155),
+    '中野新橋': (35.691715, 139.673980),
+    '乃木坂': (35.666615, 139.726210),
+    '九段下': (35.695510, 139.751115),
+    '亀戸': (35.697340, 139.826610),
+    '二重橋前': (35.680505, 139.761780),
+    '五反田': (35.627110, 139.724185),
+    '京橋': (35.676700, 139.770115),
+    '人形町': (35.686350, 139.782170),
+    '代々木': (35.683795, 139.702210),
+    '代々木上原': (35.669015, 139.679885),
+    '代々木公園': (35.669100, 139.689790),
+    '仲御徒町': (35.706655, 139.776190),
+    '住吉': (35.688705, 139.815670),
+    '信濃町': (35.679965, 139.721100),
+    '光が丘': (35.758470, 139.629240),
+    '入谷': (35.720570, 139.784460),
+    '八丁堀': (35.675365, 139.777340),
+    '六本木': (35.664065, 139.731275),
+    '六本木一丁目': (35.665075, 139.738900),
+    '内幸町': (35.669175, 139.755340),
+    '勝どき': (35.658945, 139.777155),
+    '北千住': (35.748845, 139.804640),
+    '北参道': (35.678485, 139.705435),
+    '北綾瀬': (35.776890, 139.832095),
+    '千川': (35.738175, 139.689400),
+    '千石': (35.727965, 139.744745),
+    '千駄ヶ谷': (35.681195, 139.711530),
+    '千駄木': (35.725745, 139.763305),
+    '半蔵門': (35.685380, 139.741695),
+    '南千住': (35.732310, 139.798780),
+    '南砂町': (35.668415, 139.831695),
+    '南阿佐ヶ谷': (35.699455, 139.635575),
+    '原宿': (35.671310, 139.702730),
+    '吉祥寺': (35.702290, 139.580310),
+    '品川': (35.629640, 139.740130),
+    '四ツ谷': (35.685650, 139.730540),
+    '四谷三丁目': (35.687835, 139.719325),
+    '国会議事堂前': (35.675005, 139.745410),
+    '国立競技場': (35.679855, 139.714875),
+    '地下鉄成増': (35.776740, 139.631170),
+    '地下鉄赤塚': (35.769980, 139.644000),
+    '外苑前': (35.670375, 139.717825),
+    '大久保': (35.700635, 139.697445),
+    '大塚': (35.731785, 139.727940),
+    '大島': (35.689765, 139.834360),
+    '大崎': (35.619945, 139.728245),
+    '大手町': (35.684695, 139.766030),
+    '大門': (35.656680, 139.755705),
+    '宝町': (35.675670, 139.772115),
+    '小伝馬町': (35.690425, 139.778760),
+    '小岩': (35.733330, 139.881850),
+    '小川町': (35.695215, 139.766860),
+    '小竹向原': (35.743395, 139.679520),
+    '岩本町': (35.695575, 139.775185),
+    '巣鴨': (35.733720, 139.740350),
+    '市ヶ谷': (35.691455, 139.737385),
+    '平井': (35.706450, 139.842385),
+    '平和台': (35.757555, 139.654300),
+    '広尾': (35.651500, 139.722210),
+    '後楽園': (35.707310, 139.750860),
+    '御徒町': (35.707195, 139.774715),
+    '御成門': (35.660985, 139.751485),
+    '御茶ノ水': (35.699605, 139.765030),
+    '志村三丁目': (35.777465, 139.685860),
+    '志村坂上': (35.776340, 139.694730),
+    '志茂': (35.778025, 139.732500),
+    '恵比寿': (35.646680, 139.710125),
+    '戸越': (35.614425, 139.716375),
+    '押上': (35.708470, 139.813750),
+    '新中野': (35.697475, 139.669510),
+    '新大久保': (35.700930, 139.700255),
+    '新大塚': (35.726130, 139.729355),
+    '新宿': (35.689210, 139.701220),
+    '新宿三丁目': (35.690840, 139.706535),
+    '新宿御苑前': (35.688525, 139.710915),
+    '新宿西口': (35.693160, 139.699160),
+    '新富町': (35.670530, 139.773595),
+    '新小岩': (35.716785, 139.857650),
+    '新御徒町': (35.707005, 139.781910),
+    '新御茶ノ水': (35.696925, 139.765450),
+    '新日本橋': (35.689040, 139.774295),
+    '新木場': (35.645830, 139.826600),
+    '新板橋': (35.748840, 139.719365),
+    '新橋': (35.667375, 139.758510),
+    '新江古田': (35.732490, 139.670565),
+    '新高円寺': (35.697860, 139.648510),
+    '新高島平': (35.790220, 139.654330),
+    '方南町': (35.683515, 139.657935),
+    '日暮里': (35.727330, 139.771015),
+    '日本橋': (35.681880, 139.773335),
+    '日比谷': (35.676620, 139.760145),
+    '早稲田': (35.705680, 139.722190),
+    '明治神宮前': (35.668205, 139.705240),
+    '春日': (35.708495, 139.752170),
+    '曙橋': (35.692330, 139.722580),
+    '月島': (35.664710, 139.784405),
+    '有楽町': (35.675040, 139.763260),
+    '木場': (35.669350, 139.807115),
+    '末広町': (35.702780, 139.771765),
+    '本所吾妻橋': (35.708595, 139.804560),
+    '本蓮沼': (35.768985, 139.702110),
+    '本郷三丁目': (35.706705, 139.760135),
+    '本駒込': (35.724365, 139.753815),
+    '東中野': (35.706250, 139.685080),
+    '東京': (35.681195, 139.767440),
+    '東大前': (35.717985, 139.757820),
+    '東大島': (35.689790, 139.847265),
+    '東新宿': (35.697895, 139.707690),
+    '東日本橋': (35.691780, 139.784800),
+    '東池袋': (35.725950, 139.718865),
+    '東銀座': (35.669655, 139.767125),
+    '東陽町': (35.669590, 139.817680),
+    '東高円寺': (35.697965, 139.658295),
+    '板橋区役所前': (35.751305, 139.710055),
+    '板橋本町': (35.761100, 139.705605),
+    '根津': (35.717325, 139.765750),
+    '桜田門': (35.677465, 139.751885),
+    '森下': (35.688005, 139.798200),
+    '水天宮前': (35.682995, 139.785165),
+    '水道橋': (35.702000, 139.753745),
+    '氷川台': (35.749620, 139.665470),
+    '永田町': (35.678010, 139.741815),
+    '汐留': (35.664915, 139.761270),
+    '江戸川橋': (35.709295, 139.734130),
+    '池袋': (35.727660, 139.710830),
+    '泉岳寺': (35.638130, 139.739730),
+    '浅草': (35.708990, 139.796595),
+    '浅草橋': (35.697390, 139.784490),
+    '浜松町': (35.655410, 139.757125),
+    '浜町': (35.688590, 139.788125),
+    '淡路町': (35.694870, 139.767455),
+    '清澄白河': (35.682945, 139.798665),
+    '渋谷': (35.659095, 139.702674),
+    '湯島': (35.706805, 139.769980),
+    '溜池山王': (35.673090, 139.741295),
+    '牛込柳町': (35.699460, 139.725190),
+    '牛込神楽坂': (35.700915, 139.736040),
+    '王子': (35.752325, 139.738210),
+    '王子神谷': (35.765295, 139.735650),
+    '瑞江': (35.693390, 139.897810),
+    '田原町': (35.709910, 139.790305),
+    '田町': (35.645740, 139.747605),
+    '田端': (35.737475, 139.761575),
+    '町屋': (35.742070, 139.780045),
+    '白山': (35.721335, 139.752210),
+    '白金台': (35.637770, 139.725860),
+    '白金高輪': (35.643145, 139.734285),
+    '目白': (35.720390, 139.706280),
+    '目黒': (35.632940, 139.715900),
+    '神保町': (35.694930, 139.758430),
+    '神楽坂': (35.703865, 139.734520),
+    '神田': (35.691770, 139.770875),
+    '神谷町': (35.662625, 139.744725),
+    '秋葉原': (35.698075, 139.773240),
+    '稲荷町': (35.711385, 139.782210),
+    '竹橋': (35.690440, 139.757670),
+    '築地': (35.667925, 139.772475),
+    '築地市場': (35.664960, 139.766750),
+    '篠崎': (35.706120, 139.903885),
+    '綾瀬': (35.762165, 139.824935),
+    '練馬': (35.737315, 139.654570),
+    '練馬春日町': (35.751360, 139.640760),
+    '船堀': (35.683785, 139.863855),
+    '芝公園': (35.653455, 139.749720),
+    '若松河田': (35.699165, 139.718185),
+    '茅場町': (35.679075, 139.779625),
+    '茗荷谷': (35.717200, 139.736895),
+    '荻窪': (35.704430, 139.620245),
+    '菊川': (35.688410, 139.806125),
+    '落合': (35.710635, 139.685965),
+    '落合南長崎': (35.723385, 139.683510),
+    '葛西': (35.663620, 139.872530),
+    '蓮根': (35.784055, 139.679060),
+    '蔵前': (35.703145, 139.790855),
+    '虎ノ門': (35.670160, 139.750120),
+    '虎ノ門ヒルズ': (35.667444, 139.747778),
+    '表参道': (35.665145, 139.712380),
+    '西ヶ原': (35.745945, 139.742260),
+    '西台': (35.787080, 139.672680),
+    '西大島': (35.689345, 139.826320),
+    '西巣鴨': (35.743415, 139.728725),
+    '西新宿': (35.694515, 139.692560),
+    '西新宿五丁目': (35.689900, 139.684665),
+    '西日暮里': (35.732080, 139.766775),
+    '西早稲田': (35.707800, 139.709150),
+    '西荻窪': (35.703785, 139.599450),
+    '西葛西': (35.664560, 139.859600),
+    '西馬込': (35.587305, 139.706320),
+    '西高島平': (35.791895, 139.645685),
+    '要町': (35.733215, 139.698480),
+    '護国寺': (35.719180, 139.727450),
+    '豊島園': (35.741610, 139.649205),
+    '豊洲': (35.655155, 139.795995),
+    '赤坂': (35.672080, 139.736435),
+    '赤坂見附': (35.676865, 139.737385),
+    '赤羽岩淵': (35.783355, 139.722110),
+    '赤羽橋': (35.654970, 139.744195),
+    '辰巳': (35.645775, 139.810330),
+    '都庁前': (35.690590, 139.692625),
+    '銀座': (35.673235, 139.763830),
+    '銀座一丁目': (35.674510, 139.766780),
+    '錦糸町': (35.696720, 139.814320),
+    '門前仲町': (35.672770, 139.795105),
+    '阿佐ヶ谷': (35.704880, 139.635855),
+    '雑司が谷': (35.720200, 139.714715),
+    '霞ヶ関': (35.674235, 139.752680),
+    '青山一丁目': (35.672955, 139.724075),
+    '飯田橋': (35.701420, 139.746530),
+    '馬喰横山': (35.692010, 139.782925),
+    '馬喰町': (35.693370, 139.782435),
+    '馬込': (35.596445, 139.711850),
+    '駒込': (35.736860, 139.748055),
+    '高円寺': (35.705325, 139.649700),
+    '高島平': (35.788935, 139.661295),
+    '高田馬場': (35.713280, 139.705045),
+    '高輪ゲートウェイ': (35.635500, 139.740700),
+    '高輪台': (35.631680, 139.730365),
+    '鶯谷': (35.721455, 139.778030),
+    '麹町': (35.684785, 139.737350),
+    '麻布十番': (35.656490, 139.736105),
+    '大井町': (35.607417, 139.734583),
+    '品川シーサイド': (35.609720, 139.749720),
+    '天王洲アイル': (35.620560, 139.750830),
+    '東京テレポート': (35.627500, 139.778890),
+    '国際展示場': (35.634463, 139.791792),
+    '東雲': (35.640639, 139.803389),
+    '竹芝': (35.653972, 139.761917),
+    '日の出': (35.649194, 139.759083),
+    '芝浦ふ頭': (35.641750, 139.757833),
+    'お台場海浜公園': (35.629889, 139.778778),
+    '台場': (35.625889, 139.771417),
+    '東京国際クルーズターミナル': (35.621333, 139.773083),
+    'テレコムセンター': (35.617556, 139.779389),
+    '青海': (35.624750, 139.781306),
+    '東京ビッグサイト': (35.630222, 139.791361),
+    '有明(ゆりかもめ)': (35.634700, 139.793300),
+    '有明テニスの森': (35.639944, 139.788890),
+    '市場前': (35.645667, 139.785639),
+    '新豊洲': (35.648667, 139.790056),
+    '赤土小学校前': (35.742861, 139.769000),
+    '足立小台': (35.754667, 139.770389),
+    '扇大橋': (35.763944, 139.770806),
+    '高野': (35.768417, 139.770694),
+    '江北': (35.773890, 139.770306),
+    '西新井大師西': (35.781472, 139.770056),
+    '谷在家': (35.788778, 139.770056),
+    '舎人公園': (35.796390, 139.770167),
+    '舎人': (35.805667, 139.770083),
+    '見沼代親水公園': (35.814528, 139.770694),
+    '面影橋': (35.712917, 139.714528),
+    '学習院下': (35.716222, 139.712500),
+    '鬼子母神前': (35.720333, 139.715000),
+    '都電雑司ヶ谷': (35.724250, 139.718000),
+    '東池袋四丁目': (35.725361, 139.720444),
+    '向原': (35.728889, 139.724889),
+    '大塚駅前': (35.731583, 139.729333),
+    '巣鴨新田': (35.735444, 139.727778),
+    '庚申塚': (35.739528, 139.729639),
+    '新庚申塚': (35.741333, 139.730444),
+    '西ヶ原四丁目': (35.744444, 139.732778),
+    '滝野川一丁目': (35.747361, 139.735389),
+    '飛鳥山': (35.750167, 139.737417),
+    '王子駅前': (35.752722, 139.738278),
+    '栄町': (35.750917, 139.742194),
+    '梶原': (35.751139, 139.747472),
+    '荒川車庫前': (35.750861, 139.752750),
+    '荒川遊園地前': (35.750667, 139.757722),
+    '小台': (35.750528, 139.761639),
+    '宮ノ前': (35.750083, 139.765000),
+    '熊野前': (35.749167, 139.769222),
+    '東尾久三丁目': (35.745389, 139.774389),
+    '町屋二丁目': (35.743694, 139.776944),
+    '町屋駅前': (35.742778, 139.780833),
+    '荒川七丁目': (35.741944, 139.784167),
+    '荒川二丁目': (35.738583, 139.784722),
+    '荒川区役所前': (35.734972, 139.786389),
+    '荒川一中前': (35.733722, 139.788889),
+    '三ノ輪橋': (35.732139, 139.791528),
+    '越中島': (35.667944, 139.792694),
+    '潮見': (35.658722, 139.817333),
+    '葛西臨海公園': (35.644389, 139.861583),
+    '浮間舟渡': (35.791222, 139.691390),
+    '北赤羽': (35.786694, 139.706194),
+    '赤羽': (35.778028, 139.720830),
+    '十条': (35.760280, 139.722220),
+    '板橋': (35.746028, 139.719528),
+    '東十条': (35.762944, 139.727694),
+    '上中里': (35.746556, 139.746940),
+    '大森': (35.588444, 139.727917),
+    '蒲田': (35.562472, 139.716056),
+    '尾久': (35.746778, 139.754639),
+    '三河島': (35.733472, 139.776417),
+    '亀有': (35.766670, 139.847780),
+    '金町': (35.769556, 139.870472),
+    '西大井': (35.601806, 139.721806),
+}
+# Keep pre-existing wider-area stations; reference points remain separate from STATIONS.
+STATION_MAP_POINTS.update({name:point for name,point in STATIONS.items() if name not in STATION_MAP_POINTS})
+
 LINES = {
     "山手線": "東京 品川 大崎 五反田 目黒 恵比寿 渋谷 新宿 池袋 上野 秋葉原 東京".split(),
     "京浜東北線": "大宮 浦和 南浦和 川口 赤羽 上野 秋葉原 東京 品川 大井町 蒲田 川崎 横浜".split(),
@@ -5074,33 +5393,100 @@ class MonotoneBase(MacroElement):
 
 
 class MapReferenceLabels(MacroElement):
-    """Keep ward names and major stations readable above dense translucent rent points."""
+    """Zoom-aware station names above rent dots. A viewport-only set keeps mobile DOM light."""
     _template=Template("""{% macro script(this, kwargs) %}
-    var map = {{ this._parent.get_name() }};
-    var pane = map.getPane('referenceLabelPane');
-    if (pane) pane.style.pointerEvents = 'none';
-    var wardLabels = {{ this.ward_payload }};
-    var stationLabels = {{ this.station_payload }};
-    wardLabels.forEach(function(item) {
-        L.marker([item.lat,item.lng], {pane:'referenceLabelPane',interactive:false,
-            icon:L.divIcon({className:'',iconSize:null,html:
-                '<div style="white-space:nowrap;transform:translate(-50%,-50%);font-size:15px;font-weight:900;letter-spacing:.08em;color:#202020;text-shadow:-2px -2px 0 rgba(255,255,255,.98),2px -2px 0 rgba(255,255,255,.98),-2px 2px 0 rgba(255,255,255,.98),2px 2px 0 rgba(255,255,255,.98),0 0 5px rgba(255,255,255,1);">'+item.name+'</div>'})
-        }).addTo(map);
-    });
-    stationLabels.forEach(function(item) {
-        L.circleMarker([item.lat,item.lng],{pane:'referenceLabelPane',radius:3.3,color:'#202020',weight:1.2,fill:true,fillColor:'#ffffff',fillOpacity:.96,interactive:false}).addTo(map);
-        L.marker([item.lat,item.lng], {pane:'referenceLabelPane',interactive:false,
-            icon:L.divIcon({className:'',iconSize:null,iconAnchor:[0,11],html:
-                '<div style="white-space:nowrap;transform:translate(-50%,-100%);padding:1px 4px;border-radius:4px;background:rgba(255,255,255,.86);border:1px solid rgba(40,40,40,.35);font-size:11.5px;font-weight:850;color:#1f1f1f;box-shadow:0 1px 2px rgba(0,0,0,.12);">'+item.name+'駅</div>'})
-        }).addTo(map);
-    });
+    (function () {
+      var map = {{ this._parent.get_name() }};
+      var stations = {{ this.station_payload }};
+      var wards = {{ this.ward_payload }};
+      var stationLayer = L.layerGroup().addTo(map);
+      var wardLayer = L.layerGroup().addTo(map);
+      var lastSignature = null, pending = false;
+      var pane = map.getPane('referenceLabelPane');
+      if (pane) pane.style.pointerEvents = 'none';
+      function escapeLabel(value) {
+        return String(value).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});
+      }
+      function cellIntersects(grid,x1,y1,x2,y2) {
+        var size=28, a=Math.floor(x1/size),b=Math.floor(y1/size),c=Math.floor(x2/size),d=Math.floor(y2/size);
+        for(var gx=a;gx<=c;gx++)for(var gy=b;gy<=d;gy++)if(grid[gx+':'+gy])return true;
+        return false;
+      }
+      function fillCells(grid,x1,y1,x2,y2) {
+        var size=28,a=Math.floor(x1/size),b=Math.floor(y1/size),c=Math.floor(x2/size),d=Math.floor(y2/size);
+        for(var gx=a;gx<=c;gx++)for(var gy=b;gy<=d;gy++)grid[gx+':'+gy]=1;
+      }
+      function redraw() {
+        pending = false;
+        if (!map._loaded) return;
+        var zoom=map.getZoom(), bounds=map.getBounds().pad(0.08), size=map.getSize();
+        var signature=[zoom,bounds.getSouth().toFixed(4),bounds.getWest().toFixed(4),bounds.getNorth().toFixed(4),bounds.getEast().toFixed(4),size.x,size.y].join('|');
+        if (lastSignature===signature) return;
+        lastSignature=signature;
+        stationLayer.clearLayers(); wardLayer.clearLayers();
+        if (zoom<=13) {
+          wards.forEach(function(item) {
+            if (!bounds.contains([item.lat,item.lng]))return;
+            var html='<div style="white-space:nowrap;transform:translate(-50%,-50%);font-size:14px;font-weight:900;color:#1d1d1d;text-shadow:-2px -2px white,2px -2px white,-2px 2px white,2px 2px white;">'+escapeLabel(item.name)+'</div>';
+            L.marker([item.lat,item.lng],{pane:'referenceLabelPane',interactive:false,keyboard:false,icon:L.divIcon({className:'',iconSize:[0,0],html:html})}).addTo(wardLayer);
+          });
+        }
+        if (zoom<10) return;
+        var occupied=Object.create(null),selected=0;
+        var limit = zoom<=11?16:zoom===12?26:zoom===13?38:zoom===14?55:zoom===15?65:zoom===16?85:110;
+        // Prefer major stations, then previously shown transport stations, then local stops.
+        // At close zoom all known stations become eligible, but overlapping text is hidden.
+        stations.forEach(function(item) {
+          if(selected>=limit || !bounds.contains([item.lat,item.lng]))return;
+          if(zoom<=11 && item.priority>0)return;
+          if(zoom===12 && item.priority>1)return;
+          var pixel=map.latLngToContainerPoint([item.lat,item.lng]);
+          var name= /駅前$|駅$/.test(item.name)?item.name:item.name+'駅';
+          var width=name.length*12+14, left=pixel.x-width/2, top=pixel.y-33;
+          if(left < -width || pixel.x > size.x+width || top< -24 || top > size.y+30)return;
+          if(cellIntersects(occupied,left-3,top-3,left+width+3,top+23))return;
+          fillCells(occupied,left-3,top-3,left+width+3,top+23);
+          var html='<div style="display:inline-block;white-space:nowrap;transform:translate(-50%,-115%);'+
+            'padding:2px 5px;border-radius:5px;background:rgba(255,255,255,.93);'+
+            'border:1px solid rgba(50,50,50,.5);box-shadow:0 1px 2px rgba(0,0,0,.12);'+
+            'font:800 12px/1.3 sans-serif;color:#151515;">'+escapeLabel(name)+'</div>'+
+            '<div style="position:absolute;left:-3px;top:-3px;width:6px;height:6px;'+
+            'border:1px solid #222;border-radius:50%;background:#fff;"></div>';
+          L.marker([item.lat,item.lng],{pane:'referenceLabelPane',interactive:false,keyboard:false,
+             icon:L.divIcon({className:'',iconSize:[0,0],html:html})}).addTo(stationLayer);
+          selected++;
+        });
+      }
+      function schedule() {
+        if (pending) return;
+        pending=true;
+        requestAnimationFrame(redraw);
+      }
+      map.on('moveend zoomend resize',schedule);
+      map.whenReady(schedule);
+      function resume(){lastSignature=null; if(map._loaded)map.invalidateSize({pan:false,animate:false});schedule();}
+      function visibleResume(){if(document.visibilityState==='visible')resume();}
+      document.addEventListener('visibilitychange',visibleResume);
+      window.addEventListener('pageshow',resume);
+      map.on('unload',function(){
+        map.off('moveend zoomend resize',schedule);
+        document.removeEventListener('visibilitychange',visibleResume);
+        window.removeEventListener('pageshow',resume);
+        stationLayer.clearLayers();wardLayer.clearLayers();
+      });
+    })();
     {% endmacro %}""")
     def __init__(self):
         super().__init__();self._name='MapReferenceLabels'
         wards=[{'name':name,'lat':point[0],'lng':point[1]} for name,point in WARD_LABELS.items()]
-        stations=[{'name':name,'lat':STATIONS[name][0],'lng':STATIONS[name][1]} for name in MAJOR_STATION_LABELS if name in STATIONS]
+        major=set(MAJOR_STATION_LABELS)
+        # Priority only determines which overlapping label wins: no station is omitted from the data.
+        all_points=[{'name':name,'lat':point[0],'lng':point[1],
+                     'priority':0 if name in major else 1 if name in STATIONS else 2}
+                    for name,point in STATION_MAP_POINTS.items()]
+        all_points.sort(key=lambda item:(item['priority'],item['name']))
         self.ward_payload=json.dumps(wards,ensure_ascii=False,separators=(',',':')).replace('<','\u003c').replace('>','\u003e').replace('&','\u0026')
-        self.station_payload=json.dumps(stations,ensure_ascii=False,separators=(',',':')).replace('<','\u003c').replace('>','\u003e').replace('&','\u0026')
+        self.station_payload=json.dumps(all_points,ensure_ascii=False,separators=(',',':')).replace('<','\u003c').replace('>','\u003e').replace('&','\u0026')
 
 class MobileScrollControl(MacroElement):
     """Allow direct touch pan/pinch by default, with optional page-scroll mode."""
@@ -7155,6 +7541,7 @@ def main():
     with tabs[0]:
         st.subheader('地図を動かして、探す地域を表示してください')
         st.caption('地図に見えている四角い範囲が検索対象です。駅名の選択や取得件数の上限はありません。')
+        st.caption('駅名は拡大すると周辺駅まで表示されます。重なる駅名は自動で間引き、物件の点より上に表示します。')
         st.caption('検索中の取得済み物件は「取得済みデータを地図へ反映」で表示できます。進捗と中断ボタンは地図のすぐ下に表示します。')
         st.caption('保存する募集データは家賃・間取り・種別（マンション／一戸建て）・詳細住所（推定）・データ取得日時です。地図画像や緯度経度は保存しません。')
         selected_group=state.get('layout_display_group','group1')
