@@ -40,7 +40,7 @@ import streamlit as st
 from streamlit_folium import st_folium
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v124"
+BUILD = "REBUILD-01-v125"
 
 # ============================================================================
 # NON-NEGOTIABLE SUUMO ADDRESS POLICY -- DO NOT DELETE OR WEAKEN
@@ -7888,7 +7888,6 @@ def automatic_collection_panel():
     memory=cloud_memory_pressure()
     if memory:
         st.caption(f"メモリ {memory['used_mib']}/{memory['limit_mib']} MiB（{memory['ratio']:.0%}）｜Python本体 {memory['rss_mib']} MiB｜ファイル関連 {memory['cache_mib']} MiB。80%で収集停止。")
-    render_memory_diagnostic_v124()
     st.caption('画面を閉じてもサーバー稼働中は収集します。休止・再起動では止まり、次にアプリを開くと保存した設定・町の順番から再開します。')
     controller=get_automatic_collection();snap=controller.snapshot() if controller else None
     # Legacy per-error persistence bridge intentionally disabled. Historical
@@ -8769,6 +8768,9 @@ def main():
                             st.caption('差分はログの観測件数です。精度は同じ物件の正解データとの照合で確認してください。')
                         else:st.info('比較対象として現在の検索ログまたは保存ログを読み込んでください。')
                     except (ValueError,UnicodeError,AttributeError):st.error('このアプリからダウンロードした解析用JSONログを選択してください。')
+        # Diagnostics are occasional tools; keep routine SUUMO collection and
+        # saved-list access at the top of the Saved Data tab.
+        render_memory_diagnostic_v124()
     with tabs[2]:
         st.subheader('通勤の目安')
         options=physical_units([r for r in state.new_units if has_point(r) and r.get('coordinate_precision')!='town'])
