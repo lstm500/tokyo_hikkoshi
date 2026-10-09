@@ -39,7 +39,7 @@ import streamlit as st
 from streamlit_folium import st_folium
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v111"
+BUILD = "REBUILD-01-v112"
 
 # ============================================================================
 # NON-NEGOTIABLE SUUMO ADDRESS POLICY -- DO NOT DELETE OR WEAKEN
@@ -5393,100 +5393,126 @@ class MonotoneBase(MacroElement):
 
 
 class MapReferenceLabels(MacroElement):
-    """Zoom-aware station names above rent dots. A viewport-only set keeps mobile DOM light."""
+    """Fault-isolated, deferred station labels: station JS must never block Leaflet map creation.
+
+    The map and the rent SVG remain usable even if station-label rendering fails.
+    Only labels in the viewport are materialized; nothing is fetched from the DB.
+    """
     _template=Template("""{% macro script(this, kwargs) %}
-    (function () {
-      var map = {{ this._parent.get_name() }};
-      var stations = {{ this.station_payload }};
-      var wards = {{ this.ward_payload }};
-      var stationLayer = L.layerGroup().addTo(map);
-      var wardLayer = L.layerGroup().addTo(map);
-      var lastSignature = null, pending = false;
-      var pane = map.getPane('referenceLabelPane');
-      if (pane) pane.style.pointerEvents = 'none';
-      function escapeLabel(value) {
-        return String(value).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});
-      }
-      function cellIntersects(grid,x1,y1,x2,y2) {
-        var size=28, a=Math.floor(x1/size),b=Math.floor(y1/size),c=Math.floor(x2/size),d=Math.floor(y2/size);
-        for(var gx=a;gx<=c;gx++)for(var gy=b;gy<=d;gy++)if(grid[gx+':'+gy])return true;
-        return false;
-      }
-      function fillCells(grid,x1,y1,x2,y2) {
-        var size=28,a=Math.floor(x1/size),b=Math.floor(y1/size),c=Math.floor(x2/size),d=Math.floor(y2/size);
-        for(var gx=a;gx<=c;gx++)for(var gy=b;gy<=d;gy++)grid[gx+':'+gy]=1;
-      }
-      function redraw() {
-        pending = false;
-        if (!map._loaded) return;
-        var zoom=map.getZoom(), bounds=map.getBounds().pad(0.08), size=map.getSize();
-        var signature=[zoom,bounds.getSouth().toFixed(4),bounds.getWest().toFixed(4),bounds.getNorth().toFixed(4),bounds.getEast().toFixed(4),size.x,size.y].join('|');
-        if (lastSignature===signature) return;
-        lastSignature=signature;
-        stationLayer.clearLayers(); wardLayer.clearLayers();
-        if (zoom<=13) {
-          wards.forEach(function(item) {
-            if (!bounds.contains([item.lat,item.lng]))return;
-            var html='<div style="white-space:nowrap;transform:translate(-50%,-50%);font-size:14px;font-weight:900;color:#1d1d1d;text-shadow:-2px -2px white,2px -2px white,-2px 2px white,2px 2px white;">'+escapeLabel(item.name)+'</div>';
-            L.marker([item.lat,item.lng],{pane:'referenceLabelPane',interactive:false,keyboard:false,icon:L.divIcon({className:'',iconSize:[0,0],html:html})}).addTo(wardLayer);
-          });
+    // Station labels are optional decoration. Run after the base map and tile layer
+    // have had time to mount, and contain exceptions inside this callback.
+    window.setTimeout(function () {
+      try {
+        var map = {{ this._parent.get_name() }};
+        if (!map || !window.L || !map.getPane('referenceLabelPane')) return;
+        var stations = {{ this.station_payload }};
+        var wards = {{ this.ward_payload }};
+        if (map._sumaiStationOverlay && map._sumaiStationOverlay.dispose) {
+          map._sumaiStationOverlay.dispose();
         }
-        if (zoom<10) return;
-        var occupied=Object.create(null),selected=0;
-        var limit = zoom<=11?16:zoom===12?26:zoom===13?38:zoom===14?55:zoom===15?65:zoom===16?85:110;
-        // Prefer major stations, then previously shown transport stations, then local stops.
-        // At close zoom all known stations become eligible, but overlapping text is hidden.
-        stations.forEach(function(item) {
-          if(selected>=limit || !bounds.contains([item.lat,item.lng]))return;
-          if(zoom<=11 && item.priority>0)return;
-          if(zoom===12 && item.priority>1)return;
-          var pixel=map.latLngToContainerPoint([item.lat,item.lng]);
-          var name= /駅前$|駅$/.test(item.name)?item.name:item.name+'駅';
-          var width=name.length*12+14, left=pixel.x-width/2, top=pixel.y-33;
-          if(left < -width || pixel.x > size.x+width || top< -24 || top > size.y+30)return;
-          if(cellIntersects(occupied,left-3,top-3,left+width+3,top+23))return;
-          fillCells(occupied,left-3,top-3,left+width+3,top+23);
-          var html='<div style="display:inline-block;white-space:nowrap;transform:translate(-50%,-115%);'+
-            'padding:2px 5px;border-radius:5px;background:rgba(255,255,255,.93);'+
-            'border:1px solid rgba(50,50,50,.5);box-shadow:0 1px 2px rgba(0,0,0,.12);'+
-            'font:800 12px/1.3 sans-serif;color:#151515;">'+escapeLabel(name)+'</div>'+
-            '<div style="position:absolute;left:-3px;top:-3px;width:6px;height:6px;'+
-            'border:1px solid #222;border-radius:50%;background:#fff;"></div>';
-          L.marker([item.lat,item.lng],{pane:'referenceLabelPane',interactive:false,keyboard:false,
-             icon:L.divIcon({className:'',iconSize:[0,0],html:html})}).addTo(stationLayer);
-          selected++;
-        });
+        var stationLayer = L.layerGroup().addTo(map);
+        var wardLayer = L.layerGroup().addTo(map);
+        var timer = null, disposed = false, lastKey = '';
+        function htmlEscape(v) {
+          return String(v).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});
+        }
+        function redraw() {
+          timer = null;
+          if (disposed || !map._loaded || !map.getContainer().isConnected) return;
+          try {
+            var zoom = map.getZoom(), bounds = map.getBounds(), size = map.getSize();
+            if (!size.x || !size.y) return;
+            var key = [zoom,bounds.getSouth().toFixed(4),bounds.getWest().toFixed(4),
+              bounds.getNorth().toFixed(4),bounds.getEast().toFixed(4),size.x,size.y].join('|');
+            if (key === lastKey) return;
+            var nextStations = [], nextWards = [];
+            var taken = Object.create(null);
+            if (zoom <= 13) {
+              wards.forEach(function(item) {
+                if (bounds.contains([item.lat,item.lng])) nextWards.push(item);
+              });
+            }
+            if (zoom >= 11) {
+              var limit = zoom <= 11 ? 14 : zoom === 12 ? 22 : zoom === 13 ? 32 :
+                zoom === 14 ? 44 : zoom === 15 ? 55 : 68;
+              stations.forEach(function(item) {
+                if (nextStations.length >= limit || !bounds.contains([item.lat,item.lng])) return;
+                if (zoom <= 11 && item.priority !== 0) return;
+                if (zoom === 12 && item.priority > 1) return;
+                var pt = map.latLngToContainerPoint([item.lat,item.lng]);
+                if (pt.x < 0 || pt.x > size.x || pt.y < 0 || pt.y > size.y) return;
+                var name = /駅前$|駅$/.test(item.name) ? item.name : item.name+'駅';
+                var width = name.length*12+18;
+                var cellX=Math.floor(pt.x/45),cellY=Math.floor(pt.y/33);
+                var span=Math.max(1,Math.ceil(width/45));
+                for (var d=-span;d<=span;d++){
+                  if (taken[(cellX+d)+':'+cellY]) return;
+                }
+                for(var d=-span;d<=span;d++) taken[(cellX+d)+':'+cellY]=true;
+                nextStations.push({lat:item.lat,lng:item.lng,name:name});
+              });
+            }
+            // Compute first, then replace only this overlay. Never alter base tiles,
+            // rent SVG, map viewport, or Streamlit session state from this layer.
+            stationLayer.clearLayers();
+            wardLayer.clearLayers();
+            nextWards.forEach(function(item) {
+              L.marker([item.lat,item.lng],{pane:'referenceLabelPane',interactive:false,keyboard:false,
+                icon:L.divIcon({className:'',iconSize:[0,0],html:
+                  '<div style="white-space:nowrap;transform:translate(-50%,-50%);font:900 14px sans-serif;color:#202020;text-shadow:-2px -2px white,2px -2px white,-2px 2px white,2px 2px white;">'+htmlEscape(item.name)+'</div>'})
+              }).addTo(wardLayer);
+            });
+            nextStations.forEach(function(item) {
+              L.marker([item.lat,item.lng],{pane:'referenceLabelPane',interactive:false,keyboard:false,
+                icon:L.divIcon({className:'',iconSize:[0,0],html:
+                  '<div style="white-space:nowrap;transform:translate(-50%,-112%);display:inline-block;background:rgba(255,255,255,.96);padding:2px 4px;border:1px solid #555;border-radius:4px;font:800 12px sans-serif;color:#171717;">'+htmlEscape(item.name)+'</div>'})
+              }).addTo(stationLayer);
+            });
+            lastKey = key;
+          } catch (drawError) {
+            // Decorative label failure must not break Leaflet or the rent layer.
+            if (window.console && console.warn) console.warn('Station labels skipped:',drawError);
+          }
+        }
+        function schedule() {
+          if (disposed || timer !== null) return;
+          timer = window.setTimeout(redraw,120);
+        }
+        function dispose() {
+          disposed=true;
+          if (timer !== null) {window.clearTimeout(timer);timer=null;}
+          map.off('moveend zoomend resize',schedule);
+          map.off('unload',dispose);
+          document.removeEventListener('visibilitychange',resume);
+          window.removeEventListener('pageshow',resume);
+          stationLayer.clearLayers();wardLayer.clearLayers();
+          if(map.hasLayer(stationLayer)) map.removeLayer(stationLayer);
+          if(map.hasLayer(wardLayer)) map.removeLayer(wardLayer);
+        }
+        function resume() {
+          if (document.visibilityState !== 'hidden') {lastKey='';schedule();}
+        }
+        map._sumaiStationOverlay={dispose:dispose};
+        map.on('moveend zoomend resize',schedule);
+        map.on('unload',dispose);
+        document.addEventListener('visibilitychange',resume);
+        window.addEventListener('pageshow',resume);
+        schedule();
+      } catch (initError) {
+        if (window.console && console.warn) console.warn('Station labels disabled:',initError);
       }
-      function schedule() {
-        if (pending) return;
-        pending=true;
-        requestAnimationFrame(redraw);
-      }
-      map.on('moveend zoomend resize',schedule);
-      map.whenReady(schedule);
-      function resume(){lastSignature=null; if(map._loaded)map.invalidateSize({pan:false,animate:false});schedule();}
-      function visibleResume(){if(document.visibilityState==='visible')resume();}
-      document.addEventListener('visibilitychange',visibleResume);
-      window.addEventListener('pageshow',resume);
-      map.on('unload',function(){
-        map.off('moveend zoomend resize',schedule);
-        document.removeEventListener('visibilitychange',visibleResume);
-        window.removeEventListener('pageshow',resume);
-        stationLayer.clearLayers();wardLayer.clearLayers();
-      });
-    })();
+    },400);
     {% endmacro %}""")
     def __init__(self):
         super().__init__();self._name='MapReferenceLabels'
         wards=[{'name':name,'lat':point[0],'lng':point[1]} for name,point in WARD_LABELS.items()]
         major=set(MAJOR_STATION_LABELS)
-        # Priority only determines which overlapping label wins: no station is omitted from the data.
-        all_points=[{'name':name,'lat':point[0],'lng':point[1],
-                     'priority':0 if name in major else 1 if name in STATIONS else 2}
-                    for name,point in STATION_MAP_POINTS.items()]
-        all_points.sort(key=lambda item:(item['priority'],item['name']))
-        self.ward_payload=json.dumps(wards,ensure_ascii=False,separators=(',',':')).replace('<','\u003c').replace('>','\u003e').replace('&','\u0026')
-        self.station_payload=json.dumps(all_points,ensure_ascii=False,separators=(',',':')).replace('<','\u003c').replace('>','\u003e').replace('&','\u0026')
+        points=[{'name':name,'lat':point[0],'lng':point[1],
+                 'priority':0 if name in major else 1 if name in STATIONS else 2}
+                for name,point in STATION_MAP_POINTS.items()]
+        points.sort(key=lambda item:(item['priority'],item['name']))
+        self.ward_payload=json.dumps(wards,ensure_ascii=False,separators=(',',':')).replace('<','\\u003c').replace('>','\\u003e').replace('&','\\u0026')
+        self.station_payload=json.dumps(points,ensure_ascii=False,separators=(',',':')).replace('<','\\u003c').replace('>','\\u003e').replace('&','\\u0026')
 
 class MobileScrollControl(MacroElement):
     """Allow direct touch pan/pinch by default, with optional page-scroll mode."""
@@ -6576,6 +6602,13 @@ def capture_map_fragment():
     if not had_bounds and st.session_state.get('new_bounds'):
         st.session_state['map_initial_bounds_ready']=True
 
+def capture_map_fragment_v112():
+    """Bridge the fresh map widget into existing search-bounds state without rewriting search logic."""
+    current=st.session_state.get('new_map_v112')
+    if isinstance(current,dict):
+        st.session_state['new_map']=current
+    capture_map_fragment()
+
 @st.cache_resource(show_spinner=False)
 def stable_mobile_base_map(build_version):
     """Keep Folium's JS IDs stable across all map fragments and button reruns."""
@@ -6605,16 +6638,16 @@ def interactive_rental_map(pins,cells,facilities):
     # Only the initial mount receives an explicit center/zoom.  After Leaflet is live,
     # the browser owns its viewport; Python records only the bounds needed for search.
     # This prevents a pan/zoom -> fragment rerun -> setView feedback loop.
-    kwargs=dict(key='new_map',height=480,use_container_width=True,returned_objects=['bounds'],
-                on_change=capture_map_fragment)
+    kwargs=dict(key='new_map_v112',height=480,use_container_width=True,returned_objects=['bounds'],
+                on_change=capture_map_fragment_v112)
     # Leaflet already owns the marker canvas. A pan/zoom must not serialize and
     # resend the entire rental dataset to the mobile component. A full Python
     # rerun recreates the list and requests a new group if data changed.
     signature=(BUILD,mobile_map_content_signature(pins,facilities))
-    if not state.get('new_map') or state.get('_mobile_map_payload_signature')!=signature:
+    if not state.get('new_map_v112') or state.get('_mobile_map_payload_signature')!=signature:
         kwargs['feature_group_to_add']=rental_features(pins,cells,facilities)
         state['_mobile_map_payload_signature']=signature
-    if not state.get('new_map'):
+    if not state.get('new_map_v112'):
         kwargs['center']=state.get('new_view_center',DEFAULT_CENTER)
         kwargs['zoom']=state.get('new_view_zoom',15)
     st_folium(stable_mobile_base_map(BUILD),**kwargs)
