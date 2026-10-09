@@ -40,7 +40,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v130"
+BUILD = "REBUILD-01-v131"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -1297,6 +1297,11 @@ class Database:
                     self.acquisition_cache[pid]=row['finished_at']
             saved.update(key for key,_ in batch)
             self.last_save_stats['new']+=len(inserted);self.last_save_stats['updated']+=len(updates)
+            # Notify after each fully confirmed batch.  Even if a later batch
+            # fails, already-persisted listings will reach the town map. These
+            # local signals are coalesced into a bounded background refresh.
+            try:notify_town_summary_saved(self)
+            except Exception as exc:self.last_save_stats['map_refresh_notice_error']=type(exc).__name__
         if not set(unique)<=saved:raise AppError('Supabaseから募集情報の保存確認が得られません。')
         if address_points:
             try:self.save_address_points(address_points)
@@ -6421,6 +6426,10 @@ class SearchJob:
             try:self.audit.persist(db,force=True)
             except Exception:pass
             with self.lock: self.finished=True
+            # The automatic controller releases its update only after the whole
+            # selected collection stops. Manual searches can refresh promptly.
+            if conditions.get('mode')!='automatic_collection':
+                notify_town_collection_finished(db)
     def request_stop(self):
         self.cancel_event.set()
         with self.lock:self.message='中止要求を受け付けました。新しい取得を止め、通信終了後に取得済みデータを保存・確認して終了します。'
@@ -7630,6 +7639,9 @@ class AutomaticCollection:
             except Exception:pass
         finally:
             with self.lock:self.current=None
+            # Flush all pending town-map changes once the automatic collection
+            # has stopped, including cancellation and partial results.
+            notify_town_collection_finished(self.db)
 
 @st.cache_resource
 def automatic_registry():
@@ -8179,30 +8191,150 @@ def town_aggregate_streaming(raw_rows):
             # TemporaryDirectory cleanup is performed by its context manager.
 
 
-class TownSummaryWorker:
-    """A single namespace worker builds a compact snapshot and persists it once.
+# Application-local notifications, not cgroup/OS operations. They contain
+# no listing data and require no external polling or additional Supabase writes.
+# Multiple browser sessions of this Streamlit process share one worker per DB.
+_TOWN_SAVE_CHANGE_LOCK = threading.RLock()
+_TOWN_SAVE_CHANGES = {}
+TOWN_AUTO_REFRESH_DEBOUNCE = 12.0  # seconds after the first successful save
+TOWN_AUTO_REFRESH_MIN_GAP = 180.0  # no full-table scan per saved listing/page
 
-    While the map is browsed, no individual listing GET occurs. Auto collection
-    keeps writing normal source listings; a user can refresh the area snapshot.
+
+def _town_change_key(db):
+    return hashlib.sha256((db.url + '|' + db.namespace).encode()).hexdigest()
+
+
+def notify_town_summary_saved(db):
+    """Record a confirmed write; never touch other processes or system caches."""
+    key=_town_change_key(db)
+    with _TOWN_SAVE_CHANGE_LOCK:
+        entry=_TOWN_SAVE_CHANGES.setdefault(key, {'sequence':0,'worker':None})
+        entry['sequence']+=1
+        sequence=entry['sequence']
+        worker=entry['worker']
+    if worker is not None:
+        worker.on_listing_saved(sequence)
+
+
+def notify_town_collection_finished(db):
+    """Promptly finish queued changes after the last manual/automatic save."""
+    with _TOWN_SAVE_CHANGE_LOCK:
+        entry=_TOWN_SAVE_CHANGES.get(_town_change_key(db))
+        worker=entry.get('worker') if entry else None
+    if worker is not None:
+        worker.flush_saved_changes()
+
+
+def attach_town_summary_worker(worker):
+    key=_town_change_key(worker.db)
+    with _TOWN_SAVE_CHANGE_LOCK:
+        entry=_TOWN_SAVE_CHANGES.setdefault(key, {'sequence':0,'worker':None})
+        entry['worker']=worker
+        sequence=entry['sequence']
+    if sequence:
+        worker.on_listing_saved(sequence)
+
+
+class TownSummaryWorker:
+    """One namespace snapshot, automatically refreshed after verified saves.
+
+    Changes are coalesced: a running collector never triggers one full database
+    scan per listing.  One bounded SQLite aggregation updates the town-map
+    snapshot and then the persistent Leaflet layer receives a new revision.
     """
     def __init__(self,db):
         self.db=db;self.lock=threading.RLock();self.running=False;self.progress=0;self.total_pages=None;self.total_records=None;self.scanned_records=0;self.page_size=160
         self.ready=False;self.summary=None;self.message='';self.error='';self.thread=None
         self.initialized=False
-        # Only one scan per server process, shared by all browser sessions.
-        # A usable saved summary stays visible during this refresh.
+        self.revision=0
+        self.saved_sequence=0
+        self.scan_sequence=0
+        self.pending=False
+        self._urgent_after_scan=False
+        self._refresh_timer=None
+        self._last_scan_started=0.0
+        self._retry_count=0
+        self._last_saved_at=None
+        # One scan (only when needed) for all browser sessions and new writes.
         self._startup_scan_requested=False
     def refresh_on_startup(self):
-        """Do not rescan every saved listing when a stored town summary exists.
-
-        Collection completion and the explicit refresh button still recalculate
-        the summary. An empty database boot builds the initial summary once.
-        """
+        """Catch up once from earlier builds; never repeat a scan on each page view."""
         with self.lock:
             if self._startup_scan_requested:return False
             self._startup_scan_requested=True
-            if self.ready:return False
+            if self.ready:
+                # v130 could leave a stale map snapshot after newer listings were
+                # saved. Rebuild it only once on migration to this version.
+                if (self.summary or {}).get('generated_by')!=BUILD:
+                    self.pending=True
+                    self._schedule_refresh_locked(urgent=True)
+                else:
+                    # A worker can die between a saved listing and its queued
+                    # refresh. Check only for existence of newer rows on startup;
+                    # this runs in the background and returns at most one ID.
+                    self._startup_probe_thread=threading.Thread(
+                        target=self._check_unsummarized_writes,daemon=True,
+                        name='town-map-startup-change-check')
+                    self._startup_probe_thread.start()
+                return False
         return self.start()
+    def _check_unsummarized_writes(self):
+        stamp=(self.summary or {}).get('updated_at')
+        if not stamp:
+            with self.lock:
+                self.pending=True
+                self._schedule_refresh_locked(urgent=True)
+            return
+        try:
+            rows=self.db.call('GET',SEARCH_TABLE,{
+                'namespace':'eq.'+self.db.namespace,'status':'eq.rental_listing',
+                'and':'(id.gte.listing.,id.lt.listing/)',
+                'started_at':'gte.'+str(stamp),'select':'id','limit':1})
+            if not isinstance(rows,list):raise AppError('保存物件の更新有無を確認できません。')
+            if rows:
+                with self.lock:
+                    self.pending=True
+                    self._schedule_refresh_locked(urgent=True)
+        except AppError as exc:
+            with self.lock:
+                self.error='保存物件の最終更新確認に失敗: '+str(exc)
+                self.pending=True
+                self._schedule_refresh_locked()
+    def _schedule_refresh_locked(self,urgent=False):
+        """Lock must be held; at most one application-only timer per namespace."""
+        if urgent:self._urgent_after_scan=True
+        if self.running or not self.pending or self._retry_count>2:return False
+        if self._refresh_timer is not None:
+            if not urgent:return False
+            self._refresh_timer.cancel()
+            self._refresh_timer=None
+        since=time.monotonic()-self._last_scan_started
+        delay=1.0 if urgent else max(TOWN_AUTO_REFRESH_DEBOUNCE,TOWN_AUTO_REFRESH_MIN_GAP-since)
+        # Failures are retried at most twice and never in a tight loop.
+        if self._retry_count:delay=max(delay,TOWN_AUTO_REFRESH_MIN_GAP)
+        timer=threading.Timer(delay,self._run_pending_refresh)
+        timer.daemon=True
+        timer.name='town-map-auto-refresh-delay'
+        self._refresh_timer=timer
+        timer.start()
+        return True
+    def _run_pending_refresh(self):
+        with self.lock:
+            self._refresh_timer=None
+            if not self.pending or self.running:return
+        self.start()
+    def on_listing_saved(self,sequence):
+        with self.lock:
+            if sequence<=self.saved_sequence:return
+            self.saved_sequence=sequence
+            self.pending=True
+            self._last_saved_at=utc_now()
+            self._retry_count=0
+            self._schedule_refresh_locked()
+    def flush_saved_changes(self):
+        with self.lock:
+            if not self.pending:return
+            self._schedule_refresh_locked(urgent=True)
     def initialize(self):
         with self.lock:
             if self.initialized:return
@@ -8212,13 +8344,19 @@ class TownSummaryWorker:
                 'id':'eq.'+TOWN_SUMMARY_ID,'select':'summary','limit':1})
             summary=(records[0].get('summary') if records else None) if isinstance(records,list) else None
             if isinstance(summary,dict) and summary.get('schema')==1 and isinstance(summary.get('groups'),dict):
-                with self.lock:self.summary=summary;self.ready=True
+                with self.lock:self.summary=summary;self.ready=True;self.revision+=1
         except Exception as exc:
             with self.lock:self.error='町丁目集計の保存データを確認できません: '+str(exc)
     def start(self):
         with self.lock:
             if self.running:return False
+            if self._refresh_timer is not None:
+                self._refresh_timer.cancel();self._refresh_timer=None
             self.running=True;self.progress=0;self.total_pages=None;self.total_records=None;self.scanned_records=0;self.page_size=160;self.error='';self.message='町丁目の家賃を裏で集計中'
+            self.scan_sequence=self.saved_sequence
+            self.pending=False
+            self._urgent_after_scan=False
+            self._last_scan_started=time.monotonic()
             self.thread=threading.Thread(target=self.run,daemon=True,name='town-rent-aggregate')
             self.thread.start();return True
     def count_source_records(self):
@@ -8292,22 +8430,35 @@ class TownSummaryWorker:
                     if count<page_size:break
             summary=town_aggregate_streaming(source_rows())
             summary['started_at']=started
+            summary['generated_by']=BUILD
             # Persist the new snapshot only after the FULL scan succeeds.
             # Never overwrite a usable snapshot on partial/failed collection.
             self.db.save_search({'id':TOWN_SUMMARY_ID,'status':'town_rent_summary',
                 'started_at':summary['updated_at'],'finished_at':summary['updated_at'],
                 'conditions':{'schema':1,'source':'rental_listing'},'summary':summary})
-            with self.lock:self.summary=summary;self.ready=True;self.message='集計完了';self.error=''
+            with self.lock:
+                self.summary=summary;self.ready=True;self.revision+=1
+                self.message='集計完了';self.error='';self._retry_count=0
+                # A listing saved DURING the scan might have been missed;
+                # it is necessarily carried forward to another refresh.
+                if self.saved_sequence>self.scan_sequence:self.pending=True
             _v126_work_finished('town-summary')
         except Exception as exc:
-            with self.lock:self.error=str(exc);self.message='集計を更新できませんでした。以前の集計は保持します。'
+            with self.lock:
+                self.pending=True
+                self._retry_count+=1
+                self.error=str(exc);self.message='集計を更新できませんでした。以前の集計は保持します。'
         finally:
-            with self.lock:self.running=False
+            with self.lock:
+                self.running=False
+                if self.pending:
+                    self._schedule_refresh_locked(urgent=self._urgent_after_scan and self._retry_count==0)
     def snapshot(self):
         with self.lock:return {'summary':self.summary,'ready':self.ready,'running':self.running,
                                'progress':self.progress,'total_pages':self.total_pages,
                                'total_records':self.total_records,'scanned_records':self.scanned_records,
-                               'message':self.message,'error':self.error}
+                               'message':self.message,'error':self.error,'revision':self.revision,
+                               'pending':self.pending,'last_saved_at':self._last_saved_at}
 
 
 @st.cache_resource
@@ -8316,15 +8467,14 @@ def town_summary_registry():
 
 
 def current_town_summary_worker():
-    jobs,lock=town_summary_registry();db=Database();key=manual_registry_key(db)+'|town-v123'
+    jobs,lock=town_summary_registry();db=Database();key=manual_registry_key(db)+'|town-v131'
     with lock:
         job=jobs.get(key)
         if job is None:
             job=TownSummaryWorker(db);jobs[key]=job
     job.initialize()
-    # Only build at startup when no persisted snapshot exists. Refresh after
-    # a collection or with the existing explicit re-aggregation button.
     job.refresh_on_startup()
+    attach_town_summary_worker(job)
     return job
 
 
@@ -8589,10 +8739,17 @@ def town_choropleth_status():
     automatic=get_automatic_collection()
     active=bool(automatic and automatic.snapshot().get('running'))
     if state.get('_v117_was_collecting') and not active and not snap['running']:
-        store.start();snap=store.snapshot()
+        # The save hook already queued an update: avoid a second full scan.
+        if snap.get('pending'):
+            store.flush_saved_changes();snap=store.snapshot()
+        elif automatic is not None and getattr(automatic,'build',None)!=BUILD:
+            # An older collector may still be running after a code deployment.
+            store.start();snap=store.snapshot()
     state['_v117_was_collecting']=active
     boundaries=town_boundary_registry();boundaries.start()
     shapes,ready,busy,error=boundaries.snapshot()
+    if snap['pending'] and not snap['running']:
+        st.caption('追加・更新された物件の地図反映を予約済み（自動更新）')
     if snap['running']:
         done=snap['progress'];total=snap.get('total_pages')
         if isinstance(total,int) and total>0:
@@ -8610,7 +8767,7 @@ def town_choropleth_status():
         st.caption('町丁目家賃：集計の開始待ち')
 
 
-@st.fragment
+@st.fragment(run_every='15s')
 def interactive_town_choropleth(group,facilities):
     """Leaflet map persists in the browser across Streamlit fragment reruns.
 
@@ -8619,17 +8776,20 @@ def interactive_town_choropleth(group,facilities):
     observed map-whitening failure when bounds callbacks cause a rerun.
     """
     state=st.session_state
-    if st.button('地図の色・表示範囲を更新',key='refresh_v118_town_map'):
+    if st.button('表示範囲を更新（地図移動後のみ）',key='refresh_v118_town_map'):
         state['_v118_map_revision']=int(state.get('_v118_map_revision',0))+1
         st.rerun(scope='fragment')
     reset=int(state.get('_v118_map_reset_count',0))
     revision=int(state.get('_v118_map_revision',0))
-    signature=(BUILD,group,revision,reset)
+    store=current_town_summary_worker();snap=store.snapshot()
+    boundary_worker=town_boundary_registry();boundary_worker.start()
+    shapes,ready,busy,error=boundary_worker.snapshot()
+    # A new successful aggregate automatically invalidates the cached colors.
+    # The stable component key preserves browser pan/zoom and avoids an iframe
+    # remount; Leaflet replaces only the GeoJSON layer for changed revisions.
+    signature=(BUILD,group,revision,reset,snap['revision'],bool(ready))
     cached=state.get('_v118_choropleth_payload')
     if not isinstance(cached,dict) or cached.get('signature')!=signature:
-        store=current_town_summary_worker();snap=store.snapshot()
-        boundary_worker=town_boundary_registry();boundary_worker.start()
-        shapes,ready,busy,error=boundary_worker.snapshot()
         bounds=state.get('new_bounds')
         center=bounds_center(bounds) if bounds else state.get('new_view_center',DEFAULT_CENTER)
         if bounds and len(bounds)==4:
@@ -8643,11 +8803,11 @@ def interactive_town_choropleth(group,facilities):
                 'colored_count':len(geo['features']),'center':center}
         state['_v118_choropleth_payload']=cached
     if cached['limited']:
-        st.caption('広域表示：上位700町丁目。移動後は「地図の色・表示範囲を更新」')
+        st.caption('広域表示：上位700町丁目。移動後は「表示範囲を更新」を押してください')
     elif cached['ready']:
         st.caption(f"着色：{cached['colored_count']}町丁目")
     else:
-        st.caption('集計中。完了後に地図の色を更新')
+        st.caption('集計中。完了後、地図の色は自動更新されます')
     stations,wards=town_station_refs_v118()
     widget=town_component_v121()
     data=widget(center=list(cached['center']),zoom=14,geo=cached['geo'],
@@ -8689,7 +8849,7 @@ def main():
         st.subheader('地図を動かして、探す地域を表示してください')
         st.caption('地図に見えている四角い範囲が検索対象です。駅名の選択や取得件数の上限はありません。')
         st.caption('地図上には駅名を優先表示します。町丁目名は区域をタップすると確認できます。')
-        st.caption('保存物件は裏側で町丁目ごとに集計します。検索・保存は従来どおり継続し、地図は集計済みの区域だけを表示します。')
+        st.caption('追加・更新された保存物件は町丁目別の平均家賃へ自動反映します。大量収集中は負荷を抑えてまとめて更新します。')
         st.caption('保存する募集データは家賃・間取り・種別（マンション／一戸建て）・詳細住所（推定）・データ取得日時です。地図画像や緯度経度は保存しません。')
         selected_group=state.get('layout_display_group','group1')
         if selected_group not in ('group1','group2','house'):selected_group='group1';state.layout_display_group='group1'
