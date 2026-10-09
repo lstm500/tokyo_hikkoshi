@@ -40,7 +40,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v128-diagnostic-ui"
+BUILD = "REBUILD-01-v130"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -6038,7 +6038,7 @@ class SavedLoadJob:
                 self.pages+=1;self.placed=sum(has_point(r) for r in self.rows.values());self.diagnostic=diag
                 self.last_activity_at=time.monotonic()
             pressure=cloud_memory_pressure()
-            if pressure and pressure['ratio']>=.80:
+            if memory_needs_guard(pressure):
                 self.error=('メモリ保護により一時停止：'+str(pressure['used_mib'])+'/'+
                             str(pressure['limit_mib'])+' MiB。読込済み物件は保持しています。')
                 self.cancel_event.set()
@@ -6424,13 +6424,20 @@ class SearchJob:
     def request_stop(self):
         self.cancel_event.set()
         with self.lock:self.message='中止要求を受け付けました。新しい取得を止め、通信終了後に取得済みデータを保存・確認して終了します。'
-    def snapshot(self):
+    def snapshot(self,include_units=True):
         with self.lock:
-            return dict(progress=self.progress,message=self.message,log=self.text,finished=self.finished,stopping=getattr(self,'cancel_event',threading.Event()).is_set(),
-                        updated_at=getattr(self,'updated_at',None),last_saved_at=getattr(self.state,'new_last_saved_at',None),units=list(self.state.new_units),saved=list(self.state.new_saved_keys),
+            result=dict(progress=self.progress,message=self.message,log=self.text,finished=self.finished,stopping=self.cancel_event.is_set(),
+                        updated_at=getattr(self,'updated_at',None),last_saved_at=getattr(self.state,'new_last_saved_at',None),
                         live_metrics=dict(getattr(self.state,'live_metrics',{}) or {}),result=self.state.new_search,
+                        unit_count=len(self.state.new_units),saved_count=len(self.state.new_saved_keys),
                         idle_seconds=max(0,int(time.monotonic()-getattr(self.state,'last_activity_at',time.monotonic()))),
                         collection_stage=str(getattr(self.state,'last_collection_stage','')))
+            # The automatic collector polls every few seconds but needs only
+            # counts, not hundreds of copied listing references each time.
+            if include_units:
+                result['units']=list(self.state.new_units)
+                result['saved']=list(self.state.new_saved_keys)
+            return result
 
 class PositionRepairJob(SearchJob):
     def __init__(self,db,rows,bounds,saved):
@@ -6805,61 +6812,34 @@ def cloud_memory_pressure():
                 'cache_mib':round(stats.get('file',0)/mb),
                 'inactive_mib':round(stats.get('inactive_file',0)/mb),
                 'anon_mib':round(stats.get('anon',0)/mb),
-                'effective_mib':round(max(0,used-stats.get('inactive_file',0))/mb)}
+                'effective_mib':round(max(0,used-stats.get('inactive_file',0))/mb),
+                'effective_ratio':max(0,used-stats.get('inactive_file',0))/limit}
     except (OSError,ValueError,ZeroDivisionError):return None
 
 
-# v126: reduce actual cgroup file pages instead of reclassifying cached bytes.
-# memory.reclaim is a *cgroup-local* kernel interface; do not write global
-# /proc/sys/vm/drop_caches, do not erase application or Supabase data.
-# On hosted Streamlit it may be read-only; failures are reported truthfully.
-_CACHE_RECLAIM_MIN_INTERVAL = 300
-_CACHE_RECLAIM_LOCK = threading.Lock()
-_CACHE_RECLAIM_LAST = {'time': 0.0, 'status': '未実行', 'before_mib': None,
-                       'after_mib': None, 'requested_mib': 0, 'reason': '起動前'}
+
+def memory_needs_guard(pressure):
+    """Only block jobs for genuinely tight cgroup memory, not clean inactive cache.
+
+    Linux generally reclaims inactive_file under pressure. Still keep a strict
+    absolute cgroup guard to avoid running with almost no remaining headroom.
+    """
+    if not pressure:return False
+    if pressure.get('effective_ratio',pressure.get('ratio',0))>=0.80:return True
+    return pressure.get('ratio',0)>=0.96
 
 
-def _v126_cgroup_sample():
-    """Small cgroup snapshot; never infer memory.current is all private RSS."""
-    root='/sys/fs/cgroup/'
-    def read_number(name):
-        try:
-            with open(root+name,encoding='ascii') as handle: return int(handle.read().strip())
-        except (OSError,ValueError): return 0
-    keys=('file','inactive_file','shmem','anon','kernel')
-    stats={}
-    try:
-        with open(root+'memory.stat',encoding='ascii') as handle:
-            for line in handle:
-                parts=line.split()
-                if len(parts)==2 and parts[0] in keys:
-                    stats[parts[0]]=int(parts[1])
-    except (OSError,ValueError): pass
-    stats['current']=read_number('memory.current')
-    return stats
 
 
-def _v126_discard_file_cache(path):
-    """Best-effort DONTNEED for app-owned *closed* temporary data files only."""
-    if _V127_INSPECTION_ONLY:return False
-    if not getattr(os,'posix_fadvise',None):return False
-    try:
-        # Do not dereference arbitrary symlinks, and do not touch live DB WALs.
-        if not path or not os.path.isfile(path) or os.path.islink(path):return False
-        fd=os.open(path,os.O_RDONLY|getattr(os,'O_CLOEXEC',0))
-        try:
-            os.posix_fadvise(fd,0,0,os.POSIX_FADV_DONTNEED)
-            return True
-        finally:os.close(fd)
-    except (AttributeError,OSError,ValueError):return False
-
-
+# v130: Resource isolation policy.
+# The application must never change shared OS file caches, cgroup memory,
+# Conda/uv package caches, installed libraries, or other applications' files.
+# Only memory owned by this Python process may be reclaimed.
 def _v126_trim_heap():
-    """Return released glibc arenas to OS after a bulk worker exits."""
+    """Release unused heap arenas owned by this Python process only."""
     try:
         import gc
         gc.collect()
-        # Trim only after reaching an idle point, never for each HTTP page.
         import ctypes
         libc=ctypes.CDLL(None)
         trim=getattr(libc,'malloc_trim',None)
@@ -6868,57 +6848,13 @@ def _v126_trim_heap():
             trim.restype=ctypes.c_int
             trim(0)
         return True
-    except (ImportError,OSError,AttributeError,TypeError,ValueError):return False
-
-
-def _v126_reclaim_idle_cache(reason='idle', *, force=False):
-    """Attempt to shrink observed *total* memory.current, not calculated RSS.
-
-    Use memory.reclaim only when cgroup2 grants access. It is strictly local
-    and opportunistic; EACCES/EROFS are ordinary supported outcomes. Never
-    report a theoretical reclaim amount as actual saved memory.
-    """
-    now=time.monotonic()
-    with _CACHE_RECLAIM_LOCK:
-        if not force and now-_CACHE_RECLAIM_LAST['time']<_CACHE_RECLAIM_MIN_INTERVAL:
-            return dict(_CACHE_RECLAIM_LAST)
-        before=_v126_cgroup_sample()
-        inactive=before.get('inactive_file',0)
-        # Prefer a generous active filesystem cache; do not target all pages.
-        target=min(1024*1024*1024,max(0,inactive-96*1024*1024))
-        status='回収不要'
-        if target>=64*1024*1024:
-            try:
-                with open('/sys/fs/cgroup/memory.reclaim','w',encoding='ascii') as handle:
-                    handle.write(str(target))
-                status='回収を要求済み'
-            except OSError as exc:
-                # Typical Streamlit Cloud: root cgroup is mounted read-only.
-                status='コンテナ権限で回収不可' if exc.errno in (1,13,30) else '回収要求失敗'
-        after=_v126_cgroup_sample()
-        _CACHE_RECLAIM_LAST.update({'time':now,'reason':str(reason)[:32],
-                                   'status':status,'requested_mib':round(target/1048576),
-                                   'before_mib':round(before.get('current',0)/1048576,1),
-                                   'after_mib':round(after.get('current',0)/1048576,1),
-                                   'file_before_mib':round(before.get('file',0)/1048576,1),
-                                   'file_after_mib':round(after.get('file',0)/1048576,1)})
-        return dict(_CACHE_RECLAIM_LAST)
+    except (ImportError,OSError,AttributeError,TypeError,ValueError):
+        return False
 
 
 def _v126_work_finished(reason, file_path=None):
-    # No global caches discarded. Read-only fadvise never changes saved rows.
-    if _V127_INSPECTION_ONLY:return
-    if file_path:_v126_discard_file_cache(file_path)
-    _v126_trim_heap()
-    _v126_reclaim_idle_cache(reason)
-
-
-def _v126_startup_reclaim():
-    """One asynchronous attempt per Streamlit process, no UI or HTTP delay."""
-    if getattr(_v126_startup_reclaim,'started',False):return
-    _v126_startup_reclaim.started=True
-    threading.Thread(target=lambda: _v126_reclaim_idle_cache('server-start'),
-                     name='sumai-cache-reclaim',daemon=True).start()
+    """Clean up the application's Python heap after its own worker completes."""
+    return _v126_trim_heap()
 
 
 # v124: On-demand, bounded, private memory diagnosis. No subprocess, no DB read,
@@ -7004,6 +6940,10 @@ def _v124_temp_folder_totals(path, max_entries=2500, depth=2):
         try:
             with os.scandir(folder) as iterator:
                 for entry in iterator:
+                    # Do not descend into, inspect, or count other apps' temp files.
+                    # Only this app's reserved sumai-* / sumai_* names are in scope.
+                    if level==0 and not entry.name.startswith(('sumai-', 'sumai_')):
+                        continue
                     if count>=max_entries:truncated=True;break
                     count+=1
                     try:
@@ -7043,7 +6983,6 @@ def memory_diagnostic_v124():
         'events':_v124_parse_kv(_v124_read_numeric(root+'memory.events')),
         'stat':{k:stat[k] for k in MEMORY_DIAGNOSTIC_FIELDS if k in stat},
     }
-    result['cache_reclaim']=dict(_CACHE_RECLAIM_LAST)
     result['processes']=_v124_process_rows()
     result['temp']={
         '/tmp':_v124_temp_folder_totals('/tmp'),
@@ -7112,14 +7051,7 @@ def format_memory_diagnostic_v124(samples):
                 if p.get('pss_anon') is not None:line+=f' / PSS匿名 {n(p["pss_anon"])}'
                 if p.get('pss_file') is not None:line+=f' / PSSファイル {n(p["pss_file"])}'
             out.append(line)
-        report=s.get('cache_reclaim') or {}
-        if report.get('before_mib') is not None:
-            out.append('■ ファイルページの回収（実測）')
-            out.append('  結果：'+str(report.get('status','未確認')))
-            out.append('  実測前：'+str(report.get('before_mib'))+' MiB / 実測後：'+str(report.get('after_mib'))+' MiB')
-            out.append('  ファイル関連：'+str(report.get('file_before_mib'))+' → '+str(report.get('file_after_mib'))+' MiB')
-            out.append('  指定回収量：'+str(report.get('requested_mib',0))+' MiB（実績とは異なる）')
-        out += [f'■ 一時ファイルの容量（RAM使用量ではありません）']
+        out += [f'■ アプリ専用の一時ファイル容量（RAM使用量ではありません）']
         for folder,v in s['temp'].items():
             out.append(f'  {folder}：{v["file_entries_scanned"]}件を調査'+('（件数上限につき一部のみ）' if v['incomplete'] else ''))
             for key,size in v['bytes'].items():out.append(f'    {key}：{n(size)}')
@@ -7134,379 +7066,9 @@ def format_memory_diagnostic_v124(samples):
     return ('\n'.join(out)+'\n').encode('utf-8-sig')
 
 
-# v127 passive runtime file cache inventory. This code never drops caches or deletes files.
-class _V127FileCacheInventory:
-    """Read-only full-filesystem mincore inventory; NOT exact cgroup ownership."""
-    MAX_FILES = 1500000
-    MAX_SECONDS = 600
-    MAX_TOP = 100
-    CHUNK = 64 * 1024 * 1024
-
-    def __init__(self, roots=None, max_files=None, max_seconds=None):
-        self.roots = roots or ['/']
-        self.max_files = max_files or self.MAX_FILES
-        self.max_seconds = max_seconds or self.MAX_SECONDS
-        self.lock = threading.RLock()
-        self.thread = None
-        self._done = False
-        self.error = ''
-        self.progress = {'phase':'未開始', 'files':0, 'directories':0, 'regular_bytes':0,
-                         'resident_bytes':0,'unknown_files':0,'skipped_permissions':0,
-                         'elapsed_seconds':0}
-        self.txt_path = ''
-        self.csv_path = ''
-        self.started_at = None
-        self.completed_at = None
-        self.summary = None
-
-    def launch(self):
-        self.thread = threading.Thread(target=self._run, name='sumai-file-resident-probe', daemon=True)
-        self.thread.start()
-
-    def snapshot(self):
-        with self.lock:
-            return {'done':self._done, 'error':self.error,'progress':dict(self.progress),
-                    'txt_path':self.txt_path,'csv_path':self.csv_path,'summary':self.summary}
-
-    @staticmethod
-    def _segment(path):
-        bits=path.split('/')
-        if len(bits)<=2:return '/'
-        if bits[1] in ('usr','opt','home','var','mnt','run','tmp') and len(bits)>3:
-            return '/'+bits[1]+'/'+bits[2]
-        return '/'+bits[1]
-
-    @staticmethod
-    def _mincore_setup():
-        import ctypes
-        libc=ctypes.CDLL(None, use_errno=True)
-        try:map_fn=libc.mmap;core_fn=libc.mincore;unmap_fn=libc.munmap
-        except AttributeError as exc:raise RuntimeError('Linux mincore/mmap is not available') from exc
-        map_fn.restype=ctypes.c_void_p
-        map_fn.argtypes=[ctypes.c_void_p,ctypes.c_size_t,ctypes.c_int,ctypes.c_int,ctypes.c_int,ctypes.c_longlong]
-        core_fn.restype=ctypes.c_int
-        core_fn.argtypes=[ctypes.c_void_p,ctypes.c_size_t,ctypes.c_void_p]
-        unmap_fn.restype=ctypes.c_int
-        unmap_fn.argtypes=[ctypes.c_void_p,ctypes.c_size_t]
-        return ctypes,map_fn,core_fn,unmap_fn
-
-    @classmethod
-    def _resident_bytes_fd(cls,fd,size,platform):
-        """Check pages already in the page cache without reading their contents."""
-        import mmap
-        ctypes,map_fn,core_fn,unmap_fn=platform
-        page=os.sysconf('SC_PAGESIZE')
-        resident=0
-        for offset in range(0,size,cls.CHUNK):
-            part=min(cls.CHUNK,size-offset)
-            ptr=map_fn(None,part,0,mmap.MAP_PRIVATE,fd,offset)
-            if ptr is None or ptr==ctypes.c_void_p(-1).value:
-                raise OSError(ctypes.get_errno(),'mmap failed')
-            try:
-                count=(part+page-1)//page
-                vec=(ctypes.c_ubyte*count)()
-                if core_fn(ptr,part,vec)!=0:
-                    raise OSError(ctypes.get_errno(),'mincore failed')
-                resident+=sum(1 for byte in vec if byte&1)*page
-            finally:
-                if unmap_fn(ptr,part)!=0:raise OSError(ctypes.get_errno(),'munmap failed')
-        return resident
-
-    @classmethod
-    def _resident_bytes_path(cls,path,stat_info,platform):
-        import stat
-        if not stat.S_ISREG(stat_info.st_mode):return None
-        if stat_info.st_size==0:return 0
-        flags=os.O_RDONLY|getattr(os,'O_CLOEXEC',0)|getattr(os,'O_NOFOLLOW',0)|getattr(os,'O_NONBLOCK',0)
-        fd=os.open(path,flags)
-        try:
-            actual=os.fstat(fd)
-            if not stat.S_ISREG(actual.st_mode) or actual.st_dev!=stat_info.st_dev or actual.st_ino!=stat_info.st_ino:
-                raise OSError('file was replaced during scan')
-            return cls._resident_bytes_fd(fd,actual.st_size,platform)
-        finally:os.close(fd)
-
-    def _collect_open_deleted(self,platform):
-        """Open-but-deleted files cannot be found with os.scandir('/')."""
-        import stat
-        raw=_v124_read_numeric('/sys/fs/cgroup/cgroup.procs',32768)
-        pids={int(x) for x in raw.split() if x.isdecimal()}
-        pids.add(os.getpid())
-        rows=[];blocked=0
-        seen=set()
-        for pid in sorted(pids):
-            folder=f'/proc/{pid}/fd'
-            try:names=os.listdir(folder)
-            except OSError:blocked+=1;continue
-            for entry in names[:2000]:
-                fd_path=folder+'/'+entry
-                try:target=os.readlink(fd_path)
-                except OSError:continue
-                if not target.endswith(' (deleted)'):continue
-                try:
-                    st_info=os.stat(fd_path)
-                    if not stat.S_ISREG(st_info.st_mode):continue
-                    identity=(st_info.st_dev,st_info.st_ino)
-                    if identity in seen:continue
-                    seen.add(identity)
-                    try:
-                        fd=os.open(fd_path,os.O_RDONLY|getattr(os,'O_CLOEXEC',0))
-                        try:resident=self._resident_bytes_fd(fd,st_info.st_size,platform)
-                        finally:os.close(fd)
-                    except (OSError,ValueError):resident=None
-                    rows.append({'pid':pid,'path':target,'size':st_info.st_size,'resident':resident})
-                except OSError:continue
-        return rows,blocked
-
-    def _run(self):
-        import csv
-        import gzip
-        import heapq
-        import stat
-        started=time.monotonic()
-        file_handle=None
-        try:
-            platform=self._mincore_setup()
-            before=_v126_cgroup_sample()
-            self.started_at=datetime.now(timezone(timedelta(hours=9))).isoformat(timespec='seconds')
-            fd,self.csv_path=tempfile.mkstemp(prefix='sumai-v127-file-resident-',suffix='.csv.gz')
-            file_handle=os.fdopen(fd,'wb')
-            with gzip.open(file_handle,mode='wt',encoding='utf-8',newline='',compresslevel=3) as output:
-                writer=csv.writer(output)
-                writer.writerow(['path','folder_group','file_size_bytes','resident_page_bytes',
-                                 'resident_percent_of_file_size','status'])
-                stack=list(self.roots)
-                directories=0;files=0;total_size=0;resident_total=0;unknown=0
-                permission_errors=0;other_errors=0;dup_files=0
-                top=[];groups={};seen_files=set();exclusions=['/proc','/sys','/dev']
-                truncation=''
-                while stack:
-                    if time.monotonic()-started>self.max_seconds:
-                        truncation='時間上限';break
-                    if files>=self.max_files:
-                        truncation='件数上限';break
-                    folder=stack.pop()
-                    directories+=1
-                    try:
-                        with os.scandir(folder) as directory:
-                            for entry in directory:
-                                if time.monotonic()-started>self.max_seconds:
-                                    truncation='時間上限';break
-                                try:
-                                    info=entry.stat(follow_symlinks=False)
-                                    mode=info.st_mode
-                                    if stat.S_ISDIR(mode):
-                                        path=entry.path
-                                        if path not in exclusions:stack.append(path)
-                                        continue
-                                    if not stat.S_ISREG(mode):continue
-                                    if files>=self.max_files:
-                                        truncation='件数上限';break
-                                    identity=(info.st_dev,info.st_ino)
-                                    if info.st_nlink>1:
-                                        if identity in seen_files:
-                                            dup_files+=1;continue
-                                        seen_files.add(identity)
-                                    files+=1
-                                    group=self._segment(entry.path)
-                                    stat_group=groups.setdefault(group,{'files':0,'size_bytes':0,'resident_bytes':0,'unknown':0})
-                                    stat_group['files']+=1;stat_group['size_bytes']+=info.st_size
-                                    total_size+=info.st_size
-                                    try:
-                                        resident=self._resident_bytes_path(entry.path,info,platform)
-                                        status='measured'
-                                        stat_group['resident_bytes']+=resident;resident_total+=resident
-                                        if resident:
-                                            row=(resident,info.st_size,entry.path)
-                                            if len(top)<self.MAX_TOP:heapq.heappush(top,row)
-                                            elif row>top[0]:heapq.heapreplace(top,row)
-                                    except PermissionError:
-                                        resident=None;status='permission_denied';permission_errors+=1
-                                    except (OSError,OverflowError,ValueError) as exc:
-                                        resident=None;status='unmeasurable_'+type(exc).__name__;other_errors+=1
-                                    if resident is None:
-                                        unknown+=1;stat_group['unknown']+=1
-                                    writer.writerow([entry.path,group,info.st_size,
-                                                     '' if resident is None else resident,
-                                                     '' if resident is None or info.st_size==0 else round(100*resident/info.st_size,2),status])
-                                    if files%500==0:
-                                        with self.lock:
-                                            self.progress={'phase':'ファイル走査中','files':files,
-                                                'directories':directories,'regular_bytes':total_size,
-                                                'resident_bytes':resident_total,'unknown_files':unknown,
-                                                'skipped_permissions':permission_errors,
-                                                'elapsed_seconds':int(time.monotonic()-started)}
-                                except OSError:
-                                    other_errors+=1
-                    except PermissionError:
-                        permission_errors+=1
-                    except OSError:
-                        other_errors+=1
-                    if truncation:break
-            file_handle.close()
-            file_handle=None
-            deleted,fd_blocked=self._collect_open_deleted(platform)
-            after=_v126_cgroup_sample()
-            delta=after.get('current',0)-before.get('current',0)
-            duration=round(time.monotonic()-started,1)
-            self.completed_at=datetime.now(timezone(timedelta(hours=9))).isoformat(timespec='seconds')
-            summary={'before':before,'after':after,'elapsed_seconds':duration,
-                'total_files':files,'total_dirs':directories,'disk_size_bytes':total_size,
-                'resident_page_bytes':resident_total,'unknown_files':unknown,
-                'permission_errors':permission_errors,'other_errors':other_errors,
-                'duplicate_inode_files':dup_files,'truncation':truncation,
-                'unsearched_directory_count':len(stack),'groups':groups,
-                'top':sorted(top,reverse=True),'deleted_open':deleted,'fd_blocked':fd_blocked}
-            self.summary=summary
-            lines=['住まいコンパス｜実ファイル・ページキャッシュ調査 v127 (読み取り専用)',
-                '測定開始：'+self.started_at,'測定終了：'+self.completed_at,
-                '調査時間：'+str(duration)+' 秒',
-                '注記: mincore はファイルごとに既に常駐しているページを表示するが、',
-                'cgroup内の課金先やactive_file/inactive_fileの区別を示さない。',
-                'よって以下のファイル別合計はinactive_fileの厳密な内訳ではない。',
-                '内容は読み取らず、ファイル名・容量・常駐ページの状況を検査。削除・圧縮・キャッシュ解放は一切しない。',
-                '', '【Linux cgroup memory.stat】']
-            def mib(value):return f'{int(value)/1048576:,.1f} MiB'
-            for key in ('current','file','inactive_file','active_file','shmem','anon','kernel'):
-                lines.append(f'  {key}: 前 {mib(before.get(key,0))} → 後 {mib(after.get(key,0))}')
-            lines+=['','【ファイル走査】',
-                '  調査ファイル：'+str(files)+' 件 / ディレクトリ：'+str(directories),
-                '  調査ファイルの実サイズ合計：'+mib(total_size),
-                '  mincoreで観測した常駐ページ合計：'+mib(resident_total),
-                '  対象ファイルの測定不可：'+str(unknown)+' 件 (権限エラー '+str(permission_errors)+' 件)',
-                '  同一inode重複を除外：'+str(dup_files)+' 件',
-                '  走査打ち切り：'+(truncation or 'なし'),
-                '  未走査ディレクトリ：'+str(len(stack)),
-                '  調査前後のコンテナ使用量変化：'+mib(abs(delta))+(' 増' if delta>=0 else ' 減'),
-                '', '【常駐ページの多いディレクトリ】']
-            for folder,group in sorted(groups.items(),key=lambda pair:pair[1]['resident_bytes'],reverse=True):
-                lines.append(f'  {folder}：常駐 {mib(group["resident_bytes"])} / 合計ファイルサイズ {mib(group["size_bytes"])} / {group["files"]} 件 / 測定不可 {group["unknown"]} 件')
-            lines+=['','【常駐ページの多い実ファイル（最大100件）】']
-            for resident,size,path in sorted(top,reverse=True):
-                lines.append('  常駐 '+mib(resident)+' / 実サイズ '+mib(size)+' / '+path)
-            lines+=['','【削除済みだが開かれている実ファイル】',
-                '  確認件数 '+str(len(deleted))+' 件 / PIDのfd参照不可 '+str(fd_blocked)+' 件']
-            for row in sorted(deleted,key=lambda r:r.get('resident') or 0,reverse=True)[:100]:
-                lines.append(f'  PID {row["pid"]} / 常駐 {mib(row["resident"]) if row["resident"] is not None else "測定不可"} / 実サイズ {mib(row["size"])} / {row["path"]}')
-            lines+=['', '【未特定量の扱い】',
-                '  上記常駐合計とinactive_fileとの差は、そのまま未解放量ではない。',
-                '  mincoreは別cgroupが課金したキャッシュも観測し得る。',
-                '  ファイル一覧に現れないページや削除済みファイル、走査できない権限領域もある。',
-                '  このTXTと全件CSVを確認してから個別に回収方針を決める。']
-            fd,self.txt_path=tempfile.mkstemp(prefix='sumai-v127-file-resident-',suffix='.txt')
-            with os.fdopen(fd,'w',encoding='utf-8-sig') as handle:handle.write('\n'.join(lines)+'\n')
-            with self.lock:
-                self.progress={'phase':'完了','files':files,'directories':directories,
-                    'regular_bytes':total_size,'resident_bytes':resident_total,
-                    'unknown_files':unknown,'skipped_permissions':permission_errors,
-                    'elapsed_seconds':duration}
-                self._done=True
-        except Exception as exc:
-            import traceback
-            with self.lock:
-                self._done=True
-                self.error=type(exc).__name__+': '+str(exc)[:200]
-                self.progress['phase']='失敗'
-        finally:
-            if file_handle:
-                try:file_handle.close()
-                except OSError:pass
-
-@st.cache_resource
-def _v127_file_inventory_slot():
-    return {'job':None,'lock':threading.Lock()}
-
-
-@st.fragment(run_every="4s")
-def render_file_cache_inventory_v128():
-    """Always-visible, auto-refreshing, read-only file-cache investigation UI.
-
-    The investigation and both output controls stay in the Saved Data tab.
-    No separate expander or manual refresh is required. The v127 job cache is
-    deliberately reused across hot reloads so an ongoing scan is not lost.
-    """
-    st.markdown('#### 実ファイルとページキャッシュの調査')
-    st.caption('サーバー内に存在する実ファイルと、メモリに残っているページを調べます。元ファイルとSupabaseのデータは変更しません。')
-
-    slot=_v127_file_inventory_slot()
-    with slot['lock']:
-        job=slot.get('job')
-    snap=job.snapshot() if job else None
-    running=bool(job and job.thread and job.thread.is_alive() and not (snap or {}).get('done'))
-
-    label=('調査中（自動更新しています）' if running else
-           '実ファイルの調査を開始' if not job else '実ファイルを再調査する')
-    if st.button(label,key='v128_start_file_scan',disabled=running,
-                 type='primary' if not job else 'secondary',use_container_width=True):
-        with slot['lock']:
-            old=slot.get('job')
-            if old and old.thread and old.thread.is_alive():
-                job=old
-            else:
-                job=_V127FileCacheInventory()
-                slot['job']=job
-                job.launch()
-        snap=job.snapshot()
-        running=bool(job.thread and job.thread.is_alive() and not snap.get('done'))
-
-    if not job:
-        st.info('未調査です。「実ファイルの調査を開始」を押してください。完了すると下の2ファイルをダウンロードできます。')
-    else:
-        snap=snap or job.snapshot()
-        progress=snap.get('progress') or {}
-        count=int(progress.get('files') or 0)
-        resident=float(progress.get('resident_bytes') or 0)/1048576
-        elapsed=int(progress.get('elapsed_seconds') or 0)
-        if running:
-            st.info(f'調査中｜{count:,}ファイル確認｜常駐ページ推定 {resident:,.1f} MiB｜経過 {elapsed:,}秒。4秒ごとに自動更新します。')
-            st.caption('調査は最大10分です。進捗は取得できたファイル数を表示します（総ファイル数は調査完了まで未確定です）。')
-        elif snap.get('error'):
-            st.error('調査に失敗しました：'+str(snap['error']))
-            st.caption('上の「実ファイルを再調査する」からやり直せます。')
-        elif snap.get('done'):
-            summary=snap.get('summary') or {}
-            st.success('実ファイルの調査が完了しました。下のTXTとCSV.gzをダウンロードしてください。')
-            st.caption(f'確認 {int(summary.get("total_files") or 0):,}件｜'
-                       f'実サイズ合計 {float(summary.get("disk_size_bytes") or 0)/1048576:,.1f} MiB｜'
-                       f'常駐ページ推定 {float(summary.get("resident_page_bytes") or 0)/1048576:,.1f} MiB｜'
-                       f'所要 {float(summary.get("elapsed_seconds") or 0):,.1f}秒')
-            if summary.get('truncation'):
-                st.warning('調査は '+str(summary['truncation'])+' で打ち切られました。TXTに調査範囲・測定不能件数を記載しています。')
-            elif int(summary.get('unknown_files') or 0)>0:
-                st.caption('測定不能なファイル '+f'{int(summary["unknown_files"]):,}'+'件。詳細はTXTと全件CSV.gzをご確認ください。')
-        elif job.thread and not job.thread.is_alive():
-            st.error('調査スレッドが終了しましたが、完了結果を取得できませんでした。再調査してください。')
-        else:
-            st.info('調査開始の準備中です。4秒ごとに画面を自動更新します。')
-
-    st.markdown('**調査結果ファイル（2種類）**')
-    finished=bool(snap and snap.get('done') and not snap.get('error'))
-    txt=snap.get('txt_path') if finished else None
-    csv_gz=snap.get('csv_path') if finished else None
-    txt_ready=bool(txt and os.path.isfile(txt))
-    csv_ready=bool(csv_gz and os.path.isfile(csv_gz))
-    col1,col2=st.columns(2)
-    if txt_ready:
-        with open(txt,'rb') as stream:
-            col1.download_button('調査TXTをダウンロード',stream.read(),
-                'sumai_real_file_memory_v128.txt','text/plain',
-                key='v128_probe_txt',use_container_width=True,on_click='ignore')
-    else:
-        col1.button('調査TXTをダウンロード（完了待ち）',key='v128_probe_txt_wait',
-                    disabled=True,use_container_width=True)
-    if csv_ready:
-        with open(csv_gz,'rb') as stream:
-            col2.download_button('全件CSV.gzをダウンロード',stream.read(),
-                'sumai_real_file_memory_v128.csv.gz','application/gzip',
-                key='v128_probe_csv',use_container_width=True,on_click='ignore')
-    else:
-        col2.button('全件CSV.gzをダウンロード（完了待ち）',key='v128_probe_csv_wait',
-                    disabled=True,use_container_width=True)
-    if finished and not (txt_ready and csv_ready):
-        st.error('調査は終了しましたが結果ファイルが見つかりません。上の「実ファイルを再調査する」で再取得してください。')
-    st.caption('CSV.gzは診断結果の圧縮ファイルです。サーバー内の元ファイルは圧縮・削除しません。'
-               ' mincoreの常駐ページはinactive_fileと厳密に一致するものではありません。')
-
+# v130: Full-server file inspection was removed. It scanned unrelated files,
+# raised memory usage during measurement, and did not identify cgroup ownership.
+# Lightweight read-only process/container counters remain available below.
 
 def render_memory_diagnostic_v124():
     """Small opt-in expander; no sampling on every Streamlit fragment refresh."""
@@ -7530,9 +7092,6 @@ def render_memory_diagnostic_v124():
             a.metric('ファイル関連',metric(stat.get('file')))
             b.metric('うち共有メモリ',metric(stat.get('shmem')))
             st.caption('記録 '+str(len(history))+'/3回｜直近 '+last['timestamp_jst']+'。ファイル関連には共有メモリ等も含みます。')
-            reclaim=last.get('cache_reclaim') or {}
-            if reclaim.get('before_mib') is not None:
-                st.caption('ファイルページ回収：'+str(reclaim.get('status'))+'｜全体 '+str(reclaim.get('before_mib'))+' → '+str(reclaim.get('after_mib'))+' MiB')
             st.download_button('メモリ診断TXTをダウンロード',
                                format_memory_diagnostic_v124(history),
                                'sumai_memory_diagnostic_v124.txt','text/plain',
@@ -7880,7 +7439,7 @@ class AutomaticCollection:
             result=dict(settings=dict(self.settings),summary=dict(self.summary),message=self.message,error=self.error,build=getattr(self,'build',None),
                         running=self.thread.is_alive(),stopping=self.stop_event.is_set(),progress=self.progress)
         if job:
-            snap=job.snapshot();result.update(message=snap['message'],progress=snap['progress'],current=snap)
+            snap=job.snapshot(include_units=False);result.update(message=snap['message'],progress=snap['progress'],current=snap)
         return result
     def request_stop(self):
         with self.lock:
@@ -7894,7 +7453,7 @@ class AutomaticCollection:
             self.ensure_plan()
             while not self.stop_event.is_set():
                 pressure=cloud_memory_pressure()
-                if pressure and pressure['ratio']>=.80:
+                if memory_needs_guard(pressure):
                     with self.lock:
                         self.error=('サーバーメモリの使用率が80%に達したため、自動収集を一時停止しました。'+
                                     '保存済み物件と未着手の町は保持しています。')
@@ -7941,7 +7500,7 @@ class AutomaticCollection:
                         running_for=time.monotonic()-started_town
                         idle_for=time.monotonic()-job.state.last_activity_at
                         memory=cloud_memory_pressure()
-                        if memory and memory['ratio']>=.80:
+                        if memory_needs_guard(memory):
                             timeout_reason.append('サーバーメモリ保護により中断（'+str(memory['used_mib'])+
                                                   '/'+str(memory['limit_mib'])+' MiB）')
                             self.error=timeout_reason[-1]+'。保存済み物件は保持しています。'
@@ -7965,7 +7524,7 @@ class AutomaticCollection:
                 finally:
                     watchdog_finished.set()
                     watcher.join(timeout=2)
-                snap=job.snapshot();result=snap.get('result') or {};status=result.get('status','failed')
+                snap=job.snapshot(include_units=False);result=snap.get('result') or {};status=result.get('status','failed')
                 if timeout_reason and not self.stop_event.is_set() and status!='failed':
                     result['status']='partial'
                     stats=result.setdefault('summary',{})
@@ -7981,13 +7540,13 @@ class AutomaticCollection:
                     self.summary['last_summary']=dict(result.get('summary',{}) or {})
                     self.summary['last_summary']['issues']=list((
                         self.summary['last_summary'].get('issues') or [])[-5:])
-                    self.summary['saved_observations']=int(self.summary.get('saved_observations',0))+len(snap['saved'])
+                    self.summary['saved_observations']=int(self.summary.get('saved_observations',0))+int(snap['saved_count'])
                     stats=result.get('summary',{})
                     for name,source in (('new_saved_observations','new_saved'),('updated_saved_observations','updated_saved'),('failed_save_observations','unsaved'),('processed_observations','processed'),('error_observations','errors'),('detail_observations','detail'),('skipped_observations','already_acquired'),('rejected_observations','rejected')):
                         self.summary[name]=int(self.summary.get(name,0))+int(stats.get(source,0))
                     self.summary['statistics_started_at']=self.summary.get('statistics_started_at') or self.summary['last_started_at']
                     self.summary['collection_seconds']=float(self.summary.get('collection_seconds',0))+float(stats.get('elapsed',0))
-                    self.summary['confirmed_observations']=int(self.summary.get('confirmed_observations',0))+len(snap['units'])
+                    self.summary['confirmed_observations']=int(self.summary.get('confirmed_observations',0))+int(snap['unit_count'])
                     total=max(1,int(conditions.get('auto_total_tasks',len(plan)) or len(plan)))
                     actual_index=int(conditions.get('auto_task_index',index) or 0)%total
                     success=status in ('completed','partial') and not incomplete and not self.stop_event.is_set()
@@ -8140,7 +7699,11 @@ def restore_automatic_collection():
             st.session_state.automatic_saved_settings=settings;st.session_state.automatic_saved_summary=summary
             controller=AutomaticCollection(db,settings,summary);registry[key]=controller
             st.session_state.automatic_collection_controller=controller
-            if settings.get('enabled'):controller.thread.start()
+            # Restore progress but never start an automatic job merely because
+            # an old DB checkpoint still says enabled. Explicit Start resumes.
+            if settings.get('enabled'):
+                controller.settings['enabled']=False
+                controller.message='前回の進捗を復元しました。収集は停止中です。開始・再開ボタンで再開できます。'
     except Exception as exc:st.session_state.automatic_settings_error=str(exc) if isinstance(exc,AppError) else '自動収集設定の復元に失敗しました（'+type(exc).__name__+'）'
 
 def validate_automatic_settings(settings):
@@ -8391,8 +7954,11 @@ def automatic_collection_panel():
     st.subheader('アプリ内の自動収集（SUUMO）')
     memory=cloud_memory_pressure()
     if memory:
-        st.caption(f"メモリ {memory['used_mib']}/{memory['limit_mib']} MiB（{memory['ratio']:.0%}）｜Python本体 {memory['rss_mib']} MiB｜ファイル関連 {memory['cache_mib']} MiB。80%で収集停止。")
-    st.caption('画面を閉じてもサーバー稼働中は収集します。休止・再起動では止まり、次にアプリを開くと保存した設定・町の順番から再開します。')
+        st.caption(f"処理と非回収キャッシュの目安 {memory['effective_mib']}/{memory['limit_mib']} MiB" 
+                   f"（{memory['effective_ratio']:.0%}）｜コンテナ計上 {memory['used_mib']} MiB" 
+                   f"｜Python RSS {memory['rss_mib']} MiB｜非アクティブなファイルページ {memory['inactive_mib']} MiB。"
+                   '保護停止は実効80%以上またはコンテナ全体96%以上。')
+    st.caption('収集中は画面を閉じても継続します。サーバーの再起動後は自動再開しません。進捗は保存され、開始・再開ボタンで再開できます。')
     controller=get_automatic_collection();snap=controller.snapshot() if controller else None
     # Legacy per-error persistence bridge intentionally disabled. Historical
     # diagnostics can now be discarded without being written back on UI reruns.
@@ -8609,9 +8175,8 @@ def town_aggregate_streaming(raw_rows):
                     'examined':examined,'unmatched':examined-latest_count,'updated_at':utc_now()}
         finally:
             db.close()
-            # Reclaim clean pages of the now-closed spill file; the OS might
-            # otherwise retain them in inactive_file after deletion.
-            _v126_discard_file_cache(os.path.join(folder,'latest.sqlite'))
+            # No OS-wide or page-cache manipulation. The app's private
+            # TemporaryDirectory cleanup is performed by its context manager.
 
 
 class TownSummaryWorker:
@@ -8628,9 +8193,15 @@ class TownSummaryWorker:
         # A usable saved summary stays visible during this refresh.
         self._startup_scan_requested=False
     def refresh_on_startup(self):
+        """Do not rescan every saved listing when a stored town summary exists.
+
+        Collection completion and the explicit refresh button still recalculate
+        the summary. An empty database boot builds the initial summary once.
+        """
         with self.lock:
             if self._startup_scan_requested:return False
             self._startup_scan_requested=True
+            if self.ready:return False
         return self.start()
     def initialize(self):
         with self.lock:
@@ -8680,7 +8251,7 @@ class TownSummaryWorker:
                 nonlocal last_id,page,page_size
                 while True:
                     pressure=cloud_memory_pressure()
-                    if pressure and pressure.get('ratio',0)>.82:
+                    if memory_needs_guard(pressure):
                         raise AppError('サーバーメモリ保護により町丁目集計を中断しました。')
                     params={'namespace':'eq.'+self.db.namespace,'select':'id,summary',
                         'status':'eq.rental_listing','and':'(id.gte.listing.,id.lt.listing/)',
@@ -8751,8 +8322,8 @@ def current_town_summary_worker():
         if job is None:
             job=TownSummaryWorker(db);jobs[key]=job
     job.initialize()
-    # Refresh even if yesterday's stored town summary is already ready.
-    # One background scan per backend worker, not on every Streamlit rerun.
+    # Only build at startup when no persisted snapshot exists. Refresh after
+    # a collection or with the existing explicit re-aggregation button.
     job.refresh_on_startup()
     return job
 
@@ -8909,8 +8480,8 @@ class TownBoundaryWorker:
                             conn.executemany('INSERT INTO areas VALUES(?,?,?,?,?,?)',batch)
                             batch.clear()
                     if batch:conn.executemany('INSERT INTO areas VALUES(?,?,?,?,?,?)',batch)
-                    # The 36MB input is no longer used after parsing.
-                    _v126_discard_file_cache(source)
+                    # Source cache stays under the application's own temp directory.
+                    # Do not advise global/shared kernel file-cache eviction.
                     count=conn.execute('SELECT COUNT(*) FROM areas').fetchone()[0]
                     if not count:raise ValueError('東京23区の町丁目境界が見つかりません。')
                     conn.execute('CREATE INDEX areas_bbox ON areas(south,north,west,east)')
@@ -9094,7 +8665,6 @@ def interactive_town_choropleth(group,facilities):
 
 
 def main():
-    # v127: no automatic cache reclaim before actual file inspection.
     st.set_page_config(page_title='住まいコンパス｜新しい住まいを探す',page_icon='🏡',layout='wide',initial_sidebar_state='collapsed')
     st.markdown(CSS,unsafe_allow_html=True)
     st.markdown(f'<div class="hero"><span class="badge">SUMAI COMPASS · {BUILD}</span><h1>次の住まいを、地図から。</h1><p>掲載物件を確認し、家賃と暮らしやすさを比べます。<br>間取りと家賃帯を、取得できた情報で比較します。</p></div>',unsafe_allow_html=True)
@@ -9282,9 +8852,6 @@ def main():
                             st.caption('差分はログの観測件数です。精度は同じ物件の正解データとの照合で確認してください。')
                         else:st.info('比較対象として現在の検索ログまたは保存ログを読み込んでください。')
                     except (ValueError,UnicodeError,AttributeError):st.error('このアプリからダウンロードした解析用JSONログを選択してください。')
-        # Inventory controls and both downloads remain visible, independent of
-        # the optional memory-diagnostic expander.
-        render_file_cache_inventory_v128()
         render_memory_diagnostic_v124()
     with tabs[2]:
         st.subheader('通勤の目安')
