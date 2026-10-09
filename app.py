@@ -39,7 +39,7 @@ import streamlit as st
 from streamlit_folium import st_folium
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v103"
+BUILD = "REBUILD-01-v104"
 
 # ============================================================================
 # NON-NEGOTIABLE SUUMO ADDRESS POLICY -- DO NOT DELETE OR WEAKEN
@@ -826,7 +826,7 @@ class Database:
                 if len(parts)!=3 or payload.get('role')!='service_role': raise ValueError()
             except Exception: raise AppError('Secret keyまたはservice_roleキーを設定してください。') from None
             self.headers['Authorization']='Bearer '+self.key
-        self.session=requests.Session();self.address_points=saved_position_memory()
+        self.session=requests.Session();self.address_points=saved_position_memory();self._saved_address_coords={}
     def call(self,method,table,params=None,data=None,prefer=None):
         if table not in (UNIT_TABLE,SEARCH_TABLE,PLACE_TABLE): raise AppError('保存先が不正です。')
         headers=dict(self.headers)
@@ -912,7 +912,8 @@ class Database:
             unique[property_id]={'namespace':self.namespace,'id':'acquired.'+hashlib.sha256(property_id.encode()).hexdigest(),
                 'status':'rental_acquisition','started_at':stamp,'finished_at':stamp,
                 'conditions':{'provider':'SUUMO','property_id':property_id,'schema':2},
-                'summary':{'last_success_at':stamp,'listing_key':compact_listing_key(row)}}
+                'summary':{'last_success_at':stamp,'listing_key':compact_listing_key(row),
+                           'address_complete':not saved_address_requires_reacquisition(row.get('address') or row.get('inferred_address'))}}
         return list(unique.values())
 
     def save_units(self,rows):
@@ -953,7 +954,11 @@ class Database:
                 response=self.call('POST',SEARCH_TABLE,{'on_conflict':'namespace,id','select':'id'},rest,'resolution=merge-duplicates,return=representation')
                 returned={r.get('id') for r in response if isinstance(r,dict)} if isinstance(response,list) else set()
                 if not {r['id'] for r in rest}<=returned:raise AppError('募集情報の更新・取得済みIDの保存を確認できません。')
-            for row in ledger:self.covered_acquisitions[row['conditions']['property_id']]=(row['finished_at'],row['summary']['listing_key'])
+            for row in ledger:
+                pid=row['conditions']['property_id']
+                self.covered_acquisitions[pid]=(row['finished_at'],row['summary']['listing_key'])
+                if getattr(self,'acquisition_cache',None) is not None and row['summary'].get('address_complete'):
+                    self.acquisition_cache[pid]=row['finished_at']
             saved.update(key for key,_ in batch)
             self.last_save_stats['new']+=len(inserted);self.last_save_stats['updated']+=len(updates)
         if not set(unique)<=saved:raise AppError('Supabaseから募集情報の保存確認が得られません。')
@@ -976,69 +981,73 @@ class Database:
         if not {r['id'] for r in payload}<=returned:raise AppError('物件IDの取得済み管理情報を保存できません。')
 
     def load_recent_acquisition_ids(self):
-        """Indexed, bounded ledger reads; never scan all saved listings for addresses.
+        """Read acquisition IDs once per controller, without re-reading every listing.
 
-        IDs without linked saved listing are deliberately re-fetched. Town-only
-        saved addresses are likewise re-fetched, never skipped by ledger alone.
+        New ledger entries contain the address-complete flag at write time. Only
+        legacy ledger entries require indexed point lookups. An incomplete or
+        unlinked saved listing is NEVER allowed to suppress reacquisition.
         """
+        now=time.monotonic()
         cached=getattr(self,'acquisition_cache',None)
-        if cached is not None and time.monotonic()-getattr(self,'acquisition_cache_at',0)<900:
-            return cached
-        ledger={};last_id='';pages=0;raw=0
+        if cached is not None and now-getattr(self,'acquisition_cache_at',0)<28800:
+            return dict(cached)
         cutoff=acquisition_cutoff().isoformat(timespec='seconds')
+        ledger={};legacy={};last_id='';pages=0;raw_count=0
         while True:
             params={'namespace':'eq.'+self.namespace,
+                    'status':'eq.rental_acquisition',
+                    'finished_at':'gte.'+cutoff,
                     'and':'(id.gte.acquired.,id.lt.acquired/)',
                     'select':'id,conditions,summary,finished_at',
-                    'order':'id.asc','limit':100}
+                    'order':'id.asc','limit':500}
             if last_id:params['id']='gt.'+last_id
             rows=self.call('GET',SEARCH_TABLE,params)
             if not isinstance(rows,list):raise AppError('取得済み物件IDを確認できません。')
-            pages+=1;raw+=len(rows)
+            pages+=1;raw_count+=len(rows)
             for row in rows:
                 if not str(row.get('id') or '').startswith('acquired.'):continue
-                cond=row.get('conditions') or {}; summary=row.get('summary') or {}
+                cond=row.get('conditions') or {};summary=row.get('summary') or {}
                 pid=normal(cond.get('property_id'))
                 stamp=summary.get('last_success_at') or row.get('finished_at')
-                if not re.fullmatch(r'SUUMO:(?:bc|jnc):\d+',pid):continue
-                if not recent_acquisition(stamp) or str(stamp)<cutoff:continue
+                if not re.fullmatch(r'SUUMO:(?:bc|jnc):\d+',pid) or not recent_acquisition(stamp):continue
+                complete=summary.get('address_complete')
                 key=normal(summary.get('listing_key'))
-                if key and re.fullmatch(r'[0-9a-f]{64}',key):
-                    ledger[pid]=(stamp,key)
-            if len(rows)<100:break
+                if complete is True:
+                    ledger[pid]=stamp
+                elif complete is None and re.fullmatch(r'[0-9a-f]{64}',key):
+                    legacy[pid]=(stamp,key)
+                # Explicit incomplete addresses / missing linkage must be retried.
+            if len(rows)<500:break
             new_last=str(rows[-1].get('id') or '')
             if not new_last or new_last<=last_id:raise AppError('取得済みIDのページ送りが停止しました。')
             last_id=new_last
-        keys=sorted({key for _,key in ledger.values()})
-        addresses={};address_requests=0
-        for offset in range(0,len(keys),60):
-            batch=keys[offset:offset+60]
-            # PostgREST `in` on primary key (namespace,id), no status JSON scan.
-            lookup='in.('+','.join('listing.'+key for key in batch)+')'
-            rows=self.call('GET',SEARCH_TABLE,{
-                'namespace':'eq.'+self.namespace,'id':lookup,
+        unique_keys=sorted({key for _,key in legacy.values()})
+        addresses={};lookups=0
+        for offset in range(0,len(unique_keys),60):
+            batch=unique_keys[offset:offset+60]
+            rows=self.call('GET',SEARCH_TABLE,{'namespace':'eq.'+self.namespace,
+                'id':'in.('+','.join('listing.'+key for key in batch)+')',
                 'select':'id,summary','limit':60})
-            address_requests+=1
-            if not isinstance(rows,list):raise AppError('保存物件の住所品質を確認できません。')
+            lookups+=1
+            if not isinstance(rows,list):raise AppError('旧取得済み物件の住所品質を確認できません。')
             for item in rows:
                 key=str(item.get('id') or '').removeprefix('listing.')
                 listing=((item.get('summary') or {}).get('listing') or {})
                 if isinstance(listing,dict):
                     addresses[key]=normal(listing.get('address') or listing.get('inferred_address'))
-        out={};requeued_incomplete=0;requeued_missing=0
-        for pid,(stamp,key) in ledger.items():
-            addr=addresses.get(key)
-            if addr is None:requeued_missing+=1;continue
-            if saved_address_requires_reacquisition(addr):
-                requeued_incomplete+=1;continue
-            out[pid]=stamp
-        self.last_acquisition_load_stats={
-            'pages':pages,'raw_records':raw,'recent_ids':len(out),
-            'full_listing_scan':False,'address_lookup_batches':address_requests,
+        requeued_incomplete=0;requeued_missing=0
+        for pid,(stamp,key) in legacy.items():
+            address=addresses.get(key)
+            if address is None:requeued_missing+=1;continue
+            if saved_address_requires_reacquisition(address):requeued_incomplete+=1;continue
+            ledger[pid]=stamp
+        self.last_acquisition_load_stats={'pages':pages,'raw_records':raw_count,
+            'recent_ids':len(ledger),'full_listing_scan':False,
+            'address_lookup_batches':lookups,'legacy_ledger_rows':len(legacy),
             'requeued_incomplete_address':requeued_incomplete,
-            'requeued_missing_listing':requeued_missing}
-        self.acquisition_cache=out;self.acquisition_cache_at=time.monotonic()
-        return out
+            'requeued_missing_listing':requeued_missing,'cache_seconds':28800}
+        self.acquisition_cache=dict(ledger);self.acquisition_cache_at=now
+        return dict(ledger)
 
     def load_units(self,bounds=None,layouts=None,on_progress=None,cancel_event=None):
         """Load saved rental rows using keyset pagination and report storage-vs-display counts.
@@ -1150,6 +1159,7 @@ class Database:
                 lat,lng=float(point[0]),float(point[1])
             except (ValueError,TypeError,IndexError):continue
             if not has_point({'latitude':lat,'longitude':lng}):continue
+            if getattr(self,'_saved_address_coords',{}).get(key)==(lat,lng):continue
             payload.append(dict(namespace=self.namespace,key=key,title=address[:220],kind=ADDRESS_POINT_KIND,
                                 latitude=lat,longitude=lng,fetched_at=utc_now()))
         saved=0
@@ -1161,6 +1171,8 @@ class Database:
             expected={r['key'] for r in batch}
             if not expected<=returned:raise AppError('住所座標キャッシュの保存を確認できません。')
             saved+=len(expected)
+            if not hasattr(self,'_saved_address_coords'):self._saved_address_coords={}
+            self._saved_address_coords.update({r['key']:(r['latitude'],r['longitude']) for r in batch})
         return saved
 
     def load_address_points(self,addresses,cancel_event=None):
@@ -4209,7 +4221,12 @@ def search_all(db,conditions,screen,state=None):
     screen['status'].info('検索実行中｜保存先の接続・新しいテーブルを確認しています')
     try:
         if not getattr(db,'collection_checked',False):db.check();db.collection_checked=True
-        db.save_search(search)
+        # The automatic controller already checkpoints the current town.
+        # Do not duplicate enormous region / municipality dictionaries in a
+        # second 'started' search row; keep the finished result as history.
+        if conditions.get('mode')!='automatic_collection':
+            db.save_search({**search,'conditions':{k:v for k,v in conditions.items()
+                if k in ('bounds','providers','mode','ward_code','town_codes')}})
     except Exception as exc:
         message=str(exc) if isinstance(exc,AppError) else type(exc).__name__+': '+str(exc)
         audit.add('database','save','ERROR',{'stage':'search.preflight','message':message,'traceback':traceback.format_exc()})
@@ -4540,9 +4557,18 @@ def search_all(db,conditions,screen,state=None):
         search['summary']['diagnostic_storage_error']=diagnostic_error
         search['summary']['issues']=list(search['summary'].get('issues') or [])+['詳細ログの保存に失敗：'+diagnostic_error]
     search['summary']['diagnostics']={'search_id':audit.search_id,'events':audit.count,'persisted_events':audit.persisted_events,
-                                     'persisted_failures':audit.persisted_failures,'pending_failures':len(audit.pending_failures)}
+                                     'persisted_failures':audit.persisted_failures,'pending_failures':len(audit.pending_failures),
+                                     'storage_error':audit.storage_error}
+    if audit.storage_error:
+        search['summary']['diagnostic_storage_error']=audit.storage_error
+        search['summary']['issues']=list(search['summary'].get('issues') or [])+['重要ログの永続保存に失敗：'+audit.storage_error]
     search['finished_at']=utc_now()
-    try: db.save_search(search)
+    try:
+        stored_search=dict(search)
+        stored_search['conditions']={k:v for k,v in search.get('conditions',{}).items()
+            if k in ('bounds','providers','mode','ward_code','town_codes','auto_task_index',
+                     'auto_task_label','auto_task_identity','region_source','providers_after_fallback')}
+        db.save_search(stored_search)
     except AppError as exc:
         audit.add('database','save','ERROR',{'stage':'search.history','message':str(exc),'status':search.get('status')})
         try:audit.persist(db,force=True)
@@ -4674,54 +4700,60 @@ class AuditLog:
         with self.lock:
             with open(self.path,encoding='utf-8') as f:return [json.loads(line) for line in f if line.strip()]
     def _persist_failures(self,db):
-        """Flush failure events on every persist poll, independent of the 30-second normal-log cadence."""
-        while True:
-            with self.lock:
-                batch=list(self.pending_failures[:100])
-            if not batch:
-                self.failure_storage_error=None;return
-            try:
-                db._saving_audit=True
-                saved=save_diagnostic_failures_compat(db,batch)
-            except Exception as exc:
-                self.failure_storage_error=str(exc) if isinstance(exc,AppError) else type(exc).__name__
-                return
-            finally:
-                db._saving_audit=False
-            with self.lock:
-                seqs={int(e.get('seq',-1)) for e in batch}
-                self.pending_failures=[e for e in self.pending_failures if int(e.get('seq',-1)) not in seqs]
-                self.persisted_failures+=saved
+        """Compatibility method: errors are saved in compact diagnostic_log chunks."""
+        return
     def persist(self,db,force=False):
-        # Error/warning events are written on every poll (normally within ~0.35 s during search).
-        # The complete verbose log remains chunked every 30 seconds to avoid needless DB traffic.
-        self._persist_failures(db)
-        if not force and time.monotonic()-self.last_save<30:return
-        self.last_save=time.monotonic()
+        """Save only essential events in compact chunks; verbose logs remain local.
+
+        One diagnostic_log row now holds up to 150 important events. Unlike older
+        versions we do NOT write a second diagnostic_error row for each failure.
+        Old per-error records remain readable; new errors can be restored from
+        the same diagnostic_log rows used by historical CSV export.
+        """
+        now=time.monotonic()
+        if not force and now-self.last_save<60:return
+        self.last_save=now
         while True:
             with self.lock:
-                with open(self.path,encoding='utf-8') as f:
-                    f.seek(self.offset);events=[]
-                    for _ in range(200):
-                        line=f.readline()
+                with open(self.path,encoding='utf-8') as file:
+                    file.seek(self.offset)
+                    selected=[];examined=0
+                    while examined<1500 and len(selected)<150:
+                        line=file.readline()
                         if not line:break
-                        events.append(json.loads(line))
-                    end=f.tell()
-            if not events:
-                self.storage_error=None;return
-            row=dict(id=f'{self.search_id}.log.{self.chunk:08d}',status='diagnostic_log',started_at=events[0]['time'],finished_at=events[-1]['time'],
-                     conditions={'search_id':self.search_id,'build':BUILD,'chunk':self.chunk},summary={'events':events})
-            try:
-                db._saving_audit=True;db.save_search(row)
-            except Exception as exc:
-                self.storage_error=str(exc) if isinstance(exc,AppError) else type(exc).__name__
-                self.add('log_storage','save','ERROR',{'message':self.storage_error,'local_download_available':True});return
-            finally:db._saving_audit=False
-            self.offset=end;self.chunk+=1;self.persisted_events+=len(events)
+                        examined+=1
+                        event=json.loads(line)
+                        if (diagnostic_failure_event(event) or
+                            (event.get('stage')=='search' and event.get('code') in ('start','finish')) or
+                            (event.get('stage')=='database' and event.get('level') in ('ERROR','WARNING'))):
+                            selected.append(event)
+                    end=file.tell()
+            if not examined:
+                self.storage_error=None
+                return
+            if selected:
+                row=dict(id=f'{self.search_id}.log.{self.chunk:08d}',status='diagnostic_log',
+                    started_at=selected[0]['time'],finished_at=selected[-1]['time'],
+                    conditions={'search_id':self.search_id,'build':BUILD,'chunk':self.chunk,'compact':True},
+                    summary={'events':selected})
+                try:
+                    db._saving_audit=True
+                    db.save_search(row)
+                except Exception as exc:
+                    self.storage_error=str(exc) if isinstance(exc,AppError) else type(exc).__name__
+                    return
+                finally:
+                    db._saving_audit=False
+                self.chunk+=1
+                self.persisted_events+=len(selected)
+                self.persisted_failures+=sum(bool(diagnostic_failure_event(e)) for e in selected)
+                with self.lock:
+                    persisted_seq={int(e.get('seq',-1)) for e in selected}
+                    self.pending_failures=[e for e in self.pending_failures if int(e.get('seq',-1)) not in persisted_seq]
+            with self.lock:self.offset=end
             if not force:
-                self.storage_error=None;return
-            # A failure could have been appended while the normal chunk was being saved.
-            self._persist_failures(db)
+                self.storage_error=None
+                return
 
 
 def begin_listing(web,provider,url):
@@ -6101,7 +6133,7 @@ class AutomaticCollection:
         with self.io_lock:
             with self.lock:
                 record={'id':AUTO_COLLECTION_ID,'status':'automatic_collection_settings','started_at':self.settings.get('created_at',utc_now()),
-                        'finished_at':None,'conditions':json.loads(json.dumps(self.settings)), 'summary':json.loads(json.dumps(self.summary))}
+                        'finished_at':None,'conditions':json.loads(json.dumps({k:v for k,v in self.settings.items() if k not in ('auto_regions','auto_munis')})), 'summary':json.loads(json.dumps(self.summary))}
             self.db.save_search(record)
     def snapshot(self):
         with self.lock:
