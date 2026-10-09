@@ -40,7 +40,8 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v126"
+BUILD = "REBUILD-01-v127-diagnostic"
+_V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
 # NON-NEGOTIABLE SUUMO ADDRESS POLICY -- DO NOT DELETE OR WEAKEN
@@ -6840,6 +6841,7 @@ def _v126_cgroup_sample():
 
 def _v126_discard_file_cache(path):
     """Best-effort DONTNEED for app-owned *closed* temporary data files only."""
+    if _V127_INSPECTION_ONLY:return False
     if not getattr(os,'posix_fadvise',None):return False
     try:
         # Do not dereference arbitrary symlinks, and do not touch live DB WALs.
@@ -6905,6 +6907,7 @@ def _v126_reclaim_idle_cache(reason='idle', *, force=False):
 
 def _v126_work_finished(reason, file_path=None):
     # No global caches discarded. Read-only fadvise never changes saved rows.
+    if _V127_INSPECTION_ONLY:return
     if file_path:_v126_discard_file_cache(file_path)
     _v126_trim_heap()
     _v126_reclaim_idle_cache(reason)
@@ -7131,11 +7134,329 @@ def format_memory_diagnostic_v124(samples):
     return ('\n'.join(out)+'\n').encode('utf-8-sig')
 
 
+# v127 passive runtime file cache inventory. This code never drops caches or deletes files.
+class _V127FileCacheInventory:
+    """Read-only full-filesystem mincore inventory; NOT exact cgroup ownership."""
+    MAX_FILES = 1500000
+    MAX_SECONDS = 600
+    MAX_TOP = 100
+    CHUNK = 64 * 1024 * 1024
+
+    def __init__(self, roots=None, max_files=None, max_seconds=None):
+        self.roots = roots or ['/']
+        self.max_files = max_files or self.MAX_FILES
+        self.max_seconds = max_seconds or self.MAX_SECONDS
+        self.lock = threading.RLock()
+        self.thread = None
+        self._done = False
+        self.error = ''
+        self.progress = {'phase':'未開始', 'files':0, 'directories':0, 'regular_bytes':0,
+                         'resident_bytes':0,'unknown_files':0,'skipped_permissions':0,
+                         'elapsed_seconds':0}
+        self.txt_path = ''
+        self.csv_path = ''
+        self.started_at = None
+        self.completed_at = None
+        self.summary = None
+
+    def launch(self):
+        self.thread = threading.Thread(target=self._run, name='sumai-file-resident-probe', daemon=True)
+        self.thread.start()
+
+    def snapshot(self):
+        with self.lock:
+            return {'done':self._done, 'error':self.error,'progress':dict(self.progress),
+                    'txt_path':self.txt_path,'csv_path':self.csv_path,'summary':self.summary}
+
+    @staticmethod
+    def _segment(path):
+        bits=path.split('/')
+        if len(bits)<=2:return '/'
+        if bits[1] in ('usr','opt','home','var','mnt','run','tmp') and len(bits)>3:
+            return '/'+bits[1]+'/'+bits[2]
+        return '/'+bits[1]
+
+    @staticmethod
+    def _mincore_setup():
+        import ctypes
+        libc=ctypes.CDLL(None, use_errno=True)
+        try:map_fn=libc.mmap;core_fn=libc.mincore;unmap_fn=libc.munmap
+        except AttributeError as exc:raise RuntimeError('Linux mincore/mmap is not available') from exc
+        map_fn.restype=ctypes.c_void_p
+        map_fn.argtypes=[ctypes.c_void_p,ctypes.c_size_t,ctypes.c_int,ctypes.c_int,ctypes.c_int,ctypes.c_longlong]
+        core_fn.restype=ctypes.c_int
+        core_fn.argtypes=[ctypes.c_void_p,ctypes.c_size_t,ctypes.c_void_p]
+        unmap_fn.restype=ctypes.c_int
+        unmap_fn.argtypes=[ctypes.c_void_p,ctypes.c_size_t]
+        return ctypes,map_fn,core_fn,unmap_fn
+
+    @classmethod
+    def _resident_bytes_fd(cls,fd,size,platform):
+        """Check pages already in the page cache without reading their contents."""
+        import mmap
+        ctypes,map_fn,core_fn,unmap_fn=platform
+        page=os.sysconf('SC_PAGESIZE')
+        resident=0
+        for offset in range(0,size,cls.CHUNK):
+            part=min(cls.CHUNK,size-offset)
+            ptr=map_fn(None,part,0,mmap.MAP_PRIVATE,fd,offset)
+            if ptr is None or ptr==ctypes.c_void_p(-1).value:
+                raise OSError(ctypes.get_errno(),'mmap failed')
+            try:
+                count=(part+page-1)//page
+                vec=(ctypes.c_ubyte*count)()
+                if core_fn(ptr,part,vec)!=0:
+                    raise OSError(ctypes.get_errno(),'mincore failed')
+                resident+=sum(1 for byte in vec if byte&1)*page
+            finally:
+                if unmap_fn(ptr,part)!=0:raise OSError(ctypes.get_errno(),'munmap failed')
+        return resident
+
+    @classmethod
+    def _resident_bytes_path(cls,path,stat_info,platform):
+        import stat
+        if not stat.S_ISREG(stat_info.st_mode):return None
+        if stat_info.st_size==0:return 0
+        flags=os.O_RDONLY|getattr(os,'O_CLOEXEC',0)|getattr(os,'O_NOFOLLOW',0)|getattr(os,'O_NONBLOCK',0)
+        fd=os.open(path,flags)
+        try:
+            actual=os.fstat(fd)
+            if not stat.S_ISREG(actual.st_mode) or actual.st_dev!=stat_info.st_dev or actual.st_ino!=stat_info.st_ino:
+                raise OSError('file was replaced during scan')
+            return cls._resident_bytes_fd(fd,actual.st_size,platform)
+        finally:os.close(fd)
+
+    def _collect_open_deleted(self,platform):
+        """Open-but-deleted files cannot be found with os.scandir('/')."""
+        import stat
+        raw=_v124_read_numeric('/sys/fs/cgroup/cgroup.procs',32768)
+        pids={int(x) for x in raw.split() if x.isdecimal()}
+        pids.add(os.getpid())
+        rows=[];blocked=0
+        seen=set()
+        for pid in sorted(pids):
+            folder=f'/proc/{pid}/fd'
+            try:names=os.listdir(folder)
+            except OSError:blocked+=1;continue
+            for entry in names[:2000]:
+                fd_path=folder+'/'+entry
+                try:target=os.readlink(fd_path)
+                except OSError:continue
+                if not target.endswith(' (deleted)'):continue
+                try:
+                    st_info=os.stat(fd_path)
+                    if not stat.S_ISREG(st_info.st_mode):continue
+                    identity=(st_info.st_dev,st_info.st_ino)
+                    if identity in seen:continue
+                    seen.add(identity)
+                    try:
+                        fd=os.open(fd_path,os.O_RDONLY|getattr(os,'O_CLOEXEC',0))
+                        try:resident=self._resident_bytes_fd(fd,st_info.st_size,platform)
+                        finally:os.close(fd)
+                    except (OSError,ValueError):resident=None
+                    rows.append({'pid':pid,'path':target,'size':st_info.st_size,'resident':resident})
+                except OSError:continue
+        return rows,blocked
+
+    def _run(self):
+        import csv
+        import gzip
+        import heapq
+        import stat
+        started=time.monotonic()
+        file_handle=None
+        try:
+            platform=self._mincore_setup()
+            before=_v126_cgroup_sample()
+            self.started_at=datetime.now(timezone(timedelta(hours=9))).isoformat(timespec='seconds')
+            fd,self.csv_path=tempfile.mkstemp(prefix='sumai-v127-file-resident-',suffix='.csv.gz')
+            file_handle=os.fdopen(fd,'wb')
+            with gzip.open(file_handle,mode='wt',encoding='utf-8',newline='',compresslevel=3) as output:
+                writer=csv.writer(output)
+                writer.writerow(['path','folder_group','file_size_bytes','resident_page_bytes',
+                                 'resident_percent_of_file_size','status'])
+                stack=list(self.roots)
+                directories=0;files=0;total_size=0;resident_total=0;unknown=0
+                permission_errors=0;other_errors=0;dup_files=0
+                top=[];groups={};seen_files=set();exclusions=['/proc','/sys','/dev']
+                truncation=''
+                while stack:
+                    if time.monotonic()-started>self.max_seconds:
+                        truncation='時間上限';break
+                    if files>=self.max_files:
+                        truncation='件数上限';break
+                    folder=stack.pop()
+                    directories+=1
+                    try:
+                        with os.scandir(folder) as directory:
+                            for entry in directory:
+                                if time.monotonic()-started>self.max_seconds:
+                                    truncation='時間上限';break
+                                try:
+                                    info=entry.stat(follow_symlinks=False)
+                                    mode=info.st_mode
+                                    if stat.S_ISDIR(mode):
+                                        path=entry.path
+                                        if path not in exclusions:stack.append(path)
+                                        continue
+                                    if not stat.S_ISREG(mode):continue
+                                    if files>=self.max_files:
+                                        truncation='件数上限';break
+                                    identity=(info.st_dev,info.st_ino)
+                                    if info.st_nlink>1:
+                                        if identity in seen_files:
+                                            dup_files+=1;continue
+                                        seen_files.add(identity)
+                                    files+=1
+                                    group=self._segment(entry.path)
+                                    stat_group=groups.setdefault(group,{'files':0,'size_bytes':0,'resident_bytes':0,'unknown':0})
+                                    stat_group['files']+=1;stat_group['size_bytes']+=info.st_size
+                                    total_size+=info.st_size
+                                    try:
+                                        resident=self._resident_bytes_path(entry.path,info,platform)
+                                        status='measured'
+                                        stat_group['resident_bytes']+=resident;resident_total+=resident
+                                        if resident:
+                                            row=(resident,info.st_size,entry.path)
+                                            if len(top)<self.MAX_TOP:heapq.heappush(top,row)
+                                            elif row>top[0]:heapq.heapreplace(top,row)
+                                    except PermissionError:
+                                        resident=None;status='permission_denied';permission_errors+=1
+                                    except (OSError,OverflowError,ValueError) as exc:
+                                        resident=None;status='unmeasurable_'+type(exc).__name__;other_errors+=1
+                                    if resident is None:
+                                        unknown+=1;stat_group['unknown']+=1
+                                    writer.writerow([entry.path,group,info.st_size,
+                                                     '' if resident is None else resident,
+                                                     '' if resident is None or info.st_size==0 else round(100*resident/info.st_size,2),status])
+                                    if files%500==0:
+                                        with self.lock:
+                                            self.progress={'phase':'ファイル走査中','files':files,
+                                                'directories':directories,'regular_bytes':total_size,
+                                                'resident_bytes':resident_total,'unknown_files':unknown,
+                                                'skipped_permissions':permission_errors,
+                                                'elapsed_seconds':int(time.monotonic()-started)}
+                                except OSError:
+                                    other_errors+=1
+                    except PermissionError:
+                        permission_errors+=1
+                    except OSError:
+                        other_errors+=1
+                    if truncation:break
+            file_handle.close()
+            file_handle=None
+            deleted,fd_blocked=self._collect_open_deleted(platform)
+            after=_v126_cgroup_sample()
+            delta=after.get('current',0)-before.get('current',0)
+            duration=round(time.monotonic()-started,1)
+            self.completed_at=datetime.now(timezone(timedelta(hours=9))).isoformat(timespec='seconds')
+            summary={'before':before,'after':after,'elapsed_seconds':duration,
+                'total_files':files,'total_dirs':directories,'disk_size_bytes':total_size,
+                'resident_page_bytes':resident_total,'unknown_files':unknown,
+                'permission_errors':permission_errors,'other_errors':other_errors,
+                'duplicate_inode_files':dup_files,'truncation':truncation,
+                'unsearched_directory_count':len(stack),'groups':groups,
+                'top':sorted(top,reverse=True),'deleted_open':deleted,'fd_blocked':fd_blocked}
+            self.summary=summary
+            lines=['住まいコンパス｜実ファイル・ページキャッシュ調査 v127 (読み取り専用)',
+                '測定開始：'+self.started_at,'測定終了：'+self.completed_at,
+                '調査時間：'+str(duration)+' 秒',
+                '注記: mincore はファイルごとに既に常駐しているページを表示するが、',
+                'cgroup内の課金先やactive_file/inactive_fileの区別を示さない。',
+                'よって以下のファイル別合計はinactive_fileの厳密な内訳ではない。',
+                '内容は読み取らず、ファイル名・容量・常駐ページの状況を検査。削除・圧縮・キャッシュ解放は一切しない。',
+                '', '【Linux cgroup memory.stat】']
+            def mib(value):return f'{int(value)/1048576:,.1f} MiB'
+            for key in ('current','file','inactive_file','active_file','shmem','anon','kernel'):
+                lines.append(f'  {key}: 前 {mib(before.get(key,0))} → 後 {mib(after.get(key,0))}')
+            lines+=['','【ファイル走査】',
+                '  調査ファイル：'+str(files)+' 件 / ディレクトリ：'+str(directories),
+                '  調査ファイルの実サイズ合計：'+mib(total_size),
+                '  mincoreで観測した常駐ページ合計：'+mib(resident_total),
+                '  対象ファイルの測定不可：'+str(unknown)+' 件 (権限エラー '+str(permission_errors)+' 件)',
+                '  同一inode重複を除外：'+str(dup_files)+' 件',
+                '  走査打ち切り：'+(truncation or 'なし'),
+                '  未走査ディレクトリ：'+str(len(stack)),
+                '  調査前後のコンテナ使用量変化：'+mib(abs(delta))+(' 増' if delta>=0 else ' 減'),
+                '', '【常駐ページの多いディレクトリ】']
+            for folder,group in sorted(groups.items(),key=lambda pair:pair[1]['resident_bytes'],reverse=True):
+                lines.append(f'  {folder}：常駐 {mib(group["resident_bytes"])} / 合計ファイルサイズ {mib(group["size_bytes"])} / {group["files"]} 件 / 測定不可 {group["unknown"]} 件')
+            lines+=['','【常駐ページの多い実ファイル（最大100件）】']
+            for resident,size,path in sorted(top,reverse=True):
+                lines.append('  常駐 '+mib(resident)+' / 実サイズ '+mib(size)+' / '+path)
+            lines+=['','【削除済みだが開かれている実ファイル】',
+                '  確認件数 '+str(len(deleted))+' 件 / PIDのfd参照不可 '+str(fd_blocked)+' 件']
+            for row in sorted(deleted,key=lambda r:r.get('resident') or 0,reverse=True)[:100]:
+                lines.append(f'  PID {row["pid"]} / 常駐 {mib(row["resident"]) if row["resident"] is not None else "測定不可"} / 実サイズ {mib(row["size"])} / {row["path"]}')
+            lines+=['', '【未特定量の扱い】',
+                '  上記常駐合計とinactive_fileとの差は、そのまま未解放量ではない。',
+                '  mincoreは別cgroupが課金したキャッシュも観測し得る。',
+                '  ファイル一覧に現れないページや削除済みファイル、走査できない権限領域もある。',
+                '  このTXTと全件CSVを確認してから個別に回収方針を決める。']
+            fd,self.txt_path=tempfile.mkstemp(prefix='sumai-v127-file-resident-',suffix='.txt')
+            with os.fdopen(fd,'w',encoding='utf-8-sig') as handle:handle.write('\n'.join(lines)+'\n')
+            with self.lock:
+                self.progress={'phase':'完了','files':files,'directories':directories,
+                    'regular_bytes':total_size,'resident_bytes':resident_total,
+                    'unknown_files':unknown,'skipped_permissions':permission_errors,
+                    'elapsed_seconds':duration}
+                self._done=True
+        except Exception as exc:
+            import traceback
+            with self.lock:
+                self._done=True
+                self.error=type(exc).__name__+': '+str(exc)[:200]
+                self.progress['phase']='失敗'
+        finally:
+            if file_handle:
+                try:file_handle.close()
+                except OSError:pass
+
+@st.cache_resource
+def _v127_file_inventory_slot():
+    return {'job':None,'lock':threading.Lock()}
+
+
+def render_file_cache_inventory_v127():
+    with st.expander('実ファイルとページキャッシュの調査（読み取り専用）',expanded=False):
+        st.caption('稼働中のサーバー内を調査します。アプリのファイルやSupabaseのデータは変更しません。')
+        st.caption('Linuxのmincoreによる常駐ページ推定です。cgroupの inactive_file を個別ファイルへ厳密に帰属することはできません。')
+        slot=_v127_file_inventory_slot()
+        with slot['lock']:job=slot.get('job')
+        running=bool(job and job.thread and job.thread.is_alive())
+        if st.button('サーバー上の実ファイルを全件調査',key='v127_start_file_scan',disabled=running,use_container_width=True):
+            with slot['lock']:
+                old=slot.get('job')
+                if old and old.thread and old.thread.is_alive():st.warning('すでに調査中です')
+                else:
+                    job=_V127FileCacheInventory()
+                    slot['job']=job
+                    job.launch()
+                    running=True
+        if job:
+            snap=job.snapshot();p=snap['progress']
+            st.write('進行状況：'+str(p.get('phase'))+'｜調査 '+f'{p.get("files",0):,}'+' ファイル｜常駐推定 '+f'{p.get("resident_bytes",0)/1048576:,.1f}'+' MiB')
+            if running:st.caption('最大600秒間走査します。下の「進捗を更新」で進捗を確認してください。')
+            if st.button('調査の進捗を更新',key='v127_file_scan_refresh',disabled=not running):st.rerun()
+            if snap['error']:st.error('調査失敗：'+snap['error'])
+            elif snap['done']:
+                summary=snap.get('summary') or {}
+                st.caption('ファイル数 '+f'{summary.get("total_files",0):,}'+'｜走査打ち切り '+str(summary.get('truncation') or 'なし'))
+                if snap['txt_path'] and os.path.isfile(snap['txt_path']):
+                    with open(snap['txt_path'],'rb') as file:
+                        st.download_button('実ファイル調査TXTをダウンロード',file.read(),
+                            'sumai_real_file_memory_v127.txt','text/plain',key='v127_probe_txt',use_container_width=True,on_click='ignore')
+                if snap['csv_path'] and os.path.isfile(snap['csv_path']):
+                    with open(snap['csv_path'],'rb') as file:
+                        st.download_button('全実ファイル明細CSV.gzをダウンロード',file.read(),
+                            'sumai_real_file_memory_v127.csv.gz','application/gzip',key='v127_probe_csv',use_container_width=True,on_click='ignore')
+        st.caption('圧縮CSVは調査結果を配布しやすくするための形式で、元のファイルは圧縮しません。')
+
 def render_memory_diagnostic_v124():
     """Small opt-in expander; no sampling on every Streamlit fragment refresh."""
     with st.expander('メモリ診断（必要なときだけ）',expanded=False):
         st.caption('現在の内訳を記録してTXTを出力します。待機中・収集中など最大3回を比較できます。')
-        if st.button('ファイル関連メモリの回収を試す',key='v126_memory_reclaim',use_container_width=True):
+        if st.button('ファイル関連メモリの回収を試す（調査中は無効）',key='v126_memory_reclaim',use_container_width=True,disabled=True):
             result=_v126_reclaim_idle_cache('user-diagnostic',force=True)
             st.caption('回収結果：'+result['status']+'｜全体 '+str(result.get('before_mib'))+' → '+str(result.get('after_mib'))+' MiB')
         if st.button('現在のメモリを記録',key='v124_memory_sample',use_container_width=True):
@@ -7164,6 +7485,7 @@ def render_memory_diagnostic_v124():
                                'sumai_memory_diagnostic_v124.txt','text/plain',
                                key='v124_memory_download',use_container_width=True,on_click='ignore')
         st.caption('物件データ・秘密鍵・ファイル名・URLは出力しません。')
+    render_file_cache_inventory_v127()
 
 
 # Keep searches moving when one town has too many listings or stops making progress.
@@ -8720,7 +9042,7 @@ def interactive_town_choropleth(group,facilities):
 
 
 def main():
-    _v126_startup_reclaim()
+    # v127: no automatic cache reclaim before actual file inspection.
     st.set_page_config(page_title='住まいコンパス｜新しい住まいを探す',page_icon='🏡',layout='wide',initial_sidebar_state='collapsed')
     st.markdown(CSS,unsafe_allow_html=True)
     st.markdown(f'<div class="hero"><span class="badge">SUMAI COMPASS · {BUILD}</span><h1>次の住まいを、地図から。</h1><p>掲載物件を確認し、家賃と暮らしやすさを比べます。<br>間取りと家賃帯を、取得できた情報で比較します。</p></div>',unsafe_allow_html=True)
