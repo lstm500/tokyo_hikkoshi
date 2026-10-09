@@ -39,7 +39,7 @@ import streamlit as st
 from streamlit_folium import st_folium
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v117"
+BUILD = "REBUILD-01-v118"
 
 # ============================================================================
 # NON-NEGOTIABLE SUUMO ADDRESS POLICY -- DO NOT DELETE OR WEAKEN
@@ -7815,7 +7815,7 @@ class TownSummaryWorker:
     keeps writing normal source listings; a user can refresh the area snapshot.
     """
     def __init__(self,db):
-        self.db=db;self.lock=threading.RLock();self.running=False;self.progress=0
+        self.db=db;self.lock=threading.RLock();self.running=False;self.progress=0;self.total_pages=None;self.total_records=None;self.scanned_records=0;self.page_size=300
         self.ready=False;self.summary=None;self.message='';self.error='';self.thread=None
         self.initialized=False
     def initialize(self):
@@ -7833,12 +7833,33 @@ class TownSummaryWorker:
     def start(self):
         with self.lock:
             if self.running:return False
-            self.running=True;self.progress=0;self.error='';self.message='町丁目の家賃を裏で集計中'
+            self.running=True;self.progress=0;self.total_pages=None;self.total_records=None;self.scanned_records=0;self.page_size=300;self.error='';self.message='町丁目の家賃を裏で集計中'
             self.thread=threading.Thread(target=self.run,daemon=True,name='town-rent-aggregate')
             self.thread.start();return True
+    def count_source_records(self):
+        # Query one row only; Content-Range gives the exact count, not a scan
+        # of all listing JSON. If counting exceeds DB limits, show an unknown
+        # total rather than an invented figure.
+        params={'namespace':'eq.'+self.db.namespace,'select':'id',
+                'status':'eq.rental_listing',
+                'and':'(id.gte.listing.,id.lt.listing/)','limit':1}
+        headers=dict(self.db.headers);headers['Prefer']='count=exact'
+        try:
+            response=self.db.session.get(self.db.url+'/rest/v1/'+SEARCH_TABLE,
+                    params=params,headers=headers,timeout=(4,12),allow_redirects=False)
+            if response.status_code not in (200,206):return None
+            text=response.headers.get('Content-Range','')
+            match=re.search(r'/(\d+)\s*$',text)
+            return int(match.group(1)) if match else None
+        except (requests.RequestException,ValueError,OverflowError):return None
+
     def run(self):
         try:
             rows=[];last_id='';page=0;page_size=300;started=utc_now()
+            total=self.count_source_records()
+            with self.lock:
+                self.total_records=total
+                self.total_pages=math.ceil(total/page_size) if total is not None else None
             # Use index (namespace,id), not a full diagnostic/search-log scan.
             # Keep only compact fields in memory; no latitude, longitude or HTML.
             while True:
@@ -7857,6 +7878,11 @@ class TownSummaryWorker:
                         if (diag.get('code')=='57014' or diag.get('status') in (500,502,503,504)) and page_size>50:
                             page_size=max(50,page_size//2)
                             params['limit']=page_size
+                            with self.lock:
+                                self.page_size=page_size
+                                if self.total_records is not None:
+                                    remaining=max(0,self.total_records-self.scanned_records)
+                                    self.total_pages=self.progress+math.ceil(remaining/page_size)
                             continue
                         raise
                 if not isinstance(got,list):raise AppError('募集データの応答形式が不正です。')
@@ -7867,7 +7893,11 @@ class TownSummaryWorker:
                 next_id=str(got[-1].get('id') or '')
                 if not next_id or next_id<=last_id:raise AppError('町丁目集計のページ位置が進みません。')
                 last_id=next_id;page+=1
-                with self.lock:self.progress=page;self.message=f'集計元を確認中：{page}ページ'
+                with self.lock:
+                    self.progress=page;self.scanned_records+=len(got);self.page_size=page_size
+                    if self.total_records is not None:
+                        self.total_pages=page+math.ceil(max(0,self.total_records-self.scanned_records)/page_size)
+                    self.message=f'集計元を確認中：{page}ページ'
                 if len(got)<page_size:break
             summary=town_aggregate_record(rows)
             summary['started_at']=started
@@ -7883,7 +7913,9 @@ class TownSummaryWorker:
             with self.lock:self.running=False
     def snapshot(self):
         with self.lock:return {'summary':self.summary,'ready':self.ready,'running':self.running,
-                               'progress':self.progress,'message':self.message,'error':self.error}
+                               'progress':self.progress,'total_pages':self.total_pages,
+                               'total_records':self.total_records,'scanned_records':self.scanned_records,
+                               'message':self.message,'error':self.error}
 
 
 @st.cache_resource
@@ -8046,6 +8078,32 @@ def capture_map_fragment_v117():
         state['new_map']=response
 
 
+# V118: a stateful browser-side Leaflet component.  Do NOT use st_folium here:
+# its folium-html prop and result callbacks can remount the iframe on every
+# viewport update. The browser map lives independently; only bounds are sent
+# to Python, while the layer changes only on explicit map revision changes.
+TOWN_COMPONENT_HTML_V118 = '<!doctype html><html lang="ja"><head><meta charset="utf-8">\n<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">\n<link id="leaflet-css" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.css">\n<style>\nhtml,body{margin:0;padding:0;width:100%;height:480px;overflow:hidden;background:#ecefee;font-family:system-ui,"Hiragino Kaku Gothic ProN",sans-serif}\n#map{height:480px;width:100%;background:#ebeeeb;position:relative}\n#notice{position:absolute;z-index:9999;left:10px;bottom:12px;max-width:80%;background:rgba(255,255,255,.95);border-radius:5px;padding:7px 10px;font-size:12px;color:#173a5e;pointer-events:none;display:none}\n#touchmode{position:absolute;z-index:1200;right:12px;top:12px;border:1px solid #ddd;border-radius:5px;background:#fff;padding:10px;color:#193b45;font-size:13px;box-shadow:0 1px 6px #999;display:none}\n.station-chip{display:block;white-space:nowrap;color:#1d2930;font-weight:700;font-size:12px;line-height:15px;background:rgba(255,255,255,.92);border:1px solid #aeb6bc;border-radius:3px;padding:1px 3px;box-shadow:0 1px 2px #888;pointer-events:none;transform:translate(-50%,-40%)}\n.station-chip.minor{font-size:10.5px;font-weight:600;background:rgba(255,255,255,.87)}\n.ward-chip{display:block;white-space:nowrap;font-weight:800;font-size:17px;color:#24313a;text-shadow:-1px -1px 0 white,1px -1px 0 white,-1px 1px 0 white,1px 1px 0 white;pointer-events:none;transform:translate(-50%,-50%)}\n.leaflet-tooltip{font-family:inherit}\n</style></head>\n<body>\n<div id="map"></div><button id="touchmode" type="button">ページをスクロール</button><div id="notice" role="status"></div>\n<script src="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.js" onerror="var script=document.createElement(\'script\');script.src=\'https://unpkg.com/leaflet@1.9.4/dist/leaflet.js\';document.head.appendChild(script);"></script>\n<script>\n(function(){\'use strict\';\nvar state={map:null,overlay:null,stationLayer:null,wardLayer:null,groupSignature:null,stations:[],wards:[],lastBounds:null,\n           loading:false,started:false,sentBounds:\'\',revision:-1,touchPan:true,pendingArgs:null,retryCount:0,retryTimer:null};\nfunction hostMessage(type,extra){window.parent.postMessage(Object.assign({isStreamlitMessage:true,type:type},extra||{}),\'*\')}\nfunction setHeight(){hostMessage(\'streamlit:setFrameHeight\',{height:480})}\nfunction note(message){var el=document.getElementById(\'notice\');el.textContent=message||\'\';el.style.display=message?\'block\':\'none\'}\nfunction initMap(args){\n if(state.map)return;\n if(!window.L){note(\'地図を読み込み中…\');return}\n var center=Array.isArray(args.center)&&args.center.length===2?args.center:[35.6812,139.7671];\n var zoom=Number.isFinite(+args.zoom)?+args.zoom:14;\n state.map=L.map(\'map\',{center:center,zoom:zoom,zoomControl:true,preferCanvas:true,zoomSnap:.25,\n   zoomDelta:.5,wheelPxPerZoomLevel:110,scrollWheelZoom:true,gestureHandling:false,touchZoom:true,dragging:true});\n var base=L.tileLayer(\'https://cyberjapandata.gsi.go.jp/xyz/std/{z}/{x}/{y}.png\',{\n  attribution:\'国土地理院\',maxZoom:18,keepBuffer:1,updateWhenIdle:true});\n state.map.createPane(\'grayBase\');state.map.getPane(\'grayBase\').style.zIndex=\'200\';\n state.map.getPane(\'grayBase\').style.filter=\'grayscale(1)\';\n base.options.pane=\'grayBase\';base.addTo(state.map);\n var errors=0, backup=false;\n base.on(\'tileerror\',function(){errors++;if(errors>=6&&!backup){backup=true;\n   state.map.removeLayer(base);\n   L.tileLayer(\'https://tile.openstreetmap.org/{z}/{x}/{y}.png\',{\n     attribution:\'&copy; OpenStreetMap contributors\',maxZoom:19,keepBuffer:1,pane:\'grayBase\',updateWhenIdle:true}).addTo(state.map);\n }});\n state.stationLayer=L.layerGroup().addTo(state.map);\n state.wardLayer=L.layerGroup().addTo(state.map);\n var touch=window.matchMedia && window.matchMedia(\'(pointer:coarse)\').matches;\n if(touch){\n   var button=document.getElementById(\'touchmode\');button.style.display=\'block\';\n   button.addEventListener(\'click\',function(){state.touchPan=!state.touchPan;\n      if(state.touchPan){state.map.dragging.enable();state.map.touchZoom.enable();button.textContent=\'ページをスクロール\';document.getElementById(\'map\').style.touchAction=\'none\'}\n      else{state.map.dragging.disable();state.map.touchZoom.disable();button.textContent=\'地図を動かす\';document.getElementById(\'map\').style.touchAction=\'pan-y\'}\n   });document.getElementById(\'map\').style.touchAction=\'none\';\n }\n var schedule=null;\n state.map.on(\'moveend zoomend\',function(){\n    if(schedule!==null)clearTimeout(schedule);\n    schedule=setTimeout(function(){schedule=null;redrawStations();emitBounds()},420);\n });\n state.map.on(\'resize\',function(){redrawStations()});\n document.addEventListener(\'visibilitychange\',function(){if(document.visibilityState===\'visible\')setTimeout(function(){state.map.invalidateSize();redrawStations()},100)});\n window.addEventListener(\'pageshow\',function(){setTimeout(function(){if(state.map){state.map.invalidateSize();redrawStations()}},200)});\n state.map.whenReady(function(){setTimeout(function(){state.map.invalidateSize();redrawStations();emitBounds()},350)});\n note(\'\');setHeight();\n}\nfunction emitBounds(){if(!state.map)return;var b=state.map.getBounds();\n var arr=[b.getSouth(),b.getWest(),b.getNorth(),b.getEast()];\n if(arr.some(function(x){return !isFinite(x)}))return;\n var key=arr.map(function(v){return v.toFixed(5)}).join(\',\')+\'|\'+state.map.getZoom();\n if(key===state.sentBounds)return;\n state.sentBounds=key;\n hostMessage(\'streamlit:setComponentValue\',{dataType:\'json\',value:{bounds:{_southWest:{lat:arr[0],lng:arr[1]},_northEast:{lat:arr[2],lng:arr[3]}},zoom:state.map.getZoom()}});\n}\nfunction updateOverlay(geo,signature){\n if(!state.map || signature===state.groupSignature)return;\n try{\n  var fresh=null;\n  if(geo && geo.features && geo.features.length){\n   fresh=L.geoJSON(geo,{smoothFactor:1.7,style:function(feature){return {color:\'#606b72\',weight:.7,fillColor:feature.properties.color||\'#bbb\',fillOpacity:.65}},\n       onEachFeature:function(feature,layer){var props=feature.properties||{},name=String(props.name||\'\'),avg=String(props.price_label||\'\'),count=String(props.count_label||\'\');\n         var el=document.createElement(\'div\');el.textContent=name+\'｜平均 \'+avg+\'｜\'+count;layer.bindPopup(el);}});\n  }\n  if(state.overlay){state.map.removeLayer(state.overlay);state.overlay=null}\n  if(fresh){fresh.addTo(state.map);state.overlay=fresh}\n  state.groupSignature=signature;\n }catch(err){note(\'地図の塗り分けを表示できません: \'+(err&&err.message||\'エラー\'))}\n}\nfunction redrawStations(){\n if(!state.map || !state.stationLayer)return;\n var m=state.map,zoom=m.getZoom(),bounds=m.getBounds(),size=m.getSize();\n if(size.x<30||size.y<30)return;\n state.stationLayer.clearLayers();state.wardLayer.clearLayers();\n var used=Object.create(null),max=zoom>=16?140:zoom>=15?95:zoom>=14?64:zoom>=13?42:zoom>=12?25:13;\n var count=0,stations=state.stations||[];\n for(var i=0;i<stations.length&&count<max;i++){\n  var s=stations[i];if(zoom<13&&s.priority>0)continue;\n  if(zoom<15&&s.priority>1)continue;\n  if(!bounds.contains([s.lat,s.lng]))continue;\n  var p=m.latLngToContainerPoint([s.lat,s.lng]),cx=Math.floor(p.x/(zoom>=15?60:77)),cy=Math.floor(p.y/26),cell=cx+\':\'+cy;\n  if(used[cell])continue;used[cell]=true;count++;\n  var name=String(s.name||\'\').replace(/[&<>"]/g,function(c){return {\'&\':\'&amp;\',\'<\':\'&lt;\',\'>\':\'&gt;\',\'"\':\'&quot;\'}[c]});\n  var ic=L.divIcon({className:\'\',html:\'<span class="station-chip\'+(s.priority>0?\' minor\':\'\')+\'">\'+name+\'</span>\',iconSize:[0,0]});\n  L.marker([s.lat,s.lng],{icon:ic,interactive:false,keyboard:false}).addTo(state.stationLayer);\n }\n if(zoom<=13){for(var j=0;j<state.wards.length;j++){\n   var w=state.wards[j];if(!bounds.contains([w.lat,w.lng]))continue;\n   var safe=String(w.name||\'\').replace(/[&<>"]/g,function(c){return {\'&\':\'&amp;\',\'<\':\'&lt;\',\'>\':\'&gt;\',\'"\':\'&quot;\'}[c]});\n   L.marker([w.lat,w.lng],{interactive:false,keyboard:false,icon:L.divIcon({className:\'\',html:\'<span class="ward-chip">\'+safe+\'</span>\',iconSize:[0,0]})}).addTo(state.wardLayer);\n }}\n}\nfunction render(args){\n args=args||{};\n if(!state.map){\n   if(!window.L){\n      state.pendingArgs=args;\n      if(!state.retryTimer && state.retryCount<30){\n        state.retryTimer=setTimeout(function(){state.retryTimer=null;state.retryCount++;render(state.pendingArgs)},500);\n      }\n      if(state.retryCount>=30)note(\'地図ライブラリの読込に失敗しました。通信を確認してください。\');\n      return;\n   }\n   initMap(args);if(!state.map)return;\n }\n state.stations=Array.isArray(args.stations)?args.stations:state.stations;\n state.wards=Array.isArray(args.wards)?args.wards:state.wards;\n updateOverlay(args.geo,args.signature);\n redrawStations();\n setHeight();\n}\nwindow.addEventListener(\'message\',function(e){if(e.data&&e.data.type===\'streamlit:render\')render(e.data.args)});\nhostMessage(\'streamlit:componentReady\',{apiVersion:1});setHeight();\n})();\n</script>\n</body></html>\n'
+
+@st.cache_resource(show_spinner=False)
+def town_component_v118():
+    folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-v118')
+    os.makedirs(folder,exist_ok=True)
+    path=os.path.join(folder,'index.html')
+    # Component HTML is small; create once per worker process. Never include
+    # any Supabase key or listing details in this static file.
+    if not os.path.isfile(path) or os.path.getsize(path)!=len(TOWN_COMPONENT_HTML_V118.encode('utf-8')):
+        with open(path,'w',encoding='utf-8') as output:output.write(TOWN_COMPONENT_HTML_V118)
+    return st.components.v1.declare_component('sumai_town_map_v118',path=folder)
+
+@st.cache_data(show_spinner=False)
+def town_station_refs_v118():
+    majors=set(MAJOR_STATION_LABELS)
+    items=[{'name':name,'lat':float(coords[0]),'lng':float(coords[1]),
+            'priority':0 if name in majors else 1 if name in STATIONS else 2}
+           for name,coords in STATION_MAP_POINTS.items()]
+    items.sort(key=lambda item:(item['priority'],item['name']))
+    return items,[{'name':name,'lat':float(p[0]),'lng':float(p[1])} for name,p in WARD_LABELS.items()]
+
 @st.fragment(run_every='15s')
 def town_choropleth_status():
     """Poll summary/boundary readiness WITHOUT remounting the map iframe."""
@@ -8060,33 +8118,37 @@ def town_choropleth_status():
     boundaries=town_boundary_registry();boundaries.start()
     shapes,ready,busy,error=boundaries.snapshot()
     if snap['running']:
-        st.caption(f"町丁目家賃を集計中：{snap['progress']}ページ。地図は操作できます。")
-    if busy:st.caption('町丁目境界を準備しています。地図本体は表示し続けます。')
+        done=snap['progress'];total=snap.get('total_pages')
+        if isinstance(total,int) and total>0:
+            st.caption(f"町丁目集計 {done}/{total}ページ（{min(100,100*done/total):.0f}%）")
+            st.progress(min(1.0,done/total))
+        else:
+            st.caption(f"町丁目集計 {done}/-- ページ（総数取得不可）")
+    if busy:st.caption('境界データ読込中')
     if snap['error']:st.warning('平均家賃の集計：'+snap['error'])
     if error:st.warning('境界取得：'+error+'。不明な区域は塗りません。')
     if ready and snap['ready']:
-        st.caption('町丁目の集計と境界を準備済み。新しい結果を反映する場合は下の「地図の色を更新」を押してください。')
+        st.caption('集計完了')
     if st.button('町丁目平均家賃を再集計',key='refresh_town_aggregate',disabled=snap['running']):
         store.start();st.rerun(scope='fragment')
 
 
 @st.fragment
 def interactive_town_choropleth(group,facilities):
-    """Render the Leaflet map only on demand, never on a periodic timer.
+    """Leaflet map persists in the browser across Streamlit fragment reruns.
 
-    A browser bounds event only updates stored bounds. It does NOT rebuild
-    Folium / GeoJSON, preventing mobile iframe unmount during interaction.
+    Only aggregate geometry and the selected group enter the map.  Do not
+    mount folium/st_folium in this fragment: the mount/unmount cycle is the
+    observed map-whitening failure when bounds callbacks cause a rerun.
     """
     state=st.session_state
-    if st.button('地図の色・表示範囲を更新',key='refresh_v117_town_map'):
-        state['_v117_map_revision']=int(state.get('_v117_map_revision',0))+1
-        state.pop('_v117_choropleth_map',None)
+    if st.button('地図の色・表示範囲を更新',key='refresh_v118_town_map'):
+        state['_v118_map_revision']=int(state.get('_v118_map_revision',0))+1
         st.rerun(scope='fragment')
-    reset=int(state.get('_v117_reset_count',0))
-    revision=int(state.get('_v117_map_revision',0))
+    reset=int(state.get('_v118_map_reset_count',0))
+    revision=int(state.get('_v118_map_revision',0))
     signature=(BUILD,group,revision,reset)
-    cached=state.get('_v117_choropleth_map')
-    # No JSON building, database reads, or map construction on pan/pinch reruns.
+    cached=state.get('_v118_choropleth_payload')
     if not isinstance(cached,dict) or cached.get('signature')!=signature:
         store=current_town_summary_worker();snap=store.snapshot()
         boundary_worker=town_boundary_registry();boundary_worker.start()
@@ -8095,45 +8157,33 @@ def interactive_town_choropleth(group,facilities):
         center=bounds_center(bounds) if bounds else state.get('new_view_center',DEFAULT_CENTER)
         if bounds and len(bounds)==4:
             south,west,north,east=map(float,bounds)
-            lat_pad=max(.018,(north-south)*1.1)
-            lng_pad=max(.018,(east-west)*1.1)
+            lat_pad=max(.018,(north-south)*1.1);lng_pad=max(.018,(east-west)*1.1)
             window=(south-lat_pad,west-lng_pad,north+lat_pad,east+lng_pad)
-        else:
-            window=(center[0]-.045,center[1]-.065,center[0]+.045,center[1]+.065)
-        grouped=(snap['summary'] or {}).get('groups') or {}
-        geo,limited,count=town_colored_shapes(grouped,group,shapes if ready else {},window)
-        # Deliberately do not include the thousands of individual listing dots.
-        m=rental_map([],center,1500,[],facilities)
-        if geo['features']:
-            layer=folium.GeoJson(geo,name='町丁目平均家賃',smooth_factor=1.6,
-                style_function=lambda feature:{'fillColor':feature['properties']['color'],
-                    'color':'#56616a','weight':0.8,'fillOpacity':0.61},
-                highlight_function=lambda feature:{'color':'#22313f','weight':1.8,'fillOpacity':0.78})
-            folium.GeoJsonTooltip(fields=['name','price_label','count_label'],
-                aliases=['町丁目','平均家賃','募集件数'],labels=True,sticky=True).add_to(layer)
-            layer.add_to(m)
-        state['_v117_choropleth_map']={'signature':signature,'map':m,
-            'colored_count':len(geo['features']),'limited':limited,
-            'ready':bool(ready and snap['ready'])}
-        cached=state['_v117_choropleth_map']
+        else:window=(center[0]-.045,center[1]-.065,center[0]+.045,center[1]+.065)
+        groups=(snap['summary'] or {}).get('groups') or {}
+        geo,limited,count=town_colored_shapes(groups,group,shapes if ready else {},window)
+        cached={'signature':signature,'geo':geo,'limited':limited,'ready':bool(ready and snap['ready']),
+                'colored_count':len(geo['features']),'center':center}
+        state['_v118_choropleth_payload']=cached
     if cached['limited']:
-        st.caption('広域のため表示区域は最大700町丁目です。別の地域を表示する際は上の更新ボタンを押してください。')
-    elif not cached['ready']:
-        st.caption('地図の背景を表示中です。集計と境界の準備後、上の更新ボタンで町丁目を着色できます。')
+        st.caption('広域表示：上位700町丁目。移動後は「地図の色・表示範囲を更新」')
+    elif cached['ready']:
+        st.caption(f"着色：{cached['colored_count']}町丁目")
     else:
-        st.caption(f"平均家賃で着色：{cached['colored_count']}町丁目。移動後は上の更新ボタンで区域を切り替えられます。")
-    data=st_folium(cached['map'],key='new_map_v117_'+str(reset),
-                   height=480,use_container_width=True,returned_objects=['bounds'],
-                   on_change=capture_map_fragment_v117)
+        st.caption('集計・境界の準備中。完了後に地図の色を更新')
+    stations,wards=town_station_refs_v118()
+    widget=town_component_v118()
+    data=widget(center=list(cached['center']),zoom=14,geo=cached['geo'],
+                signature='|'.join(map(str,signature)),stations=stations,wards=wards,
+                key='town_map_v118_'+str(reset),default=None)
     if isinstance(data,dict):
         current=viewport_bounds(data)
         if current:
-            state['new_bounds']=current
-            state['new_view_center']=bounds_center(current)
+            state['new_bounds']=current;state['new_view_center']=bounds_center(current)
             state['new_map']=data
-    if st.button('地図が表示されない場合は再初期化',key='reset_v117_map'):
-        state.pop('_v117_choropleth_map',None)
-        state['_v117_reset_count']=reset+1
+    if st.button('地図を再初期化',key='reset_v118_map'):
+        state.pop('_v118_choropleth_payload',None)
+        state['_v118_map_reset_count']=reset+1
         st.rerun(scope='fragment')
 
 
