@@ -34,13 +34,13 @@ from email.utils import parsedate_to_datetime
 from urllib.parse import urlencode, urljoin, urlparse, parse_qs, quote
 
 from branca.element import MacroElement, Template
-import folium
+# folium is loaded only by the legacy point-map fallback, not the active town map.
 import requests
 import streamlit as st
-from streamlit_folium import st_folium
+# streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v125"
+BUILD = "REBUILD-01-v126"
 
 # ============================================================================
 # NON-NEGOTIABLE SUUMO ADDRESS POLICY -- DO NOT DELETE OR WEAKEN
@@ -5588,6 +5588,7 @@ class MobileScrollControl(MacroElement):
 
 
 def rental_map(rows,center,radius,cells,facilities):
+    import folium
     m=folium.Map(location=center,zoom_start=15,tiles=None,control_scale=True,prefer_canvas=True,
                  zoom_control=True)
     folium.map.CustomPane('monotoneBase',z_index=200,pointer_events=False).add_to(m)
@@ -5753,6 +5754,7 @@ class ReplaceRentalFeatureLayer(MacroElement):
 
 
 def rental_features(rows,cells,facilities):
+    import folium
     m=folium.FeatureGroup(name='1募集1点・家賃帯')
     IndividualRentPoints(rows).add_to(m)
     for f in facilities:
@@ -6707,6 +6709,7 @@ def mobile_map_content_signature(rows,facilities):
 
 @st.fragment
 def interactive_rental_map(pins,cells,facilities):
+    from streamlit_folium import st_folium
     """Reliable map mount: base map and rental data are rendered atomically.
 
     Do not share one mutable Folium.Map through cache_resource across Streamlit
@@ -6803,6 +6806,116 @@ def cloud_memory_pressure():
                 'anon_mib':round(stats.get('anon',0)/mb),
                 'effective_mib':round(max(0,used-stats.get('inactive_file',0))/mb)}
     except (OSError,ValueError,ZeroDivisionError):return None
+
+
+# v126: reduce actual cgroup file pages instead of reclassifying cached bytes.
+# memory.reclaim is a *cgroup-local* kernel interface; do not write global
+# /proc/sys/vm/drop_caches, do not erase application or Supabase data.
+# On hosted Streamlit it may be read-only; failures are reported truthfully.
+_CACHE_RECLAIM_MIN_INTERVAL = 300
+_CACHE_RECLAIM_LOCK = threading.Lock()
+_CACHE_RECLAIM_LAST = {'time': 0.0, 'status': '未実行', 'before_mib': None,
+                       'after_mib': None, 'requested_mib': 0, 'reason': '起動前'}
+
+
+def _v126_cgroup_sample():
+    """Small cgroup snapshot; never infer memory.current is all private RSS."""
+    root='/sys/fs/cgroup/'
+    def read_number(name):
+        try:
+            with open(root+name,encoding='ascii') as handle: return int(handle.read().strip())
+        except (OSError,ValueError): return 0
+    keys=('file','inactive_file','shmem','anon','kernel')
+    stats={}
+    try:
+        with open(root+'memory.stat',encoding='ascii') as handle:
+            for line in handle:
+                parts=line.split()
+                if len(parts)==2 and parts[0] in keys:
+                    stats[parts[0]]=int(parts[1])
+    except (OSError,ValueError): pass
+    stats['current']=read_number('memory.current')
+    return stats
+
+
+def _v126_discard_file_cache(path):
+    """Best-effort DONTNEED for app-owned *closed* temporary data files only."""
+    if not getattr(os,'posix_fadvise',None):return False
+    try:
+        # Do not dereference arbitrary symlinks, and do not touch live DB WALs.
+        if not path or not os.path.isfile(path) or os.path.islink(path):return False
+        fd=os.open(path,os.O_RDONLY|getattr(os,'O_CLOEXEC',0))
+        try:
+            os.posix_fadvise(fd,0,0,os.POSIX_FADV_DONTNEED)
+            return True
+        finally:os.close(fd)
+    except (AttributeError,OSError,ValueError):return False
+
+
+def _v126_trim_heap():
+    """Return released glibc arenas to OS after a bulk worker exits."""
+    try:
+        import gc
+        gc.collect()
+        # Trim only after reaching an idle point, never for each HTTP page.
+        import ctypes
+        libc=ctypes.CDLL(None)
+        trim=getattr(libc,'malloc_trim',None)
+        if trim is not None:
+            trim.argtypes=[ctypes.c_size_t]
+            trim.restype=ctypes.c_int
+            trim(0)
+        return True
+    except (ImportError,OSError,AttributeError,TypeError,ValueError):return False
+
+
+def _v126_reclaim_idle_cache(reason='idle', *, force=False):
+    """Attempt to shrink observed *total* memory.current, not calculated RSS.
+
+    Use memory.reclaim only when cgroup2 grants access. It is strictly local
+    and opportunistic; EACCES/EROFS are ordinary supported outcomes. Never
+    report a theoretical reclaim amount as actual saved memory.
+    """
+    now=time.monotonic()
+    with _CACHE_RECLAIM_LOCK:
+        if not force and now-_CACHE_RECLAIM_LAST['time']<_CACHE_RECLAIM_MIN_INTERVAL:
+            return dict(_CACHE_RECLAIM_LAST)
+        before=_v126_cgroup_sample()
+        inactive=before.get('inactive_file',0)
+        # Prefer a generous active filesystem cache; do not target all pages.
+        target=min(1024*1024*1024,max(0,inactive-96*1024*1024))
+        status='回収不要'
+        if target>=64*1024*1024:
+            try:
+                with open('/sys/fs/cgroup/memory.reclaim','w',encoding='ascii') as handle:
+                    handle.write(str(target))
+                status='回収を要求済み'
+            except OSError as exc:
+                # Typical Streamlit Cloud: root cgroup is mounted read-only.
+                status='コンテナ権限で回収不可' if exc.errno in (1,13,30) else '回収要求失敗'
+        after=_v126_cgroup_sample()
+        _CACHE_RECLAIM_LAST.update({'time':now,'reason':str(reason)[:32],
+                                   'status':status,'requested_mib':round(target/1048576),
+                                   'before_mib':round(before.get('current',0)/1048576,1),
+                                   'after_mib':round(after.get('current',0)/1048576,1),
+                                   'file_before_mib':round(before.get('file',0)/1048576,1),
+                                   'file_after_mib':round(after.get('file',0)/1048576,1)})
+        return dict(_CACHE_RECLAIM_LAST)
+
+
+def _v126_work_finished(reason, file_path=None):
+    # No global caches discarded. Read-only fadvise never changes saved rows.
+    if file_path:_v126_discard_file_cache(file_path)
+    _v126_trim_heap()
+    _v126_reclaim_idle_cache(reason)
+
+
+def _v126_startup_reclaim():
+    """One asynchronous attempt per Streamlit process, no UI or HTTP delay."""
+    if getattr(_v126_startup_reclaim,'started',False):return
+    _v126_startup_reclaim.started=True
+    threading.Thread(target=lambda: _v126_reclaim_idle_cache('server-start'),
+                     name='sumai-cache-reclaim',daemon=True).start()
 
 
 # v124: On-demand, bounded, private memory diagnosis. No subprocess, no DB read,
@@ -6927,6 +7040,7 @@ def memory_diagnostic_v124():
         'events':_v124_parse_kv(_v124_read_numeric(root+'memory.events')),
         'stat':{k:stat[k] for k in MEMORY_DIAGNOSTIC_FIELDS if k in stat},
     }
+    result['cache_reclaim']=dict(_CACHE_RECLAIM_LAST)
     result['processes']=_v124_process_rows()
     result['temp']={
         '/tmp':_v124_temp_folder_totals('/tmp'),
@@ -6995,6 +7109,13 @@ def format_memory_diagnostic_v124(samples):
                 if p.get('pss_anon') is not None:line+=f' / PSS匿名 {n(p["pss_anon"])}'
                 if p.get('pss_file') is not None:line+=f' / PSSファイル {n(p["pss_file"])}'
             out.append(line)
+        report=s.get('cache_reclaim') or {}
+        if report.get('before_mib') is not None:
+            out.append('■ ファイルページの回収（実測）')
+            out.append('  結果：'+str(report.get('status','未確認')))
+            out.append('  実測前：'+str(report.get('before_mib'))+' MiB / 実測後：'+str(report.get('after_mib'))+' MiB')
+            out.append('  ファイル関連：'+str(report.get('file_before_mib'))+' → '+str(report.get('file_after_mib'))+' MiB')
+            out.append('  指定回収量：'+str(report.get('requested_mib',0))+' MiB（実績とは異なる）')
         out += [f'■ 一時ファイルの容量（RAM使用量ではありません）']
         for folder,v in s['temp'].items():
             out.append(f'  {folder}：{v["file_entries_scanned"]}件を調査'+('（件数上限につき一部のみ）' if v['incomplete'] else ''))
@@ -7014,6 +7135,9 @@ def render_memory_diagnostic_v124():
     """Small opt-in expander; no sampling on every Streamlit fragment refresh."""
     with st.expander('メモリ診断（必要なときだけ）',expanded=False):
         st.caption('現在の内訳を記録してTXTを出力します。待機中・収集中など最大3回を比較できます。')
+        if st.button('ファイル関連メモリの回収を試す',key='v126_memory_reclaim',use_container_width=True):
+            result=_v126_reclaim_idle_cache('user-diagnostic',force=True)
+            st.caption('回収結果：'+result['status']+'｜全体 '+str(result.get('before_mib'))+' → '+str(result.get('after_mib'))+' MiB')
         if st.button('現在のメモリを記録',key='v124_memory_sample',use_container_width=True):
             try:
                 current=memory_diagnostic_v124()
@@ -7032,6 +7156,9 @@ def render_memory_diagnostic_v124():
             a.metric('ファイル関連',metric(stat.get('file')))
             b.metric('うち共有メモリ',metric(stat.get('shmem')))
             st.caption('記録 '+str(len(history))+'/3回｜直近 '+last['timestamp_jst']+'。ファイル関連には共有メモリ等も含みます。')
+            reclaim=last.get('cache_reclaim') or {}
+            if reclaim.get('before_mib') is not None:
+                st.caption('ファイルページ回収：'+str(reclaim.get('status'))+'｜全体 '+str(reclaim.get('before_mib'))+' → '+str(reclaim.get('after_mib'))+' MiB')
             st.download_button('メモリ診断TXTをダウンロード',
                                format_memory_diagnostic_v124(history),
                                'sumai_memory_diagnostic_v124.txt','text/plain',
@@ -7550,6 +7677,9 @@ class AutomaticCollection:
                         self.stop_event.set()
                         self.error='町の検索結果は保持していますが、自動収集の進捗をSupabaseへ保存できません。DB診断を確認してください。'
                         self.message='進捗保存未確認のため停止しました。物件ごとの保存確認は別途記録されています。'
+                # A town's listing objects and response caches have just been
+                # dropped. Return unused Python arenas and clean file pages.
+                _v126_work_finished('town-collection')
         except Exception as exc:
             with self.lock:
                 active_job=self.current or self.last_job
@@ -8105,6 +8235,9 @@ def town_aggregate_streaming(raw_rows):
                     'examined':examined,'unmatched':examined-latest_count,'updated_at':utc_now()}
         finally:
             db.close()
+            # Reclaim clean pages of the now-closed spill file; the OS might
+            # otherwise retain them in inactive_file after deletion.
+            _v126_discard_file_cache(os.path.join(folder,'latest.sqlite'))
 
 
 class TownSummaryWorker:
@@ -8220,6 +8353,7 @@ class TownSummaryWorker:
                 'started_at':summary['updated_at'],'finished_at':summary['updated_at'],
                 'conditions':{'schema':1,'source':'rental_listing'},'summary':summary})
             with self.lock:self.summary=summary;self.ready=True;self.message='集計完了';self.error=''
+            _v126_work_finished('town-summary')
         except Exception as exc:
             with self.lock:self.error=str(exc);self.message='集計を更新できませんでした。以前の集計は保持します。'
         finally:
@@ -8347,6 +8481,8 @@ class TownBoundaryWorker:
                     with sqlite3.connect(self.cache_path) as conn:
                         verified=conn.execute("SELECT COUNT(*) FROM areas").fetchone()[0]
                     if verified>0:
+                        # Only a metadata check was performed; do not evict
+                        # the polygon database needed for viewport queries.
                         with self.lock:
                             self.features=TownBoundaryStore(self.cache_path)
                             self.ready=True;self.error=''
@@ -8399,12 +8535,15 @@ class TownBoundaryWorker:
                             conn.executemany('INSERT INTO areas VALUES(?,?,?,?,?,?)',batch)
                             batch.clear()
                     if batch:conn.executemany('INSERT INTO areas VALUES(?,?,?,?,?,?)',batch)
+                    # The 36MB input is no longer used after parsing.
+                    _v126_discard_file_cache(source)
                     count=conn.execute('SELECT COUNT(*) FROM areas').fetchone()[0]
                     if not count:raise ValueError('東京23区の町丁目境界が見つかりません。')
                     conn.execute('CREATE INDEX areas_bbox ON areas(south,north,west,east)')
                     conn.commit()
                 finally:conn.close()
                 os.replace(target,self.cache_path)
+            _v126_work_finished('town-boundary')
             with self.lock:
                 self.features=TownBoundaryStore(self.cache_path)
                 self.ready=True;self.error=''
@@ -8581,6 +8720,7 @@ def interactive_town_choropleth(group,facilities):
 
 
 def main():
+    _v126_startup_reclaim()
     st.set_page_config(page_title='住まいコンパス｜新しい住まいを探す',page_icon='🏡',layout='wide',initial_sidebar_state='collapsed')
     st.markdown(CSS,unsafe_allow_html=True)
     st.markdown(f'<div class="hero"><span class="badge">SUMAI COMPASS · {BUILD}</span><h1>次の住まいを、地図から。</h1><p>掲載物件を確認し、家賃と暮らしやすさを比べます。<br>間取りと家賃帯を、取得できた情報で比較します。</p></div>',unsafe_allow_html=True)
