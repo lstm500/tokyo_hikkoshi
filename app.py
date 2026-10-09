@@ -39,7 +39,7 @@ import streamlit as st
 from streamlit_folium import st_folium
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v107"
+BUILD = "REBUILD-01-v108"
 
 # ============================================================================
 # NON-NEGOTIABLE SUUMO ADDRESS POLICY -- DO NOT DELETE OR WEAKEN
@@ -5146,7 +5146,8 @@ class MobileScrollControl(MacroElement):
 
 
 def rental_map(rows,center,radius,cells,facilities):
-    m=folium.Map(location=center,zoom_start=15,tiles=None,control_scale=True,prefer_canvas=True)
+    m=folium.Map(location=center,zoom_start=15,tiles=None,control_scale=True,prefer_canvas=True,
+                 zoom_control=True)
     folium.map.CustomPane('monotoneBase',z_index=200,pointer_events=False).add_to(m)
     MonotoneBase().add_to(m)
     folium.TileLayer('https://cyberjapandata.gsi.go.jp/xyz/std/{z}/{x}/{y}.png',
@@ -5168,96 +5169,100 @@ def listing_card(r,persisted):
 
 
 class IndividualRentPoints(MacroElement):
-    """One lightweight HTML canvas for all rental dots, not 12k Leaflet layers.
+    """Transparent, grouped SVG paths for all rent dots; no per-listing DOM layers.
 
-    Viewport filtering and drawing stay in the browser.  Panning never asks Python
-    to rebuild individual markers; no aggregation or loss of listing positions.
+    Deliberately avoid HTML Canvas on Android: desynchronized GPU compositing of
+    transparent canvases can turn the whole tile map black. Each price/precision
+    combination is one SVG path. Viewport selection is browser-side, not a Python
+    map rerun, and moveend rather than move drives costly geometry updates.
     """
     _template=Template("""{% macro script(this, kwargs) %}
     (function () {
       var map = {{ this._parent._parent.get_name() }};
       var data = {{ this.payload }};
-      // Dynamic map refresh replaces the old overlay, never stacks 12k layers.
-      if (map._sumaiRentalCanvas) {
-        var prior = map._sumaiRentalCanvas;
-        map.off('move zoom resize viewreset', prior.schedule);
-        if (prior.canvas.parentNode) prior.canvas.parentNode.removeChild(prior.canvas);
+      var pane = map.getPane('rentIndividualPane');
+      if (!pane) return;
+      if (map._sumaiRentalSVG) {
+        var prior = map._sumaiRentalSVG;
+        map.off('moveend zoomend resize viewreset', prior.schedule);
+        if (prior.svg.parentNode) prior.svg.parentNode.removeChild(prior.svg);
       }
-      var canvas = L.DomUtil.create('canvas', 'sumai-rent-canvas', map.getPane('rentIndividualPane'));
-      canvas.style.cssText = 'position:absolute;pointer-events:none;';
-      canvas.setAttribute('aria-hidden', 'true');
-      var ctx = canvas.getContext('2d', {alpha:true, desynchronized:true});
-      if (!ctx) return;
+      var ns = 'http://www.w3.org/2000/svg';
+      var svg = document.createElementNS(ns,'svg');
+      svg.setAttribute('class','sumai-rent-svg');
+      svg.setAttribute('aria-hidden','true');
+      svg.setAttribute('focusable','false');
+      svg.style.cssText = 'position:absolute;top:0;left:0;overflow:hidden;pointer-events:none;background:transparent!important;opacity:1;';
+      pane.appendChild(svg);
       var grid = Object.create(null);
       var CELL = 0.01;
-      for (var i = 0; i < data.length; i++) {
+      for (var i=0; i<data.length; i++) {
         var d = data[i];
-        var key = Math.floor(d[0] / CELL) + ':' + Math.floor(d[1] / CELL);
-        if (!grid[key]) grid[key] = [];
+        var key = Math.floor(d[0]/CELL)+':'+Math.floor(d[1]/CELL);
+        if (!grid[key]) grid[key]=[];
         grid[key].push(d);
       }
-      var scheduled = false, lastDraw = 0, delayTimer = null;
+      var scheduled = false;
       function paint() {
         scheduled = false;
-        if (!map || !canvas.isConnected) return;
+        if (!svg.isConnected) return;
         var size = map.getSize();
-        if (!size.x || !size.y) return;
-        var scale = Math.min(2, window.devicePixelRatio || 1);
-        var w = Math.round(size.x * scale), h = Math.round(size.y * scale);
-        if (canvas.width !== w || canvas.height !== h) {
-          canvas.width = w; canvas.height = h;
-          canvas.style.width = size.x + 'px'; canvas.style.height = size.y + 'px';
-        }
-        L.DomUtil.setPosition(canvas, map.containerPointToLayerPoint([0, 0]));
-        ctx.setTransform(scale, 0, 0, scale, 0, 0);
-        ctx.clearRect(0, 0, size.x, size.y);
+        if (size.x<=0 || size.y<=0) return;
+        svg.setAttribute('width',size.x);
+        svg.setAttribute('height',size.y);
+        svg.setAttribute('viewBox','0 0 '+size.x+' '+size.y);
+        svg.style.width=size.x+'px';
+        svg.style.height=size.y+'px';
+        L.DomUtil.setPosition(svg,map.containerPointToLayerPoint([0,0]));
         var bounds = map.getBounds().pad(0.04);
-        var south = Math.floor(bounds.getSouth() / CELL), north = Math.floor(bounds.getNorth() / CELL);
-        var west = Math.floor(bounds.getWest() / CELL), east = Math.floor(bounds.getEast() / CELL);
-        var cells = (north - south + 1) * (east - west + 1);
-        var visible = [];
-        if (cells > 0 && cells <= 3000) {
-          for (var lat = south; lat <= north; lat++) {
-            for (var lng = west; lng <= east; lng++) {
-              var bucket = grid[lat + ':' + lng];
-              if (bucket) for (var j = 0; j < bucket.length; j++) visible.push(bucket[j]);
+        var south=Math.floor(bounds.getSouth()/CELL),north=Math.floor(bounds.getNorth()/CELL);
+        var west=Math.floor(bounds.getWest()/CELL),east=Math.floor(bounds.getEast()/CELL);
+        var cells=(north-south+1)*(east-west+1),visible=[];
+        if (cells>0 && cells<=3000) {
+          for (var lat=south;lat<=north;lat++) {
+            for (var lng=west;lng<=east;lng++) {
+              var bucket=grid[lat+':'+lng];
+              if (bucket) for(var j=0;j<bucket.length;j++)visible.push(bucket[j]);
             }
           }
-        } else {
-          visible = data;
+        } else visible=data;
+        // All properties stay independent. Multiple positions share one SVG path
+        // per rent/precision group, greatly reducing DOM and memory pressure.
+        var paths=Object.create(null),metas=Object.create(null),R=5.8;
+        for (var k=0;k<visible.length;k++) {
+          var item=visible[k];
+          if (item[0]<bounds.getSouth() || item[0]>bounds.getNorth() ||
+              item[1]<bounds.getWest() || item[1]>bounds.getEast()) continue;
+          var xy=map.latLngToContainerPoint([item[0],item[1]]);
+          if (xy.x< -R || xy.x>size.x+R || xy.y< -R || xy.y>size.y+R)continue;
+          var group=item[2]+'|'+(item[3]?'approx':'exact');
+          // Circles as closed subpaths. Round only screen pixels, never listing coordinates.
+          var x=xy.x.toFixed(1),y=xy.y.toFixed(1);
+          var arc='M'+(xy.x+R).toFixed(1)+' '+y+'a'+R+' '+R+' 0 1 0 '+(-2*R)+' 0a'+R+' '+R+' 0 1 0 '+(2*R)+' 0Z';
+          (paths[group]||(paths[group]=[])).push(arc);
+          metas[group]=item;
         }
-        for (var k = 0; k < visible.length; k++) {
-          var d = visible[k];
-          if (d[0] < bounds.getSouth() || d[0] > bounds.getNorth() ||
-              d[1] < bounds.getWest() || d[1] > bounds.getEast()) continue;
-          var point = map.latLngToContainerPoint([d[0], d[1]]);
-          ctx.beginPath();
-          ctx.arc(point.x, point.y, 5.8, 0, 2 * Math.PI);
-          ctx.fillStyle = d[2];
-          ctx.globalAlpha = 0.70;
-          ctx.fill();
-          ctx.globalAlpha = 0.62;
-          ctx.strokeStyle = '#ffffff';
-          ctx.lineWidth = d[3] ? 1.35 : 0.75;
-          ctx.setLineDash(d[3] ? [2, 2] : []);
-          ctx.stroke();
-        }
-        ctx.setLineDash([]);ctx.globalAlpha = 1;
-        lastDraw = Date.now();
-      }
-      function schedule() {
-        if (scheduled || !canvas.isConnected) return;
-        // At most about 15 redraws/second while dragging; no Streamlit events.
-        var remaining = 66 - (Date.now() - lastDraw);
-        scheduled = true;
-        if (remaining > 0) {
-          delayTimer = setTimeout(function () { delayTimer = null; requestAnimationFrame(paint); }, remaining);
-        } else {
-          requestAnimationFrame(paint);
+        // Replacing <= 24 SVG path nodes only at moveend avoids touch lag.
+        while(svg.firstChild) svg.removeChild(svg.firstChild);
+        for (var name in paths) {
+          var path=document.createElementNS(ns,'path');
+          path.setAttribute('d',paths[name].join(''));
+          path.setAttribute('fill',metas[name][2]);
+          path.setAttribute('fill-opacity','0.70');
+          path.setAttribute('stroke','#ffffff');
+          path.setAttribute('stroke-opacity','0.62');
+          path.setAttribute('stroke-width',metas[name][3]?'1.35':'0.75');
+          if(metas[name][3])path.setAttribute('stroke-dasharray','2 2');
+          svg.appendChild(path);
         }
       }
-      map._sumaiRentalCanvas = {canvas:canvas, schedule:schedule};
-      map.on('move zoom resize viewreset', schedule);
+      function schedule(){
+        if(scheduled || !svg.isConnected)return;
+        scheduled=true;
+        requestAnimationFrame(paint);
+      }
+      map._sumaiRentalSVG={svg:svg,schedule:schedule};
+      map.on('moveend zoomend resize viewreset',schedule);
       map.whenReady(schedule);
     })();
     {% endmacro %}""")
@@ -5268,7 +5273,7 @@ class IndividualRentPoints(MacroElement):
             items.append([float(r['latitude']),float(r['longitude']),
                 rent_color(monthly_price(r)) if r.get('rent') else '#777777',
                 r.get('coordinate_precision') in ('town','address')])
-        self.payload=json.dumps(items,ensure_ascii=False,separators=(',',':')).replace('<','\u003c').replace('>','\u003e').replace('&','\u0026')
+        self.payload=json.dumps(items,ensure_ascii=False,separators=(',',':')).replace('<','\\u003c').replace('>','\\u003e').replace('&','\\u0026')
 
 
 def rental_features(rows,cells,facilities):
@@ -6097,6 +6102,29 @@ def capture_map_fragment():
     if not had_bounds and st.session_state.get('new_bounds'):
         st.session_state['map_initial_bounds_ready']=True
 
+@st.cache_resource(show_spinner=False)
+def stable_mobile_base_map(build_version):
+    """Keep Folium's JS IDs stable across all map fragments and button reruns."""
+    return rental_map([],DEFAULT_CENTER,1500,[],[])
+
+
+def mobile_map_content_signature(rows,facilities):
+    """Re-send property layer only when visible dataset content actually changes.
+
+    Avoid Python's id(rows): each Streamlit rerun creates a new list even if the
+    same properties are displayed, unnecessarily uploading all map points.
+    """
+    digest=hashlib.blake2s(digest_size=12)
+    for r in rows:
+        if not has_point(r):continue
+        digest.update((str(r.get('key') or '')+'|'+str(r['latitude'])+'|'+str(r['longitude'])+'|'
+                       +str(r.get('rent'))+'|'+str(r.get('fees'))+'|'
+                       +str(r.get('coordinate_precision'))+';').encode('utf-8'))
+    for f in facilities:
+        digest.update((str(f.get('name'))+'|'+str(f.get('lat'))+'|'+str(f.get('lng'))+';').encode('utf-8'))
+    return (len(rows),len(facilities),digest.hexdigest())
+
+
 @st.fragment
 def interactive_rental_map(pins,cells,facilities):
     state=st.session_state
@@ -6108,14 +6136,14 @@ def interactive_rental_map(pins,cells,facilities):
     # Leaflet already owns the marker canvas. A pan/zoom must not serialize and
     # resend the entire rental dataset to the mobile component. A full Python
     # rerun recreates the list and requests a new group if data changed.
-    signature=(id(pins),len(pins),id(facilities),len(facilities))
+    signature=(BUILD,mobile_map_content_signature(pins,facilities))
     if not state.get('new_map') or state.get('_mobile_map_payload_signature')!=signature:
         kwargs['feature_group_to_add']=rental_features(pins,cells,facilities)
         state['_mobile_map_payload_signature']=signature
     if not state.get('new_map'):
         kwargs['center']=state.get('new_view_center',DEFAULT_CENTER)
         kwargs['zoom']=state.get('new_view_zoom',15)
-    st_folium(rental_map([],DEFAULT_CENTER,1500,[],[]),**kwargs)
+    st_folium(stable_mobile_base_map(BUILD),**kwargs)
     if state.pop('map_initial_bounds_ready',False):
         st.rerun()
 
