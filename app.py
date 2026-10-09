@@ -39,7 +39,7 @@ import streamlit as st
 from streamlit_folium import st_folium
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v116"
+BUILD = "REBUILD-01-v117"
 
 # ============================================================================
 # NON-NEGOTIABLE SUUMO ADDRESS POLICY -- DO NOT DELETE OR WEAKEN
@@ -7736,7 +7736,16 @@ TOWN_GEOJSON_URL = 'https://frogcat.github.io/japan-small-area/13.json'
 TOWN_GEOJSON_BACKUP = 'https://raw.githubusercontent.com/frogcat/japan-small-area/master/docs/13.json'
 TOWN_GEOMETRY_LIMIT = 36 * 1024 * 1024
 TOWN_GROUPS = ('group1','group2','house')
-TOWN_GRADIENT = ((219,239,250),(148,202,232),(74,136,183),(231,151,148),(164,51,75),(54,12,34))
+# Breakpoints follow the prior rent-band legend: pale blue -> blue -> green
+# -> yellow -> red -> near-black burgundy (yen per month).
+TOWN_GRADIENT = (
+    (80000,(208,239,255)),
+    (125000,(36,121,210)),
+    (175000,(24,164,114)),
+    (200000,(238,199,27)),
+    (275000,(225,59,53)),
+    (450000,(51,10,26)),
+)
 
 
 def town_chome_key(text):
@@ -7764,11 +7773,18 @@ def town_layout_group(row):
 
 
 def town_rent_gradient(price):
-    """Continuous pale blue -> dark burgundy gradient. Clip 8-45 man yen."""
-    value=max(0.,min(1.,(float(price)-80000.)/370000.))*(len(TOWN_GRADIENT)-1)
-    lo=min(len(TOWN_GRADIENT)-2,int(value));fraction=value-lo
-    rgb=tuple(round(a+(b-a)*fraction) for a,b in zip(TOWN_GRADIENT[lo],TOWN_GRADIENT[lo+1]))
-    return '#'+''.join(f'{c:02x}' for c in rgb)
+    """Rent-band aligned, continuously interpolated six-stop heat colors."""
+    value=float(price)
+    if value<=TOWN_GRADIENT[0][0]:rgb=TOWN_GRADIENT[0][1]
+    elif value>=TOWN_GRADIENT[-1][0]:rgb=TOWN_GRADIENT[-1][1]
+    else:
+        rgb=TOWN_GRADIENT[-1][1]
+        for (low, a),(high, b) in zip(TOWN_GRADIENT,TOWN_GRADIENT[1:]):
+            if low<=value<=high:
+                fraction=(value-low)/(high-low)
+                rgb=tuple(round(x+(y-x)*fraction) for x,y in zip(a,b))
+                break
+    return '#'+''.join(f'{channel:02x}' for channel in rgb)
 
 
 def town_aggregate_record(raw_rows):
@@ -8013,66 +8029,112 @@ def town_colored_shapes(groups,group,features,bounds,max_features=700):
     return collection,limited,len(found)
 
 
-@st.fragment(run_every='12s')
-def interactive_town_choropleth(group,facilities):
+def capture_map_fragment_v117():
+    """Read bounds from the actual current map widget, not the v115 key.
+
+    Importantly this never forces a full rerun or rebuilds the map when the
+    user pans or pinches on an Android device.
+    """
     state=st.session_state
-    store=current_town_summary_worker();snap=store.snapshot()
-    # After an automatic collection run ends, refresh the precomputed snapshot ONCE.
-    # Do not rebuild at every listing save; that would recreate DB contention.
+    widget='new_map_v117_'+str(state.get('_v117_reset_count',0))
+    response=state.get(widget)
+    if not isinstance(response,dict):return
+    bounds=viewport_bounds(response)
+    if bounds:
+        state['new_bounds']=bounds
+        state['new_view_center']=bounds_center(bounds)
+        state['new_map']=response
+
+
+@st.fragment(run_every='15s')
+def town_choropleth_status():
+    """Poll summary/boundary readiness WITHOUT remounting the map iframe."""
+    state=st.session_state
+    store=current_town_summary_worker()
+    snap=store.snapshot()
     automatic=get_automatic_collection()
-    automatic_running=bool(automatic and automatic.snapshot().get('running'))
-    if state.get('_v116_was_collecting') and not automatic_running and not snap['running']:
+    active=bool(automatic and automatic.snapshot().get('running'))
+    if state.get('_v117_was_collecting') and not active and not snap['running']:
         store.start();snap=store.snapshot()
-    state['_v116_was_collecting']=automatic_running
+    state['_v117_was_collecting']=active
     boundaries=town_boundary_registry();boundaries.start()
     shapes,ready,busy,error=boundaries.snapshot()
-    if snap['running']:st.caption(f"町丁目家賃の事前集計中｜{snap['progress']}ページ｜地図は操作できます")
-    if snap['error']:st.warning('町丁目集計：'+snap['error'])
-    if busy:st.caption('町丁目の境界を裏で準備しています。')
-    if error:st.warning('町丁目境界の取得に失敗しました：'+error+'。架空の区域は塗りません。')
-    if st.button('町丁目平均家賃を更新',key='refresh_town_aggregate',disabled=snap['running']):
-        store.start();st.rerun()
-    bounds=state.get('new_bounds')
-    center=bounds_center(bounds) if bounds else state.get('new_view_center',DEFAULT_CENTER)
-    if bounds and len(bounds)==4:
-        south,west,north,east=map(float,bounds)
-        # Cover the currently visible map plus a margin to avoid load on every pan.
-        lat_pad=max(.008,(north-south)*.5);lng_pad=max(.008,(east-west)*.5)
-        window=(south-lat_pad,west-lng_pad,north+lat_pad,east+lng_pad)
-    else:
-        window=(center[0]-.035,center[1]-.045,center[0]+.035,center[1]+.045)
-    grouped=(snap['summary'] or {}).get('groups') or {}
-    geo,limited,count=town_colored_shapes(grouped,group,shapes if ready else {},window)
-    if limited:st.caption('広域表示のため上位700町丁目を描画しています。拡大すると他の町丁目も表示されます。')
-    elif ready and snap['ready']:st.caption(f'集計済みの区域 {count}町丁目｜最終集計 {acquisition_time_jst(snap["summary"].get("updated_at"))}')
-    if not snap['ready']:st.caption('初回の家賃集計が完了すると町丁目の色が付きます。物件単位の点は表示しません。')
-    signature=(group,tuple(round(v,4) for v in window),
-               (snap['summary'] or {}).get('updated_at'),len(geo['features']),ready,BUILD)
-    cached=state.get('_v116_choropleth_map')
+    if snap['running']:
+        st.caption(f"町丁目家賃を集計中：{snap['progress']}ページ。地図は操作できます。")
+    if busy:st.caption('町丁目境界を準備しています。地図本体は表示し続けます。')
+    if snap['error']:st.warning('平均家賃の集計：'+snap['error'])
+    if error:st.warning('境界取得：'+error+'。不明な区域は塗りません。')
+    if ready and snap['ready']:
+        st.caption('町丁目の集計と境界を準備済み。新しい結果を反映する場合は下の「地図の色を更新」を押してください。')
+    if st.button('町丁目平均家賃を再集計',key='refresh_town_aggregate',disabled=snap['running']):
+        store.start();st.rerun(scope='fragment')
+
+
+@st.fragment
+def interactive_town_choropleth(group,facilities):
+    """Render the Leaflet map only on demand, never on a periodic timer.
+
+    A browser bounds event only updates stored bounds. It does NOT rebuild
+    Folium / GeoJSON, preventing mobile iframe unmount during interaction.
+    """
+    state=st.session_state
+    if st.button('地図の色・表示範囲を更新',key='refresh_v117_town_map'):
+        state['_v117_map_revision']=int(state.get('_v117_map_revision',0))+1
+        state.pop('_v117_choropleth_map',None)
+        st.rerun(scope='fragment')
+    reset=int(state.get('_v117_reset_count',0))
+    revision=int(state.get('_v117_map_revision',0))
+    signature=(BUILD,group,revision,reset)
+    cached=state.get('_v117_choropleth_map')
+    # No JSON building, database reads, or map construction on pan/pinch reruns.
     if not isinstance(cached,dict) or cached.get('signature')!=signature:
-        # No individual listing is materialized or sent to the map.
+        store=current_town_summary_worker();snap=store.snapshot()
+        boundary_worker=town_boundary_registry();boundary_worker.start()
+        shapes,ready,busy,error=boundary_worker.snapshot()
+        bounds=state.get('new_bounds')
+        center=bounds_center(bounds) if bounds else state.get('new_view_center',DEFAULT_CENTER)
+        if bounds and len(bounds)==4:
+            south,west,north,east=map(float,bounds)
+            lat_pad=max(.018,(north-south)*1.1)
+            lng_pad=max(.018,(east-west)*1.1)
+            window=(south-lat_pad,west-lng_pad,north+lat_pad,east+lng_pad)
+        else:
+            window=(center[0]-.045,center[1]-.065,center[0]+.045,center[1]+.065)
+        grouped=(snap['summary'] or {}).get('groups') or {}
+        geo,limited,count=town_colored_shapes(grouped,group,shapes if ready else {},window)
+        # Deliberately do not include the thousands of individual listing dots.
         m=rental_map([],center,1500,[],facilities)
         if geo['features']:
             layer=folium.GeoJson(geo,name='町丁目平均家賃',smooth_factor=1.6,
-                style_function=lambda f:{'fillColor':f['properties']['color'],
-                    'color':'#56616a','weight':0.8,'fillOpacity':0.58},
-                highlight_function=lambda f:{'color':'#22313f','weight':1.8,'fillOpacity':0.75})
+                style_function=lambda feature:{'fillColor':feature['properties']['color'],
+                    'color':'#56616a','weight':0.8,'fillOpacity':0.61},
+                highlight_function=lambda feature:{'color':'#22313f','weight':1.8,'fillOpacity':0.78})
             folium.GeoJsonTooltip(fields=['name','price_label','count_label'],
                 aliases=['町丁目','平均家賃','募集件数'],labels=True,sticky=True).add_to(layer)
             layer.add_to(m)
-        state['_v116_choropleth_map']={'signature':signature,'map':m}
-    else:m=cached['map']
-    data=st_folium(m,key='new_map_v116_'+str(state.get('_v116_reset_count',0)),
+        state['_v117_choropleth_map']={'signature':signature,'map':m,
+            'colored_count':len(geo['features']),'limited':limited,
+            'ready':bool(ready and snap['ready'])}
+        cached=state['_v117_choropleth_map']
+    if cached['limited']:
+        st.caption('広域のため表示区域は最大700町丁目です。別の地域を表示する際は上の更新ボタンを押してください。')
+    elif not cached['ready']:
+        st.caption('地図の背景を表示中です。集計と境界の準備後、上の更新ボタンで町丁目を着色できます。')
+    else:
+        st.caption(f"平均家賃で着色：{cached['colored_count']}町丁目。移動後は上の更新ボタンで区域を切り替えられます。")
+    data=st_folium(cached['map'],key='new_map_v117_'+str(reset),
                    height=480,use_container_width=True,returned_objects=['bounds'],
-                   on_change=capture_map_fragment_v115)
+                   on_change=capture_map_fragment_v117)
     if isinstance(data,dict):
         current=viewport_bounds(data)
         if current:
-            state['new_bounds']=current;state['new_view_center']=bounds_center(current);state['new_map']=data
-    if st.button('地図が表示されない場合は再初期化',key='reset_v116_map'):
-        state.pop('_v116_choropleth_map',None)
-        state['_v116_reset_count']=int(state.get('_v116_reset_count',0))+1
-        st.rerun()
+            state['new_bounds']=current
+            state['new_view_center']=bounds_center(current)
+            state['new_map']=data
+    if st.button('地図が表示されない場合は再初期化',key='reset_v117_map'):
+        state.pop('_v117_choropleth_map',None)
+        state['_v117_reset_count']=reset+1
+        st.rerun(scope='fragment')
 
 
 def main():
@@ -8118,12 +8180,17 @@ def main():
         center=bounds_center(bounds) if bounds else state.get('new_view_center',DEFAULT_CENTER)
         radius=bounds_radius(bounds) if bounds else 1500
         facilities=[f for f in state.new_facilities if bounds and in_rectangle((f['lat'],f['lng']),bounds)]
-        # Pale blue -> burgundy: continuous town-average price instead of listing dots.
+        # Same thresholds as town_rent_gradient; no independent/deviating colors.
+        stops=[(price, '#'+''.join(f'{c:02x}' for c in rgb)) for price,rgb in TOWN_GRADIENT]
+        low,high=stops[0][0],stops[-1][0]
+        css_stops=','.join(f'{color} {(price-low)/(high-low)*100:.1f}%'
+                           for price,color in stops)
         st.markdown('<div style="font-size:13px;margin:3px 0 4px">町丁目別・平均家賃（万円）</div>'
             '<div style="height:13px;border-radius:5px;background:linear-gradient(90deg,'
-            '#dbef fa,#94cae8,#4a88b7,#e79794,#a4334b,#360c22)"'.replace('#dbef fa','#dbeffa')+
-            '></div><div style="display:flex;justify-content:space-between;font-size:11px">'
+            +css_stops+');"></div>'
+            '<div style="display:flex;justify-content:space-between;font-size:11px">'
             '<span>8万円以下・薄い青</span><span>45万円以上・濃い赤黒</span></div>',unsafe_allow_html=True)
+        town_choropleth_status()
         interactive_town_choropleth(selected_group,facilities)
         st.caption('実際の町丁目境界だけを着色します。物件0件・未照合の区域は地図の下地色です。境界：2015年e-Stat由来（frogcat加工）。現在の町丁目と一部異なる場合があります。')
         # Fragment owns its widget container directly, including partial reruns.
