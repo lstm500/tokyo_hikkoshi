@@ -40,7 +40,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v150"
+BUILD = "REBUILD-01-v151"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -9463,7 +9463,12 @@ def validate_automatic_summary(summary):
         except (ValueError,TypeError):raise AppError('自動収集の進捗が不正です：'+key) from None
     if not isinstance(summary.get('last_summary',{}),dict):raise AppError('自動収集の前回結果が不正です。')
 
-def start_automatic_collection(ward_code,interval_minutes=0,town_codes=None):
+def start_automatic_collection(ward_code,interval_minutes=0,town_codes=None,*,restart_all=False):
+    # A fresh pass scans ALL public SUUMO towns in the selected ward from index 0.
+    # It only resets the automatic controller's progress checkpoint; saved
+    # rental_listing and rental_acquisition records are never deleted/rewritten.
+    if restart_all:
+        town_codes=[]
     settings={'enabled':True,'ward_code':ward_code,'providers':list(AUTOMATIC_REGION_PROVIDERS),'interval_minutes':0,'created_at':utc_now(),'town_codes':sorted(set(town_codes or []))}
     validate_automatic_settings(settings)
     db=Database();db.web_config=rental_network_settings();registry,lock=automatic_registry();key=automatic_registry_key(db)
@@ -9477,8 +9482,8 @@ def start_automatic_collection(ward_code,interval_minutes=0,town_codes=None):
         # SUUMO-only run must keep its completed towns when HOME'S is re-probed.
         same_scope=(prior.get('ward_code')==settings['ward_code'] and
                     sorted(prior.get('town_codes',[]))==settings['town_codes'])
-        summary=dict(previous_summary) if same_scope else {}
-        if same_scope:
+        summary=dict(previous_summary) if same_scope and not restart_all else {}
+        if same_scope and not restart_all:
             # Preserve attempted/failed markers so a restart does not hammer the
             # same incomplete town when other towns were never attempted.
             labels=list(summary.get('task_labels') or [])
@@ -9491,9 +9496,13 @@ def start_automatic_collection(ward_code,interval_minutes=0,town_codes=None):
                 summary['cycle_attempted_indices']=list(summary.get('cycle_completed_indices') or [])
                 summary['next_task_index']=min(pending)
         for item in ('auto_regions','auto_munis'):
-            if same_scope and prior.get(item):settings[item]=prior[item]
+            # Rebuild the town plan from the live ward list on a fresh pass.
+            if same_scope and not restart_all and prior.get(item):settings[item]=prior[item]
         controller=AutomaticCollection(db,settings,summary)
-        controller.persist_best_effort('start')
+        saved=controller.persist_best_effort('restart_from_first' if restart_all else 'start')
+        # Do not announce a fresh restart unless its blank progress checkpoint is durable.
+        if restart_all and not saved:
+            raise AppError('全町の再検索を開始できません。進捗の初期化をSupabaseへ保存できませんでした。')
         registry[key]=controller;st.session_state.automatic_collection_controller=controller
         st.session_state.automatic_settings_error='';controller.thread.start()
     return controller
@@ -9714,6 +9723,11 @@ def automatic_collection_panel():
         st.caption('診断：'+json.dumps(checkpoint.get('db_diagnostic') or {},ensure_ascii=False)[:1200])
     saved=snap['settings'] if snap else st.session_state.get('automatic_saved_settings',{})
     ward_code=st.selectbox('自動収集する区',list(TOKYO_WARDS),index=list(TOKYO_WARDS).index(saved.get('ward_code','13116')),format_func=lambda code:TOKYO_WARDS[code],key='automatic_ward')
+    if st.session_state.get('_automatic_reset_town_selection')==ward_code:
+        # Reset before the multiselect widget is instantiated in this rerun.
+        st.session_state.pop('_automatic_reset_town_selection',None)
+        st.session_state['automatic_selected_'+ward_code]=[]
+        st.session_state['automatic_towns_'+ward_code]=[]
     town_codes=ward_town_selector(ward_code,'automatic',saved.get('town_codes',[]),disabled=busy)
     st.caption('SUUMOのみで町ごとに最後のページまで検索します。マンションは築15年以内、1LDK/2K/2DK・2LDK/3K/3DK、一戸建て・その他は築40年以内・50㎡以上を対象とします。')
     manual=active_job();manual_busy=bool(manual and not manual.snapshot()['finished'])
@@ -9721,6 +9735,17 @@ def automatic_collection_panel():
         try:
             controller=start_automatic_collection(ward_code,town_codes=town_codes);snap=controller.snapshot();busy=True
         except AppError as exc:st.error(str(exc))
+    if st.button('選択した区で自動収集を開始・再開（最初からすべて）',
+                 key='automatic_start_all',disabled=busy or manual_busy):
+        try:
+            controller=start_automatic_collection(ward_code,town_codes=[],restart_all=True)
+            snap=controller.snapshot();busy=True
+            st.session_state.automatic_saved_settings=dict(snap['settings'])
+            st.session_state.automatic_saved_summary=dict(snap['summary'])
+            st.session_state['_automatic_reset_town_selection']=ward_code
+            st.rerun()
+        except AppError as exc:st.error(str(exc))
+    st.caption('「最初からすべて」は町名の絞り込みと進捗・今回の累計表示を初期化し、区内の全町を1町目から再検索します。保存済み物件・履歴は削除しません。')
     if st.button('自動収集を中止（取得済みデータを保存）',key='automatic_stop',disabled=not busy or bool(snap and snap['stopping'])):
         try:
             controller.request_stop();snap=controller.snapshot()
