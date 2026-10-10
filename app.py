@@ -40,7 +40,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v153"
+BUILD = "REBUILD-01-v154"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -9812,6 +9812,37 @@ def automatic_log_download_panel(controller,busy,summary):
             st.caption('保存済みログは復元済みです。停止後の再起動でも再取得できます。')
 
 
+def automatic_collection_ward_filter_ui(ward_codes, filters, busy=False):
+    """v154: A chosen ward in the primary multiselect always takes priority.
+
+    Multi-ward collection scans ALL towns in each selected ward. The optional
+    single-ward town filter is cleared/locked to avoid silently narrowing any
+    of those wards by a stale or previously loaded town filter. If no ward is
+    chosen above, the lower selector remains an independent single-ward path
+    for users who want to narrow that ward to specific towns.
+    """
+    if ward_codes:
+        # This key belongs only to the *enabled* widget. Reset it before the
+        # disabled placeholder is rendered, even when changing from single-ward
+        # filtering to multi-ward scanning in the same Streamlit session.
+        st.session_state['automatic_filter_ward']=None
+        st.selectbox('町名を絞る区（任意）', [''], index=0,
+                     key='automatic_filter_ward_disabled',disabled=True,
+                     format_func=lambda value:'')
+        return list(ward_codes),{code:[] for code in ward_codes}
+
+    # The lower selector becomes usable only when the upper ward list is empty.
+    # index=None makes the default genuinely blank rather than preselecting a ward.
+    ward_code=st.selectbox('町名を絞る区（任意）',list(TOKYO_WARDS),index=None,
+                           format_func=lambda code:TOKYO_WARDS[code],
+                           key='automatic_filter_ward',disabled=busy)
+    if not ward_code:
+        return [],{}
+    town_codes=ward_town_selector(ward_code,'automatic',filters.get(ward_code,[]),disabled=busy)
+    filters[ward_code]=list(town_codes)
+    return [ward_code],{ward_code:list(town_codes)}
+
+
 @st.fragment(run_every='16s')
 def automatic_collection_panel():
     st.subheader('アプリ内の自動収集（SUUMO）')
@@ -9852,7 +9883,6 @@ def automatic_collection_panel():
     ward_codes=st.multiselect('自動収集する区（複数選択）',list(TOKYO_WARDS),
                               format_func=lambda code:TOKYO_WARDS[code],
                               key='automatic_wards',disabled=busy)
-    st.caption('取得順：'+(' → '.join(TOKYO_WARDS[code] for code in ward_codes) if ward_codes else '区を選択してください'))
     reset=st.session_state.pop('_automatic_reset_town_selection',[])
     if isinstance(reset,str):reset=[reset]
     for code in reset:
@@ -9863,38 +9893,26 @@ def automatic_collection_panel():
         try:st.session_state['automatic_town_filters']=automatic_ward_town_filters(saved)
         except AppError:st.session_state['automatic_town_filters']={}
     filters=st.session_state['automatic_town_filters']
-    if ward_codes:
-        if len(ward_codes)>1:
-            if st.session_state.get('automatic_filter_ward') not in ward_codes:
-                st.session_state['automatic_filter_ward']=ward_codes[0]
-            ward_code=st.selectbox('町名を絞る区（任意）',ward_codes,
-                                   format_func=lambda code:TOKYO_WARDS[code],
-                                   key='automatic_filter_ward',disabled=busy)
-        else:
-            ward_code=ward_codes[0]
-        town_codes=ward_town_selector(ward_code,'automatic',filters.get(ward_code,[]),disabled=busy)
-        filters[ward_code]=list(town_codes)
-        chosen_filters={ward:list(filters.get(ward,[])) for ward in ward_codes}
-    else:
-        chosen_filters={}
+    collection_wards,chosen_filters=automatic_collection_ward_filter_ui(ward_codes,filters,busy)
+    st.caption('取得順：'+(' → '.join(TOKYO_WARDS[code] for code in collection_wards) if collection_wards else '区を選択してください'))
     st.caption('SUUMOのみで町ごとに最後のページまで検索します。マンションは築15年以内、1LDK/2K/2DK・2LDK/3K/3DK、一戸建て・その他は築40年以内・50㎡以上を対象とします。')
     manual=active_job();manual_busy=bool(manual and not manual.snapshot()['finished'])
-    cannot_start=busy or manual_busy or not ward_codes
+    cannot_start=busy or manual_busy or not collection_wards
     if st.button('選択した区で自動収集を開始・再開',key='automatic_start',disabled=cannot_start):
         try:
-            controller=start_automatic_collection(ward_codes,town_codes=chosen_filters)
+            controller=start_automatic_collection(collection_wards,town_codes=chosen_filters)
             snap=controller.snapshot();busy=True
             st.session_state.automatic_saved_settings=dict(snap['settings'])
         except AppError as exc:st.error(str(exc))
     if st.button('選択した区で自動収集を開始・再開（最初からすべて）',
                  key='automatic_start_all',disabled=cannot_start or busy):
         try:
-            controller=start_automatic_collection(ward_codes,town_codes={},restart_all=True)
+            controller=start_automatic_collection(collection_wards,town_codes={},restart_all=True)
             snap=controller.snapshot();busy=True
             st.session_state.automatic_saved_settings=dict(snap['settings'])
             st.session_state.automatic_saved_summary=dict(snap['summary'])
             st.session_state['automatic_town_filters']={}
-            st.session_state['_automatic_reset_town_selection']=list(ward_codes)
+            st.session_state['_automatic_reset_town_selection']=list(collection_wards)
             st.rerun()
         except AppError as exc:st.error(str(exc))
     st.caption('通常は選択した区・町の進捗を復元します。「最初からすべて」は選択した全区の進捗と町名の絞り込みだけを初期化します。保存済み物件・履歴は削除しません。')
