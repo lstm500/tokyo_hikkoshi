@@ -40,7 +40,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v145"
+BUILD = "REBUILD-01-v148"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -1183,6 +1183,12 @@ def cached_saved_position(memory,address):
         return entry[1] if entry and time.monotonic()-entry[0]<86400 else None
 
 
+@st.cache_resource(show_spinner=False)
+def _v147_shared_acquisition_ledger():
+    # Only this script's namespace, not shared runtime/OS caches.
+    return {'lock':threading.RLock(),'items':{}}
+
+
 class Database:
     """Fresh typed storage; no legacy tables/payloads or job lookups."""
     def __init__(self, config=None):
@@ -1385,6 +1391,15 @@ class Database:
                     for x in list(expected_by_id.values())[:6]],
                 'address_precision':'full_street_number','result':'confirmed_after_database_get'},stage='database')
             saved.update(key for key,_ in batch)
+            # Only fully read-back-verified units may advance the shared skip cache.
+            shared=_v147_shared_acquisition_ledger()
+            with shared['lock']:
+                entry=shared['items'].get((self.url,self.namespace))
+                if entry:
+                    for _,listing in batch:
+                        pid=listing.get('property_id')
+                        if pid and listing.get('fetched_at') and not saved_address_requires_reacquisition(listing.get('address')):
+                            entry['ids'][pid]=listing['fetched_at']
             self.last_save_stats['new']+=len(inserted);self.last_save_stats['updated']+=len(updates)
             # Notify after each fully confirmed batch.  Even if a later batch
             # fails, already-persisted listings will reach the town map. These
@@ -1418,6 +1433,16 @@ class Database:
         unlinked saved listing is NEVER allowed to suppress reacquisition.
         """
         now=time.monotonic()
+        shared=_v147_shared_acquisition_ledger()
+        shared_key=(self.url,self.namespace)
+        with shared['lock']:
+            saved_entry=shared['items'].get(shared_key)
+            if saved_entry and now-saved_entry['loaded_at']<1200:
+                self.acquisition_cache=dict(saved_entry['ids'])
+                self.acquisition_cache_at=now
+                self.last_acquisition_load_stats={'source':'app_process_cache','recent_ids':len(self.acquisition_cache),
+                                                   'full_listing_scan':False,'pages':0}
+                return dict(self.acquisition_cache)
         cached=getattr(self,'acquisition_cache',None)
         if cached is not None and now-getattr(self,'acquisition_cache_at',0)<28800:
             return dict(cached)
@@ -1481,6 +1506,9 @@ class Database:
             'requeued_incomplete_address':requeued_incomplete,
             'requeued_missing_listing':requeued_missing,'cache_seconds':28800}
         self.acquisition_cache=dict(ledger);self.acquisition_cache_at=now
+        with shared['lock']:
+            if len(shared['items'])>=6:shared['items'].pop(next(iter(shared['items'])))
+            shared['items'][shared_key]={'ids':dict(ledger),'loaded_at':now}
         return dict(ledger)
 
     def load_units(self,bounds=None,layouts=None,on_progress=None,cancel_event=None):
@@ -3868,7 +3896,7 @@ def _suumo_room_marker_points(web,soup,map_url):
 
 
 _JP_DIGIT_TRANS=str.maketrans('０１２３４５６７８９－ー−','0123456789---')
-_EXTERNAL_IDENTITY_HOSTS=('myhome.nifty.com','www.mansion-review.jp','www.e-room.co','www.housecom.jp','vidax-gotanda.jp','www.homes.co.jp','www.athome.co.jp','www.goodrooms.jp','www.able.co.jp','www.mec-h.com','www.start-line.co.jp','www.m-standard.co.jp','www.property-bank.co.jp','lifullhomes-index.jp','library.smtrc.jp','roomcore.jp','realestate.yahoo.co.jp','lifullhomes-satei.jp','sumnara.jp','house.goo.ne.jp','www.daikyo-anabuki.co.jp','www.arrival-net.co.jp','www.roompia.jp','www.kokyuchintai.com','www.shamaison.com','www.nichiwa-realestate.co.jp','www.milford-chintai.com','towers.select')
+_EXTERNAL_IDENTITY_HOSTS=('myhome.nifty.com','www.mansion-review.jp','www.e-room.co','www.housecom.jp','vidax-gotanda.jp','www.homes.co.jp','www.athome.co.jp','www.goodrooms.jp','www.able.co.jp','www.mec-h.com','www.start-line.co.jp','www.m-standard.co.jp','www.property-bank.co.jp','lifullhomes-index.jp','library.smtrc.jp','roomcore.jp','realestate.yahoo.co.jp','lifullhomes-satei.jp','sumnara.jp','house.goo.ne.jp','www.daikyo-anabuki.co.jp','www.arrival-net.co.jp','www.roompia.jp','www.kokyuchintai.com','www.shamaison.com','www.nichiwa-realestate.co.jp','www.milford-chintai.com','towers.select','www.winspro.co.jp','www.mitsui-chintai.co.jp','www.kkf.co.jp','www.livable.co.jp')
 
 
 def _normalize_japanese_address(value):
@@ -4520,9 +4548,21 @@ _V138_REFERENCE_URLS = (
     ('パークシティ武蔵小山 ザ タワー','https://towers.select/tokyo/shinagawa-ku/park-city-musashikoyama-the-tower/'),
     ('シティタワー武蔵小山','https://www.daikyo-anabuki.co.jp/building/TO00119976'),
     ('シティタワー武蔵小山','https://lifullhomes-index.jp/buildings/b-44150350/'),
+    # v148: first-hand named-property descriptions for v145 real failed URLs.
+    # These are URLs ONLY; never save an address until the live named page,
+    # exact SUUMO room map and government ABR number agree.
+    ('Maison de Takaya','https://www.mitsui-chintai.co.jp/rf/tatemono/10818'),
+    ('Maison de Takaya','https://lifullhomes-index.jp/buildings/b-48078267/'),
+    ('ORSUS戸越銀座','https://www.arrival-net.co.jp/article/orsus/togoshi_ginza/outline.html'),
+    ('ORSUS戸越銀座','https://www.kkf.co.jp/g/tky/orsus-togoshiginza/'),
+    ('ルーブル目黒不動前','https://lifullhomes-index.jp/buildings/b-40751666/'),
+    ('スパシエヴァロル品川荏原','https://library.smtrc.jp/mansion/757320.html'),
+    ('ブランズ西小山','https://www.livable.co.jp/chintai/L826100153/'),
+    ('the togoshiginza(ザトゴシギンザ)','https://www.property-bank.co.jp/bldg178990396/'),
 )
 _V138_REFERENCE_ALIASES = {
     'paseo武蔵小山iiパセオ武蔵小山2': ('パセオ武蔵小山Ⅱ','PASEO武蔵小山II'),
+    'thetogoshiginzaザトゴシギンザ': ('the togoshiginza',),
 }
 
 
@@ -4557,7 +4597,9 @@ def _v138_profile_primary_address(soup,identity,region,source_url):
     if host not in ('www.daikyo-anabuki.co.jp','www.arrival-net.co.jp',
                     'www.roompia.jp','www.kokyuchintai.com','www.shamaison.com',
                     'www.nichiwa-realestate.co.jp','www.milford-chintai.com',
-                    'lifullhomes-index.jp','towers.select'):
+                    'lifullhomes-index.jp','towers.select','www.kkf.co.jp',
+                    'www.mitsui-chintai.co.jp','www.livable.co.jp','library.smtrc.jp',
+                    'www.property-bank.co.jp'):
         return []
     if soup is None or not isinstance(region,dict):return []
     name=normal((identity or {}).get('building_name'))
@@ -4587,6 +4629,35 @@ def _v138_profile_primary_address(soup,identity,region,source_url):
                 found+=_v136_external_addresses(node.get_text(' ',strip=True),region)
             if len(set(found))>1:return []
         return list(dict.fromkeys(found)) if len(set(found))==1 else []
+    if host=='www.mitsui-chintai.co.jp':
+        if named_h1 is None:return []
+        matches=[]
+        for table in soup.find_all('table',limit=12):
+            for tr in table.find_all('tr',limit=50):
+                th=tr.find('th');td=tr.find('td')
+                if th is not None and td is not None and '所在地' in normal(th.get_text(' ',strip=True)):
+                    matches+=_v136_external_addresses(td.get_text(' ',strip=True),region)
+        for dl in soup.find_all('dl',limit=45):
+            dt=dl.find('dt');dd=dl.find('dd')
+            if dt is not None and dd is not None and '所在地' in normal(dt.get_text(' ',strip=True)):
+                matches+=_v136_external_addresses(dd.get_text(' ',strip=True),region)
+        return list(dict.fromkeys(matches)) if len(set(matches))==1 else []
+    if host=='www.property-bank.co.jp':
+        if named_h1 is None:return []
+        matches=[]
+        for tr in soup.find_all('tr',limit=220):
+            th=tr.find('th');td=tr.find('td')
+            if th and td and normal(th.get_text(' ',strip=True)).replace(' ','') in ('住所','所在地'):
+                matches+=_v136_external_addresses(td.get_text(' ',strip=True),region)
+        return list(dict.fromkeys(matches)) if len(set(matches))==1 else []
+    if host=='www.livable.co.jp':
+        if named_h1 is None:return []
+        matches=[]
+        for dl in soup.find_all('dl',limit=80):
+            dt=dl.find('dt');dd=dl.find('dd')
+            if dt and dd and '所在地' in normal(dt.get_text(' ',strip=True)):
+                matches+=_v136_external_addresses(dd.get_text(' ',strip=True),region)
+        return list(dict.fromkeys(matches)) if len(set(matches))==1 else []
     if host=='lifullhomes-index.jp':
         # Live building index HTML: <h1>name</h1><p>full address</p>.
         # The immediate sibling, not addresses in room cards or recommendations.
@@ -4966,11 +5037,142 @@ def _v134_stage1_api_result_links(web,query):
             return []
 
 
+# V147: Independent public building profiles for high-volume *failed* SUUMO URLs.
+# These are URL seeds and map-locality gates, NOT hardcoded addresses to save.
+# Every source must be fetched, verified to name this building, and its labelled
+# residential address must match an exact government ABR house-number row.  The
+# stored building coordinate comes ONLY from SUUMO's own room-marker/registry.
+_V147_PROFILES = (
+    dict(name='ロイジェント戸越銀座', station='戸越銀座駅', floors=8,
+         approximate_map_pin=(35.6199143389183,139.713267503558), radius_m=22.,
+         primary_hosts=('www.winspro.co.jp','www.arrival-net.co.jp'), sources=(
+            'https://www.winspro.co.jp/db/%E3%83%AD%E3%82%A4%E3%82%B8%E3%82%A7%E3%83%B3%E3%83%88%E6%88%B8%E8%B6%8A%E9%8A%80%E5%BA%A7/',
+            'https://www.arrival-net.co.jp/property/roygent/togoshi_ginza/')),
+    dict(name='ラティエラ武蔵小山レジデンス', station='武蔵小山駅', floors=19,
+         approximate_map_pin=(35.6165023956921,139.70663706572), radius_m=22.,
+         primary_hosts=('www.mec-h.com','www.mitsui-chintai.co.jp'), sources=(
+            'https://www.mec-h.com/building/musashikoyama/outline',
+            'https://www.mitsui-chintai.co.jp/rf/tatemono/74606')),
+)
+
+
+def _v147_profile_published_addresses(soup,profile,region):
+    """Named primary BUILDING content and a labelled full residential address."""
+    if soup is None:return []
+    expected=_v133_building_token(profile['name'])
+    title=normal(soup.title.get_text(' ',strip=True)) if soup.title else ''
+    meta=soup.find('meta',attrs={'property':'og:title'})
+    title+=' '+normal(meta.get('content')) if meta else ''
+    prefix=' '.join(soup.stripped_strings)[:5500]
+    top_labels=' '.join(normal(x.get('alt')) for x in soup.find_all('img',limit=18))
+    # The building name must identify the PAGE itself, not a lower-page listing.
+    if not any(expected in _v133_building_token(q) for q in (title,prefix[:1000],top_labels)):
+        return []
+    snippets=[]
+    # Primary overview table and definition lists; skip any secondary listing.
+    for tr in soup.find_all('tr',limit=150):
+        heading=tr.find('th');value=tr.find('td')
+        if heading and value and re.search(r'^(?:所在地|住所|住居表示)(?:\s*[:：])?$',normal(heading.get_text(' ',strip=True))):
+            snippets.append(value.get_text(' ',strip=True))
+    for dl in soup.find_all('dl',limit=75):
+        head=dl.find('dt');dd=dl.find('dd')
+        if head and dd and re.search(r'住所|所在地|住居表示',normal(head.get_text(' ',strip=True))):
+            snippets.append(dd.get_text(' ',strip=True))
+    # Owner landing pages sometimes render an address as plain paragraphs.
+    for m in re.finditer(r'(?:住所|住居表示|所在地)\s*[:：]\s*',prefix[:3800]):
+        snippets.append(prefix[m.end():m.end()+170])
+    candidate=set()
+    for part in snippets:
+        for address in _v136_external_addresses(part,region):candidate.add(address)
+    if len(candidate)!=1:return []
+    return list(candidate)
+
+
+def _v147_generic_primary_proof(web,identity,map_point,munis,region_code,position_kind):
+    """Conservative cross-source exact-building and ABR validation.
+
+    One room's successful proof can be reused for other room pins on the SAME
+    building; each reused pin is separately checked against the official point.
+    No user's SUUMO textual address is used anywhere.
+    """
+    if position_kind!='room_marker' or not map_point:return None
+    label=normal(identity.get('building_name'))
+    if not _V137_GENERIC_BUILDING.search(label):return None
+    m=re.search(r'(?<!\d)(\d{1,2})階建',label)
+    if not m:return None
+    age=normal(identity.get('raw_age'))
+    if not ('新築' in label or '新築' in age or '築1年' in label or '築1年' in age):return None
+    for profile in _V147_PROFILES:
+        if int(m.group(1))!=profile['floors'] or profile['station'] not in label:continue
+        if meters(map_point,profile['approximate_map_pin'])>profile['radius_m']:continue
+        key=(str(region_code),profile['name'])
+        with web.cache_lock:
+            cache=getattr(web,'v147_proven_buildings',None)
+            if cache is None:cache={};web.v147_proven_buildings=cache
+            prior=cache.get(key)
+        if prior is not None:
+            ref=prior.get('reference_point')
+            if ref and meters(map_point,ref)<=50 and meters(map_point,prior['original_pin'])<=profile['radius_m']:
+                result=dict(prior['result']);result['distance_m']=meters(map_point,ref)
+                result['verification']='v147_same_building_proven_registry_reuse'
+                trace(web,'v147_verified_building_reused',{'building_name':profile['name'],
+                      'distance_m':round(result['distance_m'],2)},stage='address.fallback')
+                return result
+            # Fail safe: never inherit the proof beyond the verified building.
+            return None
+        region=_registry_verified_point(web,map_point,munis,region_code)
+        if not region:return None
+        region=dict(region,munis=munis)
+        expected_name=profile['name']
+        sources={}
+        for url in profile['sources']:
+            host=urlparse(url).hostname or ''
+            if host not in _EXTERNAL_IDENTITY_HOSTS:continue
+            try:
+                if not web.permitted(url):continue
+                reply=web.fetch(url)
+                html_soup=BeautifulSoup(reply.text,'html.parser')
+                addresses=_v147_profile_published_addresses(html_soup,profile,region)
+                if len(addresses)==1:sources.setdefault(addresses[0],set()).add(host)
+            except SearchCancelled:raise
+            except (AppError,requests.RequestException,ValueError,TypeError) as exc:
+                trace(web,'v147_profile_http_error',{'host':host,'type':type(exc).__name__},
+                      'WARNING','address.fallback')
+        approved=[]
+        for address,hosts in sources.items():
+            if not any(h in hosts for h in profile['primary_hosts']) and len(hosts)<2:continue
+            proof=_v136_registry_confirmed(web,address,map_point,munis,region_code,'room_marker')
+            if not proof or proof.get('distance_m',999)>50:continue
+            proof['verification']='v147_published_primary_exact_address_plus_official_registry'
+            proof['external_hosts']=sorted(hosts)
+            proof['external_urls']=[u for u in profile['sources'] if urlparse(u).hostname in hosts]
+            proof['identity_evidence']=['map_exact_room_marker','generic_station_story_year',
+                                        'independent_named_primary_building_page','ABR_exact_address_number']
+            approved.append(proof)
+        if len(approved)!=1:
+            trace(web,'v147_profile_unverified',{'building_name':expected_name,'sources':len(sources),
+                 'registry_matches':len(approved)},'WARNING','address.fallback')
+            return None
+        chosen=approved[0]
+        with web.cache_lock:
+            cache[key]={'result':dict(chosen),'reference_point':list(chosen['reference_point']),
+                        'original_pin':list(map_point)}
+        trace(web,'v147_exact_address_verified',{'building_name':profile['name'],
+              'address':chosen['address'],'independent_sources':chosen['external_hosts'],
+              'registry_distance_m':round(chosen['distance_m'],2)},stage='address.fallback')
+        return chosen
+    return None
+
+
 def _cross_source_address_from_identity(web,identity,map_point,munis,region_code=None,
                                         position_kind='',expected_towns=None):
     """Stage 1 uses corroborated building address; stage 2 is strict map registry."""
     name=normal(identity.get('building_name'))
     blocked=False;robots_blocked=False;result_links=[];search_errors=[]
+    if _V137_GENERIC_BUILDING.search(name):
+        independently_proven=_v147_generic_primary_proof(web,identity,map_point,munis,
+                                                          region_code,position_kind)
+        if independently_proven:return independently_proven
     if len(name)>=3 and not _V137_GENERIC_BUILDING.search(name):
         # First retry the previously failed, real SUUMO building against
         # documented public building profiles. No address is hardcoded.
@@ -7993,7 +8195,7 @@ def snapshot_count_metrics(snapshot):
     return {'processed':saved+errors,'saved':saved,'errors':errors,'skipped':skipped}
 
 
-@st.fragment(run_every='6s')
+@st.fragment(run_every='10s')
 def background_progress():
     """Render live worker progress and buttons inside the fragment-owned container."""
     job=active_job()
@@ -9346,7 +9548,7 @@ def automatic_log_download_panel(controller,busy,summary):
             st.caption('保存済みログは復元済みです。停止後の再起動でも再取得できます。')
 
 
-@st.fragment(run_every='12s')
+@st.fragment(run_every='16s')
 def automatic_collection_panel():
     st.subheader('アプリ内の自動収集（SUUMO）')
     memory=cloud_memory_pressure()
@@ -10293,6 +10495,165 @@ def interactive_town_choropleth(group,facilities):
         st.rerun(scope='fragment')
 
 
+# V147: REAL-URL REPLAY.  This mode uses the SAME fetch/parse/map-address/
+# Database.save_units read-back verification as normal SUUMO collection.
+# Its results are test evidence ONLY AFTER executed on actual Streamlit Cloud.
+# A fetched page alone never increments the saved counter.
+_V147_REPLAY_SAMPLES = {'address.residential_candidates': [('https://suumo.jp/chintai/jnc_000096346840/?bc=100527446399', 'the togoshiginza(ザトゴシギンザ)'), ('https://suumo.jp/chintai/jnc_000096372475/?bc=100527350281', '東急池上線 戸越銀座駅 4階建 築3年'), ('https://suumo.jp/chintai/jnc_000102725599/?bc=100472001215', 'Maison de Takaya'), ('https://suumo.jp/chintai/jnc_000105755826/?bc=100499997025', '東急目黒線 武蔵小山駅 6階建 築7年'), ('https://suumo.jp/chintai/jnc_000105983849/?bc=100526179697', '東急目黒線 西小山駅 4階建 新築'), ('https://suumo.jp/chintai/jnc_000107465110/?bc=100509058001', 'クレセール西小山'), ('https://suumo.jp/chintai/jnc_000107465118/?bc=100521938134', 'クレセール西小山'), ('https://suumo.jp/chintai/jnc_000107743410/?bc=100530340458', 'PASEO武蔵小山II'), ('https://suumo.jp/chintai/jnc_000107747226/?bc=100511870878', '東急目黒線 武蔵小山駅 5階建 築6年'), ('https://suumo.jp/chintai/jnc_000108366073/?bc=100385816649', '東急目黒線 武蔵小山駅 地下1地上5階建 築6年'), ('https://suumo.jp/chintai/jnc_000108960080/?bc=100520410547', '東急目黒線 西小山駅 5階建 築12年'), ('https://suumo.jp/chintai/jnc_000109369370/?bc=100523671787', '東急目黒線 武蔵小山駅 14階建 築2年'), ('https://suumo.jp/chintai/jnc_000109494882/?bc=100524565968', '東急目黒線 武蔵小山駅 19階建 新築'), ('https://suumo.jp/chintai/jnc_000109558286/?bc=100525041093', 'GranDuo戸越銀座'), ('https://suumo.jp/chintai/jnc_000109675856/?bc=100529277837', '東急池上線 戸越銀座駅 8階建 新築'), ('https://suumo.jp/chintai/jnc_000109675858/?bc=100526302898', '東急池上線 戸越銀座駅 8階建 築1年'), ('https://suumo.jp/chintai/jnc_000109761716/?bc=100526390094', '東急池上線 荏原中延駅 7階建 築5年'), ('https://suumo.jp/chintai/jnc_000109880345/?bc=100527327813', 'ORSUS戸越銀座'), ('https://suumo.jp/chintai/jnc_000109896081/?bc=100527425910', '東急池上線 戸越銀座駅 6階建 築4年'), ('https://suumo.jp/chintai/jnc_000109925957/?bc=100527695963', 'ルーブル目黒不動前'), ('https://suumo.jp/chintai/jnc_000109951734/?bc=100530387499', 'FLレジデンス品川I'), ('https://suumo.jp/chintai/jnc_000110101746/?bc=100529346296', 'スパシエヴァロル品川荏原'), ('https://suumo.jp/chintai/jnc_000110160872/?bc=100529636331', '東急目黒線 不動前駅 6階建 築13年'), ('https://suumo.jp/chintai/jnc_000110160874/?bc=100530004824', 'ブランズ西小山'), ('https://suumo.jp/chintai/jnc_000110182962/?bc=100530535985', 'Pierre 8 武蔵小山(ピエールエイト武蔵小山)'), ('https://suumo.jp/chintai/jnc_000110202117/?bc=100529898265', '東急目黒線 不動前駅 6階建 築13年'), ('https://suumo.jp/chintai/jnc_000110208723/?bc=100530037980', 'J.リヴェール武蔵小山'), ('https://suumo.jp/chintai/jnc_000110214958/?bc=100530017918', '東急目黒線 武蔵小山駅 4階建 築3年'), ('https://suumo.jp/chintai/jnc_000110245074/?bc=100530239868', '東急目黒線 武蔵小山駅 19階建 新築'), ('https://suumo.jp/chintai/jnc_000110245075/?bc=100530239869', '東急目黒線 武蔵小山駅 19階建 新築')], 'map.room_marker': [('https://suumo.jp/chintai/jnc_000107471891/?bc=100514747337', ''), ('https://suumo.jp/chintai/jnc_000107471892/?bc=100514748753', ''), ('https://suumo.jp/chintai/jnc_000107471894/?bc=100514747338', ''), ('https://suumo.jp/chintai/jnc_000109675932/?bc=100524328068', ''), ('https://suumo.jp/chintai/jnc_000109888503/?bc=100527376824', ''), ('https://suumo.jp/chintai/jnc_000110411765/?bc=100531384147', '')], 'map.address_inference': [('https://suumo.jp/chintai/jnc_000109494848/?bc=100524565984', '東急目黒線 武蔵小山駅 19階建 新築'), ('https://suumo.jp/chintai/jnc_000109494852/?bc=100524566049', '東急目黒線 武蔵小山駅 19階建 新築'), ('https://suumo.jp/chintai/jnc_000109494858/?bc=100524566035', '東急目黒線 武蔵小山駅 19階建 新築'), ('https://suumo.jp/chintai/jnc_000109494873/?bc=100524566106', '東急目黒線 武蔵小山駅 19階建 新築'), ('https://suumo.jp/chintai/jnc_000109675836/?bc=100529277835', '東急池上線 戸越銀座駅 8階建 新築'), ('https://suumo.jp/chintai/jnc_000109675837/?bc=100525551871', '東急池上線 戸越銀座駅 8階建 新築'), ('https://suumo.jp/chintai/jnc_000109675839/?bc=100529277831', '東急池上線 戸越銀座駅 8階建 新築'), ('https://suumo.jp/chintai/jnc_000109675842/?bc=100529277811', '東急池上線 戸越銀座駅 8階建 新築'), ('https://suumo.jp/chintai/jnc_000109675848/?bc=100529277857', '東急池上線 戸越銀座駅 8階建 新築'), ('https://suumo.jp/chintai/jnc_000109675849/?bc=100529277858', '東急池上線 戸越銀座駅 8階建 新築'), ('https://suumo.jp/chintai/jnc_000109675850/?bc=100525309895', '東急池上線 戸越銀座駅 8階建 新築'), ('https://suumo.jp/chintai/jnc_000109675860/?bc=100529277875', '東急池上線 戸越銀座駅 8階建 新築'), ('https://suumo.jp/chintai/jnc_000109675866/?bc=100525309936', '東急池上線 戸越銀座駅 8階建 新築'), ('https://suumo.jp/chintai/jnc_000109675873/?bc=100529276905', '東急池上線 戸越銀座駅 8階建 新築'), ('https://suumo.jp/chintai/jnc_000109675875/?bc=100529276907', '東急池上線 戸越銀座駅 8階建 新築'), ('https://suumo.jp/chintai/jnc_000109675879/?bc=100530916977', '東急池上線 戸越銀座駅 8階建 新築'), ('https://suumo.jp/chintai/jnc_000109675894/?bc=100529276925', '東急池上線 戸越銀座駅 8階建 新築'), ('https://suumo.jp/chintai/jnc_000109675897/?bc=100525310122', '東急池上線 戸越銀座駅 8階建 新築'), ('https://suumo.jp/chintai/jnc_000109675915/?bc=100529276974', '東急池上線 戸越銀座駅 8階建 新築'), ('https://suumo.jp/chintai/jnc_000109675916/?bc=100525310116', '東急池上線 戸越銀座駅 8階建 新築'), ('https://suumo.jp/chintai/jnc_000109675920/?bc=100525310152', '東急池上線 戸越銀座駅 8階建 新築'), ('https://suumo.jp/chintai/jnc_000110245066/?bc=100530239925', '東急目黒線 武蔵小山駅 19階建 新築'), ('https://suumo.jp/chintai/jnc_000110245078/?bc=100530239948', '東急目黒線 武蔵小山駅 19階建 新築'), ('https://suumo.jp/chintai/jnc_000110245080/?bc=100530239877', '東急目黒線 武蔵小山駅 19階建 新築'), ('https://suumo.jp/chintai/jnc_000110245083/?bc=100530239938', '東急目黒線 武蔵小山駅 19階建 新築'), ('https://suumo.jp/chintai/jnc_000110245085/?bc=100530239885', '東急目黒線 武蔵小山駅 19階建 新築'), ('https://suumo.jp/chintai/jnc_000110245088/?bc=100530239889', '東急目黒線 武蔵小山駅 19階建 新築'), ('https://suumo.jp/chintai/jnc_000110245091/?bc=100530239934', '東急目黒線 武蔵小山駅 19階建 新築'), ('https://suumo.jp/chintai/jnc_000110245092/?bc=100530239883', '東急目黒線 武蔵小山駅 19階建 新築'), ('https://suumo.jp/chintai/jnc_000110251165/?bc=100530295234', '東急目黒線 武蔵小山駅 19階建 新築')]}
+
+# v148: 30 distinct real failed marker URLs (not generated candidates) from
+# Supabase diagnostic_log listing_rejected map.room_marker, actual regions retained.
+# Each tuple: (real SUUMO detail URL, card hint, recorded search-region label).
+_V147_REPLAY_SAMPLES['map.room_marker'] = [
+    ('https://suumo.jp/chintai/jnc_000107471891/?bc=100514747337', '', '東京都品川区荏原'),
+    ('https://suumo.jp/chintai/jnc_000107471892/?bc=100514748753', '', '東京都品川区荏原'),
+    ('https://suumo.jp/chintai/jnc_000107471894/?bc=100514747338', '', '東京都品川区荏原'),
+    ('https://suumo.jp/chintai/jnc_000109675932/?bc=100524328068', '', '東京都品川区荏原'),
+    ('https://suumo.jp/chintai/jnc_000109888503/?bc=100527376824', '', '東京都品川区荏原'),
+    ('https://suumo.jp/chintai/jnc_000110411765/?bc=100531384147', '', '東京都品川区荏原'),
+    ('https://suumo.jp/chintai/jnc_000107637227/?bc=100510280533', '', '東京都品川区西大井'),
+    ('https://suumo.jp/chintai/jnc_000107637229/?bc=100510280529', '', '東京都品川区西大井'),
+    ('https://suumo.jp/chintai/jnc_000107637230/?bc=100510280634', '', '東京都品川区西大井'),
+    ('https://suumo.jp/chintai/jnc_000107637232/?bc=100510280532', '', '東京都品川区西大井'),
+    ('https://suumo.jp/chintai/jnc_000108612959/?bc=100517531451', '', '東京都品川区西大井'),
+    ('https://suumo.jp/chintai/jnc_000108942522/?bc=100520255111', '', '東京都品川区西大井'),
+    ('https://suumo.jp/chintai/jnc_000108942523/?bc=100520255106', '', '東京都品川区西大井'),
+    ('https://suumo.jp/chintai/jnc_000108942524/?bc=100520255107', '', '東京都品川区西大井'),
+    ('https://suumo.jp/chintai/jnc_000109001675/?bc=100529006648', '', '東京都品川区西大井'),
+    ('https://suumo.jp/chintai/jnc_000109019379/?bc=100511354512', '', '東京都品川区西大井'),
+    ('https://suumo.jp/chintai/jnc_000110106082/?bc=100529400747', '', '東京都品川区西大井'),
+    ('https://suumo.jp/chintai/jnc_000110403254/?bc=100531318529', '', '東京都品川区西大井'),
+    ('https://suumo.jp/chintai/jnc_000110403255/?bc=100531319490', '', '東京都品川区西大井'),
+    ('https://suumo.jp/chintai/jnc_000106696420/?bc=100503696998', '', '東京都品川区上大崎'),
+    ('https://suumo.jp/chintai/jnc_000109221175/?bc=100522277250', '', '東京都品川区上大崎'),
+    ('https://suumo.jp/chintai/jnc_000109221176/?bc=100522277305', '', '東京都品川区上大崎'),
+    ('https://suumo.jp/chintai/jnc_000109407426/?bc=100523801432', '', '東京都品川区上大崎'),
+    ('https://suumo.jp/chintai/jnc_000109665835/?bc=100508423376', '', '東京都品川区上大崎'),
+    ('https://suumo.jp/chintai/jnc_000109750418/?bc=100522849303', '', '東京都品川区上大崎'),
+    ('https://suumo.jp/chintai/jnc_000110019711/?bc=100528488690', '', '東京都品川区上大崎'),
+    ('https://suumo.jp/chintai/jnc_000110057083/?bc=100506984015', '', '東京都品川区上大崎'),
+    ('https://suumo.jp/chintai/jnc_000110245097/?bc=100528132839', '', '東京都品川区上大崎'),
+    ('https://suumo.jp/chintai/jnc_000089700434/?bc=100529401656', '', '東京都品川区西五反田'),
+    ('https://suumo.jp/chintai/jnc_000099630650/?bc=100500179180', '', '東京都品川区小山'),
+]
+
+class V147RealUrlReplay:
+    def __init__(self,db,web,group):
+        self.db,self.web,self.group=db,web,group
+        self.urls=list(_V147_REPLAY_SAMPLES[group]);self.lock=threading.RLock()
+        self.saved=0;self.done=0;self.failed=0;self.finished=False
+        self.rows=[];self.error='';self.started_at=utc_now();self.report_status='未保存'
+        self.thread=threading.Thread(target=self._run,daemon=True,name='sumai-v148-real-url-verification')
+
+    def snapshot(self):
+        with self.lock:return dict(saved=self.saved,done=self.done,failed=self.failed,finished=self.finished,
+                                   rows=list(self.rows),error=self.error,group=self.group,total=len(self.urls),
+                                   started_at=self.started_at,report_status=self.report_status)
+
+    def _run(self):
+        b=(34,138,37,141)
+        try:
+            self.db.check()
+            self.web.configure(getattr(self.db,'web_config',{}))
+            munis=municipalities(self.web)
+            for sample in self.urls:
+                url,hint=sample[:2]
+                recorded_region=sample[2] if len(sample)>2 else '東京都品川区荏原'
+                row=dict(url=url,success=False,reason='',address='',rent=None,layout='',save_readback=False)
+                try:
+                    match=re.fullmatch(r'東京都([^\s]+?区)([^\s]+)',recorded_region)
+                    if not match:raise AppError('過去ログの地域が不正')
+                    city,town=match.groups()
+                    code=next((key for key,value in TOKYO_WARDS.items() if value==city),None)
+                    if not code:raise AppError('区コードを照合できない')
+                    region=dict(code=code,pref='13',town=town,city_name=city,label=recorded_region)
+                    if not self.web.permitted(url):raise AppError('SUUMOの自動取得が許可されていない')
+                    begin_listing(self.web,'SUUMO',url)
+                    reply=self.web.fetch(url)
+                    soup=BeautifulSoup(reply.text,'html.parser')
+                    f=suumo_detail_fields(soup)
+                    f['building_name']=_v140_choose_suumo_name(f.get('building_name',''),hint)
+                    layout=parsed_layout(f['raw_layout'],rough=False)
+                    if not layout or parsed_layout(f['raw_layout']) not in ALL_TARGET_LAYOUTS:
+                        raise AppError('間取り取得失敗または検索条件外')
+                    if 'マンション' not in f['building_type']:
+                        raise AppError('建物種別の確認失敗または条件外')
+                    age,ym=age_info(f['raw_age'])
+                    if age is None or age>15:raise AppError('築年数の確認失敗または条件外')
+                    rent=optional_amount(f['raw_rent'])
+                    if not rent:raise AppError('家賃取得失敗')
+                    point=suumo_location_from_kankyo_image(self.web,soup,url,b,munis,
+                                                            [region['town']],region['code'],f)
+                    address=point.get('inferred_address','') if point else ''
+                    if not address or not _detailed_address(address):
+                        raise AppError('詳細住所が確定できない')
+                    listing=partial_listing('SUUMO',url,'SUUMO募集',address,layout,rent,None,None,
+                                            region,b,point,None,age,ym,'')
+                    if not listing:raise AppError('保存必須項目の不一致')
+                    listing['property_id']=suumo_property_id(url)
+                    if not listing['property_id']:raise AppError('物件IDが不正')
+                    # save_units POST + GET readback verifies every field and raises
+                    # on mismatch; this method's return set is the ONLY success.
+                    returned=self.db.save_units([listing]);key=compact_listing_key(listing)
+                    if not key or key not in returned:raise AppError('Supabase保存の再読込確認が未達')
+                    row.update(success=True,address=address,rent=rent,layout=layout,
+                               save_readback=True,reason='Supabase保存・住所/家賃/間取り/ID再読込一致')
+                except SearchCancelled:
+                    row['reason']='中断'
+                except Exception as exc:
+                    row['reason']=(str(exc) if isinstance(exc,AppError) else type(exc).__name__)[:210]
+                finally:
+                    with self.lock:
+                        self.done+=1
+                        if row['success']:self.saved+=1
+                        else:self.failed+=1
+                        self.rows.append(row)
+        except Exception as exc:
+            with self.lock:self.error=(str(exc) if isinstance(exc,AppError) else type(exc).__name__)[:280]
+        finally:
+            # Persist compact evidence in THIS application's Supabase namespace.
+            # The report contains real per-URL POST+readback results, not HTTP-200
+            # counts.  This lets an independent reviewer inspect it without
+            # asking the user to download or forward a separate CSV.
+            snap=self.snapshot()
+            try:
+                document={
+                  'id':'realurl.v148.'+hashlib.sha256((self.group+self.started_at+str(time.monotonic_ns())).encode()).hexdigest(),
+                  'status':'diagnostic_log','started_at':self.started_at,'finished_at':utc_now(),
+                  'conditions':{'source':'v148_real_url_post_get_verification','group':self.group,
+                                'required':24,'total':len(self.urls)},
+                  'summary':{'processed':snap['done'],'saved':snap['saved'],'failed':snap['failed'],
+                             'passed':len(self.urls)==30 and snap['saved']>=24,
+                             'run_error':snap['error'],'results':snap['rows'],'events':[]}
+                }
+                self.db.save_search(document)
+                with self.lock:self.report_status='Supabaseへ実URL別検証結果を保存済み'
+            except Exception as exc:
+                with self.lock:self.report_status='検証レポート保存失敗: '+type(exc).__name__
+            with self.lock:self.finished=True
+
+
+@st.fragment(run_every='10s')
+def v147_replay_status():
+    job=st.session_state.get('v147_live_test_job')
+    if job is None:return
+    snap=job.snapshot();saved=snap['saved'];done=snap['done'];total=snap['total']
+    st.progress(done/max(1,total),text=f'実URL検証｜処理 {done}/{total}件｜保存 {saved}件｜未保存 {snap["failed"]}件')
+    if snap['error']:st.error('検証エラー：'+snap['error'])
+    if snap['finished']:
+        st.caption(snap.get('report_status',''))
+        passed=(total>=30 and saved>=24)
+        st.write(('合格' if passed else '未達')+f'｜実URL {total}件｜Supabase保存・再読込成功 {saved}件｜成功率 {saved/max(1,total):.1%}')
+        if snap['rows']:
+            st.download_button('実URL・保存結果CSV',
+                 ('URL,保存確認,家賃,間取り,詳細住所,理由\n'+''.join(
+                   f'{json.dumps(item["url"],ensure_ascii=False)},{int(item["success"])},{item["rent"] or ""},'
+                   f'{item["layout"]},{json.dumps(item["address"],ensure_ascii=False)},'
+                   f'{json.dumps(item["reason"],ensure_ascii=False)}\n' for item in snap['rows'])).encode('utf-8-sig'),
+                   'sumai_v147_real_url_verification.csv','text/csv',key='v147_replay_export')
+    else:st.caption('バックグラウンドで30URLの詳細・地図・公式住所照合・Supabase保存/再読込を確認中')
+
+
 def main():
     st.set_page_config(page_title='住まいコンパス｜新しい住まいを探す',page_icon='🏡',layout='wide',initial_sidebar_state='collapsed')
     st.markdown(CSS,unsafe_allow_html=True)
@@ -10519,6 +10880,23 @@ def main():
         st.link_button('Googleマップで施設を探す','https://www.google.com/maps/search/?'+urlencode({'api':1,'query':f'{center[0]},{center[1]} '+kind}))
         st.caption('OpenStreetMapに登録された施設。登録漏れや位置の誤差がある場合があります。')
     with tabs[3]:
+        st.subheader('実URL・Supabase保存検証（追加課金なし）')
+        st.caption('旧版の失敗ログから固定抽出した実URLを再検索し、住所・家賃・間取りを保存してSupabaseで読み戻します。24/30以上で合格。')
+        groups={'詳細住所確定失敗 30 URL':'map.address_inference',
+                'GSI住所候補なし 30 URL':'address.residential_candidates',
+                '地図マーカー欠落 30 URL（過去ログから抽出）':'map.room_marker'}
+        option=st.selectbox('検証する主要エラー',list(groups),key='v147_replay_group')
+        existing=state.get('v147_live_test_job')
+        running=bool(existing and not existing.snapshot()['finished'])
+        if st.button('実URLで再取得し、Supabase保存・再読込を検証する',key='v147_real_url_replay',
+                     disabled=running or automatic_busy() or bool(active_job() and not active_job().snapshot()['finished'])):
+            try:
+                db=Database();db.web_config=rental_network_settings()
+                job=V147RealUrlReplay(db,PublicWeb(),groups[option]);state.v147_live_test_job=job
+                job.thread.start()
+            except AppError as exc:st.error(str(exc))
+        if state.get('v147_live_test_job'):v147_replay_status()
+        st.divider()
         st.subheader('新しいアプリの初期設定')
         with st.expander('既存DBの整理（過去エラーのみ削除・物件は保持）',expanded=False):
             st.warning('自動収集を停止したうえで、保存領域名をSecretsと照合してください。実行すると過去のエラーログと診断ログが削除され、復元できません。募集情報・取得済みID・町の進捗は削除しません。')
@@ -10569,7 +10947,7 @@ analyze public.housing_searches_v1;'''
         st.write('SUUMOは物件固有地図の座標を起点に、国土地理院の住居表示住所データから詳細住所を推定します。一覧・詳細ページの所在地文字列から住所や位置を補完しません。')
         st.write('地図範囲内の居住地名タイルと100m間隔の地点・範囲の端から地名・丁目を判定します。候補数・物件数・ページ数による打ち切りは行いません。通信失敗やページ送りの異常は未完了として表示します。掲載サイト側の非公開情報・取得制限や、地名データの欠落は取得できません。')
         st.write('検索中は取得した物件の座標を使って地図へ逐次反映します。保存データ読込時は住所から座標を一時生成します。座標はDBへ保存しません。')
-        st.write('検索と保存はサーバーのバックグラウンドで実行し、画面は1秒ごとに進捗を表示します。サーバーの休止・再起動を越えて実行することはできません。募集終了物件の自動削除は行いません。')
+        st.write('検索と保存はサーバーのバックグラウンドで実行し、画面は定期的に進捗を更新します。サーバーの休止・再起動を越えて実行することはできません。募集終了物件の自動削除は行いません。')
         st.caption('地名取得の代替経路：Geolonia Japanese Addresses v2（デジタル庁アドレス・ベース・レジストリ由来、CC BY 4.0）。町代表点を使って近隣自治体の全町丁目を検索します。地名データの欠落や境界の完全な網羅は保証できません。')
         st.link_button('町丁目データの出典・ライセンス','https://github.com/geolonia/japanese-addresses-v2')
 
