@@ -40,7 +40,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v148"
+BUILD = "REBUILD-01-v149"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -3845,17 +3845,27 @@ def suumo_kankyo_urls(soup,detail_url):
         if safe_url(url,'SUUMO') and url not in candidates:candidates.append(url)
     bc=suumo_bc_id(detail_url)
     if bc:add(f'https://suumo.jp/chintai/bc_{bc}/kankyo/')
-    for url in bc_links:add(url)
+    # Preserve the listing's own JNC fallback even if unrelated BC links flood
+    # the page. A JNC fallback must never be displaced by recommended rooms.
+    u=urlparse(detail_url)
+    if '/jnc_' in u.path:add(u._replace(path=u.path.rstrip('/')+'/kankyo/',fragment='').geturl())
+    # Canonical metadata identifies THIS document; related cards do not.
+    for tag in soup.select('link[rel=canonical][href],meta[property="og:url"][content]')[:3]:
+        target=urljoin(detail_url,tag.get('href') or tag.get('content') or '')
+        pm=re.search(r'/chintai/bc_(\d+)',urlparse(target).path)
+        if pm:add(f'https://suumo.jp/chintai/bc_{pm.group(1)}/kankyo/')
+    for url in bc_links[:6]:add(url)
     # A detail page can contain a canonical BC detail link but no direct surroundings link.
     for a in soup.select('a[href]'):
         target=urljoin(detail_url,a.get('href','')).split('#')[0]
         u=urlparse(target);m=re.fullmatch(r'/chintai/bc_(\d+)/?',u.path)
         if u.hostname=='suumo.jp' and m:add(f'https://suumo.jp/chintai/bc_{m.group(1)}/kankyo/')
-    for url in jnc_links:add(url)
-    for url in explicit:add(url)
     u=urlparse(detail_url)
     if '/jnc_' in u.path:add(u._replace(path=u.path.rstrip('/')+'/kankyo/',fragment='').geturl())
-    return candidates
+    for url in jnc_links[:2]:add(url)
+    for url in explicit[:2]:add(url)
+    # Keep a bounded fallback; remaining links are usually other buildings.
+    return candidates[:8]
 
 
 def suumo_kankyo_url(soup,detail_url):
@@ -3898,6 +3908,8 @@ def _suumo_room_marker_points(web,soup,map_url):
 _JP_DIGIT_TRANS=str.maketrans('０１２３４５６７８９－ー−','0123456789---')
 _EXTERNAL_IDENTITY_HOSTS=('myhome.nifty.com','www.mansion-review.jp','www.e-room.co','www.housecom.jp','vidax-gotanda.jp','www.homes.co.jp','www.athome.co.jp','www.goodrooms.jp','www.able.co.jp','www.mec-h.com','www.start-line.co.jp','www.m-standard.co.jp','www.property-bank.co.jp','lifullhomes-index.jp','library.smtrc.jp','roomcore.jp','realestate.yahoo.co.jp','lifullhomes-satei.jp','sumnara.jp','house.goo.ne.jp','www.daikyo-anabuki.co.jp','www.arrival-net.co.jp','www.roompia.jp','www.kokyuchintai.com','www.shamaison.com','www.nichiwa-realestate.co.jp','www.milford-chintai.com','towers.select','www.winspro.co.jp','www.mitsui-chintai.co.jp','www.kkf.co.jp','www.livable.co.jp')
 
+
+_EXTERNAL_IDENTITY_HOSTS = _EXTERNAL_IDENTITY_HOSTS + ('www.srhome.co.jp', 'landwork-estate.co.jp', 'asuxia.co.jp')
 
 def _normalize_japanese_address(value):
     text=normal(value).translate(_JP_DIGIT_TRANS).replace(' ','').replace('　','')
@@ -4560,6 +4572,11 @@ _V138_REFERENCE_URLS = (
     ('ブランズ西小山','https://www.livable.co.jp/chintai/L826100153/'),
     ('the togoshiginza(ザトゴシギンザ)','https://www.property-bank.co.jp/bldg178990396/'),
 )
+
+# v149: URLs are seeds only. Address and official number are fetched and verified live.
+_V149_REFERENCE_URLS = (('\u30a8\u30df\u30cd\u30f3\u30b9\u9ad8\u8f2a\u53f0', 'https://www.mitsui-chintai.co.jp/rf/tatemono/69515'), ('\u30a8\u30df\u30cd\u30f3\u30b9\u9ad8\u8f2a\u53f0', 'https://lifullhomes-index.jp/buildings/b-39619726/'), ('\u30a8\u30df\u30cd\u30f3\u30b9\u9ad8\u8f2a\u53f0', 'https://landwork-estate.co.jp/chintai/%E3%82%A8%E3%83%9F%E3%83%8D%E3%83%B3%E3%82%B9%E9%AB%98%E8%BC%AA%E5%8F%B0/'), ('AXAS\u30ec\u30b8\u30c7\u30f3\u30b9\u76ee\u9ed2\u6771', 'https://www.mitsui-chintai.co.jp/rf/tatemono/72816'), ('AXAS\u30ec\u30b8\u30c7\u30f3\u30b9\u76ee\u9ed2\u6771', 'https://www.srhome.co.jp/room/38755/'), ('AXAS RESIDENCE \u76ee\u9ed2\u6771', 'https://www.mitsui-chintai.co.jp/rf/tatemono/72816'), ('AXAS RESIDENCE \u76ee\u9ed2\u6771', 'https://www.srhome.co.jp/room/38755/'), ('\u30b3\u30f3\u30d5\u30a9\u30fc\u30eb\u6c60\u7530\u5c71', 'https://realestate.yahoo.co.jp/catalog/detail/41f0e4e8008bed6ded13518cb3cd40b4159d0ea5/'), ('\u30ac\u30ea\u30b7\u30a2\u5fa1\u6bbf\u5c71(\u30ac\u30ea\u30b7\u30a2\u30b4\u30c6\u30f3\u30e4\u30de)', 'https://lifullhomes-index.jp/buildings/b-40752253/'), ('\u30ac\u30ea\u30b7\u30a2\u5fa1\u6bbf\u5c71(\u30ac\u30ea\u30b7\u30a2\u30b4\u30c6\u30f3\u30e4\u30de)', 'https://asuxia.co.jp/outline/21298/'), ('SolanaTakanawadai', 'https://asuxia.co.jp/bukken/334403/'), ('GRAN PASEO\u5cf6\u6d25\u5c71East', 'https://www.arrival-net.co.jp/property/granpaseo/shimazuyama/outline.php'), ('GRAN PASEO\u5cf6\u6d25\u5c71East', 'https://lifullhomes-index.jp/buildings/b-46589198/'), ('\u30ac\u30ea\u30b7\u30a2\u5fa1\u6bbf\u5c71', 'https://lifullhomes-index.jp/buildings/b-40752253/'), ('\u30ac\u30ea\u30b7\u30a2\u5fa1\u6bbf\u5c71', 'https://asuxia.co.jp/outline/21298/'), ('\u30b0\u30e9\u30f3\u30d1\u30bb\u30aa\u5cf6\u6d25\u5c71', 'https://www.arrival-net.co.jp/property/granpaseo/shimazuyama/outline.php'), ('\u30b0\u30e9\u30f3\u30d1\u30bb\u30aa\u5cf6\u6d25\u5c71', 'https://lifullhomes-index.jp/buildings/b-46589198/'))
+_V138_REFERENCE_URLS = _V138_REFERENCE_URLS + _V149_REFERENCE_URLS
+
 _V138_REFERENCE_ALIASES = {
     'paseo武蔵小山iiパセオ武蔵小山2': ('パセオ武蔵小山Ⅱ','PASEO武蔵小山II'),
     'thetogoshiginzaザトゴシギンザ': ('the togoshiginza',),
@@ -4573,6 +4590,16 @@ def _v140_building_identity_token(value):
         st=_v133_building_token(suffix)
         if token.endswith(st) and len(token)>len(st)+5:token=token[:-len(st)]
     return token
+
+
+def _v149_references_only(identity):
+    name=normal((identity or {}).get('building_name'))
+    key=_v133_building_token(name)
+    if len(key)<5 or _V137_GENERIC_BUILDING.search(name):return []
+    urls=[]
+    for label,url in _V149_REFERENCE_URLS:
+        if _v133_building_token(label)==key and url not in urls:urls.append(url)
+    return urls
 
 
 def _v138_reference_urls(identity):
@@ -4821,6 +4848,58 @@ def _v142_identity_result_urls(links):
         if link not in out:out.append(link)
     return out
 
+
+def _v149_named_primary_address(soup, identity, region, source_url):
+    if soup is None:return []
+    allowed=[name for name,url in _V149_REFERENCE_URLS if source_url==url]
+    if not allowed:return []
+    requested=_v133_building_token((identity or {}).get('building_name'))
+    names={_v133_building_token(name) for name in allowed}
+    if requested not in names:return []
+    titles=[normal(soup.title.get_text(' ',strip=True))] if soup.title else []
+    headings=[h.get_text(' ',strip=True) for h in soup.find_all('h1',limit=5)]
+    # A page about another building must not be accepted based on a sidebar.
+    matching=[h for h in headings if any(name in _v133_building_token(h) for name in names)]
+    if not matching and not any(name in _v133_building_token(t) for t in titles for name in names):
+        return []
+    candidates=[]
+    for tr in soup.find_all('tr',limit=120):
+        th=tr.find('th');td=tr.find('td')
+        if th is not None and td is not None and re.search(r'^(?:所在地|住所|住居表示|物件所在地)',normal(th.get_text(' ',strip=True))):
+            candidates.extend(_v136_external_addresses(td.get_text(' ',strip=True),region))
+    for dl in soup.find_all('dl',limit=75):
+        dt=dl.find('dt');dd=dl.find('dd')
+        if dt is not None and dd is not None and re.search(r'^(?:所在地|住所|住居表示|物件所在地)',normal(dt.get_text(' ',strip=True))):
+            candidates.extend(_v136_external_addresses(dd.get_text(' ',strip=True),region))
+    # A verified named-building index may have the full address in a paragraph
+    # immediately after the H1, without a separate address label.
+    for h in soup.find_all('h1',limit=5):
+        if not any(name in _v133_building_token(h.get_text(' ',strip=True)) for name in names):continue
+        p=h.find_next_sibling('p')
+        if p is not None:candidates.extend(_v136_external_addresses(p.get_text(' ',strip=True),region))
+        break
+    if not candidates:
+        for h in soup.find_all('h1',limit=5):
+            if not any(name in _v133_building_token(h.get_text(' ',strip=True)) for name in names):continue
+            chunks=[];size=0
+            for node in h.next_elements:
+                if getattr(node,'name',None)=='h1':break
+                if not isinstance(node,str) or getattr(node,'parent',None) is None:continue
+                if getattr(node.parent,'name','') in ('script','style','template'):continue
+                value=normal(node)
+                if not value:continue
+                size+=len(value)+1
+                if size>3600:break
+                chunks.append(value)
+            paragraph=' '.join(chunks)
+            boundary=re.search(r'(?:関連物件|周辺物件|この物件を取り扱う店舗|会社概要|お問い合わせ)',paragraph)
+            if boundary:paragraph=paragraph[:boundary.start()]
+            for match in re.finditer(r'(?:所在地|住居表示|住所)\s*[:：]?\s*',paragraph):
+                candidates.extend(_v136_external_addresses(paragraph[match.end():match.end()+160],region))
+            break
+    choices=list(dict.fromkeys(candidates))
+    return choices if len(choices)==1 else []
+
 def _v136_building_address_pages(web,links,identity,region_code,munis,map_point,position_kind):
     """Match independent sources to one exact registered address, not a nearby guess.
 
@@ -4876,7 +4955,8 @@ def _v136_building_address_pages(web,links,identity,region_code,munis,map_point,
                     'status':status,'next_source':True},'WARNING','address.fallback')
                 continue
             score,evidence=_identity_match_score(page,identity)
-            special=(_v138_profile_primary_address(soup,identity,region,target)
+            special=(_v149_named_primary_address(soup,identity,region,target)
+                     or _v138_profile_primary_address(soup,identity,region,target)
                      or _v142_structured_primary_address(soup,identity,region)
                      or _v142_identity_jsonld_addresses(soup,identity,region))
             if special and 'building_name' not in evidence:
@@ -5410,8 +5490,17 @@ def suumo_location_from_kankyo_image(web,detail_soup,detail_url,bounds,munis,exp
     # hint can be hundreds of metres off, so do not reject it merely because reverse
     # geocoding returns another neighboring town; cross-source identity handles that.
     strict_towns=expected_towns if position_kind in ('room_marker','image_pin') else None
-    inferred=map_point_to_residential_address(web,(lat,lng),munis,expected_code=region_code,expected_towns=strict_towns)
     external=None
+    inferred=None
+    if position_kind in ('room_marker','image_pin') and _v149_references_only(identity):
+        external=_v136_building_address_pages(web,_v149_references_only(identity),identity,
+                                               region_code,munis,(lat,lng),position_kind)
+        if external:
+            inferred=external
+            trace(web,'v149_named_address_first',{'url':detail_url,'address':external['address'],
+                 'verification':'live_named_publisher_plus_official_registry'},stage='address.fallback')
+    if not inferred:
+        inferred=map_point_to_residential_address(web,(lat,lng),munis,expected_code=region_code,expected_towns=strict_towns)
     if not inferred:
         external=_v142_reuse_exact_building(web,identity,(lat,lng),position_kind,
                                             munis,region_code,expected_towns)
@@ -10537,13 +10626,16 @@ _V147_REPLAY_SAMPLES['map.room_marker'] = [
     ('https://suumo.jp/chintai/jnc_000099630650/?bc=100500179180', '', '東京都品川区小山'),
 ]
 
+# v149: 30 distinct actual Shinagawa URL failures in each class; save+readback is required.
+_V147_REPLAY_SAMPLES = {'address.residential_candidates': [('https://suumo.jp/chintai/jnc_000107053186/?bc=100527912346', 'JR\u5c71\u624b\u7dda \u4e94\u53cd\u7530\u99c5 \u5730\u4e0b1\u5730\u4e0a14\u968e\u5efa \u7bc94\u5e74', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u6771\u4e94\u53cd\u7530'), ('https://suumo.jp/chintai/jnc_000109743113/?bc=100528741027', '\u90fd\u55b6\u6d45\u8349\u7dda \u4e94\u53cd\u7530\u99c5 \u5730\u4e0b1\u5730\u4e0a4\u968e\u5efa \u7bc912\u5e74', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u6771\u4e94\u53cd\u7530'), ('https://suumo.jp/chintai/jnc_000108942543/?bc=100520238287', 'JR\u5c71\u624b\u7dda \u4e94\u53cd\u7530\u99c5 3\u968e\u5efa \u7bc912\u5e74', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u6771\u4e94\u53cd\u7530'), ('https://suumo.jp/chintai/jnc_000109396161/?bc=100516489596', '\u30b3\u30f3\u30d5\u30a9\u30fc\u30eb\u6c60\u7530\u5c71', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u6771\u4e94\u53cd\u7530'), ('https://suumo.jp/chintai/jnc_000109396160/?bc=100526257229', '\u30b3\u30f3\u30d5\u30a9\u30fc\u30eb\u6c60\u7530\u5c71', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u6771\u4e94\u53cd\u7530'), ('https://suumo.jp/chintai/jnc_000109264593/?bc=100522854503', '\u90fd\u55b6\u6d45\u8349\u7dda \u9ad8\u8f2a\u53f0\u99c5 \u5730\u4e0b1\u5730\u4e0a3\u968e\u5efa \u7bc96\u5e74', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u6771\u4e94\u53cd\u7530'), ('https://suumo.jp/chintai/jnc_000108721837/?bc=100518394352', '\u90fd\u55b6\u6d45\u8349\u7dda \u9ad8\u8f2a\u53f0\u99c5 4\u968e\u5efa \u7bc94\u5e74', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u6771\u4e94\u53cd\u7530'), ('https://suumo.jp/chintai/jnc_000091646397/?bc=100521306253', 'GRAN PASEO\u5cf6\u6d25\u5c71East', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u6771\u4e94\u53cd\u7530'), ('https://suumo.jp/chintai/jnc_000109617559/?bc=100525457234', '\u30ed\u30fc\u30bf\u30b9\u5cf6\u6d25\u5c71(\u30ed\u30fc\u30bf\u30b9\u30b7\u30de\u30c5\u30e4\u30de)', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u6771\u4e94\u53cd\u7530'), ('https://suumo.jp/chintai/jnc_000109609932/?bc=100526000055', 'JR\u5c71\u624b\u7dda \u4e94\u53cd\u7530\u99c5 \u5730\u4e0b1\u5730\u4e0a4\u968e\u5efa \u7bc99\u5e74', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u6771\u4e94\u53cd\u7530'), ('https://suumo.jp/chintai/jnc_000109252311/?bc=100528488680', 'SolanaTakanawadai', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u6771\u4e94\u53cd\u7530'), ('https://suumo.jp/chintai/jnc_000109743112/?bc=100526297816', '\u90fd\u55b6\u6d45\u8349\u7dda \u4e94\u53cd\u7530\u99c5 \u5730\u4e0b1\u5730\u4e0a4\u968e\u5efa \u7bc912\u5e74', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u6771\u4e94\u53cd\u7530'), ('https://suumo.jp/chintai/jnc_000109926013/?bc=100527644658', 'AXAS RESIDENCE \u76ee\u9ed2\u6771', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u6771\u4e94\u53cd\u7530'), ('https://suumo.jp/chintai/jnc_000110033956/?bc=100528553737', 'AXAS\u30ec\u30b8\u30c7\u30f3\u30b9\u76ee\u9ed2\u6771', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u6771\u4e94\u53cd\u7530'), ('https://suumo.jp/chintai/jnc_000109334208/?bc=100523742949', 'AXAS\u30ec\u30b8\u30c7\u30f3\u30b9\u76ee\u9ed2\u6771', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u6771\u4e94\u53cd\u7530'), ('https://suumo.jp/chintai/jnc_000109926010/?bc=100527769094', '\u30ac\u30ea\u30b7\u30a2\u5fa1\u6bbf\u5c71(\u30ac\u30ea\u30b7\u30a2\u30b4\u30c6\u30f3\u30e4\u30de)', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u6771\u4e94\u53cd\u7530'), ('https://suumo.jp/chintai/jnc_000109396159/?bc=100493105764', '\u30b3\u30f3\u30d5\u30a9\u30fc\u30eb\u6c60\u7530\u5c71', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u6771\u4e94\u53cd\u7530'), ('https://suumo.jp/chintai/jnc_000109027580/?bc=100529598664', '\u90fd\u55b6\u6d45\u8349\u7dda \u9ad8\u8f2a\u53f0\u99c5 14\u968e\u5efa \u7bc913\u5e74', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u6771\u4e94\u53cd\u7530'), ('https://suumo.jp/chintai/jnc_000109938040/?bc=100527747124', 'JR\u5c71\u624b\u7dda \u4e94\u53cd\u7530\u99c5 11\u968e\u5efa \u7bc912\u5e74', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u6771\u4e94\u53cd\u7530'), ('https://suumo.jp/chintai/jnc_000108973178/?bc=100529284242', '\u30a8\u30df\u30cd\u30f3\u30b9\u9ad8\u8f2a\u53f0', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u6771\u4e94\u53cd\u7530'), ('https://suumo.jp/chintai/jnc_000109019398/?bc=100520730208', '\u30a8\u30df\u30cd\u30f3\u30b9\u9ad8\u8f2a\u53f0', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u6771\u4e94\u53cd\u7530'), ('https://suumo.jp/chintai/jnc_000107645230/?bc=100516671731', 'JR\u4eac\u6d5c\u6771\u5317\u7dda \u5927\u4e95\u753a\u99c5 4\u968e\u5efa \u65b0\u7bc9', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u6771\u5927\u4e95'), ('https://suumo.jp/chintai/jnc_000109477179/?bc=100524347751', '\u4eac\u6025\u672c\u7dda \u7acb\u4f1a\u5ddd\u99c5 14\u968e\u5efa \u7bc92\u5e74', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u6771\u5927\u4e95'), ('https://suumo.jp/chintai/jnc_000110096195/?bc=100530761884', 'JR\u4eac\u6d5c\u6771\u5317\u7dda \u5927\u4e95\u753a\u99c5 4\u968e\u5efa \u65b0\u7bc9', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u6771\u5927\u4e95'), ('https://suumo.jp/chintai/jnc_000109761765/?bc=100528996336', '\u4eac\u6025\u672c\u7dda \u7acb\u4f1a\u5ddd\u99c5 \u5730\u4e0b2\u5730\u4e0a4\u968e\u5efa \u7bc96\u5e74', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u6771\u5927\u4e95'), ('https://suumo.jp/chintai/jnc_000109750459/?bc=100526804573', '\u30a8\u30b9\u30bf\u30fc\u30c8\u5927\u4e95\u753a\u30d5\u30a9\u30ec\u30b9\u30c8', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u6771\u5927\u4e95'), ('https://suumo.jp/chintai/jnc_000110106089/?bc=100529172868', '\u4eac\u6025\u672c\u7dda \u9bab\u6d32\u99c5 3\u968e\u5efa \u65b0\u7bc9', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u6771\u5927\u4e95'), ('https://suumo.jp/chintai/jnc_000107565226/?bc=100527042400', 'GRAN PASEO\u5927\u4e95\u753a', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u6771\u5927\u4e95'), ('https://suumo.jp/chintai/jnc_000107565225/?bc=100487088040', 'GRAN PASEO\u5927\u4e95\u753a', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u6771\u5927\u4e95'), ('https://suumo.jp/chintai/jnc_000109943769/?bc=100527769102', 'COMPOSITE \u5927\u4e95\u753a HILLTOP(\u30b3\u30f3\u30dd\u30b8\u30c3\u30c8\u30aa\u30aa\u30a4\u30de\u30c1\u30d2\u30eb', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u6771\u5927\u4e95')], 'map.address_inference': [('https://suumo.jp/chintai/jnc_000109750465/?bc=100526404795', '\u90fd\u55b6\u6d45\u8349\u7dda \u4e94\u53cd\u7530\u99c5 \u5730\u4e0b1\u5730\u4e0a4\u968e\u5efa \u7bc912\u5e74', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u6771\u4e94\u53cd\u7530'), ('https://suumo.jp/chintai/jnc_000108806881/?bc=100520821131', 'JR\u5c71\u624b\u7dda \u4e94\u53cd\u7530\u99c5 12\u968e\u5efa \u7bc912\u5e74', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u6771\u4e94\u53cd\u7530'), ('https://suumo.jp/chintai/jnc_000108190939/?bc=100520768033', 'JR\u5c71\u624b\u7dda \u4e94\u53cd\u7530\u99c5 11\u968e\u5efa \u7bc913\u5e74', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u6771\u4e94\u53cd\u7530'), ('https://suumo.jp/chintai/jnc_000110090550/?bc=100530294967', 'JR\u5c71\u624b\u7dda \u4e94\u53cd\u7530\u99c5 11\u968e\u5efa \u7bc913\u5e74', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u6771\u4e94\u53cd\u7530'), ('https://suumo.jp/chintai/jnc_000107565226/?bc=100491483218', 'GRAN PASEO\u5927\u4e95\u753a', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u6771\u5927\u4e95'), ('https://suumo.jp/chintai/jnc_000107565225/?bc=100491483213', 'GRAN PASEO\u5927\u4e95\u753a', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u6771\u5927\u4e95'), ('https://suumo.jp/chintai/jnc_000109381645/?bc=100516198887', 'GranDuo\u5927\u4e95\u753a3', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u6771\u5927\u4e95'), ('https://suumo.jp/chintai/jnc_000109701525/?bc=100528766445', 'JR\u4eac\u6d5c\u6771\u5317\u7dda \u5927\u4e95\u753a\u99c5 15\u968e\u5efa \u7bc93\u5e74', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u6771\u5927\u4e95'), ('https://suumo.jp/chintai/jnc_000110106093/?bc=100529172867', '\u4eac\u6025\u672c\u7dda \u9bab\u6d32\u99c5 3\u968e\u5efa \u65b0\u7bc9', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u6771\u5927\u4e95'), ('https://suumo.jp/chintai/jnc_000110106092/?bc=100529172855', '\u4eac\u6025\u672c\u7dda \u9bab\u6d32\u99c5 3\u968e\u5efa \u65b0\u7bc9', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u6771\u5927\u4e95'), ('https://suumo.jp/chintai/jnc_000110106091/?bc=100529172865', '\u4eac\u6025\u672c\u7dda \u9bab\u6d32\u99c5 3\u968e\u5efa \u65b0\u7bc9', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u6771\u5927\u4e95'), ('https://suumo.jp/chintai/jnc_000110106090/?bc=100529172863', '\u4eac\u6025\u672c\u7dda \u9bab\u6d32\u99c5 3\u968e\u5efa \u65b0\u7bc9', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u6771\u5927\u4e95'), ('https://suumo.jp/chintai/jnc_000110106088/?bc=100529172859', '\u4eac\u6025\u672c\u7dda \u9bab\u6d32\u99c5 3\u968e\u5efa \u65b0\u7bc9', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u6771\u5927\u4e95'), ('https://suumo.jp/chintai/jnc_000109743104/?bc=100523192189', '\u308a\u3093\u304b\u3044\u7dda \u54c1\u5ddd\u30b7\u30fc\u30b5\u30a4\u30c9\u99c5 15\u968e\u5efa \u7bc98\u5e74', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u6771\u5927\u4e95'), ('https://suumo.jp/chintai/jnc_000109168145/?bc=100521835169', 'GranDuo\u5927\u4e95\u753a3', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u6771\u5927\u4e95'), ('https://suumo.jp/chintai/jnc_000109857093/?bc=100516671597', 'JR\u4eac\u6d5c\u6771\u5317\u7dda \u5927\u4e95\u753a\u99c5 \u5730\u4e0b2\u5730\u4e0a4\u968e\u5efa \u7bc96\u5e74', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u6771\u5927\u4e95'), ('https://suumo.jp/chintai/jnc_000109207099/?bc=100523845600', '\u30d7\u30ec\u30b7\u30e3\u30b9', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u6771\u5927\u4e95'), ('https://suumo.jp/chintai/jnc_000109066746/?bc=100525343222', '\u6771\u6025\u5927\u4e95\u753a\u7dda \u65d7\u306e\u53f0\u99c5 \u5730\u4e0a2\u968e\u5efa \u65b0\u7bc9', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u65d7\u306e\u53f0'), ('https://suumo.jp/chintai/jnc_000108806878/?bc=100525582988', '\u6771\u6025\u5927\u4e95\u753a\u7dda \u65d7\u306e\u53f0\u99c5 \u5730\u4e0a2\u968e\u5efa \u65b0\u7bc9', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u65d7\u306e\u53f0'), ('https://suumo.jp/chintai/jnc_000108612975/?bc=100518336874', '\u30d5\u30a9\u30eb\u30e2\u30f3\u30c8 N5\u53f7\u5ba4', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u65d7\u306e\u53f0'), ('https://suumo.jp/chintai/jnc_000108802804/?bc=100529306166', '\u30d5\u30a9\u30eb\u30e2\u30f3\u30c8', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u65d7\u306e\u53f0'), ('https://suumo.jp/chintai/jnc_000104334855/?bc=100485096307', '\u30af\u30ec\u30b9\u30c8\u30b3\u30fc\u30c8\u65d7\u306e\u53f0', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u65d7\u306e\u53f0'), ('https://suumo.jp/chintai/jnc_000107485509/?bc=100521885596', '\u6771\u6025\u5927\u4e95\u753a\u7dda \u65d7\u306e\u53f0\u99c5 6\u968e\u5efa \u7bc91\u5e74', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u65d7\u306e\u53f0'), ('https://suumo.jp/chintai/jnc_000106081406/?bc=100522181828', '\u6771\u6025\u5927\u4e95\u753a\u7dda \u65d7\u306e\u53f0\u99c5 6\u968e\u5efa \u65b0\u7bc9', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u65d7\u306e\u53f0'), ('https://suumo.jp/chintai/jnc_000109415888/?bc=100528766559', '\u6771\u6025\u5927\u4e95\u753a\u7dda \u65d7\u306e\u53f0\u99c5 6\u968e\u5efa \u65b0\u7bc9', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u65d7\u306e\u53f0'), ('https://suumo.jp/chintai/jnc_000109415889/?bc=100521865920', '\u6771\u6025\u5927\u4e95\u753a\u7dda \u65d7\u306e\u53f0\u99c5 6\u968e\u5efa \u65b0\u7bc9', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u65d7\u306e\u53f0'), ('https://suumo.jp/chintai/jnc_000110396871/?bc=100525960072', '\u6771\u6025\u5927\u4e95\u753a\u7dda \u65d7\u306e\u53f0\u99c5 6\u968e\u5efa \u65b0\u7bc9', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u65d7\u306e\u53f0'), ('https://suumo.jp/chintai/jnc_000109770551/?bc=100519500473', '\u6771\u6025\u5927\u4e95\u753a\u7dda \u65d7\u306e\u53f0\u99c5 6\u968e\u5efa \u65b0\u7bc9', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u65d7\u306e\u53f0'), ('https://suumo.jp/chintai/jnc_000108065884/?bc=100515636559', '\u30a2\u30fc\u30d0\u30f3\u30b3\u30a2\u65d7\u306e\u53f0', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u65d7\u306e\u53f0'), ('https://suumo.jp/chintai/jnc_000106228351/?bc=100502599155', '\u30d7\u30e9\u30cd\u30bd\u30b7\u30a8\u30d7\u30e9\u30b9\u65d7\u306e\u53f0', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u65d7\u306e\u53f0')], 'map.room_marker': [('https://suumo.jp/chintai/jnc_000109194969/?bc=100513308001', '', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u6771\u4e94\u53cd\u7530'), ('https://suumo.jp/chintai/jnc_000105976932/?bc=100497753528', '', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u6771\u4e94\u53cd\u7530'), ('https://suumo.jp/chintai/jnc_000110215001/?bc=100529568288', '', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u6771\u5927\u4e95'), ('https://suumo.jp/chintai/jnc_000109800554/?bc=100526649041', '', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u6771\u5927\u4e95'), ('https://suumo.jp/chintai/jnc_000108910688/?bc=100519967556', '', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u6771\u5927\u4e95'), ('https://suumo.jp/chintai/jnc_000105863757/?bc=100499364270', '', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u6771\u5927\u4e95'), ('https://suumo.jp/chintai/jnc_000108902719/?bc=100519967522', '', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u6771\u5927\u4e95'), ('https://suumo.jp/chintai/jnc_000108931609/?bc=100519967523', '', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u6771\u5927\u4e95'), ('https://suumo.jp/chintai/jnc_000108902717/?bc=100520094777', '', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u6771\u5927\u4e95'), ('https://suumo.jp/chintai/jnc_000108902716/?bc=100519967525', '', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u6771\u5927\u4e95'), ('https://suumo.jp/chintai/jnc_000108902711/?bc=100519906552', '', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u6771\u5927\u4e95'), ('https://suumo.jp/chintai/jnc_000107565229/?bc=100491322868', '', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u6771\u5927\u4e95'), ('https://suumo.jp/chintai/jnc_000110332994/?bc=100530082861', '', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u6771\u5927\u4e95'), ('https://suumo.jp/chintai/jnc_000109676015/?bc=100525785572', '', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u6771\u5927\u4e95'), ('https://suumo.jp/chintai/jnc_000105857698/?bc=100500188296', '', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u6771\u5927\u4e95'), ('https://suumo.jp/chintai/jnc_000108054768/?bc=100516650796', '', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u65d7\u306e\u53f0'), ('https://suumo.jp/chintai/jnc_000109447762/?bc=100521869691', '', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u65d7\u306e\u53f0'), ('https://suumo.jp/chintai/jnc_000094728975/?bc=100410798823', '', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u65d7\u306e\u53f0'), ('https://suumo.jp/chintai/jnc_000109163442/?bc=100527450047', '', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u897f\u4e2d\u5ef6'), ('https://suumo.jp/chintai/jnc_000109455030/?bc=100524157090', '', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u897f\u4e2d\u5ef6'), ('https://suumo.jp/chintai/jnc_000110081442/?bc=100524165728', '', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u897f\u4e2d\u5ef6'), ('https://suumo.jp/chintai/jnc_000110081443/?bc=100529229356', '', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u897f\u4e2d\u5ef6'), ('https://suumo.jp/chintai/jnc_000110081440/?bc=100529229921', '', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u897f\u4e2d\u5ef6'), ('https://suumo.jp/chintai/jnc_000107673121/?bc=100531229903', '', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u897f\u54c1\u5ddd'), ('https://suumo.jp/chintai/jnc_000107534822/?bc=100515641043', '', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u897f\u54c1\u5ddd'), ('https://suumo.jp/chintai/jnc_000109750456/?bc=100531208093', '', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u897f\u54c1\u5ddd'), ('https://suumo.jp/chintai/jnc_000109609927/?bc=100525285843', '', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u897f\u54c1\u5ddd'), ('https://suumo.jp/chintai/jnc_000089700434/?bc=100529401656', '', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u897f\u4e94\u53cd\u7530'), ('https://suumo.jp/chintai/jnc_000107534814/?bc=100516061660', '', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u897f\u4e94\u53cd\u7530'), ('https://suumo.jp/chintai/jnc_000107443358/?bc=100530371515', '', '\u6771\u4eac\u90fd\u54c1\u5ddd\u533a\u897f\u4e94\u53cd\u7530')]}
+
 class V147RealUrlReplay:
     def __init__(self,db,web,group):
         self.db,self.web,self.group=db,web,group
         self.urls=list(_V147_REPLAY_SAMPLES[group]);self.lock=threading.RLock()
         self.saved=0;self.done=0;self.failed=0;self.finished=False
         self.rows=[];self.error='';self.started_at=utc_now();self.report_status='未保存'
-        self.thread=threading.Thread(target=self._run,daemon=True,name='sumai-v148-real-url-verification')
+        self.thread=threading.Thread(target=self._run,daemon=True,name='sumai-v149-real-url-verification')
 
     def snapshot(self):
         with self.lock:return dict(saved=self.saved,done=self.done,failed=self.failed,finished=self.finished,
@@ -10574,12 +10666,20 @@ class V147RealUrlReplay:
                     f=suumo_detail_fields(soup)
                     f['building_name']=_v140_choose_suumo_name(f.get('building_name',''),hint)
                     layout=parsed_layout(f['raw_layout'],rough=False)
-                    if not layout or parsed_layout(f['raw_layout']) not in ALL_TARGET_LAYOUTS:
-                        raise AppError('間取り取得失敗または検索条件外')
-                    if 'マンション' not in f['building_type']:
-                        raise AppError('建物種別の確認失敗または条件外')
+                    if not layout:raise AppError('layout not readable')
+                    kind=normal(f.get('building_type'))
+                    is_mansion='マンション' in kind
+                    is_house=not is_mansion and suumo_house_other_type(kind)
+                    if not (is_mansion or is_house):raise AppError('building type out of scope')
                     age,ym=age_info(f['raw_age'])
-                    if age is None or age>15:raise AppError('築年数の確認失敗または条件外')
+                    area=_identity_area(f.get('raw_area'))
+                    if is_mansion:
+                        if parsed_layout(f['raw_layout']) not in set().union(*map(set,SUUMO_LAYOUT_GROUPS)):
+                            raise AppError('mansion layout out of scope')
+                        if age is None or age>15:raise AppError('mansion age out of scope')
+                    else:
+                        if age is None or age>HOUSE_MAX_AGE or area is None or area<HOUSE_MIN_AREA:
+                            raise AppError('house age or floor area out of scope')
                     rent=optional_amount(f['raw_rent'])
                     if not rent:raise AppError('家賃取得失敗')
                     point=suumo_location_from_kankyo_image(self.web,soup,url,b,munis,
@@ -10587,8 +10687,9 @@ class V147RealUrlReplay:
                     address=point.get('inferred_address','') if point else ''
                     if not address or not _detailed_address(address):
                         raise AppError('詳細住所が確定できない')
-                    listing=partial_listing('SUUMO',url,'SUUMO募集',address,layout,rent,None,None,
-                                            region,b,point,None,age,ym,'')
+                    listing=partial_listing('SUUMO',url,'SUUMO募集',address,layout,rent,None,area,
+                                            region,b,point,None,age,ym,'',
+                                            dwelling_type='mansion' if is_mansion else 'house')
                     if not listing:raise AppError('保存必須項目の不一致')
                     listing['property_id']=suumo_property_id(url)
                     if not listing['property_id']:raise AppError('物件IDが不正')
@@ -10618,9 +10719,9 @@ class V147RealUrlReplay:
             snap=self.snapshot()
             try:
                 document={
-                  'id':'realurl.v148.'+hashlib.sha256((self.group+self.started_at+str(time.monotonic_ns())).encode()).hexdigest(),
+                  'id':'realurl.v149.'+hashlib.sha256((self.group+self.started_at+str(time.monotonic_ns())).encode()).hexdigest(),
                   'status':'diagnostic_log','started_at':self.started_at,'finished_at':utc_now(),
-                  'conditions':{'source':'v148_real_url_post_get_verification','group':self.group,
+                  'conditions':{'source':'v149_real_url_post_get_verification','group':self.group,
                                 'required':24,'total':len(self.urls)},
                   'summary':{'processed':snap['done'],'saved':snap['saved'],'failed':snap['failed'],
                              'passed':len(self.urls)==30 and snap['saved']>=24,
