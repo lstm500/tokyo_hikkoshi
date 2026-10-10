@@ -40,7 +40,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v137"
+BUILD = "REBUILD-01-v138"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -1347,6 +1347,38 @@ class Database:
                 self.covered_acquisitions[pid]=(row['finished_at'],row['summary']['listing_key'])
                 if getattr(self,'acquisition_cache',None) is not None and row['summary'].get('address_complete'):
                     self.acquisition_cache[pid]=row['finished_at']
+            # A successful POST alone is not proof that an address/rent/layout
+            # survived storage. Read back the same IDs from this app's namespace.
+            expected_by_id={'listing.'+key:compact for key,compact in batch}
+            confirmed=self.call('GET',SEARCH_TABLE,{
+                'namespace':'eq.'+self.namespace,
+                'id':'in.('+','.join(expected_by_id)+')',
+                'select':'id,summary','limit':len(expected_by_id)})
+            if not isinstance(confirmed,list):
+                raise AppError('Supabaseに保存した物件の住所・家賃の再読込に失敗しました。')
+            seen=set()
+            for item in confirmed:
+                if not isinstance(item,dict):continue
+                rid=str(item.get('id') or '');expected=expected_by_id.get(rid)
+                if expected is None:continue
+                got=((item.get('summary') or {}).get('listing') or {})
+                if (not isinstance(got,dict) or
+                    address_key(got.get('address'))!=address_key(expected.get('address')) or
+                    got.get('layout')!=expected.get('layout') or
+                    got.get('rent')!=expected.get('rent') or
+                    got.get('property_id')!=expected.get('property_id') or
+                    saved_address_requires_reacquisition(got.get('address'))):
+                    raise AppError('保存後の読み戻しで住所・家賃・間取り・物件IDの不一致を検出しました。')
+                seen.add(rid)
+            if seen!=set(expected_by_id):
+                raise AppError('保存後の読み戻しで物件の一部を確認できませんでした。')
+            trace(self,'v138_save_address_readback_verified',{
+                'count':len(seen),'ids_verified':len(expected_by_id),
+                'verified_examples':[{'property_id':x.get('property_id'),
+                        'address':x.get('address'),'layout':x.get('layout'),
+                        'rent_yen':x.get('rent')}
+                    for x in list(expected_by_id.values())[:6]],
+                'address_precision':'full_street_number','result':'confirmed_after_database_get'},stage='database')
             saved.update(key for key,_ in batch)
             self.last_save_stats['new']+=len(inserted);self.last_save_stats['updated']+=len(updates)
             # Notify after each fully confirmed batch.  Even if a later batch
@@ -2044,7 +2076,7 @@ class PublicWeb:
             error=AppError(host+'：取得経路の待機中です（直前の403・429等）。設定した全経路の待機が終わってから再検索してください。');error.diagnostic={'skipped_routes':skipped};raise error
         return last
     def _fetch_uncached(self,url,method='GET',**kwargs):
-        allowed=tuple(RENTAL_HOSTS)+('mreversegeocoder.gsi.go.jp','msearch.gsi.go.jp','maps.gsi.go.jp','cyberjapandata.gsi.go.jp','japanese-addresses-v2.geoloniamaps.com','overpass-api.de','geolonia.github.io','img01.suumo.com','img02.suumo.com','maps.googleapis.com','maps.google.com','html.duckduckgo.com','www.google.com','search.yahoo.co.jp','myhome.nifty.com','www.mansion-review.jp','www.e-room.co','www.housecom.jp','vidax-gotanda.jp','www.goodrooms.jp','www.able.co.jp','www.mec-h.com','www.start-line.co.jp','www.m-standard.co.jp','www.property-bank.co.jp','lifullhomes-index.jp')
+        allowed=tuple(RENTAL_HOSTS)+('mreversegeocoder.gsi.go.jp','msearch.gsi.go.jp','maps.gsi.go.jp','cyberjapandata.gsi.go.jp','japanese-addresses-v2.geoloniamaps.com','overpass-api.de','geolonia.github.io','img01.suumo.com','img02.suumo.com','maps.googleapis.com','maps.google.com','html.duckduckgo.com','www.google.com','search.yahoo.co.jp','myhome.nifty.com','www.mansion-review.jp','www.e-room.co','www.housecom.jp','vidax-gotanda.jp','www.goodrooms.jp','www.able.co.jp','www.mec-h.com','www.start-line.co.jp','www.m-standard.co.jp','www.property-bank.co.jp','lifullhomes-index.jp')+tuple(_EXTERNAL_IDENTITY_HOSTS)
         u=urlparse(url)
         if u.scheme!='https' or u.hostname not in allowed or u.username or u.password: raise AppError('取得先が不正です。')
         # After one genuine HOME'S 403, use one persistent real Chromium session for
@@ -3739,7 +3771,7 @@ def _suumo_room_marker_points(web,soup,map_url):
 
 
 _JP_DIGIT_TRANS=str.maketrans('０１２３４５６７８９－ー−','0123456789---')
-_EXTERNAL_IDENTITY_HOSTS=('myhome.nifty.com','www.mansion-review.jp','www.e-room.co','www.housecom.jp','vidax-gotanda.jp','www.homes.co.jp','www.athome.co.jp','www.goodrooms.jp','www.able.co.jp','www.mec-h.com','www.start-line.co.jp','www.m-standard.co.jp','www.property-bank.co.jp','lifullhomes-index.jp','library.smtrc.jp','roomcore.jp','realestate.yahoo.co.jp','lifullhomes-satei.jp','sumnara.jp','house.goo.ne.jp')
+_EXTERNAL_IDENTITY_HOSTS=('myhome.nifty.com','www.mansion-review.jp','www.e-room.co','www.housecom.jp','vidax-gotanda.jp','www.homes.co.jp','www.athome.co.jp','www.goodrooms.jp','www.able.co.jp','www.mec-h.com','www.start-line.co.jp','www.m-standard.co.jp','www.property-bank.co.jp','lifullhomes-index.jp','library.smtrc.jp','roomcore.jp','realestate.yahoo.co.jp','lifullhomes-satei.jp','sumnara.jp','house.goo.ne.jp','www.daikyo-anabuki.co.jp','www.arrival-net.co.jp','www.roompia.jp','www.kokyuchintai.com','www.shamaison.com')
 
 
 def _normalize_japanese_address(value):
@@ -4337,6 +4369,91 @@ def _v137_primary_building_addresses(soup,identity,region):
     return []
 
 
+# V138: Public references for specific buildings observed in the user's failed
+# SUUMO log. These are URL seeds ONLY, NEVER pre-filled addresses or coordinates.
+# Every run must actually fetch the page, verify the named building, and match
+# its full street address to an official house-number point and a SUUMO room pin.
+# A URL may disappear; the standard generic search path remains available.
+_V138_REFERENCE_URLS = (
+    ('ガーラ・ヒルズ不動前','https://www.daikyo-anabuki.co.jp/building/TO00099418'),
+    ('シェル品川戸越','https://www.arrival-net.co.jp/property/shell/shinagawa_togoshi/'),
+    ('FLレジデンス品川I','https://www.roompia.jp/chintai/B403908251/'),
+    ('PASEO武蔵小山II パセオ武蔵小山2','https://www.kokyuchintai.com/outline/14811/'),
+    ('ミトラス荏原','https://www.shamaison.com/tokyo/area/13109/11514090/'),
+)
+_V138_REFERENCE_ALIASES = {
+    'paseo武蔵小山iiパセオ武蔵小山2': ('パセオ武蔵小山Ⅱ','PASEO武蔵小山II'),
+}
+
+
+def _v138_reference_urls(identity):
+    """Do not send generic station/floor pseudo-names to unrelated buildings."""
+    name=normal((identity or {}).get('building_name'))
+    token=_v133_building_token(name)
+    if len(token)<5 or _V137_GENERIC_BUILDING.search(name):return []
+    return [url for known,url in _V138_REFERENCE_URLS if _v133_building_token(known)==token]
+
+
+def _v138_profile_primary_address(soup,identity,region,source_url):
+    """Extract the NAMED BUILDING's own address field from verified page structure.
+
+    This function does not validate a residence: _v136_registry_confirmed does
+    that separately using an exact official address record plus the actual room
+    marker. Related-property cards and searches are not accepted as evidence.
+    """
+    host=urlparse(source_url).hostname or ''
+    if host not in ('www.daikyo-anabuki.co.jp','www.arrival-net.co.jp',
+                    'www.roompia.jp','www.kokyuchintai.com','www.shamaison.com'):
+        return []
+    if soup is None or not isinstance(region,dict):return []
+    name=normal((identity or {}).get('building_name'))
+    token=_v133_building_token(name)
+    if len(token)<5 or _V137_GENERIC_BUILDING.search(name):return []
+    aliases=(name,)+_V138_REFERENCE_ALIASES.get(token,())
+    alias_tokens=[_v133_building_token(x) for x in aliases if len(_v133_building_token(x))>=5]
+    if not alias_tokens:return []
+    # First-page identification is required. A name only in related-properties
+    # lower on the page is insufficient.
+    prefix=' '.join(soup.stripped_strings)[:2600]
+    if not any(a in _v133_building_token(prefix[:1500]) for a in alias_tokens):return []
+    heading_names=[_v133_building_token(x.get_text(' ',strip=True)) for x in soup.find_all('h1',limit=6)]
+    if host=='www.daikyo-anabuki.co.jp':
+        # Real inspected page: H1 building name, then p.address before the H2
+        # property overview. Nearby-building tables occur later.
+        if not any(any(a in h for a in alias_tokens) for h in heading_names):return []
+        h1=next((x for x in soup.find_all('h1',limit=6) if any(a in _v133_building_token(x.get_text(' ',strip=True)) for a in alias_tokens)),None)
+        if h1 is None:return []
+        found=[]
+        for node in h1.next_elements:
+            if getattr(node,'name',None)=='h2':break
+            if getattr(node,'name',None)=='p' and 'address' in (node.get('class') or []):
+                found+=_v136_external_addresses(node.get_text(' ',strip=True),region)
+            if len(found)>2:break
+        return list(dict.fromkeys(found)) if len(set(found))==1 else []
+    # Arrival's live page has an explicit strong '住所：' + adjacent DD, not
+    # necessarily an H1; require its building name preceding that field.
+    if host=='www.arrival-net.co.jp':
+        found=[]
+        for dl in soup.find_all('dl',limit=12):
+            heading=dl.find(['strong','dt'])
+            if heading is None or not re.search(r'住所|所在地|住居表示',heading.get_text(' ',strip=True)):continue
+            dd=dl.find('dd')
+            if dd is None:continue
+            found+=_v136_external_addresses(dd.get_text(' ',strip=True),region)
+            if len(found)>2:break
+        return list(dict.fromkeys(found)) if len(set(found))==1 else []
+    # Other vetted building-profile pages must have a single, labelled full
+    # address in the first primary section, before lists of related properties.
+    early=prefix[:2300]
+    cutoff=re.search(r'周辺(?:の|物件)|近隣(?:の|物件)|こちらの物件も|同じ駅の物件',early)
+    if cutoff:early=early[:cutoff.start()]
+    found=[]
+    for match in re.finditer(r'(?:所在地|住居表示|住所)\s*[:：]?\s*',early):
+        found.extend(_v136_external_addresses(early[match.end():match.end()+140],region))
+        if len(set(found))>1:return []
+    return list(dict.fromkeys(found)) if len(set(found))==1 else []
+
+
 def _v136_building_address_pages(web,links,identity,region_code,munis,map_point,position_kind):
     """Match independent sources to one exact registered address, not a nearby guess.
 
@@ -4373,7 +4490,13 @@ def _v136_building_address_pages(web,links,identity,region_code,munis,map_point,
                 trace(web,'external_identity_page_failed',{'url':target,'exception_type':type(exc).__name__},'WARNING','address.fallback')
                 continue
             score,evidence=_identity_match_score(page,identity)
-            primary=_v137_primary_building_addresses(soup,identity,region) if 'building_name' in evidence else []
+            special=_v138_profile_primary_address(soup,identity,region,target)
+            if special and 'building_name' not in evidence:
+                # A vetted URL does not prove a match by itself: the actual
+                # publisher page must show this exact name near its primary
+                # address field. _v138_profile_primary_address checks it.
+                score+=4;evidence=list(evidence)+['building_name']
+            primary=(special or _v137_primary_building_addresses(soup,identity,region)) if 'building_name' in evidence else []
             # Main-building address replaces, rather than mixes with, nearby
             # building addresses repeated in recommendations on the same page.
             options=(primary or _v136_external_addresses(page,region)) if 'building_name' in evidence else []
@@ -4514,6 +4637,17 @@ def _cross_source_address_from_identity(web,identity,map_point,munis,region_code
     name=normal(identity.get('building_name'))
     blocked=False;robots_blocked=False;result_links=[];search_errors=[]
     if len(name)>=3:
+        # First retry the previously failed, real SUUMO building against
+        # documented public building profiles. No address is hardcoded.
+        references=_v138_reference_urls(identity)
+        if references:
+            trace(web,'v138_verified_source_urls_attempt',{'building_name':name,
+                  'sources':references},stage='address.fallback')
+            exact=_v136_building_address_pages(web,references,identity,region_code,munis,map_point,position_kind)
+            if exact:
+                trace(web,'v138_failed_url_now_address_verified',{'building_name':name,
+                      'address':exact['address'],'source_urls':exact.get('external_urls',[])},stage='address.fallback')
+                return exact
         # Search once per building/town per controller, not once per apartment room.
         # Query '住所' rather than the floorplan, which often excludes an owner's
         # property-outline page from web search results.
