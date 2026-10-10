@@ -40,7 +40,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v138"
+BUILD = "REBUILD-01-v140"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -2294,7 +2294,7 @@ def _cache_jhj_features(web,key,features,cached_at=None):
         cache[key]=features;times[key]=time.monotonic() if cached_at is None else cached_at
 
 
-def _jhj_tile(web,x,y,z=18):
+def _v140_jhj_tile_under_gate(web,x,y,z=18):
     """Fetch GSI residential-address points once per tile. Images are never persisted."""
     cache=getattr(web,'jhj_tile_cache',None)
     if cache is None:cache={};web.jhj_tile_cache=cache
@@ -2325,6 +2325,26 @@ def _jhj_tile(web,x,y,z=18):
     _cache_jhj_features(web,key,features)
     return features
 
+
+
+def _jhj_tile(web,x,y,z=18):
+    """Single-flight for each GSI tile in this app process (404s included).
+
+    Multiple apartment workers previously issued the same request concurrently
+    before the empty-tile cache was populated. A tile gate is not an OS lock.
+    """
+    key=(int(z),int(x),int(y))
+    with web.cache_lock:
+        gates=getattr(web,'v140_jhj_inflight',None)
+        if gates is None:gates={};web.v140_jhj_inflight=gates
+        gate=gates.setdefault(key,threading.Lock())
+        if len(gates)>160:
+            for old,other in list(gates.items()):
+                if old!=key and not other.locked():
+                    gates.pop(old,None)
+                    if len(gates)<=120:break
+    with gate:
+        return _v140_jhj_tile_under_gate(web,x,y,z)
 
 def map_point_to_residential_address(web,point,munis,max_distance_m=90,expected_code=None,expected_towns=None):
     expected_towns=tuple(normal(x) for x in (expected_towns or ()) if normal(x))
@@ -3631,6 +3651,30 @@ def _clean_suumo_building_name(value):
     return text[:120]
 
 
+def _v140_card_building_name(building):
+    """Use only the building TITLE of this SUUMO cassette, never its address.
+
+    Some detail pages have a generic `station + floor count` H1, while the
+    parent cassette displays the actual building name. Reject generic titles.
+    """
+    if building is None:return ''
+    for selector in ('div.cassetteitem_content-title','h2.cassetteitem_content-title',
+                     '.cassetteitem_content-title','.cassetteitem_content-name'):
+        node=building.select_one(selector)
+        if not node:continue
+        name=_clean_suumo_building_name(node.get_text(' ',strip=True))
+        if len(_v133_building_token(name))>=5 and not _V137_GENERIC_BUILDING.search(name):return name
+    return ''
+
+
+def _v140_choose_suumo_name(detail_name,card_hint):
+    candidate=_clean_suumo_building_name(detail_name)
+    hint=_clean_suumo_building_name(card_hint)
+    if candidate and not _V137_GENERIC_BUILDING.search(candidate):return candidate
+    if hint and len(_v133_building_token(hint))>=5 and not _V137_GENERIC_BUILDING.search(hint):return hint
+    return candidate
+
+
 def suumo_detail_fields(soup):
     """Read SUUMO identity/spec fields while deliberately excluding textual address."""
     visible=' '.join(soup.stripped_strings);structured=json_listing_fields(soup)
@@ -3771,7 +3815,7 @@ def _suumo_room_marker_points(web,soup,map_url):
 
 
 _JP_DIGIT_TRANS=str.maketrans('０１２３４５６７８９－ー−','0123456789---')
-_EXTERNAL_IDENTITY_HOSTS=('myhome.nifty.com','www.mansion-review.jp','www.e-room.co','www.housecom.jp','vidax-gotanda.jp','www.homes.co.jp','www.athome.co.jp','www.goodrooms.jp','www.able.co.jp','www.mec-h.com','www.start-line.co.jp','www.m-standard.co.jp','www.property-bank.co.jp','lifullhomes-index.jp','library.smtrc.jp','roomcore.jp','realestate.yahoo.co.jp','lifullhomes-satei.jp','sumnara.jp','house.goo.ne.jp','www.daikyo-anabuki.co.jp','www.arrival-net.co.jp','www.roompia.jp','www.kokyuchintai.com','www.shamaison.com')
+_EXTERNAL_IDENTITY_HOSTS=('myhome.nifty.com','www.mansion-review.jp','www.e-room.co','www.housecom.jp','vidax-gotanda.jp','www.homes.co.jp','www.athome.co.jp','www.goodrooms.jp','www.able.co.jp','www.mec-h.com','www.start-line.co.jp','www.m-standard.co.jp','www.property-bank.co.jp','lifullhomes-index.jp','library.smtrc.jp','roomcore.jp','realestate.yahoo.co.jp','lifullhomes-satei.jp','sumnara.jp','house.goo.ne.jp','www.daikyo-anabuki.co.jp','www.arrival-net.co.jp','www.roompia.jp','www.kokyuchintai.com','www.shamaison.com','www.nichiwa-realestate.co.jp')
 
 
 def _normalize_japanese_address(value):
@@ -4380,10 +4424,20 @@ _V138_REFERENCE_URLS = (
     ('FLレジデンス品川I','https://www.roompia.jp/chintai/B403908251/'),
     ('PASEO武蔵小山II パセオ武蔵小山2','https://www.kokyuchintai.com/outline/14811/'),
     ('ミトラス荏原','https://www.shamaison.com/tokyo/area/13109/11514090/'),
+    ('ラウレア大井町 ペット共生','https://www.nichiwa-realestate.co.jp/bkndetail/2851576023/'),
 )
 _V138_REFERENCE_ALIASES = {
     'paseo武蔵小山iiパセオ武蔵小山2': ('パセオ武蔵小山Ⅱ','PASEO武蔵小山II'),
 }
+
+
+def _v140_building_identity_token(value):
+    """Normalize only confirmed advertising suffixes, never the identity core."""
+    token=_v133_building_token(value)
+    for suffix in ('ペット共生','ペット共生型','ペット可','ペット相談'):
+        st=_v133_building_token(suffix)
+        if token.endswith(st) and len(token)>len(st)+5:token=token[:-len(st)]
+    return token
 
 
 def _v138_reference_urls(identity):
@@ -4391,7 +4445,10 @@ def _v138_reference_urls(identity):
     name=normal((identity or {}).get('building_name'))
     token=_v133_building_token(name)
     if len(token)<5 or _V137_GENERIC_BUILDING.search(name):return []
-    return [url for known,url in _V138_REFERENCE_URLS if _v133_building_token(known)==token]
+    core=_v140_building_identity_token(name)
+    return [url for known,url in _V138_REFERENCE_URLS
+            if _v133_building_token(known)==token or
+            (len(core)>=7 and _v140_building_identity_token(known)==core)]
 
 
 def _v138_profile_primary_address(soup,identity,region,source_url):
@@ -4403,7 +4460,8 @@ def _v138_profile_primary_address(soup,identity,region,source_url):
     """
     host=urlparse(source_url).hostname or ''
     if host not in ('www.daikyo-anabuki.co.jp','www.arrival-net.co.jp',
-                    'www.roompia.jp','www.kokyuchintai.com','www.shamaison.com'):
+                    'www.roompia.jp','www.kokyuchintai.com','www.shamaison.com',
+                    'www.nichiwa-realestate.co.jp'):
         return []
     if soup is None or not isinstance(region,dict):return []
     name=normal((identity or {}).get('building_name'))
@@ -4414,7 +4472,8 @@ def _v138_profile_primary_address(soup,identity,region,source_url):
     if not alias_tokens:return []
     # First-page identification is required. A name only in related-properties
     # lower on the page is insufficient.
-    prefix=' '.join(soup.stripped_strings)[:2600]
+    primary_scope=(soup.find('main') or soup) if host=='www.nichiwa-realestate.co.jp' else soup
+    prefix=' '.join(primary_scope.stripped_strings)[:2600]
     if not any(a in _v133_building_token(prefix[:1500]) for a in alias_tokens):return []
     heading_names=[_v133_building_token(x.get_text(' ',strip=True)) for x in soup.find_all('h1',limit=6)]
     if host=='www.daikyo-anabuki.co.jp':
@@ -4442,6 +4501,24 @@ def _v138_profile_primary_address(soup,identity,region,source_url):
             found+=_v136_external_addresses(dd.get_text(' ',strip=True),region)
             if len(found)>2:break
         return list(dict.fromkeys(found)) if len(set(found))==1 else []
+    if host=='www.nichiwa-realestate.co.jp':
+        # Real listing confirmed on 2026-10-10, including `物件名` and `所在地`
+        # DL fields in its MAIN element. Never inspect nearby-property cards.
+        main=soup.find('main') or soup
+        headings=[_v133_building_token(h.get_text(' ',strip=True)) for h in main.find_all(['h1','h2'],limit=10)]
+        if not any(any(a in h for a in alias_tokens) for h in headings):return []
+        published_names=[];addresses=[]
+        for dl in main.find_all('dl',limit=45):
+            heading=dl.find(['strong','dt'])
+            dd=dl.find('dd')
+            if heading is None or dd is None:continue
+            label=normal(heading.get_text(' ',strip=True)).replace(' ','')
+            if label=='物件名':published_names.append(_v140_building_identity_token(dd.get_text(' ',strip=True)))
+            if label in ('所在地','住所','住居表示'):
+                addresses.extend(_v136_external_addresses(dd.get_text(' ',strip=True),region))
+        expected_core=_v140_building_identity_token(name)
+        if not published_names or expected_core not in published_names:return []
+        return list(dict.fromkeys(addresses)) if len(set(addresses))==1 else []
     # Other vetted building-profile pages must have a single, labelled full
     # address in the first primary section, before lists of related properties.
     early=prefix[:2300]
@@ -4469,6 +4546,11 @@ def _v136_building_address_pages(web,links,identity,region_code,munis,map_point,
     for target in links[:12]:
         host=urlparse(target).hostname or ''
         if host not in _EXTERNAL_IDENTITY_HOSTS:continue
+        with web.cache_lock:
+            blocked_until=getattr(web,'v140_external_host_cooldown',{}).get(host,0.)
+        if time.monotonic()<blocked_until:
+            trace(web,'v140_external_host_cooldown',{'host':host,'decision':'next_source'},stage='address.fallback')
+            continue
         # Cache only extracted facts, never entire remote HTML. Many SUUMO rooms
         # share one building; this prevents redundant external page downloads.
         page_key=(target,_v133_building_token(identity.get('building_name')),address_key(region['town']))
@@ -4487,7 +4569,14 @@ def _v136_building_address_pages(web,links,identity,region_code,munis,map_point,
                 page=' '.join(soup.stripped_strings)
             except SearchCancelled:raise
             except (AppError,ValueError,TypeError) as exc:
-                trace(web,'external_identity_page_failed',{'url':target,'exception_type':type(exc).__name__},'WARNING','address.fallback')
+                status=(getattr(exc,'diagnostic',{}) or {}).get('status')
+                if status in (403,429):
+                    with web.cache_lock:
+                        cooldown=getattr(web,'v140_external_host_cooldown',None)
+                        if cooldown is None:cooldown={};web.v140_external_host_cooldown=cooldown
+                        cooldown[host]=time.monotonic()+(600 if status==403 else 1800)
+                trace(web,'external_identity_page_failed',{'url':target,'exception_type':type(exc).__name__,
+                    'status':status,'next_source':True},'WARNING','address.fallback')
                 continue
             score,evidence=_identity_match_score(page,identity)
             special=_v138_profile_primary_address(soup,identity,region,target)
@@ -4636,7 +4725,7 @@ def _cross_source_address_from_identity(web,identity,map_point,munis,region_code
     """Stage 1 uses corroborated building address; stage 2 is strict map registry."""
     name=normal(identity.get('building_name'))
     blocked=False;robots_blocked=False;result_links=[];search_errors=[]
-    if len(name)>=3:
+    if len(name)>=3 and not _V137_GENERIC_BUILDING.search(name):
         # First retry the previously failed, real SUUMO building against
         # documented public building profiles. No address is hardcoded.
         references=_v138_reference_urls(identity)
@@ -4724,6 +4813,9 @@ def _cross_source_address_from_identity(web,identity,map_point,munis,region_code
                     cache[cache_key]=list(result_links[:12])
         exact=_v136_building_address_pages(web,result_links,identity,region_code,munis,map_point,position_kind)
         if exact:return exact
+    if _V137_GENERIC_BUILDING.search(name):
+        trace(web,'v140_generic_building_identity',{'building_name':name,
+            'decision':'skip_unreliable_web_search_use_official_registry'},stage='address.fallback')
     trace(web,'address_stage2_start',{'reason':'robots_disallowed' if robots_blocked else 'search_429' if blocked else 'no_verified_identity',
           'position_kind':position_kind,'primary_errors':search_errors,'search_result_links':len(result_links)},
           stage='address.stage2')
@@ -4854,6 +4946,7 @@ def suumo_collect(web,region,bounds,munis,emit):
             seen_pages.add(signature);page_candidates=[];page_skipped=0;skip_examples=[]
 
             for building in buildings:
+                building_name_hint=_v140_card_building_name(building)
                 # Do not read the list-page address. Town scope has already been fixed by the SUUMO town selector.
                 rooms=building.select('tr.js-cassette_link')
                 if not rooms:
@@ -4882,7 +4975,7 @@ def suumo_collect(web,region,bounds,munis,emit):
                         page_skipped+=1
                         if len(skip_examples)<3:skip_examples.append({'url':url,'property_id':property_id,'last_success_at':obtained})
                         emit('skipped',1);continue
-                    page_candidates.append(url)
+                    page_candidates.append((url,building_name_hint))
             emit('candidate',len(page_candidates)+page_skipped)
 
             scope=dict(getattr(DIAG_CONTEXT,'scope',{}))
@@ -4892,12 +4985,17 @@ def suumo_collect(web,region,bounds,munis,emit):
                 finally:web.detail_slots.release()
             def detail_work_unbounded(item):
                 web.check_cancel()
-                index,url=item;DIAG_CONTEXT.audit=getattr(web,'audit',None);DIAG_CONTEXT.scope=dict(scope)
+                index,(url,card_hint)=item;DIAG_CONTEXT.audit=getattr(web,'audit',None);DIAG_CONTEXT.scope=dict(scope)
                 emit('message',f'条件{group_number} 詳細を見る {index}/{len(page_candidates)}件');emit('detail',1)
                 try:
                     begin_listing(web,'SUUMO',url)
                     if not web.permitted(url):raise AppError('SUUMO詳細ページの自動取得が許可されていません。')
                     detail_reply=web.fetch(url);detail=BeautifulSoup(detail_reply.text,'html.parser');fields=suumo_detail_fields(detail)
+                    original_name=fields.get('building_name','')
+                    fields['building_name']=_v140_choose_suumo_name(original_name,card_hint)
+                    if original_name!=fields['building_name']:
+                        trace(web,'v140_suumo_card_building_name',{'url':url,'old':original_name,
+                            'name':fields['building_name'],'proof':'SUUMO same-cassette title'},stage='address.fallback')
                     # The detail-page address is intentionally not used for location/address acquisition.
                     # Only rent/layout/building type/age are read here; address comes from the property map below.
                     layout=parsed_layout(fields['raw_layout'],rough=False)
@@ -4930,7 +5028,7 @@ def suumo_collect(web,region,bounds,munis,emit):
 
             for item,_,error in bounded_results(list(enumerate(page_candidates,1)),detail_work,workers=DETAIL_PAGE_WORKERS,stop_event=web.cancel_event):
                 if error:
-                    url=item[1] if isinstance(item,tuple) and len(item)>1 else ''
+                    url=item[1][0] if isinstance(item,tuple) and len(item)>1 and isinstance(item[1],tuple) else ''
                     trace(web,'listing_failed',{'provider':'SUUMO','url':url,'decision':'failed','failed_stage':'detail.worker',
                         'category':'acquisition_failure','reason':'parallel detail worker exception','exception_type':type(error).__name__,
                         'observed':{},'expected':'listing detail processing completes','evidence':[]},'ERROR','rejection')
@@ -5814,17 +5912,26 @@ def search_all(db,conditions,screen,state=None):
     # Final UI accounting follows the user's simple model exactly.  A candidate that
     # reaches detail processing is either saved or an error; candidates skipped before
     # detail are counted only as skipped.
-    final_errors=max(0,int(detail)-len(saved))
+    terminal_observed=rejected+unsaved
+    # A cancelled worker may have emitted `detail` but not a final outcome.
+    # Such a partial attempt is not a confirmed address error / failed save.
+    unfinished=max(0,int(detail)-len(saved)-terminal_observed) if web.cancel_event.is_set() else 0
+    final_errors=max(0,int(detail)-len(saved)-unfinished)
     final_processed=len(saved)+final_errors
     final_candidate=int(skipped)+final_processed
-    terminal_observed=rejected+unsaved
-    if terminal_observed!=final_errors or int(candidate)!=final_candidate:
+    if web.cancel_event.is_set() and (unfinished or int(candidate)!=final_candidate):
+        audit.add('accounting','v140_cancelled_candidates','INFO',{
+            'discovered_candidates':candidate,'detail_started':detail,'saved':len(saved),'skipped':skipped,
+            'terminal_rejected':rejected,'unsaved':unsaved,'unfinished_on_stop':unfinished,
+            'not_started':max(0,int(candidate)-int(detail)-int(skipped)),
+            'reason':'収集停止時の未着手・実行中を保存失敗と混同しない'})
+    elif terminal_observed!=final_errors or int(candidate)!=final_candidate:
         audit.add('accounting','candidate_accounting_mismatch','ERROR',{
             'discovered_candidates':candidate,'detail_started':detail,'saved':len(saved),'skipped':skipped,
             'terminal_rejected':rejected,'unsaved':unsaved,'ui_processed':final_processed,'ui_errors':final_errors,
             'accounted_candidates':final_candidate,'reason':'候補・処理・保存・スキップと内部イベントの件数差を検出'})
     state.live_metrics={'processed':final_processed,'saved':len(saved),'errors':final_errors,'skipped':skipped}
-    search['summary'].update(confirmed=len(units),elapsed=round(time.monotonic()-started,3),new_saved=len(saved & getattr(db,'job_new_keys',set())),updated_saved=len(saved-getattr(db,'job_new_keys',set())),processed=final_processed,errors=final_errors,candidate=final_candidate,discovered_candidate=candidate,already_acquired=skipped,rejected=rejected,detail=detail,last_saved_at=getattr(state,'new_last_saved_at',None),saved=len(saved),unsaved=unsaved,acquisition_ids_pending=len(acquisition_pending),issues=issues[-100:],provider_fallbacks=provider_fallbacks,homes_http403_fallback=bool(provider_fallbacks))
+    search['summary'].update(confirmed=len(units),elapsed=round(time.monotonic()-started,3),new_saved=len(saved & getattr(db,'job_new_keys',set())),updated_saved=len(saved-getattr(db,'job_new_keys',set())),processed=final_processed,errors=final_errors,candidate=final_candidate,discovered_candidate=candidate,already_acquired=skipped,rejected=rejected,detail=detail,unfinished_on_stop=unfinished,last_saved_at=getattr(state,'new_last_saved_at',None),saved=len(saved),unsaved=unsaved,acquisition_ids_pending=len(acquisition_pending),issues=issues[-100:],provider_fallbacks=provider_fallbacks,homes_http403_fallback=bool(provider_fallbacks))
     if unsaved:
         audit.add('database','unsaved_listings','ERROR',{'stage':'stop.final_save' if web.cancel_event.is_set() else 'search.final_save','unsaved':unsaved,'retained_in_server_memory':True})
         for row in units.values():
@@ -5836,7 +5943,8 @@ def search_all(db,conditions,screen,state=None):
                 'category':'save_failure','reason':'Supabaseへの保存を最終再試行後も確認できない',
                 'observed':{'listing_key':key},'expected':'Supabase保存確認','evidence':[]})
     audit.add('map','data_ready','INFO',{'confirmed_units':len(units),'colored_points':sum(has_point(r) for r in units.values()),'render_deferred_until_saved_data_load':False})
-    screen['status'].info(f'検索終了｜処理 {final_processed}件｜保存 {len(saved)}件｜未保存 {final_errors}件｜スキップ {skipped}件')
+    screen['status'].info(f'検索終了｜処理 {final_processed}件｜保存 {len(saved)}件｜未保存 {final_errors}件｜スキップ {skipped}件'+
+                          (f'｜中断時の未完了 {unfinished}件' if unfinished else ''))
     audit.add('search','finish','INFO',{'status':search['status'],'summary':search['summary']})
     try:
         audit.persist(db,force=True)
@@ -8035,7 +8143,7 @@ def render_memory_diagnostic_v124():
 # Keep searches moving when one town has too many listings or stops making progress.
 # A skipped town is NEVER marked complete: it remains in incomplete_task_indices.
 AUTO_TOWN_IDLE_SECONDS = 180  # 3 minutes without actual collector events
-AUTO_TOWN_MAX_SECONDS = 600   # 10 minutes total per town, independent of screen status
+AUTO_TOWN_MAX_SECONDS = 1200  # 20 minutes total per town, independent of screen status
 
 AUTO_COLLECTION_ID='automatic.collection.settings'
 
