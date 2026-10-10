@@ -40,7 +40,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v141"
+BUILD = "REBUILD-01-v142"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -2301,10 +2301,10 @@ def _v140_jhj_tile_under_gate(web,x,y,z=18):
     key=(z,x,y)
     with web.cache_lock:
         at=getattr(web,'jhj_tile_cached_at',{}).get(key,0)
-        if key in cache and time.monotonic()-at<(3600 if not cache[key] else 86400):return cache[key]
+        if key in cache and time.monotonic()-at<(21600 if not cache[key] else 86400):return cache[key]
         cache.pop(key,None)
     with GEO_HTTP_LOCK:empty_at=GEO_EMPTY_ADDRESS_TILES.get(key)
-    if empty_at is not None and time.monotonic()-empty_at<3600:
+    if empty_at is not None and time.monotonic()-empty_at<21600:
         # A cached empty tile is not another HTTP error. The initial real
         # NoSuchKey is already logged. Preserve cached empty result quietly.
         _cache_jhj_features(web,key,[],empty_at)
@@ -2319,7 +2319,11 @@ def _v140_jhj_tile_under_gate(web,x,y,z=18):
         if diagnostic.get('status')==404 and diagnostic.get('server_error_code')=='NoSuchKey':
             _cache_jhj_features(web,key,[])
             with GEO_HTTP_LOCK:
-                if len(GEO_EMPTY_ADDRESS_TILES)>1000:GEO_EMPTY_ADDRESS_TILES.clear()
+                if len(GEO_EMPTY_ADDRESS_TILES)>1000:
+                    for old_key,when in list(GEO_EMPTY_ADDRESS_TILES.items()):
+                        if time.monotonic()-when>21600:GEO_EMPTY_ADDRESS_TILES.pop(old_key,None)
+                    if len(GEO_EMPTY_ADDRESS_TILES)>1000:
+                        for old_key in list(GEO_EMPTY_ADDRESS_TILES)[:200]:GEO_EMPTY_ADDRESS_TILES.pop(old_key,None)
                 GEO_EMPTY_ADDRESS_TILES[key]=time.monotonic()
             trace(web,'address_tile_empty',{'url':url,'tile':list(key),'status':404,'server_error_code':'NoSuchKey','reason':'この住所タイルのオブジェクトが存在しないため空タイルとして扱う'},stage='address.tiles')
             return []
@@ -2391,7 +2395,7 @@ def _map_point_to_residential_address(web,point,munis,max_distance_m=90,expected
     def read_tile(tile):return _jhj_tile(web,*tile,18)
     with web.cache_lock:
         tile_cache=web.jhj_tile_cache;tile_times=web.jhj_tile_cached_at;now=time.monotonic()
-        cached_tiles=[(t,tile_cache[(18,*t)],None) for t in tiles if (18,*t) in tile_cache and now-tile_times.get((18,*t),0)<(3600 if not tile_cache[(18,*t)] else 86400)]
+        cached_tiles=[(t,tile_cache[(18,*t)],None) for t in tiles if (18,*t) in tile_cache and now-tile_times.get((18,*t),0)<(21600 if not tile_cache[(18,*t)] else 86400)]
     tile_results=cached_tiles if len(cached_tiles)==len(tiles) else bounded_results(tiles,read_tile,workers=2,stop_event=web.cancel_event)
     for tile,features,error in tile_results:
         if tile is None:continue
@@ -2452,7 +2456,16 @@ def _map_point_to_residential_address(web,point,munis,max_distance_m=90,expected
     if not candidates:
         trace(web,'map_address_unresolved',{'point':list(point),'reason':'GSI住居表示住所の候補なし','tile_errors':tile_errors,'feature_count':feature_count,'requested_tiles':tiles,'maximum_distance_m':max_distance_m},'WARNING','location')
         return None
-    best=min(candidates,key=lambda c:c[0])
+    compatible=[c for c in candidates
+        if (not expected_code or not c[1] or c[1]==str(expected_code))
+        and (not expected_towns or any(town_matches(t,c[2]) or address_key(t)==address_key(c[2])
+            for t in expected_towns))]
+    # Never fabricate a town-specific address from unrelated GSI points.
+    # If none matches, the existing reverse-geocoder safeguard still applies.
+    best=min(compatible or candidates,key=lambda c:c[0])
+    if compatible and len(compatible)!=len(candidates):
+        trace(web,'v142_expected_town_candidates_preferred',{'matching':len(compatible),
+            'total':len(candidates),'chosen_distance_m':round(best[0],2)},stage='location')
     if best[0]>max_distance_m:
         trace(web,'map_address_unresolved',{'point':list(point),'reason':'最近傍の住居表示住所が遠すぎる','distance_m':round(best[0],1),'tile_errors':tile_errors,'feature_count':feature_count,'requested_tiles':tiles,'maximum_distance_m':max_distance_m},'WARNING','location')
         return None
@@ -3778,9 +3791,9 @@ def suumo_kankyo_urls(soup,detail_url):
         if not url:return
         u=urlparse(url);url=u._replace(fragment='').geturl()
         if safe_url(url,'SUUMO') and url not in candidates:candidates.append(url)
-    for url in bc_links:add(url)
     bc=suumo_bc_id(detail_url)
     if bc:add(f'https://suumo.jp/chintai/bc_{bc}/kankyo/')
+    for url in bc_links:add(url)
     # A detail page can contain a canonical BC detail link but no direct surroundings link.
     for a in soup.select('a[href]'):
         target=urljoin(detail_url,a.get('href','')).split('#')[0]
@@ -4589,6 +4602,97 @@ def _v138_profile_primary_address(soup,identity,region,source_url):
     return list(dict.fromkeys(found)) if len(set(found))==1 else []
 
 
+
+_V142_RELATED_HEADING = re.compile(r'(?:周辺|近隣|類似|おすすめ|関連)(?:の|物件|マンション|建物|賃貸|一覧)|(?:新着|人気)物件')
+_V142_ADDRESS_LABEL = re.compile(r'^(?:所在地(?:\(住所\))?|住所|住居表示|現住所|物件所在地|所在地住所)\s*[:：]?$')
+
+def _v142_structured_primary_address(soup,identity,region):
+    """Require a named H1 and a labelled, unique primary building address.
+
+    Never take the agency office, floor plan, neighboring building, or search
+    snippet as the subject property's address. Official registry validation
+    remains a separate, mandatory step after this extraction.
+    """
+    name=normal((identity or {}).get('building_name'))
+    core=_v140_building_identity_token(name)
+    if len(core)<7 or _V137_GENERIC_BUILDING.search(name) or soup is None:return []
+    main=soup.find('main') or soup
+    match=None
+    for h in main.find_all('h1',limit=6):
+        hcore=_v140_building_identity_token(h.get_text(' ',strip=True))
+        if hcore and (core==hcore or (len(core)>=9 and (hcore.startswith(core) or core.startswith(hcore)))):
+            match=h;break
+    if match is None:return []
+    found=[];visited=0
+    for node in match.next_elements:
+        if not getattr(node,'name',None):continue
+        visited+=1
+        if visited>600:break
+        if node.name=='h1':break
+        if node.name in ('h2','h3') and _V142_RELATED_HEADING.search(normal(node.get_text(' ',strip=True))):break
+        addr_text=None
+        if node.name=='tr':
+            head=node.find(['th'],recursive=False);value=node.find(['td'],recursive=False)
+            if head and value and _V142_ADDRESS_LABEL.fullmatch(normal(head.get_text(' ',strip=True)).replace(' ','')):
+                addr_text=value.get_text(' ',strip=True)
+        elif node.name=='dl':
+            head=node.find(['dt','strong'],recursive=False);value=node.find('dd',recursive=False)
+            if head and value and _V142_ADDRESS_LABEL.fullmatch(normal(head.get_text(' ',strip=True)).replace(' ','')):
+                addr_text=value.get_text(' ',strip=True)
+        if addr_text:
+            found+=_v136_external_addresses(addr_text,region)
+            if len(set(found))>1:return []
+    return list(dict.fromkeys(found)) if len(set(found))==1 else []
+
+
+def _v142_identity_jsonld_addresses(soup,identity,region):
+    """Only structured exact-building address where schema name == H1 identity.
+
+    JSON-LD outside the building's main heading never qualifies on its own.
+    """
+    name=normal((identity or {}).get('building_name'))
+    core=_v140_building_identity_token(name)
+    if len(core)<7 or _V137_GENERIC_BUILDING.search(name) or soup is None:return []
+    h1=soup.find('h1')
+    if not h1 or core!=_v140_building_identity_token(h1.get_text(' ',strip=True)):return []
+    matches=[]
+    for script in soup.find_all('script',attrs={'type':re.compile(r'application/ld\+json',re.I)},limit=8):
+        raw=(script.string or script.get_text(' ',strip=False) or '')
+        if len(raw)>100_000:continue
+        try:payload=json.loads(raw)
+        except (ValueError,TypeError):continue
+        roots=payload if isinstance(payload,list) else [payload]
+        stack=list(roots);count=0
+        while stack and count<40:
+            node=stack.pop();count+=1
+            if not isinstance(node,dict):continue
+            if isinstance(node.get('@graph'),list):stack.extend(node['@graph'][:30])
+            kind=node.get('@type') or ''
+            if isinstance(kind,list):kind=' '.join(map(str,kind))
+            if not re.search(r'(?:Building|Apartment|Residence|Accommodation|Place)',str(kind),re.I):continue
+            if _v140_building_identity_token(node.get('name'))!=core:continue
+            address=node.get('address')
+            if isinstance(address,dict):
+                addr=str(address.get('streetAddress') or '')
+                locality=str(address.get('addressLocality') or '')
+                area=str(address.get('addressRegion') or '')
+                address=''.join((area,locality,addr)) if addr else ''
+            elif not isinstance(address,str):address=''
+            matches.extend(_v136_external_addresses(address,region))
+    return list(dict.fromkeys(matches)) if len(set(matches))==1 else []
+
+
+def _v142_identity_result_urls(links):
+    """Discard redirects/contact pages that cannot provide a property address."""
+    out=[]
+    for link in links:
+        parsed=urlparse(str(link or ''))
+        if parsed.scheme!='https' or parsed.hostname not in _EXTERNAL_IDENTITY_HOSTS:continue
+        if re.search(r'/(?:contact[_/-]|login|signin|search[/?]|inquiry|entryform)',parsed.path,re.I):continue
+        if re.search(r'(?:\.pdf|\.jpg|\.png|\.webp)$',parsed.path,re.I):continue
+        if link not in out:out.append(link)
+    return out
+
 def _v136_building_address_pages(web,links,identity,region_code,munis,map_point,position_kind):
     """Match independent sources to one exact registered address, not a nearby guess.
 
@@ -4601,7 +4705,7 @@ def _v136_building_address_pages(web,links,identity,region_code,munis,map_point,
     if not region or position_kind not in ('room_marker','image_pin'):return None
     region=dict(region,munis=munis)
     candidates={}
-    for target in links[:12]:
+    for target in _v142_identity_result_urls(links)[:12]:
         host=urlparse(target).hostname or ''
         if host not in _EXTERNAL_IDENTITY_HOSTS:continue
         with web.cache_lock:
@@ -4643,7 +4747,9 @@ def _v136_building_address_pages(web,links,identity,region_code,munis,map_point,
                     'status':status,'next_source':True},'WARNING','address.fallback')
                 continue
             score,evidence=_identity_match_score(page,identity)
-            special=_v138_profile_primary_address(soup,identity,region,target)
+            special=(_v138_profile_primary_address(soup,identity,region,target)
+                     or _v142_structured_primary_address(soup,identity,region)
+                     or _v142_identity_jsonld_addresses(soup,identity,region))
             if special and 'building_name' not in evidence:
                 # A vetted URL does not prove a match by itself: the actual
                 # publisher page must show this exact name near its primary
@@ -4879,6 +4985,9 @@ def _cross_source_address_from_identity(web,identity,map_point,munis,region_code
                 with web.cache_lock:
                     if len(cache)>=120:cache.pop(next(iter(cache)))
                     cache[cache_key]=list(result_links[:12])
+        # Search engines often return dead contact/marketing URLs. Treat them
+        # as weak clues, not mandatory or repeated property-content requests.
+        result_links=_v142_identity_result_urls(result_links)
         exact=_v136_building_address_pages(web,result_links,identity,region_code,munis,map_point,position_kind)
         if exact:return exact
     if _V137_GENERIC_BUILDING.search(name):
@@ -4896,6 +5005,58 @@ def _cross_source_address_from_identity(web,identity,map_point,munis,region_code
           'candidate_count':0,'stage2':'official_registry_unresolved'},'WARNING','address.fallback')
     return None
 
+
+
+def _v142_verified_building_key(identity,region_code):
+    name=normal((identity or {}).get('building_name'))
+    token=_v140_building_identity_token(name)
+    if len(token)<9 or _V137_GENERIC_BUILDING.search(name) or not region_code:return None
+    return str(region_code),token
+
+
+def _v142_reuse_exact_building(web,identity,point,kind,munis,region_code,expected_towns):
+    """Reuse ONLY an independently & officially verified address, same building.
+
+    A room marker in a second listing must be within 20m of the source marker;
+    actual official address number and reverse town must also remain identical.
+    """
+    key=_v142_verified_building_key(identity,region_code)
+    if not key or kind!='room_marker':return None
+    with web.cache_lock:
+        row=getattr(web,'v142_verified_buildings',{}).get(key)
+    if not row or meters(point,row['source_point'])>20:return None
+    ref=row.get('reference_point')
+    if not ref or meters(point,ref)>_V136_MAX_REGISTRY_DISTANCE_M:return None
+    try:town=reverse(web,point,munis,force=True)
+    except AppError:return None
+    if not town or town['code']!=str(region_code):return None
+    if not any(town_matches(t,town['town']) for t in (expected_towns or [town['town']])):return None
+    if address_key(town['town'])!=address_key(row['town']):return None
+    result={k:(list(v) if isinstance(v,list) else v) for k,v in row['result'].items()}
+    result['distance_m']=meters(point,ref)
+    result['verification']='v142_same_building_independent_registry_reuse'
+    trace(web,'v142_reuse_verified_building',{'building_name':normal(identity.get('building_name')),
+        'address':result.get('address'),'pin_distance_m':round(meters(point,row['source_point']),2)},stage='address.fallback')
+    return result
+
+
+def _v142_remember_exact_building(web,identity,point,kind,region_code,inferred):
+    if kind!='room_marker' or not isinstance(inferred,dict):return
+    key=_v142_verified_building_key(identity,region_code)
+    reference=inferred.get('reference_point')
+    official=inferred.get('official_region') or {}
+    if not key or not reference or official.get('code')!=str(region_code):return
+    if inferred.get('verification') not in (
+        'external_exact_building_address_plus_official_registry',
+        'v137_primary_building_location_plus_official_registry'):
+        return
+    if not _detailed_address(inferred.get('address')):return
+    with web.cache_lock:
+        cache=getattr(web,'v142_verified_buildings',None)
+        if cache is None:cache={};web.v142_verified_buildings=cache
+        if len(cache)>=200:cache.pop(next(iter(cache)),None)
+        cache[key]={'source_point':list(point),'reference_point':list(reference),
+                    'town':official['town'],'result':dict(inferred)}
 
 def suumo_location_from_kankyo_image(web,detail_soup,detail_url,bounds,munis,expected_towns=None,region_code=None,identity=None):
     """Resolve SUUMO map position then infer address, with identity-only fallback."""
@@ -4918,6 +5079,21 @@ def suumo_location_from_kankyo_image(web,detail_soup,detail_url,bounds,munis,exp
         soup=BeautifulSoup(reply.text,'html.parser');fetched.append((target,soup))
         point,meta=_suumo_room_marker_points(web,soup,target)
         if point:
+            # Published marker coordinates are evidence, but a BC link may refer
+            # to another room. Reject an obviously different ward/town and try
+            # the next published SUUMO map before declaring the listing missing.
+            try:marker_region=reverse(web,point,munis,force=True)
+            except AppError:marker_region=None
+            wrong_code=bool(marker_region and region_code and marker_region.get('code')!=str(region_code))
+            wrong_town=bool(marker_region and expected_towns and not any(
+                town_matches(t,marker_region.get('town','')) for t in expected_towns))
+            if wrong_code or wrong_town:
+                failures.append({'url':target,'reason':'published_marker_wrong_search_region',
+                    'actual_code':marker_region.get('code'),'actual_town':marker_region.get('town')})
+                trace(web,'v142_map_marker_wrong_area',{'url':target,'expected_code':region_code,
+                    'actual_code':marker_region.get('code'),'actual_town':marker_region.get('town'),
+                    'decision':'next_published_kankyo_map'},'WARNING','location')
+                continue
             lat,lng=point;source=target;position_kind='room_marker';method='SUUMO地図・周辺環境の物件マーカー座標→詳細住所推定'
             if number>1:trace(web,'suumo_map_fallback_success',{'detail_url':detail_url,'map_url':target,'attempt':number,'attempted_urls':targets[:number]},stage='location')
             break
@@ -4960,20 +5136,25 @@ def suumo_location_from_kankyo_image(web,detail_soup,detail_url,bounds,munis,exp
     inferred=map_point_to_residential_address(web,(lat,lng),munis,expected_code=region_code,expected_towns=strict_towns)
     external=None
     if not inferred:
-        external=_cross_source_address_from_identity(web,identity,(lat,lng),munis,region_code,
-                                                     position_kind=position_kind,expected_towns=expected_towns)
+        external=_v142_reuse_exact_building(web,identity,(lat,lng),position_kind,
+                                            munis,region_code,expected_towns)
+        if not external:
+            external=_cross_source_address_from_identity(web,identity,(lat,lng),munis,region_code,
+                                                         position_kind=position_kind,expected_towns=expected_towns)
         inferred=external
+    if external:
+        _v142_remember_exact_building(web,identity,(lat,lng),position_kind,region_code,external)
     if not inferred:return None
     address=inferred['address']
     if not _detailed_address(address):return None
     external_used=bool(external)
     location={'latitude':lat,'longitude':lng,
-              'location_method':(('SUUMO物件マーカー→OSM建物名・住所と公的住所番号を照合' if external.get('verification')=='osm_exact_named_building_plus_address_registry' else 'SUUMO物件地図の正確なマーカー→デジタル庁住所基盤データ照合' if external.get('stage')=='official_registry' else 'SUUMO物件マーカー→独立建物住所→公的住居表示番号と座標を照合' if external.get('verification') in ('external_exact_building_address_plus_official_registry','v137_primary_building_location_plus_official_registry') else 'SUUMO物件固有地図→建物名等を独立ソース照合→GSI住所確認') if external_used else method),
+              'location_method':(('SUUMO物件マーカー→OSM建物名・住所と公的住所番号を照合' if external.get('verification')=='osm_exact_named_building_plus_address_registry' else 'SUUMO物件地図の正確なマーカー→デジタル庁住所基盤データ照合' if external.get('stage')=='official_registry' else 'SUUMO物件マーカー→独立建物住所→公的住居表示番号と座標を照合' if external.get('verification') in ('external_exact_building_address_plus_official_registry','v137_primary_building_location_plus_official_registry','v142_same_building_independent_registry_reuse') else 'SUUMO物件固有地図→建物名等を独立ソース照合→GSI住所確認') if external_used else method),
               'map_address':address,'inferred_address':address,
-              'address_match':(('建物名と番地を独立情報で照合（OSM＋住所レジストリ）' if external.get('verification')=='osm_exact_named_building_plus_address_registry' else '公式住所点との近接・一意性を確認（推定）' if external.get('stage')=='official_registry' else '外部掲載の建物名・詳細住所と公的住所番号・位置を照合' if external.get('verification') in ('external_exact_building_address_plus_official_registry','v137_primary_building_location_plus_official_registry') else '独立ソースで建物同一性を照合しGSIで番地確認') if external_used else '地図座標から番地・住居番号相当まで推定'),
+              'address_match':(('建物名と番地を独立情報で照合（OSM＋住所レジストリ）' if external.get('verification')=='osm_exact_named_building_plus_address_registry' else '公式住所点との近接・一意性を確認（推定）' if external.get('stage')=='official_registry' else '外部掲載の建物名・詳細住所と公的住所番号・位置を照合' if external.get('verification') in ('external_exact_building_address_plus_official_registry','v137_primary_building_location_plus_official_registry','v142_same_building_independent_registry_reuse') else '独立ソースで建物同一性を照合しGSIで番地確認') if external_used else '地図座標から番地・住居番号相当まで推定'),
               'coordinate_precision':'building' if external_used else 'listing_map',
               'position_source_url':source,
-              'address_precision':(('住居表示住所の公式点・近接一意性（建物一致は推定）' if external.get('stage')=='official_registry' else '外部掲載の住居表示住所＋公的住所番号・位置照合（推定）' if external.get('verification') in ('external_exact_building_address_plus_official_registry','v137_primary_building_location_plus_official_registry') else '独立複数ソース照合＋GSI住所検索') if external_used else 'GSI住居表示・街区符号/基礎番号'),
+              'address_precision':(('住居表示住所の公式点・近接一意性（建物一致は推定）' if external.get('stage')=='official_registry' else '外部掲載の住居表示住所＋公的住所番号・位置照合（推定）' if external.get('verification') in ('external_exact_building_address_plus_official_registry','v137_primary_building_location_plus_official_registry','v142_same_building_independent_registry_reuse') else '独立複数ソース照合＋GSI住所検索') if external_used else 'GSI住居表示・街区符号/基礎番号'),
               'address_distance_m':round(float(inferred.get('distance_m') or 0),2),
               'suumo_map_hint_latitude':lat,'suumo_map_hint_longitude':lng,
               'suumo_map_position_kind':position_kind,
@@ -5127,7 +5308,7 @@ def suumo_collect(web,region,bounds,munis,emit):
 def suumo_house_collect(web,region,bounds,munis,emit):
     """SUUMO third building-type category: house/other, <=40y, >=50 sqm."""
     prepared=suumo_prepare_region(web,region);filter_params=dict(prepared['base_params']);filter_params.update(SUUMO_HOUSE_PARAMS)
-    current_url=prepared['url'];current_params=filter_params;seen_pages=set();seen_urls=set();seen_ids=set();list_type_by_url={};page_number=1;found=0
+    current_url=prepared['url'];current_params=filter_params;seen_pages=set();seen_urls=set();seen_ids=set();list_type_by_url={};list_name_by_url={};list_age_by_url={};page_number=1;found=0
     collection_towns=[town_base_name(region.get('town',''))];scope=dict(getattr(DIAG_CONTEXT,'scope',{}))
     emit('message','SUUMO条件3｜一戸建て・その他（アパート除外）｜築40年以内｜50㎡以上')
     trace(web,'suumo_building_type_filter',{'selected':'一戸建て・その他','ts':filter_params['ts'],
@@ -5150,6 +5331,13 @@ def suumo_house_collect(web,region,bounds,munis,emit):
         seen_pages.add(signature);page_candidates=[];page_skipped=0;skip_examples=[]
         for building in buildings:
             building_type_on_card=suumo_house_card_type(building)
+            card_name=_v140_card_building_name(building)
+            # SUUMO card's published 築年月 / 築N年, never infer age from map.
+            card_age=''
+            for age_node in building.select('.cassetteitem_detail-col3,.cassetteitem_content-body'):
+                val=normal(age_node.get_text(' ',strip=True))
+                match=re.search(r'(?:築\s*\d{1,3}\s*年|(?:19|20)\d{2}年\s*\d{1,2}月|新築)',val)
+                if match:card_age=match.group(0);break
             rooms=building.select('tr.js-cassette_link') or [x for x in building.select('tr') if x.select_one('a[href*="/chintai/"]')]
             for room in rooms:
                 links=[]
@@ -5160,6 +5348,8 @@ def suumo_house_collect(web,region,bounds,munis,emit):
                 if not links:continue
                 url=min(links,key=lambda x:x[0])[1]
                 list_type_by_url[url]=building_type_on_card
+                list_name_by_url[url]=card_name
+                list_age_by_url[url]=card_age
                 if url in seen_urls:continue
                 seen_urls.add(url);property_id=suumo_property_id(url)
                 if property_id and property_id in seen_ids:continue
@@ -5185,6 +5375,11 @@ def suumo_house_collect(web,region,bounds,munis,emit):
                     begin_listing(web,'SUUMO',url)
                     if not web.permitted(url):raise AppError('SUUMO一戸建て詳細ページの自動取得が許可されていません。')
                     detail_reply=web.fetch(url);detail=BeautifulSoup(detail_reply.text,'html.parser');fields=suumo_detail_fields(detail)
+                    fields['building_name']=_v140_choose_suumo_name(fields.get('building_name',''),list_name_by_url.get(url,''))
+                    if age_info(fields['raw_age'])[0] is None and age_info(list_age_by_url.get(url,''))[0] is not None:
+                        fields['raw_age']=list_age_by_url[url]
+                        trace(web,'v142_house_card_age',{'url':url,'source':'same_suumo_cassette',
+                            'raw_age':fields['raw_age']},stage='collector')
                     layout=parsed_layout(fields['raw_layout'],rough=False)
                     if not layout:
                         reject_listing(web,'SUUMO',url,'detail.layout','missing_data','一戸建ての間取りを読み取れない',fields['raw_layout'],'間取り');emit('rejected',1);return
