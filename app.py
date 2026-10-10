@@ -40,7 +40,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v154"
+BUILD = "REBUILD-01-v155"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -10876,14 +10876,24 @@ TOWN_COMPONENT_HTML_V121=(
 
 @st.cache_resource(show_spinner=False)
 def town_component_v121():
-    folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-v121')
+    folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-v155')
     os.makedirs(folder,exist_ok=True)
     path=os.path.join(folder,'index.html')
     # Component HTML is small; create once per worker process. Never include
     # any Supabase key or listing details in this static file.
-    if not os.path.isfile(path) or os.path.getsize(path)!=len(TOWN_COMPONENT_HTML_V121.encode('utf-8')):
-        with open(path,'w',encoding='utf-8') as output:output.write(TOWN_COMPONENT_HTML_V121)
-    return st.components.v1.declare_component('sumai_town_map_v121',path=folder)
+    # Prevent stale legend-less HTML, including a same-byte-size predecessor.
+    current=None
+    try:
+        with open(path,'r',encoding='utf-8') as previous:
+            current=previous.read()
+    except OSError:
+        pass
+    if current != TOWN_COMPONENT_HTML_V121:
+        temp_path=path+'.tmp-'+str(os.getpid())
+        with open(temp_path,'w',encoding='utf-8') as output:
+            output.write(TOWN_COMPONENT_HTML_V121)
+        os.replace(temp_path,path)
+    return st.components.v1.declare_component('sumai_town_map_v155',path=folder)
 
 @st.cache_data(show_spinner=False)
 def town_station_refs_v118():
@@ -10998,7 +11008,7 @@ def interactive_town_choropleth(group,facilities):
     widget=town_component_v121()
     data=widget(center=list(cached['center']),zoom=14,geo=cached['geo'],
                 signature='|'.join(map(str,signature)),stations=stations,wards=wards,
-                key='town_map_v121_'+str(reset),default=None)
+                key='town_map_v155_'+str(reset),default=None)
     if isinstance(data,dict):
         current=viewport_bounds(data)
         if current:
