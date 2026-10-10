@@ -40,7 +40,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v140"
+BUILD = "REBUILD-01-v141"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -2305,7 +2305,10 @@ def _v140_jhj_tile_under_gate(web,x,y,z=18):
         cache.pop(key,None)
     with GEO_HTTP_LOCK:empty_at=GEO_EMPTY_ADDRESS_TILES.get(key)
     if empty_at is not None and time.monotonic()-empty_at<3600:
-        _cache_jhj_features(web,key,[],empty_at);trace(web,'address_tile_empty',{'tile':list(key),'source':'cached_NoSuchKey_404'},stage='address.tiles');return []
+        # A cached empty tile is not another HTTP error. The initial real
+        # NoSuchKey is already logged. Preserve cached empty result quietly.
+        _cache_jhj_features(web,key,[],empty_at)
+        return []
     url=f'https://cyberjapandata.gsi.go.jp/xyz/experimental_jhj/{z}/{x}/{y}.geojson'
     try:
         data=web.fetch(url).json()
@@ -2718,6 +2721,19 @@ def image_pin_point(content,center,zoom,scale=1):
     return point,{'method':'赤色ピンの連結領域・先端認識＋Web Mercator逆投影','center':list(center),'zoom':zoom,'scale':scale,'pin':pin,'width':width,'height':height,'point':list(point)}
 
 
+def _v141_image_georef_notice(web,details):
+    """Report one missing metadata reason per SUUMO listing, not per image URL."""
+    listing=str(getattr(DIAG_CONTEXT,'scope',{}).get('listing_url') or '')
+    key=(listing,normal(details.get('reason')))
+    with web.cache_lock:
+        seen=getattr(web,'v141_image_georef_seen',None)
+        if seen is None:seen=set();web.v141_image_georef_seen=seen
+        if key in seen:return
+        if len(seen)>400:seen.clear()
+        seen.add(key)
+    trace(web,'image_georef_missing',details,'WARNING','image_location')
+
+
 def map_image_candidates(web,soup,source_url):
     """Find georeferenced static-map images, then recognize the property pin from pixels."""
     results=[];entries=[]
@@ -2740,11 +2756,11 @@ def map_image_candidates(web,soup,source_url):
         try:zoom=float(params.get('zoom',[data_zoom])[0]);scale=float(params.get('scale',[1])[0])
         except (ValueError,TypeError):zoom=None;scale=1
         if not match or zoom is None or not math.isfinite(zoom) or not math.isfinite(scale) or not (0<=zoom<=22 and scale in (1,2)):
-            trace(web,'image_georef_missing',{'image_host':urlparse(url).hostname,'reason':'地図画像の基準座標・ズームを読み取れない'},'WARNING','image_location');continue
+            _v141_image_georef_notice(web,{'image_host':urlparse(url).hostname,'reason':'地図画像の基準座標・ズームを読み取れない'});continue
         supported=urlparse(url).hostname in ('maps.googleapis.com','maps.google.com') and 'staticmap' in urlparse(url).path
         size=re.fullmatch(r'(\d+)x(\d+)',params.get('size',[''])[0])
         if not supported or not size:
-            trace(web,'image_georef_missing',{'reason':'地図画像の投影方式・元の画像サイズを検証できない'},'WARNING','image_location');continue
+            _v141_image_georef_notice(web,{'reason':'地図画像の投影方式・元の画像サイズを検証できない'});continue
         try:
             if not web.permitted(url):continue
             response=web.fetch(url)
@@ -2752,7 +2768,7 @@ def map_image_candidates(web,soup,source_url):
             actual=Image.open(io.BytesIO(response.content)).size
             expected=(int(size[1])*int(scale),int(size[2])*int(scale))
             if actual!=expected:
-                trace(web,'image_georef_missing',{'reason':'元画像と宣言サイズが一致せず、拡縮・切り抜きの可能性','actual_size':list(actual),'expected_size':list(expected)},'WARNING','image_location');continue
+                _v141_image_georef_notice(web,{'reason':'元画像と宣言サイズが一致せず、拡縮・切り抜きの可能性','actual_size':list(actual),'expected_size':list(expected)});continue
             point,details=image_pin_point(response.content,(float(match[1]),float(match[2])),zoom,scale)
             details.update(image_url=url,image_sha256=hashlib.sha256(response.content).hexdigest(),projection='Google Static Maps Web Mercator')
             trace(web,'image_pin_result',details,'INFO' if point else 'WARNING','image_location')
@@ -3815,7 +3831,7 @@ def _suumo_room_marker_points(web,soup,map_url):
 
 
 _JP_DIGIT_TRANS=str.maketrans('０１２３４５６７８９－ー−','0123456789---')
-_EXTERNAL_IDENTITY_HOSTS=('myhome.nifty.com','www.mansion-review.jp','www.e-room.co','www.housecom.jp','vidax-gotanda.jp','www.homes.co.jp','www.athome.co.jp','www.goodrooms.jp','www.able.co.jp','www.mec-h.com','www.start-line.co.jp','www.m-standard.co.jp','www.property-bank.co.jp','lifullhomes-index.jp','library.smtrc.jp','roomcore.jp','realestate.yahoo.co.jp','lifullhomes-satei.jp','sumnara.jp','house.goo.ne.jp','www.daikyo-anabuki.co.jp','www.arrival-net.co.jp','www.roompia.jp','www.kokyuchintai.com','www.shamaison.com','www.nichiwa-realestate.co.jp')
+_EXTERNAL_IDENTITY_HOSTS=('myhome.nifty.com','www.mansion-review.jp','www.e-room.co','www.housecom.jp','vidax-gotanda.jp','www.homes.co.jp','www.athome.co.jp','www.goodrooms.jp','www.able.co.jp','www.mec-h.com','www.start-line.co.jp','www.m-standard.co.jp','www.property-bank.co.jp','lifullhomes-index.jp','library.smtrc.jp','roomcore.jp','realestate.yahoo.co.jp','lifullhomes-satei.jp','sumnara.jp','house.goo.ne.jp','www.daikyo-anabuki.co.jp','www.arrival-net.co.jp','www.roompia.jp','www.kokyuchintai.com','www.shamaison.com','www.nichiwa-realestate.co.jp','www.milford-chintai.com','towers.select')
 
 
 def _normalize_japanese_address(value):
@@ -4425,6 +4441,15 @@ _V138_REFERENCE_URLS = (
     ('PASEO武蔵小山II パセオ武蔵小山2','https://www.kokyuchintai.com/outline/14811/'),
     ('ミトラス荏原','https://www.shamaison.com/tokyo/area/13109/11514090/'),
     ('ラウレア大井町 ペット共生','https://www.nichiwa-realestate.co.jp/bkndetail/2851576023/'),
+    # Public, named building profiles observed in failed Shinagawa-ward URLs.
+    # Only URLs are seeded; no addresses, points or prices are embedded.
+    ('SOLASIA residence 武蔵小山','https://www.milford-chintai.com/chintai/B55507703413592410000033436/'),
+    ('SOLASIA residence 武蔵小山','https://lifullhomes-index.jp/buildings/b-48545496/'),
+    ('ラヴィエール洗足','https://lifullhomes-index.jp/buildings/b-47627543/'),
+    ('パークシティ武蔵小山 ザ タワー','https://www.daikyo-anabuki.co.jp/building/TO00117194'),
+    ('パークシティ武蔵小山 ザ タワー','https://towers.select/tokyo/shinagawa-ku/park-city-musashikoyama-the-tower/'),
+    ('シティタワー武蔵小山','https://www.daikyo-anabuki.co.jp/building/TO00119976'),
+    ('シティタワー武蔵小山','https://lifullhomes-index.jp/buildings/b-44150350/'),
 )
 _V138_REFERENCE_ALIASES = {
     'paseo武蔵小山iiパセオ武蔵小山2': ('パセオ武蔵小山Ⅱ','PASEO武蔵小山II'),
@@ -4461,7 +4486,8 @@ def _v138_profile_primary_address(soup,identity,region,source_url):
     host=urlparse(source_url).hostname or ''
     if host not in ('www.daikyo-anabuki.co.jp','www.arrival-net.co.jp',
                     'www.roompia.jp','www.kokyuchintai.com','www.shamaison.com',
-                    'www.nichiwa-realestate.co.jp'):
+                    'www.nichiwa-realestate.co.jp','www.milford-chintai.com',
+                    'lifullhomes-index.jp','towers.select'):
         return []
     if soup is None or not isinstance(region,dict):return []
     name=normal((identity or {}).get('building_name'))
@@ -4476,18 +4502,50 @@ def _v138_profile_primary_address(soup,identity,region,source_url):
     prefix=' '.join(primary_scope.stripped_strings)[:2600]
     if not any(a in _v133_building_token(prefix[:1500]) for a in alias_tokens):return []
     heading_names=[_v133_building_token(x.get_text(' ',strip=True)) for x in soup.find_all('h1',limit=6)]
+    # Every specialized parser below requires the *main building* H1. A nearby
+    # listing containing the desired name only in its recommendations cannot qualify.
+    named_h1=next((x for x in soup.find_all('h1',limit=6)
+                   if any(a in _v133_building_token(x.get_text(' ',strip=True)) for a in alias_tokens)),None)
     if host=='www.daikyo-anabuki.co.jp':
-        # Real inspected page: H1 building name, then p.address before the H2
-        # property overview. Nearby-building tables occur later.
-        if not any(any(a in h for a in alias_tokens) for h in heading_names):return []
-        h1=next((x for x in soup.find_all('h1',limit=6) if any(a in _v133_building_token(x.get_text(' ',strip=True)) for a in alias_tokens)),None)
-        if h1 is None:return []
+        # Profiles publish the building's one address as p.address OR a plain p
+        # in the introductory <ul>, before the first property overview <h2>.
+        if named_h1 is None:return []
         found=[]
-        for node in h1.next_elements:
+        for node in named_h1.next_elements:
             if getattr(node,'name',None)=='h2':break
-            if getattr(node,'name',None)=='p' and 'address' in (node.get('class') or []):
+            if getattr(node,'name',None)=='p':
                 found+=_v136_external_addresses(node.get_text(' ',strip=True),region)
-            if len(found)>2:break
+            if len(set(found))>1:return []
+        return list(dict.fromkeys(found)) if len(set(found))==1 else []
+    if host=='lifullhomes-index.jp':
+        # Live building index HTML: <h1>name</h1><p>full address</p>.
+        # The immediate sibling, not addresses in room cards or recommendations.
+        if named_h1 is None:return []
+        sibling=named_h1.find_next_sibling()
+        if sibling is None or sibling.name!='p':return []
+        found=_v136_external_addresses(sibling.get_text(' ',strip=True),region)
+        return found if len(set(found))==1 else []
+    if host=='www.milford-chintai.com':
+        # First building overview, exact labelled <th>所在地</th><td>ADDRESS</td>.
+        if named_h1 is None:return []
+        found=[]
+        for table in soup.find_all('table',limit=3):
+            for tr in table.find_all('tr',limit=15):
+                th=tr.find('th');td=tr.find('td')
+                if th and td and normal(th.get_text(' ',strip=True)).replace(' ','')=='所在地':
+                    found+=_v136_external_addresses(td.get_text(' ',strip=True),region)
+            if found:break
+        return list(dict.fromkeys(found)) if len(set(found))==1 else []
+    if host=='towers.select':
+        # The published building fact table explicitly labels a residence
+        # address. Never use unlabeled street numbers or a second building.
+        if named_h1 is None:return []
+        found=[]
+        for tr in soup.find_all('tr',limit=180):
+            th=tr.find('th');td=tr.find('td')
+            if not th or not td:continue
+            if '所在地' in normal(th.get_text(' ',strip=True)) and '住居表示' in normal(th.get_text(' ',strip=True)):
+                found+=_v136_external_addresses(td.get_text(' ',strip=True),region)
         return list(dict.fromkeys(found)) if len(set(found))==1 else []
     # Arrival's live page has an explicit strong '住所：' + adjacent DD, not
     # necessarily an H1; require its building name preceding that field.
@@ -4549,7 +4607,13 @@ def _v136_building_address_pages(web,links,identity,region_code,munis,map_point,
         with web.cache_lock:
             blocked_until=getattr(web,'v140_external_host_cooldown',{}).get(host,0.)
         if time.monotonic()<blocked_until:
-            trace(web,'v140_external_host_cooldown',{'host':host,'decision':'next_source'},stage='address.fallback')
+            # One audit event per blocked external host, not once per room.
+            with web.cache_lock:
+                noted=getattr(web,'v141_noted_blocked_hosts',None)
+                if noted is None:noted=set();web.v141_noted_blocked_hosts=noted
+                first=host not in noted
+                if first:noted.add(host)
+            if first:trace(web,'v140_external_host_cooldown',{'host':host,'decision':'next_source'},stage='address.fallback')
             continue
         # Cache only extracted facts, never entire remote HTML. Many SUUMO rooms
         # share one building; this prevents redundant external page downloads.
@@ -4570,11 +4634,11 @@ def _v136_building_address_pages(web,links,identity,region_code,munis,map_point,
             except SearchCancelled:raise
             except (AppError,ValueError,TypeError) as exc:
                 status=(getattr(exc,'diagnostic',{}) or {}).get('status')
-                if status in (403,429):
+                if status in (403,405,429):
                     with web.cache_lock:
                         cooldown=getattr(web,'v140_external_host_cooldown',None)
                         if cooldown is None:cooldown={};web.v140_external_host_cooldown=cooldown
-                        cooldown[host]=time.monotonic()+(600 if status==403 else 1800)
+                        cooldown[host]=time.monotonic()+(600 if status in (403,405) else 1800)
                 trace(web,'external_identity_page_failed',{'url':target,'exception_type':type(exc).__name__,
                     'status':status,'next_source':True},'WARNING','address.fallback')
                 continue
@@ -4636,6 +4700,10 @@ def _v136_building_address_pages(web,links,identity,region_code,munis,map_point,
                    'address_candidates':len(candidates),'domains':len({h for row in candidates.values() for h in row['hosts']})},'WARNING','address.fallback')
         return None
     result=approved[0]
+    if len(result.get('external_hosts',()))>=2:
+        trace(web,'v141_independent_building_sources_agreed',{'building_name':normal(identity.get('building_name')),
+               'address':result['address'],'sources':result['external_hosts'],
+               'distance_m':round(result['distance_m'],2)},stage='address.fallback')
     trace(web,'v136_exact_building_address_verified',{'building_name':normal(identity.get('building_name')),
           'address':result['address'],'distance_m':round(result['distance_m'],1),
           'sources':result['external_hosts']},stage='address.fallback')
