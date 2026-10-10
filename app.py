@@ -40,7 +40,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v151"
+BUILD = "REBUILD-01-v153"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -3522,6 +3522,72 @@ def _suumo_probe_town_url(web,canonical_url,municipality_code,city_name,wanted,m
 
 
 TOKYO_WARDS={str(13101+i):name for i,name in enumerate(('千代田区','中央区','港区','新宿区','文京区','台東区','墨田区','江東区','品川区','目黒区','大田区','世田谷区','渋谷区','中野区','杉並区','豊島区','北区','荒川区','板橋区','練馬区','足立区','葛飾区','江戸川区'))}
+
+
+# v152: Category definitions are explicit and visible in the UI. The four
+# directions + the three central wards partition all 23 wards; central-five
+# overlaps the direction groups intentionally. Categories are quick-add only.
+TOKYO_WARD_CATEGORIES = {
+    '城東': ('13106','13107','13108','13118','13121','13122','13123'),
+    '城西': ('13104','13113','13114','13115','13120'),
+    '城南': ('13109','13110','13111','13112'),
+    '城北': ('13105','13116','13117','13119'),
+    '都心3区': ('13101','13102','13103'),
+    '都心5区': ('13101','13102','13103','13104','13113'),
+}
+
+
+def automatic_ward_codes(settings):
+    '''Return user-selected ward order, with v151's single ward compatible.'''
+    if not isinstance(settings, dict):
+        raise AppError('自動収集の対象区設定が不正です。')
+    raw=settings.get('ward_codes')
+    if raw is None:
+        raw=[settings.get('ward_code')]
+    if isinstance(raw,str):
+        raw=[raw]
+    if not isinstance(raw,(list,tuple)) or not raw:
+        raise AppError('自動収集する区を一つ以上選択してください。')
+    if any(not isinstance(code,str) or code not in TOKYO_WARDS for code in raw):
+        raise AppError('自動収集する区は東京23区から選択してください。')
+    # Duplicates are never re-scanned because of overlapping category choices.
+    return list(dict.fromkeys(raw))
+
+
+def automatic_ward_town_filters(settings):
+    '''Normalize persisted per-ward filters without modifying old saved rows.'''
+    wards=automatic_ward_codes(settings)
+    raw=settings.get('town_codes_by_ward')
+    if raw is None:
+        raw={settings.get('ward_code'):settings.get('town_codes',[])}
+    if not isinstance(raw,dict):
+        raise AppError('区ごとの町名指定が不正です。')
+    if any(code not in wards for code in raw):
+        raise AppError('対象区以外の町名指定があります。')
+    normalized={}
+    for code in wards:
+        values=raw.get(code,[])
+        if not isinstance(values,list) or any(
+            not isinstance(value,str) or not re.fullmatch(re.escape(code)+r'\d{3}',value)
+            for value in values
+        ):
+            raise AppError('町名の選択が不正です：'+TOKYO_WARDS[code])
+        normalized[code]=list(dict.fromkeys(values))
+    return normalized
+
+
+def automatic_add_area_categories():
+    '''Streamlit on_change callback: append only *newly* selected categories.'''
+    chosen=list(st.session_state.get('automatic_area_categories') or [])
+    previous=set(st.session_state.get('automatic_applied_area_categories') or [])
+    selected=list(st.session_state.get('automatic_wards') or [])
+    for label in chosen:
+        if label not in previous:
+            for code in TOKYO_WARD_CATEGORIES.get(label,()):
+                if code not in selected:
+                    selected.append(code)
+    st.session_state['automatic_wards']=selected
+    st.session_state['automatic_applied_area_categories']=chosen
 
 def acquisition_cutoff(now=None):
     now=now or datetime.now(timezone.utc);month_index=now.year*12+now.month-1-3
@@ -8855,10 +8921,11 @@ def automatic_task_identity(code,town,provider):
 
 
 def automatic_task_plan(settings):
-    """Return the exact interleaved SUUMO/HOME'S town/provider task order."""
+    """Town-by-town, and strictly ward-by-ward, in the user's selection order."""
     if not isinstance(settings,dict):return []
     regions=settings.get('auto_regions') or [];munis=settings.get('auto_munis') or {}
     if not regions:return []
+    wards=automatic_ward_codes(settings)
     providers=[canonical_provider(p) for p in (settings.get('providers') or AUTOMATIC_REGION_PROVIDERS)]
     providers=[p for p in dict.fromkeys(providers) if p in AUTOMATIC_REGION_PROVIDERS]
     target_sets=[]
@@ -8866,14 +8933,19 @@ def automatic_task_plan(settings):
         groups=suumo_area_groups(regions,munis) if provider=='SUUMO' else homes_area_groups(regions,munis)
         target_sets.append((provider,groups))
     plan=[]
-    for number in range(max((len(groups) for _,groups in target_sets),default=0)):
-        for provider,groups in target_sets:
-            if number>=len(groups):continue
-            g=groups[number];town=g.get('suumo_town') if provider=='SUUMO' else g.get('homes_town')
-            plan.append({'index':len(plan),'provider':provider,
-                         'label':(g.get('label') or ('東京都'+str(g.get('city_name') or '')+str(town or g.get('town') or '')))+'｜'+PROVIDER_DISPLAY.get(provider,provider),
-                         'town':town or g.get('town') or '',
-                         'identity':automatic_task_identity(g.get('code'),town or g.get('town'),provider)})
+    # Finishing all towns of the first ward is required before starting the
+    # second ward. No provider/ward interleaving is allowed across that border.
+    for ward in wards:
+        ward_groups=[(provider,[g for g in groups if str(g.get('code'))==ward])
+                     for provider,groups in target_sets]
+        for number in range(max((len(groups) for _,groups in ward_groups),default=0)):
+            for provider,groups in ward_groups:
+                if number>=len(groups):continue
+                g=groups[number];town=g.get('suumo_town') if provider=='SUUMO' else g.get('homes_town')
+                plan.append({'index':len(plan),'ward_code':ward,'provider':provider,
+                             'label':(g.get('label') or ('東京都'+str(g.get('city_name') or '')+str(town or g.get('town') or '')))+'｜'+PROVIDER_DISPLAY.get(provider,provider),
+                             'town':town or g.get('town') or '',
+                             'identity':automatic_task_identity(g.get('code'),town or g.get('town'),provider)})
     return plan
 
 
@@ -9116,8 +9188,11 @@ class AutomaticCollection:
         self.last_job=None;self.current=None;self.message='検索候補の町名を確認しています';self.progress=0.;self.error=''
         self.thread=threading.Thread(target=self.run,daemon=True,name='housing-automatic-collection')
     def ensure_plan(self):
+        wards=automatic_ward_codes(self.settings)
         with self.lock:
-            if self.settings.get('auto_regions') and self.settings.get('auto_munis'):
+            cached=self.settings.get('auto_regions') or []
+            cached_wards={str(r.get('code')) for r in cached}
+            if cached and self.settings.get('auto_munis') and set(wards).issubset(cached_wards):
                 plan=automatic_task_plan(self.settings)
                 if plan:
                     if self.summary.get('task_labels')!=[p['label'] for p in plan]:
@@ -9127,11 +9202,21 @@ class AutomaticCollection:
                     return plan
         self.shared_web.cancel_event=self.stop_event
         if hasattr(self.shared_web,'configure'):self.shared_web.configure(getattr(self.db,'web_config',{}))
-        regions,munis,_=suumo_ward_regions(self.shared_web,self.settings['ward_code'])
-        regions=select_ward_towns(regions,self.settings.get('town_codes',[]))
-        if not regions:raise AppError('自動収集する町が見つかりません。')
+        town_filters=automatic_ward_town_filters(self.settings)
+        all_regions=[];all_munis={}
+        # Only one ward's area catalog is fetched at a time. The visible
+        # progress and a cooperative stop are preserved between wards.
+        for ordinal,ward in enumerate(wards,1):
+            if self.stop_event.is_set():return []
+            with self.lock:
+                self.message=f'町名一覧の取得 {ordinal}/{len(wards)}区｜{TOKYO_WARDS[ward]}'
+            regions,munis,_=suumo_ward_regions(self.shared_web,ward)
+            regions=select_ward_towns(regions,town_filters.get(ward,[]))
+            if not regions:raise AppError(TOKYO_WARDS[ward]+'の検索対象の町がありません。')
+            all_regions.extend(regions)
+            if isinstance(munis,dict):all_munis.update(munis)
         with self.lock:
-            self.settings['auto_regions']=regions;self.settings['auto_munis']=munis
+            self.settings['auto_regions']=all_regions;self.settings['auto_munis']=all_munis
             plan=automatic_task_plan(self.settings)
             if not plan:raise AppError('自動収集する町が見つかりません。')
             if self.summary.get('task_labels')!=[p['label'] for p in plan]:
@@ -9142,7 +9227,7 @@ class AutomaticCollection:
                 nxt=int(self.summary.get('next_task_index',0) or 0)%len(plan)
                 self.summary['cycle_completed_indices']=list(range(nxt))
             self.summary.setdefault('cycle_number',1)
-            self.message=f'検索候補 {len(plan)}町を確認しました。'
+            self.message=f'選択 {len(wards)}区｜検索候補 {len(plan)}町を確認しました。'
         self.persist_best_effort('region_plan')
         return plan
     def persist_best_effort(self,stage):
@@ -9211,12 +9296,20 @@ class AutomaticCollection:
                         self.summary['cycle_number']=int(self.summary.get('cycle_number',1) or 1)+1
                     self.summary['task_labels']=[p['label'] for p in plan];self.summary['total_tasks']=total
                     self.summary['current_task_index']=index;self.summary['current_task_label']=plan[index]['label']
-                    conditions={'bounds':[34,138,37,141],'ward_code':self.settings['ward_code'],'providers':['SUUMO'],
-                                'mode':'automatic_collection','auto_task_index':index,'auto_task_label':plan[index]['label'],
-                                'auto_task_identity':plan[index]['identity'],
-                                'town_codes':list(self.settings.get('town_codes',[]))}
-                    for key in ('auto_regions','auto_munis'):
-                        if self.settings.get(key):conditions[key]=self.settings[key]
+                    current_task=plan[index]
+                    ward=current_task['ward_code']
+                    # Pass only the active ward to SearchJob. Its local town
+                    # index is NOT the global controller progress index.
+                    active_regions=[r for r in (self.settings.get('auto_regions') or [])
+                                    if str(r.get('code'))==ward]
+                    if not active_regions:raise AppError('選択区の収集対象を確認できません：'+TOKYO_WARDS[ward])
+                    conditions={'bounds':[34,138,37,141],'ward_code':ward,'providers':['SUUMO'],
+                                'mode':'automatic_collection','auto_task_index':index,'auto_task_label':current_task['label'],
+                                'auto_task_identity':current_task['identity'],
+                                'auto_controller_index':index,
+                                'auto_regions':active_regions,'auto_munis':self.settings.get('auto_munis') or {},
+                                # Each ward has already been filtered in ensure_plan.
+                                'town_codes':[]}
                     self.summary['last_started_at']=utc_now();self.summary['current_status']='running'
                     self.message='検索中｜'+plan[index]['label']
                     job=SearchJob(self.db,conditions)
@@ -9285,8 +9378,10 @@ class AutomaticCollection:
                     self.summary['statistics_started_at']=self.summary.get('statistics_started_at') or self.summary['last_started_at']
                     self.summary['collection_seconds']=float(self.summary.get('collection_seconds',0))+float(stats.get('elapsed',0))
                     self.summary['confirmed_observations']=int(self.summary.get('confirmed_observations',0))+int(snap['unit_count'])
-                    total=max(1,int(conditions.get('auto_total_tasks',len(plan)) or len(plan)))
-                    actual_index=int(conditions.get('auto_task_index',index) or 0)%total
+                    # SearchJob rewrites auto_task_index for its *single* ward;
+                    # the queue checkpoint must use the original GLOBAL index.
+                    total=len(plan)
+                    actual_index=int(conditions.get('auto_controller_index',index) or 0)%total
                     success=status in ('completed','partial') and not incomplete and not self.stop_event.is_set()
                     self.summary.pop('next_run_at',None)
                     if status=='cancelled' or self.stop_event.is_set():
@@ -9302,8 +9397,8 @@ class AutomaticCollection:
                         outcome=advance_automatic_task(self.summary,actual_index,total,success)
                         if success:
                             self.summary['completed_runs']=int(self.summary.get('completed_runs',0))+1
-                            for key in ('auto_regions','auto_munis'):
-                                if conditions.get(key):self.settings[key]=conditions[key]
+                            # Keep the whole multi-ward plan. Saving only this
+                            # SearchJob's active ward would erase subsequent wards.
                         if outcome=='paused_incomplete':
                             self.settings['enabled']=False;self.stop_event.set()
                             self.error='未確認の町が'+str(len(self.summary.get('incomplete_task_indices',[])))+'件残っています。取得できた町は保持し、次回は未確認の町から再開します。'
@@ -9449,9 +9544,15 @@ def restore_automatic_collection():
 
 def validate_automatic_settings(settings):
     if not isinstance(settings,dict):raise AppError('自動収集設定の形式が不正です。')
-    if settings.get('ward_code') not in TOKYO_WARDS:raise AppError('東京23区から対象区を選択してください。')
-    codes=settings.get('town_codes',[])
-    if not isinstance(codes,list) or any(not isinstance(c,str) or not re.fullmatch(re.escape(settings['ward_code'])+r'\d{3}',c) for c in codes):raise AppError('対象町名の設定が不正です。')
+    wards=automatic_ward_codes(settings)
+    if settings.get('ward_code')!=wards[0]:
+        raise AppError('自動収集の先頭区設定が一致しません。')
+    legacy_codes=settings.get('town_codes',[])
+    if not isinstance(legacy_codes,list) or any(
+        not isinstance(code,str) or not re.fullmatch(re.escape(wards[0])+r'\d{3}',code)
+        for code in legacy_codes
+    ):raise AppError('対象町名の設定が不正です。')
+    automatic_ward_town_filters(settings)
     providers=[canonical_provider(p) for p in (settings.get('providers') or [])]
     if providers!=['SUUMO']:raise AppError('SUUMO-only automatic collection requires SUUMO.')
 
@@ -9463,13 +9564,21 @@ def validate_automatic_summary(summary):
         except (ValueError,TypeError):raise AppError('自動収集の進捗が不正です：'+key) from None
     if not isinstance(summary.get('last_summary',{}),dict):raise AppError('自動収集の前回結果が不正です。')
 
-def start_automatic_collection(ward_code,interval_minutes=0,town_codes=None,*,restart_all=False):
-    # A fresh pass scans ALL public SUUMO towns in the selected ward from index 0.
-    # It only resets the automatic controller's progress checkpoint; saved
-    # rental_listing and rental_acquisition records are never deleted/rewritten.
+def start_automatic_collection(ward_codes,interval_minutes=0,town_codes=None,*,restart_all=False):
+    # A fresh pass resets the selected wards' checkpoint only. The original
+    # rental_listing and rental_acquisition records are never deleted.
+    wards=automatic_ward_codes({'ward_codes':ward_codes})
     if restart_all:
-        town_codes=[]
-    settings={'enabled':True,'ward_code':ward_code,'providers':list(AUTOMATIC_REGION_PROVIDERS),'interval_minutes':0,'created_at':utc_now(),'town_codes':sorted(set(town_codes or []))}
+        filters={ward:[] for ward in wards}
+    elif isinstance(town_codes,dict):
+        filters={ward:list(dict.fromkeys(town_codes.get(ward,[]))) for ward in wards}
+    else:
+        # Backwards-compatible one-ward callers.
+        filters={ward:(list(dict.fromkeys(town_codes or [])) if ward==wards[0] else []) for ward in wards}
+    settings={'enabled':True,'ward_code':wards[0],'ward_codes':wards,
+              'providers':list(AUTOMATIC_REGION_PROVIDERS),'interval_minutes':0,
+              'created_at':utc_now(),'town_codes':list(filters[wards[0]]),
+              'town_codes_by_ward':filters}
     validate_automatic_settings(settings)
     db=Database();db.web_config=rental_network_settings();registry,lock=automatic_registry();key=automatic_registry_key(db)
     with lock:
@@ -9480,8 +9589,12 @@ def start_automatic_collection(ward_code,interval_minutes=0,town_codes=None,*,re
         previous_summary=old_snapshot.get('summary',st.session_state.get('automatic_saved_summary',{}))
         # Provider availability is not part of the town scope. A previously saved
         # SUUMO-only run must keep its completed towns when HOME'S is re-probed.
-        same_scope=(prior.get('ward_code')==settings['ward_code'] and
-                    sorted(prior.get('town_codes',[]))==settings['town_codes'])
+        try:
+            prior_wards=automatic_ward_codes(prior)
+            prior_filters=automatic_ward_town_filters(prior)
+        except AppError:
+            prior_wards=[];prior_filters={}
+        same_scope=(prior_wards==wards and prior_filters==filters)
         summary=dict(previous_summary) if same_scope and not restart_all else {}
         if same_scope and not restart_all:
             # Preserve attempted/failed markers so a restart does not hammer the
@@ -9722,30 +9835,69 @@ def automatic_collection_panel():
         st.error('自動収集の進捗保存失敗｜'+str(checkpoint.get('stage'))+'｜'+str(checkpoint.get('error')))
         st.caption('診断：'+json.dumps(checkpoint.get('db_diagnostic') or {},ensure_ascii=False)[:1200])
     saved=snap['settings'] if snap else st.session_state.get('automatic_saved_settings',{})
-    ward_code=st.selectbox('自動収集する区',list(TOKYO_WARDS),index=list(TOKYO_WARDS).index(saved.get('ward_code','13116')),format_func=lambda code:TOKYO_WARDS[code],key='automatic_ward')
-    if st.session_state.get('_automatic_reset_town_selection')==ward_code:
-        # Reset before the multiselect widget is instantiated in this rerun.
-        st.session_state.pop('_automatic_reset_town_selection',None)
-        st.session_state['automatic_selected_'+ward_code]=[]
-        st.session_state['automatic_towns_'+ward_code]=[]
-    town_codes=ward_town_selector(ward_code,'automatic',saved.get('town_codes',[]),disabled=busy)
+    # Category choice is an additive shortcut. The final ward multiselect is
+    # authoritative: users may remove/add any individual ward afterwards.
+    try:default_wards=automatic_ward_codes(saved)
+    except AppError:default_wards=['13116']
+    if 'automatic_wards' not in st.session_state:
+        st.session_state['automatic_wards']=default_wards
+    st.session_state.setdefault('automatic_area_categories',[])
+    st.session_state.setdefault('automatic_applied_area_categories',[])
+    st.multiselect('区のカテゴリー（一括追加）',list(TOKYO_WARD_CATEGORIES),
+                   key='automatic_area_categories',disabled=busy,
+                   on_change=automatic_add_area_categories)
+    with st.expander('区カテゴリーの内訳を確認',expanded=False):
+        for label,codes in TOKYO_WARD_CATEGORIES.items():
+            st.caption(label+'：'+'・'.join(TOKYO_WARDS[code] for code in codes))
+    ward_codes=st.multiselect('自動収集する区（複数選択）',list(TOKYO_WARDS),
+                              format_func=lambda code:TOKYO_WARDS[code],
+                              key='automatic_wards',disabled=busy)
+    st.caption('取得順：'+(' → '.join(TOKYO_WARDS[code] for code in ward_codes) if ward_codes else '区を選択してください'))
+    reset=st.session_state.pop('_automatic_reset_town_selection',[])
+    if isinstance(reset,str):reset=[reset]
+    for code in reset:
+        if code in TOKYO_WARDS:
+            st.session_state['automatic_selected_'+code]=[]
+            st.session_state.pop('automatic_towns_'+code,None)
+    if 'automatic_town_filters' not in st.session_state:
+        try:st.session_state['automatic_town_filters']=automatic_ward_town_filters(saved)
+        except AppError:st.session_state['automatic_town_filters']={}
+    filters=st.session_state['automatic_town_filters']
+    if ward_codes:
+        if len(ward_codes)>1:
+            if st.session_state.get('automatic_filter_ward') not in ward_codes:
+                st.session_state['automatic_filter_ward']=ward_codes[0]
+            ward_code=st.selectbox('町名を絞る区（任意）',ward_codes,
+                                   format_func=lambda code:TOKYO_WARDS[code],
+                                   key='automatic_filter_ward',disabled=busy)
+        else:
+            ward_code=ward_codes[0]
+        town_codes=ward_town_selector(ward_code,'automatic',filters.get(ward_code,[]),disabled=busy)
+        filters[ward_code]=list(town_codes)
+        chosen_filters={ward:list(filters.get(ward,[])) for ward in ward_codes}
+    else:
+        chosen_filters={}
     st.caption('SUUMOのみで町ごとに最後のページまで検索します。マンションは築15年以内、1LDK/2K/2DK・2LDK/3K/3DK、一戸建て・その他は築40年以内・50㎡以上を対象とします。')
     manual=active_job();manual_busy=bool(manual and not manual.snapshot()['finished'])
-    if st.button('選択した区で自動収集を開始・再開',key='automatic_start',disabled=busy or manual_busy):
+    cannot_start=busy or manual_busy or not ward_codes
+    if st.button('選択した区で自動収集を開始・再開',key='automatic_start',disabled=cannot_start):
         try:
-            controller=start_automatic_collection(ward_code,town_codes=town_codes);snap=controller.snapshot();busy=True
+            controller=start_automatic_collection(ward_codes,town_codes=chosen_filters)
+            snap=controller.snapshot();busy=True
+            st.session_state.automatic_saved_settings=dict(snap['settings'])
         except AppError as exc:st.error(str(exc))
     if st.button('選択した区で自動収集を開始・再開（最初からすべて）',
-                 key='automatic_start_all',disabled=busy or manual_busy):
+                 key='automatic_start_all',disabled=cannot_start or busy):
         try:
-            controller=start_automatic_collection(ward_code,town_codes=[],restart_all=True)
+            controller=start_automatic_collection(ward_codes,town_codes={},restart_all=True)
             snap=controller.snapshot();busy=True
             st.session_state.automatic_saved_settings=dict(snap['settings'])
             st.session_state.automatic_saved_summary=dict(snap['summary'])
-            st.session_state['_automatic_reset_town_selection']=ward_code
+            st.session_state['automatic_town_filters']={}
+            st.session_state['_automatic_reset_town_selection']=list(ward_codes)
             st.rerun()
         except AppError as exc:st.error(str(exc))
-    st.caption('「最初からすべて」は町名の絞り込みと進捗・今回の累計表示を初期化し、区内の全町を1町目から再検索します。保存済み物件・履歴は削除しません。')
+    st.caption('通常は選択した区・町の進捗を復元します。「最初からすべて」は選択した全区の進捗と町名の絞り込みだけを初期化します。保存済み物件・履歴は削除しません。')
     if st.button('自動収集を中止（取得済みデータを保存）',key='automatic_stop',disabled=not busy or bool(snap and snap['stopping'])):
         try:
             controller.request_stop();snap=controller.snapshot()
@@ -9775,6 +9927,14 @@ def automatic_collection_panel():
             completed={int(x) for x in summary.get('cycle_completed_indices',[]) if isinstance(x,(int,float)) or str(x).isdigit()}
             completed={i for i in completed if 0<=i<total}
             current_label=labels[current_index] if busy else '停止中'
+            selected_wards=automatic_ward_codes(snap.get('settings') or {})
+            finished_wards=0
+            for ward in selected_wards:
+                matching=[i for i,label in enumerate(labels)
+                          if label.startswith('東京都'+TOKYO_WARDS[ward])]
+                if matching and all(i in completed for i in matching):
+                    finished_wards+=1
+            st.caption(f'区の進捗：{finished_wards}/{len(selected_wards)}区完了｜取得順は指定した区順')
             st.markdown(f"**検索対象 {total}町｜完了 {len(completed)}町｜未確認 {len(summary.get('incomplete_task_indices', []))}町｜現在 {current_label}**")
             # Mobile browsers became sluggish when a 50+ row interactive dataframe
             # was rebuilt every fragment poll.  Keep the same information as plain text.
@@ -10651,6 +10811,51 @@ def capture_map_fragment_v117():
 # to Python, while the layer changes only on explicit map revision changes.
 TOWN_COMPONENT_HTML_V121 = '<!doctype html><html lang="ja"><head><meta charset="utf-8">\n<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">\n<link id="leaflet-css" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.css">\n<style>\nhtml,body{margin:0;padding:0;width:100%;height:480px;overflow:hidden;background:#ecefee;font-family:system-ui,"Hiragino Kaku Gothic ProN",sans-serif}\n#map{height:480px;width:100%;background:#f5f6f4;position:relative}\n#notice{position:absolute;z-index:9999;left:10px;bottom:12px;max-width:80%;background:rgba(255,255,255,.95);border-radius:5px;padding:7px 10px;font-size:12px;color:#173a5e;pointer-events:none;display:none}\n#touchmode{position:absolute;z-index:1200;right:12px;top:12px;border:1px solid #ddd;border-radius:5px;background:#fff;padding:10px;color:#193b45;font-size:13px;box-shadow:0 1px 6px #999;display:none}\n/* v121: station-first labels; transparent text with crisp white halo,\n   no irregular opaque white rectangles competing with the rent polygons. */\n.station-chip{display:inline-flex;position:relative;align-items:center;gap:3px;white-space:nowrap;\n  color:#062d4f;font-weight:900;font-size:14px;line-height:18px;\n  background:none;border:0;border-radius:0;padding:0;box-shadow:none;\n  pointer-events:none;transform:translate(-50%,-50%);\n  text-shadow:-1.5px -1.5px 0 #fff,0 -2px 0 #fff,1.5px -1.5px 0 #fff,\n     2px 0 0 #fff,1.5px 1.5px 0 #fff,0 2px 0 #fff,\n     -1.5px 1.5px 0 #fff,-2px 0 0 #fff,0 0 4px #fff;}\n.station-chip::before{content:"";display:inline-block;flex:none;width:5px;height:5px;\n  border-radius:50%;background:#0064b0;border:1.3px solid #fff;\n  box-shadow:0 0 0 1px #005b9b;}\n.station-chip.minor{font-size:12px;line-height:16px;font-weight:800;color:#143b57;}\n.station-chip.minor::before{width:4px;height:4px;background:#216f9c;}\n/* No separate white town/ward cards. The base map has its own muted\n   geographic context; hover/tap any polygon for the exact town name. */\n.town-chip,.ward-chip{display:none}\n.leaflet-tooltip{font-family:inherit}\n</style></head>\n<body>\n<div id="map"></div><button id="touchmode" type="button">ページをスクロール</button><div id="notice" role="status"></div>\n<script src="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.js" onerror="var script=document.createElement(\'script\');script.src=\'https://unpkg.com/leaflet@1.9.4/dist/leaflet.js\';document.head.appendChild(script);"></script>\n<script>\n(function(){\'use strict\';\nvar state={map:null,overlay:null,stationLayer:null,townLabelLayer:null,wardLayer:null,townAnchors:[],groupSignature:null,stations:[],wards:[],lastBounds:null,\n           loading:false,started:false,sentBounds:\'\',revision:-1,touchPan:true,pendingArgs:null,retryCount:0,retryTimer:null};\nfunction hostMessage(type,extra){window.parent.postMessage(Object.assign({isStreamlitMessage:true,type:type},extra||{}),\'*\')}\nfunction setHeight(){hostMessage(\'streamlit:setFrameHeight\',{height:480})}\nfunction note(message){var el=document.getElementById(\'notice\');el.textContent=message||\'\';el.style.display=message?\'block\':\'none\'}\nfunction initMap(args){\n if(state.map)return;\n if(!window.L){note(\'地図を読み込み中…\');return}\n var center=Array.isArray(args.center)&&args.center.length===2?args.center:[35.6812,139.7671];\n var zoom=Number.isFinite(+args.zoom)?+args.zoom:14;\n state.map=L.map(\'map\',{center:center,zoom:zoom,zoomControl:true,preferCanvas:true,zoomSnap:.25,\n   zoomDelta:.5,wheelPxPerZoomLevel:110,scrollWheelZoom:true,gestureHandling:false,touchZoom:true,dragging:true});\n var base=L.tileLayer(\'https://cyberjapandata.gsi.go.jp/xyz/pale/{z}/{x}/{y}.png\',{\n  attribution:\'国土地理院\',maxZoom:18,keepBuffer:1,updateWhenIdle:true});\n state.map.createPane(\'grayBase\');state.map.getPane(\'grayBase\').style.zIndex=\'200\';\n state.map.getPane(\'grayBase\').style.filter=\'grayscale(1) contrast(.68) brightness(1.12)\';\n state.map.getPane(\'grayBase\').style.opacity=\'.42\';\n base.options.pane=\'grayBase\';base.addTo(state.map);\n var errors=0, backup=false;\n base.on(\'tileerror\',function(){errors++;if(errors>=6&&!backup){backup=true;\n   state.map.removeLayer(base);\n   L.tileLayer(\'https://tile.openstreetmap.org/{z}/{x}/{y}.png\',{\n     attribution:\'&copy; OpenStreetMap contributors\',maxZoom:19,keepBuffer:1,pane:\'grayBase\',updateWhenIdle:true}).addTo(state.map);\n }});\n state.map.createPane(\'townNamePane\');state.map.getPane(\'townNamePane\').style.zIndex=\'640\';state.map.getPane(\'townNamePane\').style.pointerEvents=\'none\';\n state.map.createPane(\'stationNamePane\');state.map.getPane(\'stationNamePane\').style.zIndex=\'670\';state.map.getPane(\'stationNamePane\').style.pointerEvents=\'none\';\n state.stationLayer=L.layerGroup().addTo(state.map);\n state.townLabelLayer=L.layerGroup().addTo(state.map);\n state.wardLayer=L.layerGroup().addTo(state.map);\n var touch=window.matchMedia && window.matchMedia(\'(pointer:coarse)\').matches;\n if(touch){\n   var button=document.getElementById(\'touchmode\');button.style.display=\'block\';\n   button.addEventListener(\'click\',function(){state.touchPan=!state.touchPan;\n      if(state.touchPan){state.map.dragging.enable();state.map.touchZoom.enable();button.textContent=\'ページをスクロール\';document.getElementById(\'map\').style.touchAction=\'none\'}\n      else{state.map.dragging.disable();state.map.touchZoom.disable();button.textContent=\'地図を動かす\';document.getElementById(\'map\').style.touchAction=\'pan-y\'}\n   });document.getElementById(\'map\').style.touchAction=\'none\';\n }\n var schedule=null;\n state.map.on(\'moveend zoomend\',function(){\n    if(schedule!==null)clearTimeout(schedule);\n    schedule=setTimeout(function(){schedule=null;redrawStations();emitBounds()},420);\n });\n state.map.on(\'resize\',function(){redrawStations()});\n document.addEventListener(\'visibilitychange\',function(){if(document.visibilityState===\'visible\')setTimeout(function(){state.map.invalidateSize();redrawStations()},100)});\n window.addEventListener(\'pageshow\',function(){setTimeout(function(){if(state.map){state.map.invalidateSize();redrawStations()}},200)});\n state.map.whenReady(function(){setTimeout(function(){state.map.invalidateSize();redrawStations();emitBounds()},350)});\n note(\'\');setHeight();\n}\nfunction emitBounds(){if(!state.map)return;var b=state.map.getBounds();\n var arr=[b.getSouth(),b.getWest(),b.getNorth(),b.getEast()];\n if(arr.some(function(x){return !isFinite(x)}))return;\n var key=arr.map(function(v){return v.toFixed(5)}).join(\',\')+\'|\'+state.map.getZoom();\n if(key===state.sentBounds)return;\n state.sentBounds=key;\n hostMessage(\'streamlit:setComponentValue\',{dataType:\'json\',value:{bounds:{_southWest:{lat:arr[0],lng:arr[1]},_northEast:{lat:arr[2],lng:arr[3]}},zoom:state.map.getZoom()}});\n}\nfunction updateOverlay(geo,signature){\n if(!state.map || signature===state.groupSignature)return;\n try{\n  var fresh=null;\n  if(geo && geo.features && geo.features.length){\n   fresh=L.geoJSON(geo,{smoothFactor:1.7,style:function(feature){return {color:\'#606b72\',weight:.7,fillColor:feature.properties.color||\'#bbb\',fillOpacity:.77}},\n       onEachFeature:function(feature,layer){var props=feature.properties||{},name=String(props.name||\'\'),avg=String(props.price_label||\'\'),count=String(props.count_label||\'\');\n         var el=document.createElement(\'div\');el.textContent=name+\'｜平均 \'+avg+\'｜\'+count;layer.bindPopup(el);}});\n  }\n  // All town labels remain in GeoJSON popups; do not create 700+ browser\n  // markers when stations are the only permanent geographic labels.\n  var anchors=[];\n  if(state.overlay){state.map.removeLayer(state.overlay);state.overlay=null}\n  if(fresh){fresh.addTo(state.map);state.overlay=fresh}\n  state.townAnchors=anchors;\n  state.groupSignature=signature;\n }catch(err){note(\'地図の塗り分けを表示できません: \'+(err&&err.message||\'エラー\'))}\n}\nfunction safeLabel(value){return String(value||\'\').replace(/[&<>"\']/g,function(c){return {\'&\':\'&amp;\',\'<\':\'&lt;\',\'>\':\'&gt;\',\'"\':\'&quot;\',"\'":\'&#39;\'}[c]})}\nfunction reserveLabel(point,width,height,boxes,size){\n var box=[point.x-width/2,point.y-height/2,point.x+width/2,point.y+height/2];\n if(box[0]<3 || box[1]<3 || box[2]>size.x-3 || box[3]>size.y-3)return false;\n for(var i=0;i<boxes.length;i++){\n   var v=boxes[i];if(box[0]<v[2]+4&&box[2]>v[0]-4&&box[1]<v[3]+4&&box[3]>v[1]-4)return false;\n }\n boxes.push(box);return true;\n}\nfunction stationBox(p,width,height){\n return [p.x-width/2,p.y-height/2,p.x+width/2,p.y+height/2];\n}\nfunction redrawStations(){\n if(!state.map || !state.stationLayer)return;\n var m=state.map,zoom=m.getZoom(),bounds=m.getBounds(),size=m.getSize();\n if(size.x<30||size.y<30)return;\n state.stationLayer.clearLayers();\n // Explicitly clear previous town and ward labels from earlier render cycles.\n if(state.townLabelLayer)state.townLabelLayer.clearLayers();\n if(state.wardLayer)state.wardLayer.clearLayers();\n var stations=state.stations||[],boxes=[],visible=[],count=0;\n // Unlike v120, local/private stations are shown at district-scale zooms too.\n var limit=zoom>=16?150:zoom>=15?120:zoom>=14?100:zoom>=13?75:zoom>=12?55:zoom>=11?30:16;\n for(var i=0;i<stations.length;i++){\n   var s=stations[i];\n   if(zoom<11.0&&s.priority>0)continue;\n   if(zoom<11.5&&s.priority>1)continue;\n   if(!bounds.contains([s.lat,s.lng]))continue;\n   visible.push(s);\n }\n // Prioritize major stations, then stations nearest the viewport center.\n // This avoids a broad alphabetic bias when the map is densely populated.\n var cp=size.divideBy(2);\n visible.sort(function(a,b){\n   var pa=Number(a.priority||0),pb=Number(b.priority||0);\n   if(pa!==pb)return pa-pb;\n   var ap=m.latLngToContainerPoint([a.lat,a.lng]);\n   var bp=m.latLngToContainerPoint([b.lat,b.lng]);\n   var da=(ap.x-cp.x)*(ap.x-cp.x)+(ap.y-cp.y)*(ap.y-cp.y);\n   var db=(bp.x-cp.x)*(bp.x-cp.x)+(bp.y-cp.y)*(bp.y-cp.y);\n   return da-db;\n });\n for(var j=0;j<visible.length&&count<limit;j++){\n   var s=visible[j],name=String(s.name||\'\');\n   if(!name)continue;\n   var p=m.latLngToContainerPoint([s.lat,s.lng]);\n   var major=s.priority===0;\n   var fontSize=major?14:12;\n   var width=Math.min(195,Array.from(name).length*fontSize+11);\n   var height=major?21:19;\n   // Use a precise pixel collision box matching the compact halo label.\n   if(!reserveLabel(p,width,height,boxes,size))continue;\n   count++;\n   var html=\'<span class="station-chip\'+(major?\'\':\' minor\')+\'">\'+safeLabel(name)+\'</span>\';\n   L.marker([s.lat,s.lng],{icon:L.divIcon({className:\'\',html:html,iconSize:[0,0]}),\n          interactive:false,keyboard:false,pane:\'stationNamePane\'}).addTo(state.stationLayer);\n }\n}\nfunction render(args){\n args=args||{};\n if(!state.map){\n   if(!window.L){\n      state.pendingArgs=args;\n      if(!state.retryTimer && state.retryCount<30){\n        state.retryTimer=setTimeout(function(){state.retryTimer=null;state.retryCount++;render(state.pendingArgs)},500);\n      }\n      if(state.retryCount>=30)note(\'地図ライブラリの読込に失敗しました。通信を確認してください。\');\n      return;\n   }\n   initMap(args);if(!state.map)return;\n }\n state.stations=Array.isArray(args.stations)?args.stations:state.stations;\n state.wards=Array.isArray(args.wards)?args.wards:state.wards;\n updateOverlay(args.geo,args.signature);\n redrawStations();\n setHeight();\n}\nwindow.addEventListener(\'message\',function(e){if(e.data&&e.data.type===\'streamlit:render\')render(e.data.args)});\nhostMessage(\'streamlit:componentReady\',{apiVersion:1});setHeight();\n})();\n</script>\n</body></html>\n'
 
+# v153: Same gradient as TOWN_GRADIENT, now placed immediately above
+# the map INSIDE the same component iframe. No intermediate Streamlit
+# containers or buttons can separate the legend from the map.
+def _v153_attached_rent_legend():
+    low,high=TOWN_GRADIENT[0][0],TOWN_GRADIENT[-1][0]
+    gradient=','.join(
+        '#'+''.join(f'{part:02x}' for part in rgb)+f' {(price-low)/(high-low)*100:.4f}%'
+        for price,rgb in TOWN_GRADIENT)
+    ticks=''.join(
+        f'<span style="position:absolute;left:{(price-low)/(high-low)*100:.4f}%;'
+        'transform:translateX(-50%);top:0;white-space:nowrap">'
+        f'{price//10000}</span>'
+        for price in range(100000,450000,50000))
+    return ('<div id="rent-scale" aria-label="町丁目別の平均家賃の色分け">'
+            '<div class="rent-scale-title">町丁目別・平均家賃（万円）</div>'
+            f'<div class="rent-scale-bar" style="background:linear-gradient(90deg,{gradient})"></div>'
+            f'<div class="rent-scale-ticks">{ticks}</div>'
+            '<div class="rent-scale-limits"><span>8万円以下</span><span>45万円以上</span></div>'
+            '</div>')
+
+_V153_LEGEND_HEIGHT = 64
+_V153_FRAME_HEIGHT = 480 + _V153_LEGEND_HEIGHT
+_V153_LEGEND_CSS = (
+    '\n#rent-scale{height:64px;box-sizing:border-box;padding:4px 12px 2px;'
+    'background:#f5f3ed;color:#173a5e;font-family:inherit;}\n'
+    '.rent-scale-title{font-size:12px;font-weight:700;line-height:15px;margin:0 0 2px;}\n'
+    '.rent-scale-bar{height:11px;border-radius:4px;}\n'
+    '.rent-scale-ticks{height:14px;position:relative;font-size:10px;font-weight:600;line-height:14px;}\n'
+    '.rent-scale-limits{display:flex;justify-content:space-between;'
+    'font-size:10px;line-height:13px;}\n'
+    '#touchmode{top:76px!important;}\n'
+)
+assert TOWN_COMPONENT_HTML_V121.count('<div id="map"></div>')==1
+assert TOWN_COMPONENT_HTML_V121.count('</style></head>')==1
+assert 'height:480px;overflow:hidden;' in TOWN_COMPONENT_HTML_V121
+assert "hostMessage('streamlit:setFrameHeight',{height:480})" in TOWN_COMPONENT_HTML_V121
+TOWN_COMPONENT_HTML_V121=(
+    TOWN_COMPONENT_HTML_V121
+    .replace('</style></head>',_V153_LEGEND_CSS+'</style></head>',1)
+    .replace('<div id="map"></div>',_v153_attached_rent_legend()+'<div id="map"></div>',1)
+    .replace('height:480px;overflow:hidden;',f'height:{_V153_FRAME_HEIGHT}px;overflow:hidden;',1)
+    .replace("hostMessage('streamlit:setFrameHeight',{height:480})",
+             f"hostMessage('streamlit:setFrameHeight',{{height:{_V153_FRAME_HEIGHT}}})",1))
+
+
 @st.cache_resource(show_spinner=False)
 def town_component_v121():
     folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-v121')
@@ -10981,52 +11186,28 @@ def main():
     tabs=st.tabs(['住まいを探す','保存データ','通勤・周辺施設','初期設定'])
     with tabs[0]:
         st.subheader('地図を動かして、探す地域を表示してください')
-        st.caption('地図に見えている四角い範囲が検索対象です。駅名の選択や取得件数の上限はありません。')
-        st.caption('地図上には駅名を優先表示します。町丁目名は区域をタップすると確認できます。')
-        st.caption('追加・更新された保存物件は町丁目別の平均家賃へ自動反映します。大量収集中は負荷を抑えてまとめて更新します。')
-        st.caption('保存する募集データは家賃・間取り・種別・地図の町丁目（詳細住所が確認できた場合はその住所）・取得日時です。番地や建物座標を推測で作成しません。')
         selected_group=state.get('layout_display_group','group1')
         if selected_group not in ('group1','group2','house'):selected_group='group1';state.layout_display_group='group1'
         g1,g2,g3=st.columns(3)
-        if g1.button('1LDK・2K・2DK',key='layout_group1',type='primary' if selected_group=='group1' else 'secondary',use_container_width=True):
-            if state.layout_display_group!='group1':state.layout_display_group='group1';st.rerun()
-        if g2.button('2LDK・3K・3DK',key='layout_group2',type='primary' if selected_group=='group2' else 'secondary',use_container_width=True):
-            if state.layout_display_group!='group2':state.layout_display_group='group2';st.rerun()
-        if g3.button('一戸建て',key='layout_group_house',type='primary' if selected_group=='house' else 'secondary',use_container_width=True):
-            if state.layout_display_group!='house':state.layout_display_group='house';st.rerun()
+        with g1:
+            if st.button('1LDK・2K・2DK',key='layout_group1',type='primary' if selected_group=='group1' else 'secondary',use_container_width=True):
+                if state.layout_display_group!='group1':state.layout_display_group='group1';st.rerun()
+            if selected_group=='group1':st.caption('マンション・築15年以内')
+        with g2:
+            if st.button('2LDK・3K・3DK',key='layout_group2',type='primary' if selected_group=='group2' else 'secondary',use_container_width=True):
+                if state.layout_display_group!='group2':state.layout_display_group='group2';st.rerun()
+            if selected_group=='group2':st.caption('マンション・築15年以内')
+        with g3:
+            if st.button('一戸建て',key='layout_group_house',type='primary' if selected_group=='house' else 'secondary',use_container_width=True):
+                if state.layout_display_group!='house':state.layout_display_group='house';st.rerun()
+            if selected_group=='house':st.caption('築40年以内・50㎡以上')
         selected_group=state.get('layout_display_group','group1')
-        display_label={'group1':'1LDK・2K・2DK','group2':'2LDK・3K・3DK','house':'一戸建て'}[selected_group]
-        st.caption('表示中：'+display_label+'。物件は町丁目ごとに事前集計し、地図には区域の平均家賃のみ渡します。')
         bounds=state.get('new_bounds')
         center=bounds_center(bounds) if bounds else state.get('new_view_center',DEFAULT_CENTER)
         radius=bounds_radius(bounds) if bounds else 1500
         facilities=[f for f in state.new_facilities if bounds and in_rectangle((f['lat'],f['lng']),bounds)]
-        # The 5万円 tick positions share the exact 8-45万円 gradient domain.
-        stops=[(price, '#'+''.join(f'{c:02x}' for c in rgb)) for price,rgb in TOWN_GRADIENT]
-        low,high=stops[0][0],stops[-1][0]
-        css_stops=','.join(f'{color} {(price-low)/(high-low)*100:.4f}%'
-                           for price,color in stops)
-        tick_html=''.join(
-            f'<span style="position:absolute;left:{(yen-low)/(high-low)*100:.4f}%;'
-            'top:0;transform:translateX(-50%);white-space:nowrap;'
-            'font-size:11px;color:#173a5e;font-weight:650">'
-            f'<span style="display:block;height:7px;width:1px;background:#435c67;'
-            f'margin:0 auto 2px"></span>{yen//10000}</span>'
-            for yen in range(100000,450000,50000))
-        st.markdown(
-            '<div style="max-width:100%;margin:4px 0 13px">'
-            '<div style="font-size:13px;color:#173a5e;font-weight:650;margin-bottom:3px">'
-            '町丁目別・平均家賃（万円）</div>'
-            '<div style="height:15px;border-radius:5px;background:linear-gradient(90deg,'
-            +css_stops+');"></div>'
-            '<div style="position:relative;height:29px;width:100%;margin-top:0">'
-            +tick_html+'</div>'
-            '<div style="display:flex;justify-content:space-between;gap:10px;'
-            'font-size:11px;color:#173a5e"><span>8万円以下</span><span>45万円以上</span>'
-            '</div></div>',unsafe_allow_html=True)
         town_choropleth_status()
         interactive_town_choropleth(selected_group,facilities)
-        st.caption('実際の町丁目境界だけを着色します。物件0件・未照合の区域は地図の下地色です。境界：2015年e-Stat由来（frogcat加工）。現在の町丁目と一部異なる場合があります。')
         # Fragment owns its widget container directly, including partial reruns.
         background_progress()
         # Initial component defaults are not real viewport bounds. Only the browser callback makes the search ready.
@@ -11052,10 +11233,8 @@ def main():
             ward_code=st.selectbox('検索する区',list(TOKYO_WARDS),index=list(TOKYO_WARDS).index(state.get('manual_selected_ward','13116')),format_func=lambda code:TOKYO_WARDS[code],key='manual_ward',disabled=searching)
             state.manual_selected_ward=ward_code
             ward_town_selector(ward_code,'manual',disabled=searching)
-            st.caption('区・町名指定のSUUMO検索：マンションは築15年以内・指定2間取り群、一戸建ては築40年以内・50㎡以上。掲載ページの「所在地」に町丁目があれば優先し、不足するときだけ物件固有地図で町丁目を判定します。')
         st.button('表示中の地名から全件検索・保存' if scope=='地図の表示範囲' else '選択した区・町名を検索・保存',type='primary',use_container_width=True,
                   on_click=remember_search,key='new_start',disabled=searching or (scope=='地図の表示範囲' and (not bounds or not providers)))
-        st.caption('検索範囲から町名を決定し、SUUMOの掲載条件を最後のページまで調べます。所在地の町丁目が地図で使える場合はそのまま採用し、不十分な場合は物件固有地図から町丁目を確認します。番地や建物位置は捏造しません。保存は家賃・間取り・種別・町丁目・取得日時です。旧データは変更せず同じ町丁目へ集計します。')
         background_status()
         result=state.new_search
         if result:
