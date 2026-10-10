@@ -40,7 +40,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v135"
+BUILD = "REBUILD-01-v136"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -2044,12 +2044,12 @@ class PublicWeb:
             error=AppError(host+'：取得経路の待機中です（直前の403・429等）。設定した全経路の待機が終わってから再検索してください。');error.diagnostic={'skipped_routes':skipped};raise error
         return last
     def _fetch_uncached(self,url,method='GET',**kwargs):
-        allowed=tuple(RENTAL_HOSTS)+('mreversegeocoder.gsi.go.jp','msearch.gsi.go.jp','maps.gsi.go.jp','cyberjapandata.gsi.go.jp','japanese-addresses-v2.geoloniamaps.com','overpass-api.de','geolonia.github.io','img01.suumo.com','img02.suumo.com','maps.googleapis.com','maps.google.com','html.duckduckgo.com','www.google.com','search.yahoo.co.jp','myhome.nifty.com','www.mansion-review.jp','www.e-room.co','www.housecom.jp','vidax-gotanda.jp','www.goodrooms.jp','www.able.co.jp')
+        allowed=tuple(RENTAL_HOSTS)+('mreversegeocoder.gsi.go.jp','msearch.gsi.go.jp','maps.gsi.go.jp','cyberjapandata.gsi.go.jp','japanese-addresses-v2.geoloniamaps.com','overpass-api.de','geolonia.github.io','img01.suumo.com','img02.suumo.com','maps.googleapis.com','maps.google.com','html.duckduckgo.com','www.google.com','search.yahoo.co.jp','myhome.nifty.com','www.mansion-review.jp','www.e-room.co','www.housecom.jp','vidax-gotanda.jp','www.goodrooms.jp','www.able.co.jp','www.mec-h.com','www.start-line.co.jp','www.m-standard.co.jp','www.property-bank.co.jp','lifullhomes-index.jp')
         u=urlparse(url)
         if u.scheme!='https' or u.hostname not in allowed or u.username or u.password: raise AppError('取得先が不正です。')
         # After one genuine HOME'S 403, use one persistent real Chromium session for
         # the rest of this run instead of repeatedly sending blocked raw HTTP requests.
-        if method=='GET' and u.hostname=='www.homes.co.jp' and u.path!='/robots.txt' and self.homes_transport_mode=='browser':
+        if method=='GET' and u.hostname=='www.homes.co.jp' and u.path!='/robots.txt' and self.homes_transport_mode=='browser' and not getattr(self.local,'stage1_identity_only',False):
             return self.homes_browser_fetch(url,kwargs.get('params'))
         if method=='GET' and not kwargs.get('params') and url in self.http_cache:
             trace(self,'cache_hit',{'url':url,'source':'successful_detail_http_cache'},stage='http_cache');return self.http_cache[url]
@@ -2075,7 +2075,7 @@ class PublicWeb:
             # serving the same public page to an ordinary browser.  On a genuine 403,
             # retry once through real Chromium.  If Chromium is unavailable or is also
             # refused, the existing circuit breaker switches the run to SUUMO only.
-            if method=='GET' and u.hostname=='www.homes.co.jp' and u.path!='/robots.txt' and exc.response.status_code==403 and HOMES_BROWSER_FALLBACK:
+            if method=='GET' and u.hostname=='www.homes.co.jp' and u.path!='/robots.txt' and exc.response.status_code==403 and HOMES_BROWSER_FALLBACK and not getattr(self.local,'stage1_identity_only',False):
                 try:
                     trace(self,'homes_http403_browser_retry',{'url':url,'parameters':kwargs.get('params') or {},'decision':'real_chromium_once'},'WARNING','transport')
                     return self.homes_browser_fetch(url,kwargs.get('params'))
@@ -3739,7 +3739,7 @@ def _suumo_room_marker_points(web,soup,map_url):
 
 
 _JP_DIGIT_TRANS=str.maketrans('０１２３４５６７８９－ー−','0123456789---')
-_EXTERNAL_IDENTITY_HOSTS=('myhome.nifty.com','www.mansion-review.jp','www.e-room.co','www.housecom.jp','vidax-gotanda.jp','www.homes.co.jp','www.athome.co.jp','www.goodrooms.jp','www.able.co.jp')
+_EXTERNAL_IDENTITY_HOSTS=('myhome.nifty.com','www.mansion-review.jp','www.e-room.co','www.housecom.jp','vidax-gotanda.jp','www.homes.co.jp','www.athome.co.jp','www.goodrooms.jp','www.able.co.jp','www.mec-h.com','www.start-line.co.jp','www.m-standard.co.jp','www.property-bank.co.jp','lifullhomes-index.jp')
 
 
 def _normalize_japanese_address(value):
@@ -4032,7 +4032,9 @@ def _v133_osm_address_for_named_building(web,identity,map_point,region,official_
                 except SearchCancelled:raise
                 except (AppError,ValueError,TypeError,requests.RequestException) as exc:
                     status=(getattr(exc,'diagnostic',{}) or {}).get('status')
-                    if status in (403,429,503):
+                    # An unreachable external OSM server is not retried for
+                    # every room; keep this disabled ONLY in this app controller.
+                    if status in (403,429,503) or isinstance(exc,AppError):
                         with web.cache_lock:web.v133_osm_disabled=True
                     trace(web,'osm_identity_unavailable',{'reason':type(exc).__name__,'status':status},'WARNING','address.stage2')
                     return None
@@ -4179,6 +4181,185 @@ def _registry_precise_address_from_map(web,map_point,position_kind,munis,region_
     return result
 
 
+
+
+# V136: detailed-address validation from independently published building information.
+# We do not infer an exact number from the nearest address point. The external
+# source must publish that exact number; the official registry must contain it.
+_V136_MAX_REGISTRY_DISTANCE_M = 70.0
+_V136_OWNER_SITES = frozenset(('www.mec-h.com',))
+
+
+def _v136_external_addresses(text,region):
+    """Extract *this municipality and town only*; accept Japanese address spellings.
+
+    A bare N-chome text or the first nearby point is never a full address.
+    Suppress land-lot (地番) entries when a 住居表示 number is separately available.
+    """
+    if not isinstance(text,str) or not isinstance(region,dict):return []
+    code=str(region.get('code',''))
+    munis=region.get('munis') or {}
+    if code not in munis:return []
+    _,pref,city=munis[code]
+    town=address_key(region.get('town',''))
+    m=re.fullmatch(r'(.+?)(\d{1,2})丁目',town)
+    if not m:return []
+    stem,chome=m.groups()
+    if not stem or not chome:return []
+    normalized=address_key(unicodedata.normalize('NFKC',text)).translate(_JP_DIGIT_TRANS).replace('　',' ')
+    normalized=normalized.replace('‐','-').replace('‑','-').replace('–','-').replace('―','-')
+    # Some real estate sites write 荏原4-2-3 (chome-block-house).
+    p=re.compile(r'(?:(?:'+re.escape(pref)+r')\s*)?'+re.escape(city)+r'\s*'+re.escape(stem)
+        +r'\s*'+re.escape(chome)+r'(?:丁目\s*|-\s*)'
+        +r'(?P<block>\d{1,4})\s*(?:番(?:地)?(?:の)?\s*|[-－]\s*)'
+        +r'(?P<unit>\d{1,4})(?:号)?(?!\d)')
+    addresses={}
+    for mat in p.finditer(normalized):
+        # A registered land parcel number is not automatically a residential address.
+        after=normalized[mat.end():mat.end()+24]
+        before=normalized[max(0,mat.start()-24):mat.start()]
+        if re.search(r'^\s*[（(]\s*地番',after) or re.search(r'(?:地番|登記地番)\s*[:：]?\s*$',before):continue
+        block=str(int(mat.group('block')));unit=str(int(mat.group('unit')))
+        if block=='0' or unit=='0':continue
+        full=_normalize_japanese_address(pref+city+town+block+'-'+unit)
+        addresses[full]=None
+        if len(addresses)>=15:break
+    return list(addresses)
+
+
+def _v136_registry_confirmed(web,external_address,map_point,munis,region_code=None,position_kind=''):
+    """Verify independently published full address IN a real official registry row.
+
+    The pinned building position must be published as room_marker or image_pin;
+    the external full number must exist within 70m in this very municipality/town.
+    Ambiguity among nearby *other* numbers is not used to invent a winner.
+    """
+    if position_kind not in ('room_marker','image_pin') or not map_point:return None
+    region=_registry_verified_point(web,map_point,munis,region_code)
+    if not region:return None
+    region=dict(region,munis=munis)
+    code=str(region['code']);_,pref,city=munis[code]
+    expected_prefix=_normalize_japanese_address(address_key(pref+city+region['town']))
+    candidate_key=_normalize_japanese_address(address_key(external_address))
+    if not _detailed_address(candidate_key) or not candidate_key.startswith(expected_prefix):return None
+    towns=_registry_manifest(web,region)
+    wanted=address_key(region['town'])
+    matching=[]
+    for entry in towns:
+        if not isinstance(entry,dict):continue
+        place=normal(entry.get('oaza_cho'))+normal(entry.get('chome'))
+        info=(entry.get('csv_ranges') or {}).get('住居表示')
+        if address_key(place)!=wanted or not isinstance(info,dict):continue
+        try:offset,size=int(info['start']),int(info['length'])
+        except (TypeError,KeyError,ValueError):continue
+        if 0<=offset and 0<size<=ADDRESS_REGISTRY_MAX_TOWN_RANGE:matching.append((place,offset,size))
+    if len(matching)!=1:return None
+    place,offset,size=matching[0]
+    key=(code,offset,size)
+    with web.cache_lock:
+        cache=getattr(web,'address_registry_town_cache',None)
+        if cache is None:cache={};web.address_registry_town_cache=cache
+        locks=getattr(web,'address_registry_town_locks',None)
+        if locks is None:locks={};web.address_registry_town_locks=locks
+        gate=locks.setdefault(key,threading.Lock())
+    with gate:
+        with web.cache_lock:rows=cache.get(key)
+        if rows is None:
+            raw=_registry_range_text(web,region,offset,size)
+            if raw is None:return None
+            rows=_registry_read_rows(raw)
+            if not rows:return None
+            with web.cache_lock:
+                if len(cache)>=4:cache.pop(next(iter(cache)))
+                cache[key]=rows
+    matches=[]
+    for number,point in rows:
+        known=_normalize_japanese_address(address_key(pref+city+place+number))
+        if known!=candidate_key:continue
+        distance=meters(map_point,point)
+        if distance<=_V136_MAX_REGISTRY_DISTANCE_M:matches.append((distance,point))
+    if not matches:return None
+    distance,point=min(matches,key=lambda x:x[0])
+    return dict(address=candidate_key,reference_point=list(point),distance_m=distance,
+        official_region={k:region[k] for k in ('code','pref','town','label')},
+        registry_method='デジタル庁アドレス・ベース・レジストリ (Geolonia v2)',
+        verification='external_exact_building_address_plus_official_registry')
+
+
+def _v136_building_address_pages(web,links,identity,region_code,munis,map_point,position_kind):
+    """Match independent sources to one exact registered address, not a nearby guess.
+
+    An official property owner's site needs one validated publication; other
+    sites require agreement by two independent domains OR extra room facts.
+    HTML and Google/Yahoo snippets are not persisted in app memory.
+    """
+    try:region=_registry_verified_point(web,map_point,munis,region_code)
+    except (AppError,ValueError,TypeError):return None
+    if not region or position_kind not in ('room_marker','image_pin'):return None
+    region=dict(region,munis=munis)
+    candidates={}
+    for target in links[:12]:
+        host=urlparse(target).hostname or ''
+        if host not in _EXTERNAL_IDENTITY_HOSTS:continue
+        # Cache only extracted facts, never entire remote HTML. Many SUUMO rooms
+        # share one building; this prevents redundant external page downloads.
+        page_key=(target,_v133_building_token(identity.get('building_name')),address_key(region['town']))
+        with web.cache_lock:
+            fact_cache=getattr(web,'v136_external_page_facts',None)
+            if fact_cache is None:fact_cache={};web.v136_external_page_facts=fact_cache
+            facts=fact_cache.get(page_key)
+        if facts is None:
+            try:
+                if not web.permitted(target):continue
+                if host=='www.homes.co.jp':web.local.stage1_identity_only=True
+                try:reply=web.fetch(target)
+                finally:
+                    if host=='www.homes.co.jp':web.local.stage1_identity_only=False
+                soup=BeautifulSoup(reply.text,'html.parser')
+                page=' '.join(soup.stripped_strings)
+            except SearchCancelled:raise
+            except (AppError,ValueError,TypeError) as exc:
+                trace(web,'external_identity_page_failed',{'url':target,'exception_type':type(exc).__name__},'WARNING','address.fallback')
+                continue
+            score,evidence=_identity_match_score(page,identity)
+            options=_v136_external_addresses(page,region) if 'building_name' in evidence else []
+            facts=(score,tuple(evidence),tuple(options))
+            with web.cache_lock:
+                if len(fact_cache)>=120:fact_cache.pop(next(iter(fact_cache)))
+                fact_cache[page_key]=facts
+        score,evidence,options=facts
+        if 'building_name' not in evidence or not options:continue
+        for addr in options:
+            row=candidates.setdefault(addr,dict(hosts=set(),urls=[],score=0,owner=False))
+            row['hosts'].add(host);row['score']=max(row['score'],score)
+            if target not in row['urls']:row['urls'].append(target)
+            row['owner']=row['owner'] or host in _V136_OWNER_SITES
+    approved=[]
+    for address,row in candidates.items():
+        # One publisher with building name alone cannot validate an ambiguous
+        # page. Require original property owner OR two independent domains OR
+        # supporting age/area identity details on the very same public page.
+        if not (row['owner'] or len(row['hosts'])>=2 or row['score']>=8):continue
+        result=_v136_registry_confirmed(web,address,map_point,munis,region_code,position_kind)
+        if result:
+            result.update(external_hosts=sorted(row['hosts']),external_urls=row['urls'][:4],
+                          identity_evidence=['building_name','exact_registry_house_number'],
+                          stage='search_identity')
+            approved.append(result)
+    if len(approved)!=1:
+        if len(approved)>1:
+            trace(web,'v136_multiple_verified_addresses',{'building_name':normal(identity.get('building_name')),
+                   'count':len(approved),'decision':'reject_ambiguous'},'WARNING','address.fallback')
+        elif candidates:
+            trace(web,'v136_external_registry_unconfirmed',{'building_name':normal(identity.get('building_name')),
+                   'address_candidates':len(candidates),'domains':len({h for row in candidates.values() for h in row['hosts']})},'WARNING','address.fallback')
+        return None
+    result=approved[0]
+    trace(web,'v136_exact_building_address_verified',{'building_name':normal(identity.get('building_name')),
+          'address':result['address'],'distance_m':round(result['distance_m'],1),
+          'sources':result['external_hosts']},stage='address.fallback')
+    return result
+
 def _v134_stage1_api_result_links(web,query):
     """Stage 1 search via an authorized API, no anonymous search-page scraping.
 
@@ -4260,99 +4441,86 @@ def _v134_stage1_api_result_links(web,query):
 
 def _cross_source_address_from_identity(web,identity,map_point,munis,region_code=None,
                                         position_kind='',expected_towns=None):
-    """Two-stage address confirmation: independent identity then official registry.
-
-    Stage 1 uses source-page links only, never search snippets as proof.
-    A host that returns 429 is paused for one hour in THIS app controller, and
-    stage 2 can still run using independent official detailed point data.
-    Neither phase may use SUUMO's list/detail textual address.
-    """
+    """Stage 1 uses corroborated building address; stage 2 is strict map registry."""
     name=normal(identity.get('building_name'))
-    query='"'+name+'"'
-    ym=_identity_year_month(identity.get('raw_age'))
-    if ym:query+=f' {ym[0]}年{ym[1]}月'
-    layout=parsed_layout(identity.get('raw_layout'))
-    if layout:query+=' '+layout
     blocked=False;robots_blocked=False;result_links=[];search_errors=[]
     if len(name)>=3:
-        # First-stage improvement only: try the explicitly authorized API before
-        # the legacy search-page URLs. No stage-2 code was changed.
-        result_links.extend(_v134_stage1_api_result_links(web,query))
-        search_urls=(
-            'https://www.google.com/search?q='+quote(query),
-            'https://search.yahoo.co.jp/search?p='+quote(query),
-        )
-        for search_url in (() if result_links else search_urls):
-            host=urlparse(search_url).hostname
+        # Search once per building/town per controller, not once per apartment room.
+        # Query '住所' rather than the floorplan, which often excludes an owner's
+        # property-outline page from web search results.
+        query='"'+name+'" 東京都 住所'
+        cache_key=(str(region_code or ''),_v133_building_token(name))
+        # A per-building app-local lock prevents concurrent room workers from
+        # issuing the same Google/Yahoo queries simultaneously.
+        with web.cache_lock:
+            gates=getattr(web,'v136_building_search_locks',None)
+            if gates is None:gates={};web.v136_building_search_locks=gates
+            gate=gates.setdefault(cache_key,threading.Lock())
+            if len(gates)>200:
+                for key,old_gate in list(gates.items()):
+                    if key!=cache_key and not old_gate.locked():
+                        gates.pop(key,None)
+                        if len(gates)<=180:break
+        with gate:
             with web.cache_lock:
-                until=getattr(web,'identity_search_429',{}).get(host,0)
-            if not getattr(web,'stage1_direct',True):
-                blocked=True;robots_blocked=True
-                trace(web,'identity_search_direct_disabled',{'host':host,'next_stage':'address.stage2'},stage='address.fallback')
-                continue
-            if time.monotonic()<until:
-                blocked=True
-                trace(web,'identity_search_skipped_429',{'host':host,'reason':'cooldown','next_stage':'address.stage2'},stage='address.fallback')
-                continue
-            try:
-                # First-stage direct search is an independent app-scoped
-                # navigation. It bypasses only the application's own local
-                # robotparser rejection; remote HTTP responses still control
-                # whether a useful page can be fetched.
-                trace(web,'stage1_direct_search_attempt',{'host':host,'proxy_configured':bool(getattr(web,'stage1_http_proxies',[]))},stage='address.fallback')
-                reply=web.fetch(search_url)
-                search_title=response_title(reply.text)
-                if (urlparse(reply.url).path.startswith('/sorry/')
-                        or re.search(r'(?:unusual traffic|verify you are human|captcha|automated requests|通常とは異なるトラフィック)',
-                                     search_title+' '+reply.text[:5000],re.I)):
-                    blocked=True
+                cache=getattr(web,'v136_building_search_cache',None)
+                if cache is None:cache={};web.v136_building_search_cache=cache
+                cached=cache.get(cache_key)
+            if cached is not None:
+                result_links=list(cached)
+                trace(web,'v136_building_search_cache_hit',{'building_name':name,'links':len(result_links)},stage='address.fallback')
+            else:
+                result_links.extend(_v134_stage1_api_result_links(web,query))
+                search_urls=(
+                    'https://www.google.com/search?q='+quote(query),
+                    'https://search.yahoo.co.jp/search?p='+quote(query),
+                )
+                for search_url in (() if result_links else search_urls):
+                    host=urlparse(search_url).hostname
                     with web.cache_lock:
-                        breakers=getattr(web,'identity_search_429',None)
-                        if breakers is None:breakers={};web.identity_search_429=breakers
-                        breakers[host]=max(breakers.get(host,0.),time.monotonic()+1800)
-                    trace(web,'stage1_search_challenge',{'host':host,'status':reply.status_code,
-                          'decision':'stop_this_host_for_30min'},'WARNING','address.fallback')
-                    continue
-                soup=BeautifulSoup(reply.text,'html.parser')
-                result_links.extend(x for x in _external_result_links(soup,reply.url) if x not in result_links)
-            except AppError as exc:
-                status=(getattr(exc,'diagnostic',{}) or {}).get('status')
-                search_errors.append({'host':host,'status':status,'exception_type':type(exc).__name__,'reason':str(exc)})
-                if status in (403,429):
-                    blocked=True
-                    with web.cache_lock:
-                        breakers=getattr(web,'identity_search_429',None)
-                        if breakers is None:breakers={};web.identity_search_429=breakers
-                        breakers[host]=max(breakers.get(host,0.),time.monotonic()+(3600 if status==429 else 900))
-            if len(result_links)>=8:break
-    candidates={}
-    for target in result_links[:8]:
-        try:
-            if not web.permitted(target):continue
-            reply=web.fetch(target);soup=BeautifulSoup(reply.text,'html.parser');page_text=' '.join(soup.stripped_strings)
-        except AppError as exc:
-            trace(web,'external_identity_page_failed',{'url':target,'exception_type':type(exc).__name__},'WARNING','address.fallback');continue
-        score,evidence=_identity_match_score(page_text,identity)
-        if score<5 or 'building_name' not in evidence:continue
-        host=urlparse(target).hostname or ''
-        for address in _extract_detailed_addresses(page_text):
-            key=_normalize_japanese_address(address)
-            row=candidates.setdefault(key,{'address':key,'hosts':set(),'score':0,'evidence':set(),'urls':[]})
-            row['hosts'].add(host);row['score']=max(row['score'],score);row['evidence'].update(evidence);row['urls'].append(target)
-    ranked=sorted(candidates.values(),key=lambda r:(len(r['hosts']),r['score']),reverse=True)
-    for row in ranked:
-        if len(row['hosts'])<2 and row['score']<8:continue
-        validated=_gsi_validate_external_address(web,row['address'],munis,region_code)
-        if not validated:continue
-        ref=tuple(validated['reference_point']);distance=meters(map_point,ref) if map_point else None
-        if distance is not None and distance>2000:continue
-        validated.update(distance_m=distance if distance is not None else 0,
-                         external_hosts=sorted(row['hosts']),external_urls=row['urls'][:4],
-                         identity_evidence=sorted(row['evidence']),stage='search_identity')
-        trace(web,'external_identity_address_ok',{'building_name':name,'address':validated['address'],
-            'distance_m':round(distance,1) if distance is not None else None,
-            'hosts':validated['external_hosts'],'identity_evidence':validated['identity_evidence']},stage='address.fallback')
-        return validated
+                        until=getattr(web,'identity_search_429',{}).get(host,0)
+                    if not getattr(web,'stage1_direct',True):
+                        blocked=True;robots_blocked=True
+                        trace(web,'identity_search_direct_disabled',{'host':host,'next_stage':'address.stage2'},stage='address.fallback')
+                        continue
+                    if time.monotonic()<until:
+                        blocked=True
+                        trace(web,'identity_search_skipped_429',{'host':host,'reason':'cooldown','next_stage':'address.stage2'},stage='address.fallback')
+                        continue
+                    try:
+                        trace(web,'stage1_direct_search_attempt',{'host':host,
+                              'proxy_configured':bool(getattr(web,'stage1_http_proxies',[]))},stage='address.fallback')
+                        reply=web.fetch(search_url)
+                        search_title=response_title(reply.text)
+                        if (urlparse(reply.url).path.startswith('/sorry/')
+                                or re.search(r'(?:unusual traffic|verify you are human|captcha|automated requests|通常とは異なるトラフィック)',
+                                             search_title+' '+reply.text[:5000],re.I)):
+                            blocked=True
+                            with web.cache_lock:
+                                breakers=getattr(web,'identity_search_429',None)
+                                if breakers is None:breakers={};web.identity_search_429=breakers
+                                breakers[host]=max(breakers.get(host,0.),time.monotonic()+1800)
+                            trace(web,'stage1_search_challenge',{'host':host,'status':reply.status_code,
+                                  'decision':'stop_this_host_for_30min'},'WARNING','address.fallback')
+                            continue
+                        soup=BeautifulSoup(reply.text,'html.parser')
+                        result_links.extend(x for x in _external_result_links(soup,reply.url) if x not in result_links)
+                    except SearchCancelled:raise
+                    except AppError as exc:
+                        status=(getattr(exc,'diagnostic',{}) or {}).get('status')
+                        search_errors.append({'host':host,'status':status,'exception_type':type(exc).__name__})
+                        if status in (403,429):
+                            blocked=True
+                            with web.cache_lock:
+                                breakers=getattr(web,'identity_search_429',None)
+                                if breakers is None:breakers={};web.identity_search_429=breakers
+                                breakers[host]=max(breakers.get(host,0.),time.monotonic()+(3600 if status==429 else 900))
+                    if len(result_links)>=10:break
+                with web.cache_lock:
+                    if len(cache)>=120:cache.pop(next(iter(cache)))
+                    cache[cache_key]=list(result_links[:12])
+        exact=_v136_building_address_pages(web,result_links,identity,region_code,munis,map_point,position_kind)
+        if exact:return exact
     trace(web,'address_stage2_start',{'reason':'robots_disallowed' if robots_blocked else 'search_429' if blocked else 'no_verified_identity',
           'position_kind':position_kind,'primary_errors':search_errors,'search_result_links':len(result_links)},
           stage='address.stage2')
@@ -4362,7 +4530,7 @@ def _cross_source_address_from_identity(web,identity,map_point,munis,region_code
         return registry
     trace(web,'external_identity_address_unresolved',{'building_name':name,
           'search_errors':search_errors,'result_links':result_links[:8],
-          'candidate_count':len(candidates),'stage2':'official_registry_unresolved'},'WARNING','address.fallback')
+          'candidate_count':0,'stage2':'official_registry_unresolved'},'WARNING','address.fallback')
     return None
 
 
@@ -4437,12 +4605,12 @@ def suumo_location_from_kankyo_image(web,detail_soup,detail_url,bounds,munis,exp
     if not _detailed_address(address):return None
     external_used=bool(external)
     location={'latitude':lat,'longitude':lng,
-              'location_method':(('SUUMO物件マーカー→OSM建物名・住所と公的住所番号を照合' if external.get('verification')=='osm_exact_named_building_plus_address_registry' else 'SUUMO物件地図の正確なマーカー→デジタル庁住所基盤データ照合' if external.get('stage')=='official_registry' else 'SUUMO物件固有地図→建物名等を独立ソース照合→GSI住所確認') if external_used else method),
+              'location_method':(('SUUMO物件マーカー→OSM建物名・住所と公的住所番号を照合' if external.get('verification')=='osm_exact_named_building_plus_address_registry' else 'SUUMO物件地図の正確なマーカー→デジタル庁住所基盤データ照合' if external.get('stage')=='official_registry' else 'SUUMO物件マーカー→独立建物住所→公的住居表示番号と座標を照合' if external.get('verification')=='external_exact_building_address_plus_official_registry' else 'SUUMO物件固有地図→建物名等を独立ソース照合→GSI住所確認') if external_used else method),
               'map_address':address,'inferred_address':address,
-              'address_match':(('建物名と番地を独立情報で照合（OSM＋住所レジストリ）' if external.get('verification')=='osm_exact_named_building_plus_address_registry' else '公式住所点との近接・一意性を確認（推定）' if external.get('stage')=='official_registry' else '独立ソースで建物同一性を照合しGSIで番地確認') if external_used else '地図座標から番地・住居番号相当まで推定'),
+              'address_match':(('建物名と番地を独立情報で照合（OSM＋住所レジストリ）' if external.get('verification')=='osm_exact_named_building_plus_address_registry' else '公式住所点との近接・一意性を確認（推定）' if external.get('stage')=='official_registry' else '外部掲載の建物名・詳細住所と公的住所番号・位置を照合' if external.get('verification')=='external_exact_building_address_plus_official_registry' else '独立ソースで建物同一性を照合しGSIで番地確認') if external_used else '地図座標から番地・住居番号相当まで推定'),
               'coordinate_precision':'building' if external_used else 'listing_map',
               'position_source_url':source,
-              'address_precision':(('住居表示住所の公式点・近接一意性（建物一致は推定）' if external.get('stage')=='official_registry' else '独立複数ソース照合＋GSI住所検索') if external_used else 'GSI住居表示・街区符号/基礎番号'),
+              'address_precision':(('住居表示住所の公式点・近接一意性（建物一致は推定）' if external.get('stage')=='official_registry' else '外部掲載の住居表示住所＋公的住所番号・位置照合（推定）' if external.get('verification')=='external_exact_building_address_plus_official_registry' else '独立複数ソース照合＋GSI住所検索') if external_used else 'GSI住居表示・街区符号/基礎番号'),
               'address_distance_m':round(float(inferred.get('distance_m') or 0),2),
               'suumo_map_hint_latitude':lat,'suumo_map_hint_longitude':lng,
               'suumo_map_position_kind':position_kind,
