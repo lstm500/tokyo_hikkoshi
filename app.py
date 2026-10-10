@@ -40,7 +40,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v136"
+BUILD = "REBUILD-01-v137"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -3739,7 +3739,7 @@ def _suumo_room_marker_points(web,soup,map_url):
 
 
 _JP_DIGIT_TRANS=str.maketrans('０１２３４５６７８９－ー−','0123456789---')
-_EXTERNAL_IDENTITY_HOSTS=('myhome.nifty.com','www.mansion-review.jp','www.e-room.co','www.housecom.jp','vidax-gotanda.jp','www.homes.co.jp','www.athome.co.jp','www.goodrooms.jp','www.able.co.jp','www.mec-h.com','www.start-line.co.jp','www.m-standard.co.jp','www.property-bank.co.jp','lifullhomes-index.jp')
+_EXTERNAL_IDENTITY_HOSTS=('myhome.nifty.com','www.mansion-review.jp','www.e-room.co','www.housecom.jp','vidax-gotanda.jp','www.homes.co.jp','www.athome.co.jp','www.goodrooms.jp','www.able.co.jp','www.mec-h.com','www.start-line.co.jp','www.m-standard.co.jp','www.property-bank.co.jp','lifullhomes-index.jp','library.smtrc.jp','roomcore.jp','realestate.yahoo.co.jp','lifullhomes-satei.jp','sumnara.jp','house.goo.ne.jp')
 
 
 def _normalize_japanese_address(value):
@@ -4286,6 +4286,57 @@ def _v136_registry_confirmed(web,external_address,map_point,munis,region_code=No
         verification='external_exact_building_address_plus_official_registry')
 
 
+# V137: a named property's own location field is stronger than a page-wide
+# address match. Large estate-library pages often mention nearby buildings and
+# their addresses; those must NEVER be treated as this building's address.
+_V137_PRIMARY_MAX_METERS = 50.0
+_V137_LOCATION_FIELD = re.compile(
+    r'(?:\u6240\u5728\u5730(?:\s*[\uff08(]\s*\u4f4f\u6240\s*[\uff09)])?|'
+    r'\u4f4f\u6240|\u4f4f\u5c45\u8868\u793a)\s*[:\uff1a]?')
+_V137_GENERIC_BUILDING = re.compile(r'(?:\u99c5|\u7dda).*?(?:\u968e\u5efa|\u7bc9\d+\u5e74)')
+
+
+def _v137_primary_building_addresses(soup,identity,region):
+    """Exact address from the named building's own primary location field.
+
+    Requires a matching H1, an explicitly labelled location/address field,
+    only one address in the first property's main section, and a complete
+    block and residence number. Related property lists and footer matches do
+    not qualify. The official registry and pin are verified separately.
+    """
+    if soup is None or not isinstance(region,dict):return []
+    name=normal((identity or {}).get('building_name'))
+    token=_v133_building_token(name)
+    if len(token)<5 or _V137_GENERIC_BUILDING.search(name):return []
+    for heading in soup.find_all('h1',limit=8):
+        heading_token=_v133_building_token(heading.get_text(' ',strip=True))
+        if token not in heading_token:continue
+        parts=[];size=0
+        for node in heading.next_elements:
+            if getattr(node,'name',None)=='h1':break
+            if not isinstance(node,str) or getattr(node,'parent',None) is None:continue
+            if getattr(node.parent,'name','') in ('script','style','noscript','template'):continue
+            piece=normal(node)
+            if not piece:continue
+            # The property overview is near the first heading. Never scan the
+            # full document: related buildings are commonly listed later.
+            if size+len(piece)>5500:break
+            parts.append(piece);size+=len(piece)+1
+        content=' '.join(parts)
+        related=re.search(r'(?:\u5468\u8fba|\u8fd1\u96a3|\u4ed8\u8fd1)\u306e?(?:\u7269\u4ef6|\u30de\u30f3\u30b7\u30e7\u30f3|\u5efa\u7269|\u8cc3\u8cb8)|\u985e\u4f3c\u7269\u4ef6', content)
+        if related:content=content[:related.start()]
+        matches=[]
+        for label in _V137_LOCATION_FIELD.finditer(content):
+            # A labelled field, not a random full address elsewhere on a page.
+            text=content[label.end():label.end()+180]
+            candidates=_v136_external_addresses(text,region)
+            for address in candidates:
+                if address not in matches:matches.append(address)
+            if len(matches)>1:return []
+        if len(matches)==1:return matches
+    return []
+
+
 def _v136_building_address_pages(web,links,identity,region_code,munis,map_point,position_kind):
     """Match independent sources to one exact registered address, not a nearby guess.
 
@@ -4322,29 +4373,47 @@ def _v136_building_address_pages(web,links,identity,region_code,munis,map_point,
                 trace(web,'external_identity_page_failed',{'url':target,'exception_type':type(exc).__name__},'WARNING','address.fallback')
                 continue
             score,evidence=_identity_match_score(page,identity)
-            options=_v136_external_addresses(page,region) if 'building_name' in evidence else []
-            facts=(score,tuple(evidence),tuple(options))
+            primary=_v137_primary_building_addresses(soup,identity,region) if 'building_name' in evidence else []
+            # Main-building address replaces, rather than mixes with, nearby
+            # building addresses repeated in recommendations on the same page.
+            options=(primary or _v136_external_addresses(page,region)) if 'building_name' in evidence else []
+            facts=(score,tuple(evidence),tuple(options),tuple(primary))
             with web.cache_lock:
                 if len(fact_cache)>=120:fact_cache.pop(next(iter(fact_cache)))
                 fact_cache[page_key]=facts
-        score,evidence,options=facts
+        score,evidence,options,primary=facts
         if 'building_name' not in evidence or not options:continue
         for addr in options:
-            row=candidates.setdefault(addr,dict(hosts=set(),urls=[],score=0,owner=False))
+            row=candidates.setdefault(addr,dict(hosts=set(),urls=[],score=0,owner=False,primary_hosts=set()))
             row['hosts'].add(host);row['score']=max(row['score'],score)
             if target not in row['urls']:row['urls'].append(target)
             row['owner']=row['owner'] or host in _V136_OWNER_SITES
+            if addr in primary:row['primary_hosts'].add(host)
     approved=[]
     for address,row in candidates.items():
         # One publisher with building name alone cannot validate an ambiguous
         # page. Require original property owner OR two independent domains OR
         # supporting age/area identity details on the very same public page.
-        if not (row['owner'] or len(row['hosts'])>=2 or row['score']>=8):continue
+        primary=bool(row['primary_hosts'])
+        if not (row['owner'] or len(row['hosts'])>=2 or row['score']>=8 or primary):continue
         result=_v136_registry_confirmed(web,address,map_point,munis,region_code,position_kind)
         if result:
+            # One independent publisher is enough ONLY if its own building
+            # overview explicitly identifies this address, the number is in
+            # the registry, and the property marker is within 50 metres.
+            # Otherwise the v136 multisource/extra-evidence gate still applies.
+            old_gate=row['owner'] or len(row['hosts'])>=2 or row['score']>=8
+            if not old_gate and (not primary or result['distance_m']>_V137_PRIMARY_MAX_METERS):
+                trace(web,'v137_primary_address_outside_pin',{'building_name':normal(identity.get('building_name')),
+                    'distance_m':round(result['distance_m'],1),'limit_m':_V137_PRIMARY_MAX_METERS},
+                    'WARNING','address.fallback')
+                continue
             result.update(external_hosts=sorted(row['hosts']),external_urls=row['urls'][:4],
-                          identity_evidence=['building_name','exact_registry_house_number'],
+                          identity_evidence=['exact_h1_building_name','primary_location_field',
+                                             'exact_registry_house_number'] if primary else
+                          ['building_name','exact_registry_house_number'],
                           stage='search_identity')
+            if primary:result['verification']='v137_primary_building_location_plus_official_registry'
             approved.append(result)
     if len(approved)!=1:
         if len(approved)>1:
@@ -4605,12 +4674,12 @@ def suumo_location_from_kankyo_image(web,detail_soup,detail_url,bounds,munis,exp
     if not _detailed_address(address):return None
     external_used=bool(external)
     location={'latitude':lat,'longitude':lng,
-              'location_method':(('SUUMO物件マーカー→OSM建物名・住所と公的住所番号を照合' if external.get('verification')=='osm_exact_named_building_plus_address_registry' else 'SUUMO物件地図の正確なマーカー→デジタル庁住所基盤データ照合' if external.get('stage')=='official_registry' else 'SUUMO物件マーカー→独立建物住所→公的住居表示番号と座標を照合' if external.get('verification')=='external_exact_building_address_plus_official_registry' else 'SUUMO物件固有地図→建物名等を独立ソース照合→GSI住所確認') if external_used else method),
+              'location_method':(('SUUMO物件マーカー→OSM建物名・住所と公的住所番号を照合' if external.get('verification')=='osm_exact_named_building_plus_address_registry' else 'SUUMO物件地図の正確なマーカー→デジタル庁住所基盤データ照合' if external.get('stage')=='official_registry' else 'SUUMO物件マーカー→独立建物住所→公的住居表示番号と座標を照合' if external.get('verification') in ('external_exact_building_address_plus_official_registry','v137_primary_building_location_plus_official_registry') else 'SUUMO物件固有地図→建物名等を独立ソース照合→GSI住所確認') if external_used else method),
               'map_address':address,'inferred_address':address,
-              'address_match':(('建物名と番地を独立情報で照合（OSM＋住所レジストリ）' if external.get('verification')=='osm_exact_named_building_plus_address_registry' else '公式住所点との近接・一意性を確認（推定）' if external.get('stage')=='official_registry' else '外部掲載の建物名・詳細住所と公的住所番号・位置を照合' if external.get('verification')=='external_exact_building_address_plus_official_registry' else '独立ソースで建物同一性を照合しGSIで番地確認') if external_used else '地図座標から番地・住居番号相当まで推定'),
+              'address_match':(('建物名と番地を独立情報で照合（OSM＋住所レジストリ）' if external.get('verification')=='osm_exact_named_building_plus_address_registry' else '公式住所点との近接・一意性を確認（推定）' if external.get('stage')=='official_registry' else '外部掲載の建物名・詳細住所と公的住所番号・位置を照合' if external.get('verification') in ('external_exact_building_address_plus_official_registry','v137_primary_building_location_plus_official_registry') else '独立ソースで建物同一性を照合しGSIで番地確認') if external_used else '地図座標から番地・住居番号相当まで推定'),
               'coordinate_precision':'building' if external_used else 'listing_map',
               'position_source_url':source,
-              'address_precision':(('住居表示住所の公式点・近接一意性（建物一致は推定）' if external.get('stage')=='official_registry' else '外部掲載の住居表示住所＋公的住所番号・位置照合（推定）' if external.get('verification')=='external_exact_building_address_plus_official_registry' else '独立複数ソース照合＋GSI住所検索') if external_used else 'GSI住居表示・街区符号/基礎番号'),
+              'address_precision':(('住居表示住所の公式点・近接一意性（建物一致は推定）' if external.get('stage')=='official_registry' else '外部掲載の住居表示住所＋公的住所番号・位置照合（推定）' if external.get('verification') in ('external_exact_building_address_plus_official_registry','v137_primary_building_location_plus_official_registry') else '独立複数ソース照合＋GSI住所検索') if external_used else 'GSI住居表示・街区符号/基礎番号'),
               'address_distance_m':round(float(inferred.get('distance_m') or 0),2),
               'suumo_map_hint_latitude':lat,'suumo_map_hint_longitude':lng,
               'suumo_map_position_kind':position_kind,
