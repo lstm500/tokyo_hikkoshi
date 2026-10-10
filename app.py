@@ -40,7 +40,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v132"
+BUILD = "REBUILD-01-v135"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -145,6 +145,19 @@ def homes_direct_city_list_url(region, category='mansion'):
 # - Keep one browser session/cookie jar and one HOME'S navigation at a time.
 # - If HOME'S also refuses the real browser, stop HOME'S for that run and continue
 #   with SUUMO exactly as before.
+# The application-level robotparser check is not an HTTP rejection. For the
+# user-requested first-stage direct search only, use a consistent navigation
+# header profile. This cannot force remote servers to return a usable page.
+# No OS proxy/VPN settings are modified, and no CAPTCHA solving is attempted.
+_STAGE1_DIRECT_NAV_HEADERS = {
+    'User-Agent': ('Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 '
+                   '(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'),
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+    'Accept-Language': 'ja-JP,ja;q=0.9,en-US;q=0.7,en;q=0.6',
+    'Upgrade-Insecure-Requests': '1',
+}
+_STAGE1_DIRECT_MIN_INTERVAL = 5.0
+
 HOMES_BROWSER_FALLBACK = True
 HOMES_BROWSER_PAGE_TIMEOUT = 20
 HOMES_BROWSER_RENDER_WAIT = 0.8
@@ -1099,7 +1112,46 @@ def rental_network_settings():
             if u.scheme not in ('http','https') or not u.hostname or u.port is None or u.query or u.fragment or any(c.isspace() for c in value):raise ValueError()
         except ValueError:raise AppError('プロキシURLは http://ユーザー:パスワード@ホスト:ポート の形式で設定してください。') from None
         if value not in routes:routes.append(value)
-    return {'proxies':routes}
+    # Optional FIRST-STAGE-ONLY proxy routes. These are passed to requests on
+    # each Google/Yahoo request; they never alter OS-wide proxy configuration.
+    stage1_proxy_values=setting('STAGE1_SEARCH_HTTP_PROXIES',[]) or []
+    if isinstance(stage1_proxy_values,str):
+        stage1_proxy_values=[x.strip() for x in stage1_proxy_values.splitlines() if x.strip()]
+    stage1_proxy_single=setting('STAGE1_SEARCH_HTTP_PROXY','')
+    if stage1_proxy_single:stage1_proxy_values=[stage1_proxy_single,*stage1_proxy_values]
+    if not isinstance(stage1_proxy_values,(list,tuple)):
+        raise AppError('STAGE1_SEARCH_HTTP_PROXIES は接続URLの配列で設定してください。')
+    stage1_routes=[]
+    for value in stage1_proxy_values:
+        value=str(value).strip()
+        try:
+            u=urlparse(value)
+            if (u.scheme not in ('http','https') or not u.hostname or u.port is None
+                    or u.query or u.fragment or any(c.isspace() for c in value)):
+                raise ValueError()
+        except ValueError:
+            raise AppError('第1段階プロキシは http://ユーザー:パスワード@ホスト:ポート で設定してください。') from None
+        if value not in stage1_routes:stage1_routes.append(value)
+    # Direct search is enabled as requested. Set NO to disable it if a service
+    # prohibits automated fetching or a provider account requires API use.
+    direct_mode=str(setting('STAGE1_SEARCH_DIRECT','YES') or 'YES').strip().upper()=='YES'
+    # Stage 1 only: licensed search API, never an impersonated Google/Yahoo browser.
+    # An explicit affirmative secret is needed because third-party APIs may bill.
+    stage1_mode=str(setting('STAGE1_SEARCH_API_PROVIDER','off') or 'off').strip().lower()
+    accepted=str(setting('STAGE1_SEARCH_API_APPROVED','') or '').strip().upper()=='YES'
+    if accepted and stage1_mode not in ('off','brave','google_legacy'):
+        raise AppError('STAGE1_SEARCH_API_PROVIDER は off / brave / google_legacy のいずれかにしてください。')
+    stage1={'provider':'off','api_key':'','engine_id':'','max_requests':0}
+    if accepted and stage1_mode!='off':
+        key=str(setting('STAGE1_SEARCH_API_KEY','') or '').strip()
+        engine=str(setting('STAGE1_GOOGLE_CSE_ID','') or '').strip()
+        if not key or stage1_mode=='google_legacy' and not engine:
+            raise AppError('第1段階の正規検索APIを使うにはAPIキーと必要な検索エンジンIDを設定してください。')
+        try:budget=int(str(setting('STAGE1_SEARCH_API_MAX_REQUESTS',25) or 25))
+        except (ValueError,TypeError):raise AppError('STAGE1_SEARCH_API_MAX_REQUESTS は整数で指定してください。') from None
+        if not 1<=budget<=200:raise AppError('第1段階の検索API要求上限は1～200回にしてください。')
+        stage1.update(provider=stage1_mode,api_key=key,engine_id=engine,max_requests=budget)
+    return {'proxies':routes,'stage1_search':stage1,'stage1_direct':direct_mode,'stage1_http_proxies':stage1_routes}
 
 
 @st.cache_resource
@@ -1733,13 +1785,24 @@ class PublicWeb:
         self.headers={'User-Agent':'SumaiCompassRebuild/1.0 (personal rental research)', 'Accept-Language':'ja'}
         self.host_gates={};self.host_last_request={};self.host_backoff={};self.route_cooldowns={};self.session_primed=threading.local();self.proxy_routes=[];self.route_preferred={};self.route_lock=threading.Lock();self.http_cache={};self.headers.update({'Accept':'text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8'})
         self.robots={};self.lock=threading.Lock();self.layout_form_lock=threading.Lock();self.layout_form_cache={};self.provider_cache={};self.provider_lock=threading.RLock();self.unavailable_hosts={};self.failed_detail_urls={};self.provider_runtime_disabled={}
+        self.stage1_direct=True;self.stage1_http_proxies=[];self.stage1_search={}
         # HOME'S browser transport is lazy: Chromium is launched only after a genuine
         # server-side 403 from the normal HTTP path.  It is serialized because a
         # single human browser session is the intended navigation model.
         self.homes_browser_lock=threading.RLock();self.homes_browser_driver=None;self.homes_transport_mode='http';self.homes_browser_last_start=0.0;self.homes_browser_error=''
     def configure(self,config):
         self.proxy_routes=list((config or {}).get('proxies',[]))
-        trace(self,'transport_config',{'proxy_count':len(self.proxy_routes),'rental_route':'proxy' if self.proxy_routes else 'direct','other_services':'direct'},stage='http_config')
+        self.stage1_search=dict((config or {}).get('stage1_search') or {})
+        self.stage1_direct=bool((config or {}).get('stage1_direct',True))
+        self.stage1_http_proxies=list((config or {}).get('stage1_http_proxies') or [])
+        # Repeated calls across towns must not reset this app's usage counter.
+        if not hasattr(self,'stage1_api_lock'):self.stage1_api_lock=threading.RLock()
+        if not hasattr(self,'stage1_api_uses'):self.stage1_api_uses=0
+        if not hasattr(self,'stage1_api_cache'):self.stage1_api_cache={}
+        if not hasattr(self,'stage1_api_disabled'):self.stage1_api_disabled=False
+        trace(self,'transport_config',{'proxy_count':len(self.proxy_routes),'rental_route':'proxy' if self.proxy_routes else 'direct','other_services':'direct',
+            'stage1_search_api':self.stage1_search.get('provider','off'),'stage1_api_consent':self.stage1_search.get('provider','off')!='off',
+            'stage1_direct':self.stage1_direct,'stage1_proxy_count':len(self.stage1_http_proxies)},stage='http_config')
     def session(self,route=None):
         if not hasattr(self.local,'sessions'):self.local.sessions={}
         if route is None and hasattr(self.local,'session'):return self.local.session
@@ -1756,14 +1819,15 @@ class PublicWeb:
         self.check_cancel();host=urlparse(url).hostname
         headers=dict(self.headers);headers.update(options.get('headers',{}));options={k:v for k,v in options.items() if k!='headers'}
         policy=self.host_policy(host)
+        search_host=host in ('www.google.com','search.yahoo.co.jp') and urlparse(url).path=='/search'
         with policy['lock']:
             gate=policy['gates'].setdefault(host,threading.Lock())
-            slots=policy['slots'].setdefault(host,threading.BoundedSemaphore(PER_HOST_SLOTS))
+            slots=policy['slots'].setdefault(host,threading.BoundedSemaphore(1 if search_host else PER_HOST_SLOTS))
         while not slots.acquire(timeout=.1):self.check_cancel()
         try:
             while not gate.acquire(timeout=.1):self.check_cancel()
             try:
-                interval=HOMES_BROWSER_MIN_INTERVAL if host=='www.homes.co.jp' else PER_HOST_MIN_INTERVAL;parser=self.robots.get(urlparse(url).scheme+'://'+urlparse(url).netloc)
+                interval=(_STAGE1_DIRECT_MIN_INTERVAL if search_host else HOMES_BROWSER_MIN_INTERVAL if host=='www.homes.co.jp' else PER_HOST_MIN_INTERVAL);parser=self.robots.get(urlparse(url).scheme+'://'+urlparse(url).netloc)
                 if parser:
                     crawl=parser.crawl_delay(self.headers['User-Agent']);rate=parser.request_rate(self.headers['User-Agent'])
                     if crawl:interval=max(interval,float(crawl))
@@ -1894,7 +1958,11 @@ class PublicWeb:
     def request_routes(self,method,url,**kwargs):
         u=urlparse(url);host=u.hostname;root=u.scheme+'://'+u.netloc
         rental=host in RENTAL_HOSTS
-        routes=self.proxy_routes if rental and self.proxy_routes else [None]
+        stage1_page=host in ('www.google.com','search.yahoo.co.jp') and u.path=='/search'
+        if stage1_page and self.stage1_http_proxies:
+            routes=self.stage1_http_proxies
+        else:
+            routes=self.proxy_routes if rental and self.proxy_routes else [None]
         with self.route_lock:preferred=self.route_preferred.get(host,0)%len(routes)
         ordered=list(range(preferred,len(routes)))+list(range(preferred))
         last=None;skipped=[]
@@ -1904,6 +1972,8 @@ class PublicWeb:
             if until>time.monotonic():
                 skipped.append(index+1);trace(self,'route_cooldown',{'host':host,'route_number':index+1,'remaining_seconds':round(until-time.monotonic())},stage='transport');continue
             route=routes[index];session=self.session(route);options=dict(kwargs)
+            if stage1_page:
+                options['headers']={**_STAGE1_DIRECT_NAV_HEADERS,**options.get('headers',{})}
             if route:options['proxies']={'http':route,'https':route}
             referer=getattr(self.session_primed,'references',{}).get((root,index+1))
             if referer:options['headers']={**options.get('headers',{}),'Referer':referer}
@@ -1933,6 +2003,13 @@ class PublicWeb:
                             breakers[host]=max(breakers.get(host,0.),time.monotonic()+pause_seconds)
                         trace(self,'identity_search_rate_limited',{'host':host,'status':429,
                             'next_stage':'authoritative_address_registry','pause_seconds':round(pause_seconds)},'WARNING','address.fallback')
+                        # 429 is a host-level refusal: never try another proxy identity.
+                        return response
+                    # OSM's public endpoint has fair-use limits. A 429 is a
+                    # refusal, not a signal to retry under another identity.
+                    if host=='overpass-api.de' and status==429:
+                        trace(self,'osm_rate_limited',{'host':host,'status':429,
+                            'next_stage':'stop_independent_lookup'},'WARNING','address.stage2')
                         break
                     retry=status in (429,500,502,503,504)
                     if retry:
@@ -1967,7 +2044,7 @@ class PublicWeb:
             error=AppError(host+'：取得経路の待機中です（直前の403・429等）。設定した全経路の待機が終わってから再検索してください。');error.diagnostic={'skipped_routes':skipped};raise error
         return last
     def _fetch_uncached(self,url,method='GET',**kwargs):
-        allowed=tuple(RENTAL_HOSTS)+('mreversegeocoder.gsi.go.jp','msearch.gsi.go.jp','maps.gsi.go.jp','cyberjapandata.gsi.go.jp','japanese-addresses-v2.geoloniamaps.com','geolonia.github.io','img01.suumo.com','img02.suumo.com','maps.googleapis.com','maps.google.com','html.duckduckgo.com','www.google.com','search.yahoo.co.jp','myhome.nifty.com','www.mansion-review.jp','www.e-room.co','www.housecom.jp','vidax-gotanda.jp')
+        allowed=tuple(RENTAL_HOSTS)+('mreversegeocoder.gsi.go.jp','msearch.gsi.go.jp','maps.gsi.go.jp','cyberjapandata.gsi.go.jp','japanese-addresses-v2.geoloniamaps.com','overpass-api.de','geolonia.github.io','img01.suumo.com','img02.suumo.com','maps.googleapis.com','maps.google.com','html.duckduckgo.com','www.google.com','search.yahoo.co.jp','myhome.nifty.com','www.mansion-review.jp','www.e-room.co','www.housecom.jp','vidax-gotanda.jp','www.goodrooms.jp','www.able.co.jp')
         u=urlparse(url)
         if u.scheme!='https' or u.hostname not in allowed or u.username or u.password: raise AppError('取得先が不正です。')
         # After one genuine HOME'S 403, use one persistent real Chromium session for
@@ -2074,7 +2151,7 @@ class PublicWeb:
                 else: raise AppError('自動取得ルールを確認できません：'+str(exc)) from None
             with self.lock: self.robots[root]=parser
         permitted=parser.can_fetch(self.headers['User-Agent'],url)
-        trace(self,'robots_allowed' if permitted else 'http_403',{'url':url,'rule_source':root+'/robots.txt','permitted':permitted},'INFO' if permitted else 'WARNING','robots')
+        trace(self,'robots_allowed' if permitted else 'robots_disallowed',{'url':url,'rule_source':root+'/robots.txt','permitted':permitted},'INFO' if permitted else 'WARNING','robots')
         return permitted
 
 
@@ -3662,7 +3739,7 @@ def _suumo_room_marker_points(web,soup,map_url):
 
 
 _JP_DIGIT_TRANS=str.maketrans('０１２３４５６７８９－ー−','0123456789---')
-_EXTERNAL_IDENTITY_HOSTS=('myhome.nifty.com','www.mansion-review.jp','www.e-room.co','www.housecom.jp','vidax-gotanda.jp')
+_EXTERNAL_IDENTITY_HOSTS=('myhome.nifty.com','www.mansion-review.jp','www.e-room.co','www.housecom.jp','vidax-gotanda.jp','www.homes.co.jp','www.athome.co.jp','www.goodrooms.jp','www.able.co.jp')
 
 
 def _normalize_japanese_address(value):
@@ -3883,7 +3960,134 @@ def _registry_read_rows(text):
     return rows
 
 
-def _registry_precise_address_from_map(web,map_point,position_kind,munis,region_code=None,expected_towns=None):
+
+# V133: corroborate the registry with a *named physical building* from an
+# independent, public OSM element. Address points alone are not building IDs:
+# do not guess an address by relaxing the nearby-candidate distance margin.
+_OSM_V133_API = 'https://overpass-api.de/api/interpreter'
+_OSM_V133_MAX_REQUESTS = 12  # per collection worker: bound public-API demand
+_OSM_V133_MIN_INTERVAL = 4.0  # seconds between requests from this app instance
+
+
+def _v133_building_token(text):
+    value=unicodedata.normalize('NFKC',str(text or '')).casefold()
+    return re.sub(r'[^0-9a-z\u3040-\u30ff\u3400-\u9fff]', '',value)
+
+
+def _v133_osm_address_for_named_building(web,identity,map_point,region,official_ranked):
+    """Only exact building-name + exact-address + independent registry match.
+
+    Public Overpass returns OSM *buildings/POIs*, unlike residential frontage
+    number points. OSM can be incomplete: no match means no saved address.
+    """
+    name=normal((identity or {}).get('building_name'))
+    name_key=_v133_building_token(name)
+    if len(name_key)<5 or (re.search(r'(?:駅|線).*?(?:階建|築\d+年)',name)):
+        return None
+    if not map_point or not official_ranked:return None
+    if not region or not region.get('code') or not region.get('town'):return None
+    lat,lng=float(map_point[0]),float(map_point[1])
+    # One query per ~100m cell, shared by listings in the *same* collection.
+    grid=(round(lat,3),round(lng,3))
+    with web.cache_lock:
+        cache=getattr(web,'v133_osm_tile_cache',None)
+        if cache is None:cache={};web.v133_osm_tile_cache=cache
+        gate=getattr(web,'v133_osm_request_gate',None)
+        if gate is None:gate=threading.RLock();web.v133_osm_request_gate=gate
+        cached=cache.get(grid)
+    if cached is None:
+        with gate:
+            with web.cache_lock:
+                cached=cache.get(grid)
+                count=getattr(web,'v133_osm_request_count',0)
+                last=getattr(web,'v133_osm_last_request',0.)
+                disabled=getattr(web,'v133_osm_disabled',False)
+            if cached is None and count>=_OSM_V133_MAX_REQUESTS:
+                trace(web,'osm_budget_exhausted',{'max_queries':_OSM_V133_MAX_REQUESTS},stage='address.stage2')
+                return None
+            if cached is None and disabled:return None
+            if cached is None:
+                # Strong bound: one small 130m cell, named objects only, 12s
+                # Overpass server execution limit, max 500KB downloaded response.
+                q=f'[out:json][timeout:12];nwr["building"]["name"](around:130,{grid[0]:.3f},{grid[1]:.3f});out center;'
+                try:
+                    if not web.permitted(_OSM_V133_API):
+                        with web.cache_lock:web.v133_osm_disabled=True
+                        trace(web,'osm_not_permitted',{'source':'robots'},'WARNING','address.stage2')
+                        return None
+                    delay=max(0.,_OSM_V133_MIN_INTERVAL-(time.monotonic()-last)) if last else 0.
+                    if delay:web.pause(delay)
+                    with web.cache_lock:
+                        web.v133_osm_request_count=count+1
+                        web.v133_osm_last_request=time.monotonic()
+                    reply=web.fetch(_OSM_V133_API,params={'data':q})
+                    if len(reply.content)>500_000:raise ValueError('OSM response exceeds 500KB')
+                    data=reply.json()
+                    elements=data.get('elements') if isinstance(data,dict) else None
+                    if not isinstance(elements,list) or len(elements)>450:raise ValueError('OSM response exceeds the bounded element limit')
+                    cached=elements
+                    with web.cache_lock:
+                        if len(cache)>=40:cache.pop(next(iter(cache)))
+                        cache[grid]=cached
+                except SearchCancelled:raise
+                except (AppError,ValueError,TypeError,requests.RequestException) as exc:
+                    status=(getattr(exc,'diagnostic',{}) or {}).get('status')
+                    if status in (403,429,503):
+                        with web.cache_lock:web.v133_osm_disabled=True
+                    trace(web,'osm_identity_unavailable',{'reason':type(exc).__name__,'status':status},'WARNING','address.stage2')
+                    return None
+    code=str(region['code'])
+    try:pref,city=region['munis'][code][1:3]
+    except (IndexError,KeyError,TypeError):return None
+    town=normal(region['town'])
+    registry={_normalize_japanese_address(address_key(a)):(dist,point) for dist,a,point in official_ranked}
+    hits={}
+    for item in cached:
+        if not isinstance(item,dict):continue
+        tags=item.get('tags') or {}
+        if not isinstance(tags,dict):continue
+        # A named shop/node alone is not a verified apartment building.
+        if item.get('type') not in ('way','relation') or not tags.get('building'):continue
+        names=(tags.get('name'),tags.get('name:ja'),tags.get('alt_name'))
+        if name_key not in {_v133_building_token(x) for x in names if x}:continue
+        point=item.get('center') or item
+        if not isinstance(point,dict):continue
+        try:p=(float(point['lat']),float(point['lon']))
+        except (KeyError,ValueError,TypeError):continue
+        # An OSM named object must coincide with this very listing's map pin.
+        if meters(map_point,p)>32:continue
+        try:building_region=reverse(web,p,region['munis'],force=True)
+        except (AppError,ValueError,TypeError):continue
+        if not building_region or str(building_region.get('code'))!=code or address_key(building_region.get('town'))!=address_key(town):continue
+        if tags.get('addr:city') and _v133_building_token(city) not in _v133_building_token(tags['addr:city']):continue
+        if tags.get('addr:suburb') and _v133_building_token(town) not in _v133_building_token(tags['addr:suburb']):continue
+        raw=normal(tags.get('addr:full'))
+        if raw:
+            full=_normalize_japanese_address(address_key(raw))
+        else:
+            house=normal(tags.get('addr:housenumber'))
+            if not re.fullmatch(r'[0-9０-９]+[-－][0-9０-９]+(?:[-－][0-9０-９]+)?',house):continue
+            full=_normalize_japanese_address(address_key(pref+city+town+house))
+        if full not in registry:continue
+        dist,ref=registry[full]
+        if dist>50:continue  # frontages can lie well beyond building centroids
+        osm_id=item.get('id');kind=item.get('type')
+        url=(f'https://www.openstreetmap.org/{kind}/{osm_id}' if kind in ('way','node','relation') and str(osm_id).isdigit() else '')
+        hits[full]={'address':full,'reference_point':list(ref),'distance_m':dist,
+                    'verification':'osm_exact_named_building_plus_address_registry',
+                    'identity_evidence':['exact_building_name','exact_registry_house_number'],
+                    'external_hosts':['overpass-api.de',ADDRESS_REGISTRY_HOST],
+                    'external_urls':[url] if url else [],'registry_town':town}
+    if len(hits)!=1:
+        if len(hits)>1:trace(web,'osm_building_address_ambiguous',{'building_name':name,'matches':len(hits)},'WARNING','address.stage2')
+        return None
+    match=next(iter(hits.values()))
+    trace(web,'osm_building_address_verified',{'building_name':name,'address':match['address'],
+          'distance_m':round(match['distance_m'],1),'source':match['external_urls'][:1]},stage='address.stage2')
+    return match
+
+
+def _registry_precise_address_from_map(web,map_point,position_kind,munis,region_code=None,expected_towns=None,identity=None):
     """Stage 2: unique nearby official address, never a guessed block or town.
 
     Reject map centers (not necessarily the building), cross-town candidates,
@@ -3954,7 +4158,14 @@ def _registry_precise_address_from_map(web,map_point,position_kind,munis,region_
     if best_dist>ADDRESS_REGISTRY_MAX_DIST_M or second-best_dist<ADDRESS_REGISTRY_MIN_GAP_M:
         trace(web,'registry_precision_rejected',{'town':place,'nearest_m':round(best_dist,2),
               'runnerup_m':round(second,2) if math.isfinite(second) else None,
-              'max_m':ADDRESS_REGISTRY_MAX_DIST_M,'min_gap_m':ADDRESS_REGISTRY_MIN_GAP_M},'WARNING','address.stage2')
+              'max_m':ADDRESS_REGISTRY_MAX_DIST_M,'min_gap_m':ADDRESS_REGISTRY_MIN_GAP_M,
+              'next_stage':'OSM同一建物・同一番地の独立照合'},'WARNING','address.stage2')
+        verified=_v133_osm_address_for_named_building(web,identity,map_point,region,ranked)
+        if verified:
+            verified.update(official_region={k:region[k] for k in ('code','pref','town','label')},
+                            registry_method='Geolonia v2 + OpenStreetMap',
+                            registry_candidate_count=len(ranked))
+            return verified
         return None
     result={'address':address,'reference_point':list(address_point),'distance_m':best_dist,
             'official_region':{k:region[k] for k in ('code','pref','town','label')},
@@ -3968,11 +4179,90 @@ def _registry_precise_address_from_map(web,map_point,position_kind,munis,region_
     return result
 
 
+def _v134_stage1_api_result_links(web,query):
+    """Stage 1 search via an authorized API, no anonymous search-page scraping.
+
+    Explicit owner consent is mandatory (API requests may be billable); return
+    *only URLs* of original third-party pages. API snippets never verify addresses.
+    This function does not change the strict address/identity tests that follow.
+    """
+    config=getattr(web,'stage1_search',{}) or {}
+    provider=config.get('provider','off')
+    if provider not in ('brave','google_legacy') or not config.get('api_key'):
+        return []
+    gate=getattr(web,'stage1_api_lock',None)
+    if gate is None:
+        web.stage1_api_lock=threading.RLock();web.stage1_api_uses=0
+        web.stage1_api_cache={};web.stage1_api_disabled=False;gate=web.stage1_api_lock
+    with gate:
+        if query in web.stage1_api_cache:
+            return list(web.stage1_api_cache[query])
+        if web.stage1_api_disabled:
+            return []
+        limit=max(0,int(config.get('max_requests',0) or 0))
+        if web.stage1_api_uses>=limit:
+            trace(web,'stage1_api_budget_exhausted',{'provider':provider,'requests':web.stage1_api_uses,'limit':limit},stage='address.fallback')
+            return []
+        web.check_cancel()
+        # Per-controller serialized request pacing; never rotate identities on 429.
+        previous=float(getattr(web,'stage1_api_last_request',0.) or 0.)
+        delay=max(0.,1.25-(time.monotonic()-previous)) if previous else 0.
+        if delay:web.pause(delay)
+        web.stage1_api_last_request=time.monotonic()
+        # Count before sending; a rejected or timed-out call still consumes budget.
+        web.stage1_api_uses+=1
+        try:
+            if provider=='brave':
+                url='https://api.search.brave.com/res/v1/web/search'
+                headers={'X-Subscription-Token':config['api_key'],'Accept':'application/json'}
+                params={'q':query,'count':10,'country':'JP','search_lang':'ja'}
+            else:
+                # Google Custom Search JSON API: ONLY previously enabled clients.
+                # Google closed new signups in 2026; no undocumented endpoints.
+                url='https://www.googleapis.com/customsearch/v1'
+                headers={'Accept':'application/json'}
+                params={'key':config['api_key'],'cx':config['engine_id'],'q':query,'num':10,'gl':'jp','hl':'ja'}
+            # The isolated request intentionally NEVER passes a secret through
+            # PublicWeb.fetch, its URL logger, request trace, or audit exceptions.
+            reply=requests.get(url,params=params,headers=headers,timeout=(4,12),allow_redirects=False)
+            status=int(reply.status_code)
+            if status!=200:
+                if status in (401,403,429):web.stage1_api_disabled=True
+                trace(web,'stage1_api_unavailable',{'provider':provider,'status':status,
+                     'requests':web.stage1_api_uses,'disabled':web.stage1_api_disabled},'WARNING','address.fallback')
+                return []
+            if len(reply.content)>600_000:
+                trace(web,'stage1_api_response_too_large',{'provider':provider},'WARNING','address.fallback')
+                return []
+            body=reply.json()
+            rows=(body.get('web') or {}).get('results') if provider=='brave' else body.get('items')
+            if not isinstance(rows,list):rows=[]
+            links=[]
+            for row in rows[:10]:
+                if not isinstance(row,dict):continue
+                target=str(row.get('url' if provider=='brave' else 'link') or '').strip()
+                parsed=urlparse(target)
+                if parsed.scheme!='https' or parsed.hostname not in _EXTERNAL_IDENTITY_HOSTS or parsed.username or parsed.password:
+                    continue
+                if target not in links:links.append(target)
+            if len(web.stage1_api_cache)>=100:web.stage1_api_cache.pop(next(iter(web.stage1_api_cache)))
+            web.stage1_api_cache[query]=list(links)
+            trace(web,'stage1_search_api_result',{'provider':provider,'approved':True,
+                 'total_results':len(rows),'approved_original_links':len(links),'requests':web.stage1_api_uses},stage='address.fallback')
+            return links
+        except SearchCancelled:raise
+        except (requests.RequestException,ValueError,TypeError) as exc:
+            # Never log exception messages: requests exceptions may embed the API
+            # key in the request URL, and no token may enter diagnostic output.
+            trace(web,'stage1_api_network_failure',{'provider':provider,'exception_type':type(exc).__name__},'WARNING','address.fallback')
+            return []
+
+
 def _cross_source_address_from_identity(web,identity,map_point,munis,region_code=None,
                                         position_kind='',expected_towns=None):
     """Two-stage address confirmation: independent identity then official registry.
 
-    Stage 1 uses Google/Yahoo search-result LINKS, never search snippets as proof.
+    Stage 1 uses source-page links only, never search snippets as proof.
     A host that returns 429 is paused for one hour in THIS app controller, and
     stage 2 can still run using independent official detailed point data.
     Neither phase may use SUUMO's list/detail textual address.
@@ -3983,33 +4273,57 @@ def _cross_source_address_from_identity(web,identity,map_point,munis,region_code
     if ym:query+=f' {ym[0]}年{ym[1]}月'
     layout=parsed_layout(identity.get('raw_layout'))
     if layout:query+=' '+layout
-    blocked=False;result_links=[];search_errors=[]
+    blocked=False;robots_blocked=False;result_links=[];search_errors=[]
     if len(name)>=3:
+        # First-stage improvement only: try the explicitly authorized API before
+        # the legacy search-page URLs. No stage-2 code was changed.
+        result_links.extend(_v134_stage1_api_result_links(web,query))
         search_urls=(
             'https://www.google.com/search?q='+quote(query),
             'https://search.yahoo.co.jp/search?p='+quote(query),
         )
-        for search_url in search_urls:
+        for search_url in (() if result_links else search_urls):
             host=urlparse(search_url).hostname
             with web.cache_lock:
                 until=getattr(web,'identity_search_429',{}).get(host,0)
+            if not getattr(web,'stage1_direct',True):
+                blocked=True;robots_blocked=True
+                trace(web,'identity_search_direct_disabled',{'host':host,'next_stage':'address.stage2'},stage='address.fallback')
+                continue
             if time.monotonic()<until:
                 blocked=True
                 trace(web,'identity_search_skipped_429',{'host':host,'reason':'cooldown','next_stage':'address.stage2'},stage='address.fallback')
                 continue
             try:
-                if not web.permitted(search_url):raise AppError('検索元のrobotsルールで取得できません。')
-                reply=web.fetch(search_url);soup=BeautifulSoup(reply.text,'html.parser')
-                result_links.extend(x for x in _external_result_links(soup,reply.url) if x not in result_links)
-            except AppError as exc:
-                status=(getattr(exc,'diagnostic',{}) or {}).get('status')
-                search_errors.append({'host':host,'status':status,'exception_type':type(exc).__name__,'reason':str(exc)})
-                if status==429:
+                # First-stage direct search is an independent app-scoped
+                # navigation. It bypasses only the application's own local
+                # robotparser rejection; remote HTTP responses still control
+                # whether a useful page can be fetched.
+                trace(web,'stage1_direct_search_attempt',{'host':host,'proxy_configured':bool(getattr(web,'stage1_http_proxies',[]))},stage='address.fallback')
+                reply=web.fetch(search_url)
+                search_title=response_title(reply.text)
+                if (urlparse(reply.url).path.startswith('/sorry/')
+                        or re.search(r'(?:unusual traffic|verify you are human|captcha|automated requests|通常とは異なるトラフィック)',
+                                     search_title+' '+reply.text[:5000],re.I)):
                     blocked=True
                     with web.cache_lock:
                         breakers=getattr(web,'identity_search_429',None)
                         if breakers is None:breakers={};web.identity_search_429=breakers
-                        breakers[host]=max(breakers.get(host,0.),time.monotonic()+3600)
+                        breakers[host]=max(breakers.get(host,0.),time.monotonic()+1800)
+                    trace(web,'stage1_search_challenge',{'host':host,'status':reply.status_code,
+                          'decision':'stop_this_host_for_30min'},'WARNING','address.fallback')
+                    continue
+                soup=BeautifulSoup(reply.text,'html.parser')
+                result_links.extend(x for x in _external_result_links(soup,reply.url) if x not in result_links)
+            except AppError as exc:
+                status=(getattr(exc,'diagnostic',{}) or {}).get('status')
+                search_errors.append({'host':host,'status':status,'exception_type':type(exc).__name__,'reason':str(exc)})
+                if status in (403,429):
+                    blocked=True
+                    with web.cache_lock:
+                        breakers=getattr(web,'identity_search_429',None)
+                        if breakers is None:breakers={};web.identity_search_429=breakers
+                        breakers[host]=max(breakers.get(host,0.),time.monotonic()+(3600 if status==429 else 900))
             if len(result_links)>=8:break
     candidates={}
     for target in result_links[:8]:
@@ -4039,10 +4353,10 @@ def _cross_source_address_from_identity(web,identity,map_point,munis,region_code
             'distance_m':round(distance,1) if distance is not None else None,
             'hosts':validated['external_hosts'],'identity_evidence':validated['identity_evidence']},stage='address.fallback')
         return validated
-    trace(web,'address_stage2_start',{'reason':'search_429' if blocked else 'no_verified_identity',
+    trace(web,'address_stage2_start',{'reason':'robots_disallowed' if robots_blocked else 'search_429' if blocked else 'no_verified_identity',
           'position_kind':position_kind,'primary_errors':search_errors,'search_result_links':len(result_links)},
           stage='address.stage2')
-    registry=_registry_precise_address_from_map(web,map_point,position_kind,munis,region_code,expected_towns)
+    registry=_registry_precise_address_from_map(web,map_point,position_kind,munis,region_code,expected_towns,identity)
     if registry:
         registry['stage']='official_registry'
         return registry
@@ -4122,17 +4436,17 @@ def suumo_location_from_kankyo_image(web,detail_soup,detail_url,bounds,munis,exp
     address=inferred['address']
     if not _detailed_address(address):return None
     external_used=bool(external)
-    location={'latitude':float(inferred.get('reference_point',[lat,lng])[0]) if external_used else lat,
-              'longitude':float(inferred.get('reference_point',[lat,lng])[1]) if external_used else lng,
-              'location_method':(('SUUMO物件地図の正確なマーカー→デジタル庁住所基盤データ照合' if external.get('stage')=='official_registry' else 'SUUMO物件固有地図→建物名等を独立ソース照合→GSI住所確認') if external_used else method),
+    location={'latitude':lat,'longitude':lng,
+              'location_method':(('SUUMO物件マーカー→OSM建物名・住所と公的住所番号を照合' if external.get('verification')=='osm_exact_named_building_plus_address_registry' else 'SUUMO物件地図の正確なマーカー→デジタル庁住所基盤データ照合' if external.get('stage')=='official_registry' else 'SUUMO物件固有地図→建物名等を独立ソース照合→GSI住所確認') if external_used else method),
               'map_address':address,'inferred_address':address,
-              'address_match':(('公式住所点との近接・一意性を確認（推定）' if external.get('stage')=='official_registry' else '独立ソースで建物同一性を照合しGSIで番地確認') if external_used else '地図座標から番地・住居番号相当まで推定'),
+              'address_match':(('建物名と番地を独立情報で照合（OSM＋住所レジストリ）' if external.get('verification')=='osm_exact_named_building_plus_address_registry' else '公式住所点との近接・一意性を確認（推定）' if external.get('stage')=='official_registry' else '独立ソースで建物同一性を照合しGSIで番地確認') if external_used else '地図座標から番地・住居番号相当まで推定'),
               'coordinate_precision':'building' if external_used else 'listing_map',
               'position_source_url':source,
               'address_precision':(('住居表示住所の公式点・近接一意性（建物一致は推定）' if external.get('stage')=='official_registry' else '独立複数ソース照合＋GSI住所検索') if external_used else 'GSI住居表示・街区符号/基礎番号'),
               'address_distance_m':round(float(inferred.get('distance_m') or 0),2),
               'suumo_map_hint_latitude':lat,'suumo_map_hint_longitude':lng,
-              'suumo_map_position_kind':position_kind}
+              'suumo_map_position_kind':position_kind,
+              'address_reference_point':inferred.get('reference_point') if external_used else None}
     if external_used:
         location['address_identity_sources']=external.get('external_hosts',[]) or ([ADDRESS_REGISTRY_HOST] if external.get('stage')=='official_registry' else [])
         location['address_identity_evidence']=external.get('identity_evidence',[])
@@ -5044,7 +5358,7 @@ def search_all(db,conditions,screen,state=None):
                     errors_now=rejected+len(save_failed_keys-saved)
                     processed_now=len(saved)+errors_now
                     state.live_metrics={'processed':processed_now,'saved':len(saved),'errors':errors_now,'skipped':skipped}
-                    screen['status'].info(f'検索実行中｜処理 {processed_now}件｜保存 {len(saved)}件｜エラー {errors_now}件｜スキップ {skipped}件')
+                    screen['status'].info(f'検索実行中｜処理 {processed_now}件｜保存 {len(saved)}件｜未保存 {errors_now}件｜スキップ {skipped}件')
                     try:
                         for offset in range(0,len(batch),200):
                             chunk=batch[offset:offset+200];saved.update(db.save_units(chunk));state.new_last_saved_at=utc_now()
@@ -5073,7 +5387,7 @@ def search_all(db,conditions,screen,state=None):
                 errors_now=rejected+len(save_failed_keys-saved)
                 processed_now=len(saved)+errors_now
                 state.live_metrics={'processed':processed_now,'saved':len(saved),'errors':errors_now,'skipped':skipped}
-                metrics=f'処理 {processed_now}件｜保存 {len(saved)}件｜エラー {errors_now}件｜スキップ {skipped}件'
+                metrics=f'処理 {processed_now}件｜保存 {len(saved)}件｜未保存 {errors_now}件｜スキップ {skipped}件'
                 screen['bar'].progress(.2+.75*done/max(1,len(jobs)),text=metrics)
                 screen['status'].info('検索実行中｜'+metrics)
         search['status']='cancelled' if web.cancel_event.is_set() else 'partial' if issues else 'completed'
@@ -5151,7 +5465,7 @@ def search_all(db,conditions,screen,state=None):
                 'category':'save_failure','reason':'Supabaseへの保存を最終再試行後も確認できない',
                 'observed':{'listing_key':key},'expected':'Supabase保存確認','evidence':[]})
     audit.add('map','data_ready','INFO',{'confirmed_units':len(units),'colored_points':sum(has_point(r) for r in units.values()),'render_deferred_until_saved_data_load':False})
-    screen['status'].info(f'検索終了｜処理 {final_processed}件｜保存 {len(saved)}件｜エラー {final_errors}件｜スキップ {skipped}件')
+    screen['status'].info(f'検索終了｜処理 {final_processed}件｜保存 {len(saved)}件｜未保存 {final_errors}件｜スキップ {skipped}件')
     audit.add('search','finish','INFO',{'status':search['status'],'summary':search['summary']})
     try:
         audit.persist(db,force=True)
@@ -5236,6 +5550,8 @@ DIAG_ADVICE={
  'reverse_address_pending':('地図位置は保持・逆算住所は未確認','国土地理院の通信結果と市区町村コード表を確認する。逆算住所の未確認で地図位置を捨てない。'),
  'map_multiple_candidates':('物件の座標候補が競合','候補の出所を照合する。店や地図中心の座標で代用しない。'),
  'map_address_difference':('掲載住所と逆算町字が異なる','掲載地図の座標と逆算住所を別項目で確認する。番地の一致とは扱わない。'),
+ 'robots_disallowed':('取得先のrobotsルールによる制限','取得先の制限・利用規約を確認し、利用可能な検索APIを優先する。'),
+ 'osm_rate_limited':('OpenStreetMap APIの利用制限','この収集では問い合わせを中止し、次の地域へ進む。アクセス制限を回避しない。'),
  'unknown':('現時点で理由を特定できない','前後の通信・解析・除外イベントを照合する。再現URLと読取項目を追加してから修正する。原因を断定しない。')}
 
 DIAG_ADVICE.update({'address_tile_empty':('GSIの住所タイルにデータがない','HTTP 404とNoSuchKeyが両方確認された空タイル。取得できた周辺タイルの同一町丁目の住所候補を比較する。その他の通信失敗と区別する。'),'listing_rejected':('物件の除外理由と工程・取得値・期待値','failed_stage/observed/expected/evidenceで条件不一致と読取・住所推定失敗を区別する。'),'listing_failed':('物件の通信・解析処理に失敗','HTTP状態・例外型・直前の工程を確認する。原因未確定を確定扱いしない。')})
@@ -6836,11 +7152,11 @@ def snapshot_count_metrics(snapshot):
         saved=max(0,int(summary.get('saved',0) or 0));errors=max(0,int(summary.get('errors',summary.get('rejected',0)) or 0));skipped=max(0,int(summary.get('already_acquired',0) or 0))
         return {'processed':saved+errors,'saved':saved,'errors':errors,'skipped':skipped}
     message=str(snapshot.get('message') or '')
-    m=re.search(r'処理\s*(\d+)件.*?保存\s*(\d+)件.*?エラー\s*(\d+)件.*?スキップ\s*(\d+)件',message)
+    m=re.search(r'処理\s*(\d+)件.*?保存\s*(\d+)件.*?(?:未保存|エラー)\s*(\d+)件.*?スキップ\s*(\d+)件',message)
     if m:return dict(zip(keys,map(int,m.groups())))
     # Compatibility with older running collectors: '詳細' means detail processing
     # started; '除外' is a completed failure.  Only completed outcomes are shown.
-    saved_m=re.search(r'(?:保存確認|保存)\s*(\d+)(?:件)?',message);error_m=re.search(r'(?:除外|エラー)\s*(\d+)(?:件)?',message);skip_m=re.search(r'(?:取得済みスキップ|スキップ)\s*(\d+)(?:件)?',message)
+    saved_m=re.search(r'(?:保存確認|保存)\s*(\d+)(?:件)?',message);error_m=re.search(r'(?:未保存|除外|エラー)\s*(\d+)(?:件)?',message);skip_m=re.search(r'(?:取得済みスキップ|スキップ)\s*(\d+)(?:件)?',message)
     saved=int(saved_m.group(1)) if saved_m else 0;errors=int(error_m.group(1)) if error_m else 0;skipped=int(skip_m.group(1)) if skip_m else 0
     return {'processed':saved+errors,'saved':saved,'errors':errors,'skipped':skipped}
 
@@ -6855,7 +7171,7 @@ def background_progress():
         if auto and auto['running']:
             current=auto.get('current',{})
             live=snapshot_count_metrics(current)
-            live_text=f"処理 {int(live.get('processed',0))}件｜保存 {int(live.get('saved',0))}件｜エラー {int(live.get('errors',0))}件｜スキップ {int(live.get('skipped',0))}件"
+            live_text=f"処理 {int(live.get('processed',0))}件｜保存 {int(live.get('saved',0))}件｜未保存 {int(live.get('errors',0))}件｜スキップ {int(live.get('skipped',0))}件"
             st.progress(min(.99,max(0.,auto['progress'])),text=live_text)
             st.caption('現在｜'+live_text)
             if auto.get('message') and live_text not in str(auto.get('message')):st.caption(auto['message'])
@@ -6878,13 +7194,13 @@ def background_progress():
         st.caption('処理更新：'+acquisition_time_jst(snap.get('updated_at'))+'｜最終物件保存：'+acquisition_time_jst(snap.get('last_saved_at')))
         if snap['finished']:
             result=snap.get('result') or {};summary=result.get('summary',{})
-            st.info(f"検索終了｜処理 {int(summary.get('processed',0))}件｜保存 {int(summary.get('saved',0))}件｜エラー {int(summary.get('errors',0))}件｜スキップ {int(summary.get('already_acquired',0))}件")
+            st.info(f"検索終了｜処理 {int(summary.get('processed',0))}件｜保存 {int(summary.get('saved',0))}件｜未保存 {int(summary.get('errors',0))}件｜スキップ {int(summary.get('already_acquired',0))}件")
             if summary.get('unsaved'):st.error('未保存 '+str(summary['unsaved'])+'件。保存に失敗したデータはサーバーのメモリに保持しています。作業ログを確認してください。')
             if summary.get('acquisition_ids_pending'):st.error('取得済みIDの保存未確認 '+str(summary['acquisition_ids_pending'])+'件。次回は再取得対象になります。')
             if st.button('取得済みデータを地図へ反映',key='refresh_finished_map'):refresh_map()
             return
         live=snapshot_count_metrics(snap)
-        live_text=f"処理 {int(live.get('processed',0))}件｜保存 {int(live.get('saved',0))}件｜エラー {int(live.get('errors',0))}件｜スキップ {int(live.get('skipped',0))}件"
+        live_text=f"処理 {int(live.get('processed',0))}件｜保存 {int(live.get('saved',0))}件｜未保存 {int(live.get('errors',0))}件｜スキップ {int(live.get('skipped',0))}件"
         progress_text='バックグラウンドで地図位置・住所を確認しています' if isinstance(job,PositionRepairJob) else live_text
         st.progress(min(.99,snap['progress']),text=progress_text)
         if not isinstance(job,PositionRepairJob):st.caption('現在｜'+live_text)
@@ -8238,7 +8554,7 @@ def automatic_collection_panel():
     if snap:
         summary=snap['summary'];st.write(snap['message']);st.progress(min(1.,max(0.,snap['progress'])))
         current=snap.get('current') or {};live=snapshot_count_metrics(current)
-        if current:st.caption(f"現在｜処理 {int(live.get('processed',0))}件｜保存 {int(live.get('saved',0))}件｜エラー {int(live.get('errors',0))}件｜スキップ {int(live.get('skipped',0))}件")
+        if current:st.caption(f"現在｜処理 {int(live.get('processed',0))}件｜保存 {int(live.get('saved',0))}件｜未保存 {int(live.get('errors',0))}件｜スキップ {int(live.get('skipped',0))}件")
         if current and busy:
             st.caption('処理工程：'+str(current.get('collection_stage') or '確認中')+
                        '｜取得処理の最終進捗 '+str(int(current.get('idle_seconds') or 0))+'秒前')
@@ -8249,7 +8565,8 @@ def automatic_collection_panel():
         cumulative_saved=int(summary.get('saved_observations',0))
         cumulative_errors=int(summary.get('error_observations',0))
         cumulative_skipped=int(summary.get('skipped_observations',0))
-        st.caption(f'累計｜処理 {cumulative_processed}件｜保存 {cumulative_saved}件｜エラー {cumulative_errors}件｜スキップ {cumulative_skipped}件')
+        st.caption(f'累計｜処理 {cumulative_processed}件｜保存 {cumulative_saved}件｜未保存 {cumulative_errors}件｜スキップ {cumulative_skipped}件')
+        st.caption('未保存には住所未確定・検索条件外・通信失敗などを含みます。詳細ログで理由を区別します。住所照合：© OpenStreetMap contributors / ODbL（https://www.openstreetmap.org/copyright）')
 
         labels=list(summary.get('task_labels') or [p['label'] for p in automatic_task_plan(snap.get('settings') or {})])
         if labels:
@@ -9165,7 +9482,7 @@ def main():
             summary=result['summary'];saved=summary.get('saved',0);confirmed=summary.get('confirmed',0)
             if result.get('conditions',{}).get('mode')=='published_map_position_repair':st.info(f"位置の再確認：{summary.get('position_attempted',0)}件｜位置改善 {summary.get('position_updated',0)}件｜未確認 {summary.get('position_pending',0)}件｜全募集を保持")
             processed=int(summary.get('processed',0));errors=int(summary.get('errors',0));skipped=int(summary.get('already_acquired',0))
-            metrics=f'処理 {processed}件｜保存 {saved}件｜エラー {errors}件｜スキップ {skipped}件'
+            metrics=f'処理 {processed}件｜保存 {saved}件｜未保存 {errors}件｜スキップ {skipped}件'
             if result['status']=='completed': st.success('検索完了｜'+metrics)
             elif result['status']=='cancelled': st.info('検索中断｜'+metrics)
             elif result['status']=='partial': st.error('検索終了｜'+metrics)
@@ -9303,6 +9620,13 @@ def main():
         st.code('RENTAL_HTTP_PROXIES = ["http://ユーザー:パスワード@ホスト:ポート", "http://別のユーザー:パスワード@別のホスト:ポート"]',language='toml')
         try:st.caption('設定済みプロキシ：'+str(len(rental_network_settings()['proxies']))+'経路')
         except AppError as exc:st.error(str(exc))
+        st.caption('第1段階：Google・Yahoo!検索ページを通常のHTTPナビゲーションとして取得します。旧版のアプリ内robots判定で事前遮断せず、取得できた場合は元の物件掲載ページで建物と住所を照合します。公開先が実際に403/429を返す場合は停止します。')
+        st.caption('第1段階専用のHTTP(S)プロキシを使う場合は下記Secretsに設定できます。設定しなければ直接通信です。OS・他アプリ・共有環境のVPN/プロキシ設定を変更しません。')
+        st.code('STAGE1_SEARCH_DIRECT = "YES"\nSTAGE1_SEARCH_HTTP_PROXIES = ["http://ユーザー:パスワード@ホスト:ポート"]',language='toml')
+        st.caption('サイトのrobots.txt上の方針や利用規約が変更されることがあります。HTTPヘッダーやプロキシによる取得成功を保証しません。Google・Yahoo!の実際のアクセス制限・CAPTCHAを突破する処理はありません。検索APIは任意で追加できます。')
+        st.caption('検索APIは課金される場合があります。既定では無効です。利用者が契約・キー取得後に明示的に有効化した場合のみ要求します。上限はアプリ実行プロセスごとであり、請求上限ではありません。')
+        st.code('STAGE1_SEARCH_API_PROVIDER = "brave"\nSTAGE1_SEARCH_API_KEY = "契約したサービスのAPIキー"\nSTAGE1_SEARCH_API_APPROVED = "YES"\nSTAGE1_SEARCH_API_MAX_REQUESTS = 25',language='toml')
+        st.caption('Googleの既存Custom Search API契約がある場合は PROVIDER = "google_legacy" とし、STAGE1_GOOGLE_CSE_ID = "既存の検索エンジンID" を追加してください。Yahoo! JAPANのウェブ検索APIは提供を終了しています。')
         st.caption('追加対策：同じ経路で公開トップページを確認してCookieを引き継ぎ、物件サイトごとに同時通信2件・通信開始は最低1秒間隔で取得します。403の経路とURLは60秒休止し、別の公開条件ページも確認します。')
         st.caption('利用するプロキシサービスの接続URLを設定してください。設定済みの経路で403・空応答・通信失敗が出た場合は別の経路へ切り替えます。認証情報は作業ログへ出力しません。')
         st.write('3．接続確認が成功したら、「住まいを探す」の地図を動かして検索してください。')
@@ -9324,7 +9648,7 @@ analyze public.housing_searches_v1;'''
         st.caption(f'実行中の版：{BUILD}')
     with st.expander('取得・集計の範囲'):
         st.write('SUUMOのみで検索します。マンションは築15年以内、1LDK/2K/2DKまたは2LDK/3K/3DK。一戸建て・その他は築40年以内・50㎡以上を対象とします。住所は物件固有の地図の座標から推定します。')
-        st.caption('住所推定：SUUMOの物件地図→GSI住所点→建物名による独立照合。Google・Yahoo!で429等により住所を確認できない場合は、デジタル庁アドレス・ベース・レジストリ由来のGeolonia住所点で第2段階の照合を行います。正確な物件マーカーと近接・一意性が確認できなければ保存しません。出典：Geolonia japanese-addresses-v2／デジタル庁。')
+        st.caption('住所推定：SUUMOの物件地図→GSI住所点→第1段階の外部建物情報照合（設定済みの正規検索APIを優先し、なければGoogle・Yahoo!の検索ページを試行）。HTTP 403/429や照合失敗時は第2段階の住所レジストリ・OSMに進みます。番地精度の基準は維持します。')
         st.write('データベースへ保存する募集項目は家賃・間取り・種別（マンション／一戸建て）・詳細住所（推定）・データ取得日時です。取得日時はUTCで保存し、画面では日本時間で表示します。管理費・面積・築年数・画像・緯度経度・掲載URLは募集データとして保存しません。')
         st.write('募集情報は既存SupabaseのJSON保存領域へ保存するため、追加SQLは不要です。schema 4・5の保存データを読み込みます。旧データの取得日時は未記録と表示します。')
         st.write('SUUMOは物件固有地図の座標を起点に、国土地理院の住居表示住所データから詳細住所を推定します。一覧・詳細ページの所在地文字列から住所や位置を補完しません。')
