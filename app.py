@@ -40,7 +40,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v143"
+BUILD = "REBUILD-01-v145"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -962,8 +962,12 @@ def saved_address_requires_reacquisition(value):
         return not bool(re.search(r'[0-9０-９一二三四五六七八九十百]',tail))
     if re.search(r'[0-9０-９]+\s*[-‐‑‒–—―ー−－]\s*[0-9０-９]+',address):return False
     if re.search(r'[0-9０-９]+\s*番(?:地)?|[0-9０-９]+\s*号',address):return False
-    # Do not force a re-fetch for older non-chome notations unless they are empty;
-    # the explicit user requirement here is to re-fetch town/chome-only rows.
+    # A former build stored e.g. 東京都豊島区東池袋3 without 丁目, block or lot.
+    # Such bare chome numbers are *not* detailed addresses.  Do not silently
+    # treat their older acquisition ledgers as verified or draw them on the map.
+    municipality=re.search(r'(?:区|市|町|村)([^\d０-９]+)$',address)
+    if municipality and len(municipality.group(1))>=2:return True
+    if re.search(r'(?:区|市|町|村)[^0-9０-９\-‐‑‒–—―ー−－]{2,40}[0-9０-９]{1,2}$',address):return True
     return False
 
 
@@ -1301,7 +1305,8 @@ class Database:
                 'status':'rental_acquisition','started_at':stamp,'finished_at':stamp,
                 'conditions':{'provider':'SUUMO','property_id':property_id,'schema':2},
                 'summary':{'last_success_at':stamp,'listing_key':compact_listing_key(row),
-                           'address_complete':not saved_address_requires_reacquisition(row.get('address') or row.get('inferred_address'))}}
+                           'address_complete':not saved_address_requires_reacquisition(row.get('address') or row.get('inferred_address')),
+                            'address_quality_version':3}}
         return list(unique.values())
 
     def save_units(self,rows):
@@ -1437,22 +1442,26 @@ class Database:
                 if not re.fullmatch(r'SUUMO:(?:bc|jnc):\d+',pid) or not recent_acquisition(stamp):continue
                 complete=summary.get('address_complete')
                 key=normal(summary.get('listing_key'))
-                if complete is True:
+                version=summary.get('address_quality_version')
+                # Pre-v145 address_complete=True was unreliable for strings such
+                # as 東池袋3.  Validate its linked saved listing once rather than
+                # incorrectly suppressing re-acquisition indefinitely.
+                if complete is True and version==3:
                     ledger[pid]=stamp
-                elif complete is None and re.fullmatch(r'[0-9a-f]{64}',key):
+                elif re.fullmatch(r'[0-9a-f]{64}',key):
                     legacy[pid]=(stamp,key)
-                # Explicit incomplete addresses / missing linkage must be retried.
+                # Missing/explicitly incomplete linkage remains a re-fetch target.
             if len(rows)<500:break
             new_last=str(rows[-1].get('id') or '')
             if not new_last or new_last<=last_id:raise AppError('取得済みIDのページ送りが停止しました。')
             last_id=new_last
         unique_keys=sorted({key for _,key in legacy.values()})
         addresses={};lookups=0
-        for offset in range(0,len(unique_keys),60):
-            batch=unique_keys[offset:offset+60]
+        for offset in range(0,len(unique_keys),125):
+            batch=unique_keys[offset:offset+125]
             rows=self.call('GET',SEARCH_TABLE,{'namespace':'eq.'+self.namespace,
                 'id':'in.('+','.join('listing.'+key for key in batch)+')',
-                'select':'id,summary','limit':60})
+                'select':'id,summary','limit':125})
             lookups+=1
             if not isinstance(rows,list):raise AppError('旧取得済み物件の住所品質を確認できません。')
             for item in rows:
@@ -1511,7 +1520,7 @@ class Database:
             page_start=len(out)
             for item in rows:
                 meta=item.get('conditions') or {}
-                if int(meta.get('schema') or 0) not in (4,5,6,7):
+                if int(meta.get('schema') or 0) not in (3,4,5,6,7):
                     self.last_load_diagnostic['excluded']['legacy_schema']+=1;continue
                 raw=(item.get('summary') or {}).get('listing')
                 compact=compact_saved_listing(raw if isinstance(raw,dict) else {})
@@ -1561,7 +1570,7 @@ class Database:
             if not rows:break
             for item in rows:
                 meta=item.get('conditions') or {}
-                if int(meta.get('schema') or 0) not in (4,5,6,7):continue
+                if int(meta.get('schema') or 0) not in (3,4,5,6,7):continue
                 raw=(item.get('summary') or {}).get('listing')
                 compact=compact_saved_listing(raw if isinstance(raw,dict) else {})
                 if not compact:continue
@@ -2094,7 +2103,19 @@ class PublicWeb:
                 target=urljoin(response.url,response.headers.get('Location',''))
                 v=urlparse(target)
                 if v.scheme!='https' or v.hostname!=u.hostname:
-                    raise AppError('取得先が別のサイトに移動しました。')
+                    # Do not follow an untrusted, cross-host redirect.  Keep the
+                    # evidence needed to distinguish SUUMO redirects from GSI /
+                    # independent-search redirects in the next real failure log.
+                    diagnostic={'status':response.status_code,'reason':'offsite_redirect',
+                        'source_url':response.url,'source_host':u.hostname,
+                        'target_host':v.hostname or '',
+                        'target_scheme':v.scheme,
+                        'target_path':v.path[:250],
+                        'redirect_step':_+1}
+                    trace(self,'redirect_offsite',diagnostic,'ERROR','transport')
+                    error=AppError('取得先が別のサイトに移動しました（'+str(u.hostname)+' → '+str(v.hostname or '不明')+'）。')
+                    error.diagnostic=diagnostic
+                    raise error
                 response=self.request_routes('GET',target)
             response.raise_for_status()
             if response.status_code==202 and not response.content.strip():
@@ -2744,6 +2765,9 @@ def _v141_image_georef_notice(web,details):
         if key in seen:return
         if len(seen)>400:seen.clear()
         seen.add(key)
+    # Keep this failure visible for diagnostics; no unsupported image can
+    # safely yield coordinates. A verified map-center identity fallback is
+    # separately attempted, without inventing image metadata.
     trace(web,'image_georef_missing',details,'WARNING','image_location')
 
 
@@ -4292,6 +4316,35 @@ def _registry_precise_address_from_map(web,map_point,position_kind,munis,region_
 # We do not infer an exact number from the nearest address point. The external
 # source must publish that exact number; the official registry must contain it.
 _V136_MAX_REGISTRY_DISTANCE_M = 70.0
+# A map center is NOT a property marker. Only two independent matching
+# primary building-address sources plus the official exact number may use it.
+_V144_MAP_CENTER_MAX_REGISTRY_DISTANCE_M = 230.0
+# Process-local limits ONLY for this Streamlit app. No proxy/VPN/system calls,
+# no shared system caches, and no cross-container state. A denied host may be
+# retried after a bounded pause, while other public sources remain available.
+_V144_SOURCE_COOLDOWN_LOCK = threading.RLock()
+_V144_SOURCE_UNAVAILABLE_UNTIL = {}
+
+
+def _v144_source_pause_remaining(host):
+    with _V144_SOURCE_COOLDOWN_LOCK:
+        deadline=_V144_SOURCE_UNAVAILABLE_UNTIL.get(str(host or ''),0.0)
+        remaining=max(0.0,deadline-time.monotonic())
+        if not remaining and host in _V144_SOURCE_UNAVAILABLE_UNTIL:
+            _V144_SOURCE_UNAVAILABLE_UNTIL.pop(host,None)
+        return remaining
+
+
+def _v144_source_pause(host,status):
+    if status not in (403,405,429):return
+    delay={403:600.0,405:600.0,429:1800.0}[status]
+    with _V144_SOURCE_COOLDOWN_LOCK:
+        _V144_SOURCE_UNAVAILABLE_UNTIL[host]=max(_V144_SOURCE_UNAVAILABLE_UNTIL.get(host,0.0),
+                                                  time.monotonic()+delay)
+        if len(_V144_SOURCE_UNAVAILABLE_UNTIL)>100:
+            now=time.monotonic()
+            for name,deadline in list(_V144_SOURCE_UNAVAILABLE_UNTIL.items()):
+                if deadline<now:_V144_SOURCE_UNAVAILABLE_UNTIL.pop(name,None)
 _V136_OWNER_SITES = frozenset(('www.mec-h.com',))
 
 
@@ -4332,14 +4385,17 @@ def _v136_external_addresses(text,region):
     return list(addresses)
 
 
-def _v136_registry_confirmed(web,external_address,map_point,munis,region_code=None,position_kind=''):
-    """Verify independently published full address IN a real official registry row.
+def _v136_registry_confirmed(web,external_address,map_point,munis,region_code=None,position_kind='',
+                             independently_corrobated_center=False):
+    """Verify a published *exact* building number against real registry rows.
 
-    The pinned building position must be published as room_marker or image_pin;
-    the external full number must exist within 70m in this very municipality/town.
-    Ambiguity among nearby *other* numbers is not used to invent a winner.
+    Exact room pins use the unchanged 70m limit. A published SUUMO map-center
+    can be used ONLY after two independent named-building PRIMARY address fields
+    agree; address numbers are never inferred from distance alone. The
+    verified registry point, not the imprecise map center, becomes the saved pin.
     """
-    if position_kind not in ('room_marker','image_pin') or not map_point:return None
+    center_mode=(position_kind=='map_center' and independently_corrobated_center)
+    if (position_kind not in ('room_marker','image_pin') and not center_mode) or not map_point:return None
     region=_registry_verified_point(web,map_point,munis,region_code)
     if not region:return None
     region=dict(region,munis=munis)
@@ -4382,7 +4438,8 @@ def _v136_registry_confirmed(web,external_address,map_point,munis,region_code=No
         known=_normalize_japanese_address(address_key(pref+city+place+number))
         if known!=candidate_key:continue
         distance=meters(map_point,point)
-        if distance<=_V136_MAX_REGISTRY_DISTANCE_M:matches.append((distance,point))
+        if distance<=(_V144_MAP_CENTER_MAX_REGISTRY_DISTANCE_M if center_mode else _V136_MAX_REGISTRY_DISTANCE_M):
+            matches.append((distance,point))
     if not matches:return None
     distance,point=min(matches,key=lambda x:x[0])
     return dict(address=candidate_key,reference_point=list(point),distance_m=distance,
@@ -4702,7 +4759,7 @@ def _v136_building_address_pages(web,links,identity,region_code,munis,map_point,
     """
     try:region=_registry_verified_point(web,map_point,munis,region_code)
     except (AppError,ValueError,TypeError):return None
-    if not region or position_kind not in ('room_marker','image_pin'):return None
+    if not region or position_kind not in ('room_marker','image_pin','map_center'):return None
     region=dict(region,munis=munis)
     candidates={}
     for target in _v142_identity_result_urls(links)[:12]:
@@ -4710,7 +4767,7 @@ def _v136_building_address_pages(web,links,identity,region_code,munis,map_point,
         if host not in _EXTERNAL_IDENTITY_HOSTS:continue
         with web.cache_lock:
             blocked_until=getattr(web,'v140_external_host_cooldown',{}).get(host,0.)
-        if time.monotonic()<blocked_until:
+        if time.monotonic()<blocked_until or _v144_source_pause_remaining(host)>0:
             # One audit event per blocked external host, not once per room.
             with web.cache_lock:
                 noted=getattr(web,'v141_noted_blocked_hosts',None)
@@ -4739,6 +4796,7 @@ def _v136_building_address_pages(web,links,identity,region_code,munis,map_point,
             except (AppError,ValueError,TypeError) as exc:
                 status=(getattr(exc,'diagnostic',{}) or {}).get('status')
                 if status in (403,405,429):
+                    _v144_source_pause(host,status)
                     with web.cache_lock:
                         cooldown=getattr(web,'v140_external_host_cooldown',None)
                         if cooldown is None:cooldown={};web.v140_external_host_cooldown=cooldown
@@ -4773,19 +4831,29 @@ def _v136_building_address_pages(web,links,identity,region_code,munis,map_point,
             if addr in primary:row['primary_hosts'].add(host)
     approved=[]
     for address,row in candidates.items():
-        # One publisher with building name alone cannot validate an ambiguous
-        # page. Require original property owner OR two independent domains OR
-        # supporting age/area identity details on the very same public page.
+        # Map centers are NOT building locations. Two independent pages must
+        # identify this very building in their own PRIMARY location field.
+        # Search snippets, owner-office addresses, or two rooms of one site
+        # are not independent evidence. Do not relax exact-pin criteria.
         primary=bool(row['primary_hosts'])
-        if not (row['owner'] or len(row['hosts'])>=2 or row['score']>=8 or primary):continue
-        result=_v136_registry_confirmed(web,address,map_point,munis,region_code,position_kind)
+        center_mode=(position_kind=='map_center')
+        if center_mode:
+            if len(row['primary_hosts'])<2 or len(row['hosts'])<2:continue
+        elif not (row['owner'] or len(row['hosts'])>=2 or row['score']>=8 or primary):continue
+        result=_v136_registry_confirmed(web,address,map_point,munis,region_code,position_kind,
+                                       independently_corrobated_center=center_mode)
         if result:
             # One independent publisher is enough ONLY if its own building
             # overview explicitly identifies this address, the number is in
             # the registry, and the property marker is within 50 metres.
             # Otherwise the v136 multisource/extra-evidence gate still applies.
             old_gate=row['owner'] or len(row['hosts'])>=2 or row['score']>=8
-            if not old_gate and (not primary or result['distance_m']>_V137_PRIMARY_MAX_METERS):
+            if center_mode:
+                # Specific verification ID prevents downstream code from
+                # silently interpreting an address point as a room marker.
+                result['verification']='v144_two_independent_primary_addresses_plus_official_registry'
+                result['pin_precision']='official_residential_address_point'
+            if not center_mode and not old_gate and (not primary or result['distance_m']>_V137_PRIMARY_MAX_METERS):
                 trace(web,'v137_primary_address_outside_pin',{'building_name':normal(identity.get('building_name')),
                     'distance_m':round(result['distance_m'],1),'limit_m':_V137_PRIMARY_MAX_METERS},
                     'WARNING','address.fallback')
@@ -4795,7 +4863,11 @@ def _v136_building_address_pages(web,links,identity,region_code,munis,map_point,
                                              'exact_registry_house_number'] if primary else
                           ['building_name','exact_registry_house_number'],
                           stage='search_identity')
-            if primary:result['verification']='v137_primary_building_location_plus_official_registry'
+            if primary and not center_mode:result['verification']='v137_primary_building_location_plus_official_registry'
+            if center_mode:
+                result['identity_evidence']=['two_independent_primary_building_name_matches',
+                                             'two_identical_full_addresses','exact_official_registry_house_number',
+                                             'SUUMO_published_map_center_only']
             approved.append(result)
     if len(approved)!=1:
         if len(approved)>1:
@@ -4945,6 +5017,7 @@ def _cross_source_address_from_identity(web,identity,map_point,munis,region_code
                     host=urlparse(search_url).hostname
                     with web.cache_lock:
                         until=getattr(web,'identity_search_429',{}).get(host,0)
+                    until=max(until,time.monotonic()+_v144_source_pause_remaining(host))
                     if not getattr(web,'stage1_direct',True):
                         blocked=True;robots_blocked=True
                         trace(web,'identity_search_direct_disabled',{'host':host,'next_stage':'address.stage2'},stage='address.fallback')
@@ -4966,6 +5039,7 @@ def _cross_source_address_from_identity(web,identity,map_point,munis,region_code
                                 breakers=getattr(web,'identity_search_429',None)
                                 if breakers is None:breakers={};web.identity_search_429=breakers
                                 breakers[host]=max(breakers.get(host,0.),time.monotonic()+1800)
+                            _v144_source_pause(host,429)
                             trace(web,'stage1_search_challenge',{'host':host,'status':reply.status_code,
                                   'decision':'stop_this_host_for_30min'},'WARNING','address.fallback')
                             continue
@@ -4977,6 +5051,7 @@ def _cross_source_address_from_identity(web,identity,map_point,munis,region_code
                         search_errors.append({'host':host,'status':status,'exception_type':type(exc).__name__})
                         if status in (403,429):
                             blocked=True
+                            _v144_source_pause(host,status)
                             with web.cache_lock:
                                 breakers=getattr(web,'identity_search_429',None)
                                 if breakers is None:breakers={};web.identity_search_429=breakers
@@ -5162,6 +5237,22 @@ def suumo_location_from_kankyo_image(web,detail_soup,detail_url,bounds,munis,exp
     if external_used:
         location['address_identity_sources']=external.get('external_hosts',[]) or ([ADDRESS_REGISTRY_HOST] if external.get('stage')=='official_registry' else [])
         location['address_identity_evidence']=external.get('identity_evidence',[])
+        if external.get('verification')=='v144_two_independent_primary_addresses_plus_official_registry':
+            ref=external.get('reference_point')
+            if not isinstance(ref,(list,tuple)) or len(ref)<2 or not has_point({'latitude':ref[0],'longitude':ref[1]}):return None
+            location.update(latitude=float(ref[0]),longitude=float(ref[1]),
+                location_method='SUUMO物件地図中心→独立した建物情報2サイトの同一詳細住所→公的住所点',
+                address_match='独立2サイトの建物名・番地・住居番号と公式住所レジストリの完全一致',
+                address_precision='住居表示の公式住所点（建物中心位置・部屋位置ではない）',
+                coordinate_precision='official_residential_address_point',
+                address_distance_m=round(float(external['distance_m']),2),
+                verification='v144_two_independent_primary_addresses_plus_official_registry')
+            trace(web,'v144_map_center_full_address_verified',{
+                'detail_url':detail_url,'address':address,
+                'source_hosts':external.get('external_hosts',[]),
+                'map_center_distance_m':location['address_distance_m'],
+                'coordinate_kind':'official_residential_address_point',
+                'decision':'eligible_for_database_save_not_yet_saved'},stage='address.fallback')
     with web.cache_lock:
         if len(web.suumo_location_cache)>=400:web.suumo_location_cache.pop(next(iter(web.suumo_location_cache)))
         web.suumo_location_cache[cache_key]=dict(location)
@@ -6296,13 +6387,15 @@ DIAG_ADVICE={
  'osm_rate_limited':('OpenStreetMap APIの利用制限','この収集では問い合わせを中止し、次の地域へ進む。アクセス制限を回避しない。'),
  'unknown':('現時点で理由を特定できない','前後の通信・解析・除外イベントを照合する。再現URLと読取項目を追加してから修正する。原因を断定しない。')}
 
-DIAG_ADVICE.update({'address_tile_empty':('GSIの住所タイルにデータがない','HTTP 404とNoSuchKeyが両方確認された空タイル。取得できた周辺タイルの同一町丁目の住所候補を比較する。その他の通信失敗と区別する。'),'listing_rejected':('物件の除外理由と工程・取得値・期待値','failed_stage/observed/expected/evidenceで条件不一致と読取・住所推定失敗を区別する。'),'listing_failed':('物件の通信・解析処理に失敗','HTTP状態・例外型・直前の工程を確認する。原因未確定を確定扱いしない。')})
+DIAG_ADVICE.update({'address_tile_empty':('GSIの住所タイルにデータがない','HTTP 404とNoSuchKeyが両方確認された空タイル。取得できた周辺タイルの同一町丁目の住所候補を比較する。その他の通信失敗と区別する。'),'listing_rejected':('物件の除外理由と工程・取得値・期待値','failed_stage/observed/expected/evidenceで条件不一致と読取・住所推定失敗を区別する。'),'listing_failed':('物件の通信・解析処理に失敗','HTTP状態・例外型・直前の工程を確認する。原因未確定を確定扱いしない。'),
+ 'redirect_offsite':('取得先が許可済みホストから移動','source_host/target_host/target_scheme/redirect_stepを検証する。安全性が未確認の外部サイトを追跡しない。')})
 
 def diagnosis_code(message):
     text=str(message)
     if '取得経路の待機中' in text:return 'route_cooldown'
     if 'アクセス検証画面' in text:return 'http_challenge'
     if 'プロキシ接続失敗' in text:return 'proxy_error'
+    if '取得先が別のサイトに移動' in text:return 'redirect_offsite'
     if 'HTTP 202' in text and '0バイト' in text:return 'http_empty'
     for needle,code in [('タイムアウト','timeout'),('HTTP 403','http_403'),('HTTP 429','http_429'),('HTTP 404','http_404')]:
         if needle in text:return code
@@ -6333,7 +6426,7 @@ def diagnostic_failure_event(event):
 class AuditLog:
     def __init__(self,conditions,secrets=()):
         fd,self.path=tempfile.mkstemp(prefix='sumai-log-',suffix='.jsonl');os.close(fd)
-        self.lock=threading.RLock();self.count=0;self.offset=0;self.chunk=0;self.last_save=0.;self.persisted_events=0
+        self.lock=threading.RLock();self.persist_lock=threading.Lock();self.count=0;self.offset=0;self.chunk=0;self.last_save=0.;self.persisted_events=0
         self.storage_error=None;self.search_id=hashlib.sha256(os.urandom(32)).hexdigest();self.secrets=tuple(str(v) for v in secrets if v)
         self.search_mode=conditions.get('mode');self.ward_code=conditions.get('ward_code');self.town_codes=list(conditions.get('town_codes') or [])
         self.pending_failures=[];self.persisted_failures=0;self.failure_storage_error=None
@@ -6378,43 +6471,44 @@ class AuditLog:
         """Compatibility method: errors are saved in compact diagnostic_log chunks."""
         return
     def persist(self,db,force=False):
-        """Save only essential events in compact chunks; verbose logs remain local.
+        # A background region-update and the finishing worker may request a
+        # flush concurrently.  Serialize chunk IDs and cursor progression.
+        if not self.persist_lock.acquire(blocking=force):return
+        try:return self._persist_locked(db,force)
+        finally:self.persist_lock.release()
 
-        At most 32 representative non-DB failures and eight DB failures per
-        search (plus start/finish) are persisted. Unlike older versions we do NOT save a separate error row
-        for each failure. The complete TXT/JSON log is local to the live job.
-        Old per-error records remain readable; new errors can be restored from
-        the same diagnostic_log rows used by historical CSV export.
+    def _persist_locked(self,db,force=False):
+        """Persist *every* warning/error in bounded JSON chunks, plus start/finish.
+
+        Previous v144 kept only 32 non-DB errors and eight DB errors PER SEARCH,
+        losing the majority of real acquisition failures before the next job.
+        All failure events are now kept; success-only chatter remains local.
+        The cursor advances only after a confirmed DB write.  Every batch is
+        strictly bounded by event count and approximate UTF-8 payload size.
         """
         now=time.monotonic()
-        if not force and now-self.last_save<60:return
+        if not force and now-self.last_save<20:return
         self.last_save=now
         while True:
             with self.lock:
+                if not self.path:return
                 with open(self.path,encoding='utf-8') as file:
                     file.seek(self.offset)
-                    selected=[];examined=0
-                    while examined<1500 and len(selected)<150:
+                    selected=[];examined=0;selected_bytes=0
+                    while examined<1500 and len(selected)<48:
+                        before=file.tell()
                         line=file.readline()
                         if not line:break
-                        examined+=1
                         event=json.loads(line)
-                        # Save 32 other failures and reserve eight slots for late
-                        # database failures (e.g. 57014). Keep the full local log.
-                        is_start=(event.get('stage')=='search' and event.get('code')=='start')
-                        is_finish=(event.get('stage')=='search' and event.get('code')=='finish')
-                        is_fault=diagnostic_failure_event(event)
-                        db_fault=(is_fault and event.get('stage')=='database')
-                        if is_start and not self._persisted_start:
-                            selected.append(event)
-                        elif is_finish:
-                            selected.append(event)
-                        elif db_fault and (self._persisted_db_fault_samples +
-                                sum(e.get('stage')=='database' and diagnostic_failure_event(e) for e in selected))<8:
-                            selected.append(event)
-                        elif is_fault and not db_fault and (self._persisted_fault_samples +
-                                sum(e.get('stage')!='database' and diagnostic_failure_event(e) for e in selected))<32:
-                            selected.append(event)
+                        keep=(diagnostic_failure_event(event)
+                              or (event.get('stage')=='search' and event.get('code') in ('start','finish')))
+                        if keep:
+                            length=len(line.encode('utf-8'))
+                            if selected and selected_bytes+length>110_000:
+                                file.seek(before)
+                                break
+                            selected.append(event);selected_bytes+=length
+                        examined+=1
                     end=file.tell()
             if not examined:
                 self.storage_error=None
@@ -6422,7 +6516,8 @@ class AuditLog:
             if selected:
                 row=dict(id=f'{self.search_id}.log.{self.chunk:08d}',status='diagnostic_log',
                     started_at=selected[0]['time'],finished_at=selected[-1]['time'],
-                    conditions={'search_id':self.search_id,'build':BUILD,'chunk':self.chunk,'compact':True},
+                    conditions={'search_id':self.search_id,'build':BUILD,'chunk':self.chunk,'compact':True,
+                                'complete_failure_coverage':True},
                     summary={'events':selected})
                 try:
                     db._saving_audit=True
@@ -6434,12 +6529,7 @@ class AuditLog:
                     db._saving_audit=False
                 self.chunk+=1
                 self.persisted_events+=len(selected)
-                new_faults=sum(bool(diagnostic_failure_event(e)) for e in selected)
-                self.persisted_failures+=new_faults
-                self._persisted_db_fault_samples+=sum(
-                    e.get('stage')=='database' and diagnostic_failure_event(e) for e in selected)
-                self._persisted_fault_samples+=sum(
-                    e.get('stage')!='database' and diagnostic_failure_event(e) for e in selected)
+                self.persisted_failures+=sum(bool(diagnostic_failure_event(e)) for e in selected)
                 self._persisted_start=self._persisted_start or any(
                     e.get('stage')=='search' and e.get('code')=='start' for e in selected)
                 with self.lock:
