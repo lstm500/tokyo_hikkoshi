@@ -40,7 +40,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v142"
+BUILD = "REBUILD-01-v143"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -9366,6 +9366,12 @@ def automatic_collection_panel():
 # Source: https://github.com/frogcat/japan-small-area (see its LICENSE).
 # ==========================================================================
 TOWN_SUMMARY_ID = 'map.town.average.v116'
+# Durable, per-namespace generation marker for verified listing writes. It
+# belongs to this application and is tiny (one existing search-table record).
+# No OS/cache/sibling-app operations and no new database schema are required.
+TOWN_DIRTY_MARKER_ID = 'map.town.dirty.v143'
+TOWN_DIRTY_POLL_SECONDS = 60.0
+
 TOWN_GEOJSON_URL = 'https://frogcat.github.io/japan-small-area/13.json'
 TOWN_GEOJSON_BACKUP = 'https://raw.githubusercontent.com/frogcat/japan-small-area/master/docs/13.json'
 TOWN_GEOMETRY_LIMIT = 36 * 1024 * 1024
@@ -9501,15 +9507,30 @@ def _town_change_key(db):
 
 
 def notify_town_summary_saved(db):
-    """Record a confirmed write; never touch other processes or system caches."""
+    """Record fully read-back-verified writes in memory AND in this DB namespace.
+
+    v131-v142 only sent an in-process signal: a restart or another process
+    could miss it and continue displaying an old persisted color map forever.
+    Here a single tiny, upserted search record identifies the latest batch.
+    Full listings and their existing retention are not changed.
+    """
     key=_town_change_key(db)
     with _TOWN_SAVE_CHANGE_LOCK:
         entry=_TOWN_SAVE_CHANGES.setdefault(key, {'sequence':0,'worker':None})
         entry['sequence']+=1
         sequence=entry['sequence']
         worker=entry['worker']
+    # First notify the local worker so a transient marker-write failure cannot
+    # suppress already-verified listings from its local map.
     if worker is not None:
         worker.on_listing_saved(sequence)
+    marker=hashlib.sha256(os.urandom(24)).hexdigest()[:32]
+    now=utc_now()
+    db.save_search({'id':TOWN_DIRTY_MARKER_ID,'status':'town_rent_dirty',
+        'started_at':now,'finished_at':now,
+        'conditions':{'schema':1,'scope':'rental_listing','source':'confirmed_save'},
+        'summary':{'token':marker,'changed_at':now}})
+    return marker
 
 
 def notify_town_collection_finished(db):
@@ -9553,25 +9574,55 @@ class TownSummaryWorker:
         self._last_saved_at=None
         # One scan (only when needed) for all browser sessions and new writes.
         self._startup_scan_requested=False
+        self._last_marker_probe=0.0
+        self._marker_probe_running=False
+        self._scan_source_marker=''
+    def read_source_marker(self):
+        """Read an app-owned one-row dirty marker, never the entire listing set."""
+        rows=self.db.call('GET',SEARCH_TABLE,{'namespace':'eq.'+self.db.namespace,
+            'id':'eq.'+TOWN_DIRTY_MARKER_ID,'status':'eq.town_rent_dirty',
+            'select':'id,summary','limit':1})
+        if not isinstance(rows,list):raise AppError('地図更新通知の読込形式が不正です。')
+        payload=(rows[0].get('summary') or {}) if rows else {}
+        return str(payload.get('token') or '') if isinstance(payload,dict) else ''
+    def _poll_source_marker(self):
+        try:
+            remote=self.read_source_marker()
+            with self.lock:
+                current=str((self.summary or {}).get('source_marker') or '')
+                if self.ready and remote and remote!=current:
+                    self.pending=True
+                    self._retry_count=0
+                    self._schedule_refresh_locked(urgent=True)
+        except Exception as exc:
+            with self.lock:self.error='自動更新通知の確認に失敗しました: '+str(exc)
+        finally:
+            with self.lock:self._marker_probe_running=False
+    def poll_source_marker(self,force=False):
+        """Background-only check: map rendering never waits on a DB request."""
+        with self.lock:
+            now=time.monotonic()
+            if self._marker_probe_running or (not force and now-self._last_marker_probe<TOWN_DIRTY_POLL_SECONDS):return False
+            self._last_marker_probe=now
+            self._marker_probe_running=True
+        thread=threading.Thread(target=self._poll_source_marker,daemon=True,
+                                name='town-map-durable-change-check')
+        thread.start()
+        return True
     def refresh_on_startup(self):
         """Catch up once from earlier builds; never repeat a scan on each page view."""
         with self.lock:
             if self._startup_scan_requested:return False
             self._startup_scan_requested=True
             if self.ready:
-                # v130 could leave a stale map snapshot after newer listings were
-                # saved. Rebuild it only once on migration to this version.
+                # Rebuild any older schema once to restore listings saved
+                # while earlier code missed in-process notifications. This also
+                # detects already-saved Shinagawa/Shibuya rows from v130-v142.
                 if (self.summary or {}).get('generated_by')!=BUILD:
                     self.pending=True
                     self._schedule_refresh_locked(urgent=True)
                 else:
-                    # A worker can die between a saved listing and its queued
-                    # refresh. Check only for existence of newer rows on startup;
-                    # this runs in the background and returns at most one ID.
-                    self._startup_probe_thread=threading.Thread(
-                        target=self._check_unsummarized_writes,daemon=True,
-                        name='town-map-startup-change-check')
-                    self._startup_probe_thread.start()
+                    self.poll_source_marker(force=True)
                 return False
         return self.start()
     def _check_unsummarized_writes(self):
@@ -9675,6 +9726,9 @@ class TownSummaryWorker:
     def run(self):
         try:
             last_id='';page=0;page_size=160;started=utc_now()
+            # Bind this scan to the marker existing BEFORE pages are read.
+            # A marker created during a scan must trigger a later catch-up.
+            source_marker=self.read_source_marker()
             total=self.count_source_records()
             with self.lock:
                 self.total_records=total
@@ -9727,6 +9781,7 @@ class TownSummaryWorker:
             summary=town_aggregate_streaming(source_rows())
             summary['started_at']=started
             summary['generated_by']=BUILD
+            summary['source_marker']=source_marker
             # Persist the new snapshot only after the FULL scan succeeds.
             # Never overwrite a usable snapshot on partial/failed collection.
             self.db.save_search({'id':TOWN_SUMMARY_ID,'status':'town_rent_summary',
@@ -9738,6 +9793,9 @@ class TownSummaryWorker:
                 # A listing saved DURING the scan might have been missed;
                 # it is necessarily carried forward to another refresh.
                 if self.saved_sequence>self.scan_sequence:self.pending=True
+            # Also catch writes from other app processes during the scan.
+            # Polling is asynchronous so no second DB request delays render.
+            self.poll_source_marker(force=True)
             _v126_work_finished('town-summary')
         except Exception as exc:
             with self.lock:
@@ -9758,12 +9816,15 @@ class TownSummaryWorker:
 
 
 @st.cache_resource
-def town_summary_registry():
+def town_summary_registry_v143():
+    # A new cache identity is essential: Streamlit preserves st.cache_resource
+    # objects over source hot-reloads. The unchanged v131 key reused an old
+    # already-initialized worker, permanently skipping new startup refreshes.
     return {},threading.RLock()
 
 
 def current_town_summary_worker():
-    jobs,lock=town_summary_registry();db=Database();key=manual_registry_key(db)+'|town-v131'
+    jobs,lock=town_summary_registry_v143();db=Database();key=manual_registry_key(db)+'|town-v143'
     with lock:
         job=jobs.get(key)
         if job is None:
@@ -10032,6 +10093,9 @@ def town_choropleth_status():
     state=st.session_state
     store=current_town_summary_worker()
     snap=store.snapshot()
+    # Persisted, per-namespace change marker makes out-of-process saves visible.
+    # Background polling is rate-limited to one tiny DB record per 60 seconds.
+    store.poll_source_marker()
     automatic=get_automatic_collection()
     active=bool(automatic and automatic.snapshot().get('running'))
     if state.get('_v117_was_collecting') and not active and not snap['running']:
@@ -10057,8 +10121,18 @@ def town_choropleth_status():
     if snap['error']:st.warning('平均家賃の集計：'+snap['error'])
     if error:st.warning('境界取得：'+error+'。不明な区域は塗りません。')
     if snap['ready'] and not snap['running']:
-        updated=(snap.get('summary') or {}).get('updated_at')
+        result=snap.get('summary') or {}
+        updated=result.get('updated_at')
         st.caption('町丁目家賃：集計済み' + ('｜更新 '+acquisition_time_jst(updated) if updated else ''))
+        # Distinguish a stale snapshot from the absence of saved listings.
+        group_totals=result.get('groups') or {}
+        def ward_saved_count(ward):
+            return sum(int(v[1]) for nodes in group_totals.values()
+                       if isinstance(nodes,dict) for k,v in nodes.items()
+                       if str(k).startswith(ward+'|') and isinstance(v,(list,tuple)) and len(v)>1)
+        st.caption(f"地図集計対象：{int(result.get('listing_count') or 0):,}件"
+                   f"｜品川区 {ward_saved_count('品川区'):,}件"
+                   f"｜渋谷区 {ward_saved_count('渋谷区'):,}件")
     elif not snap['running'] and not snap['ready'] and not snap['error']:
         st.caption('町丁目家賃：集計の開始待ち')
 
@@ -10072,18 +10146,27 @@ def interactive_town_choropleth(group,facilities):
     observed map-whitening failure when bounds callbacks cause a rerun.
     """
     state=st.session_state
+    # Optional one-tap repair; regular saves refresh automatically. Keep
+    # controls vertical so their Japanese labels stay legible on Android.
+    if st.button('保存物件を再集計（通常は自動更新）',key='recompute_v143_town_map'):
+        job=current_town_summary_worker()
+        if not job.snapshot()['running']:
+            job.start()
+        st.rerun(scope='fragment')
     if st.button('表示範囲を更新（地図移動後のみ）',key='refresh_v118_town_map'):
         state['_v118_map_revision']=int(state.get('_v118_map_revision',0))+1
         st.rerun(scope='fragment')
     reset=int(state.get('_v118_map_reset_count',0))
     revision=int(state.get('_v118_map_revision',0))
     store=current_town_summary_worker();snap=store.snapshot()
+    store.poll_source_marker()
     boundary_worker=town_boundary_registry();boundary_worker.start()
     shapes,ready,busy,error=boundary_worker.snapshot()
     # A new successful aggregate automatically invalidates the cached colors.
     # The stable component key preserves browser pan/zoom and avoids an iframe
     # remount; Leaflet replaces only the GeoJSON layer for changed revisions.
-    signature=(BUILD,group,revision,reset,snap['revision'],bool(ready))
+    summary_version=(snap.get('summary') or {}).get('updated_at','')
+    signature=(BUILD,group,revision,reset,snap['revision'],summary_version,bool(ready))
     cached=state.get('_v118_choropleth_payload')
     if not isinstance(cached,dict) or cached.get('signature')!=signature:
         bounds=state.get('new_bounds')
