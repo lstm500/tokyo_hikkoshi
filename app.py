@@ -40,7 +40,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v160"
+BUILD = "REBUILD-01-v161"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -10973,9 +10973,23 @@ _V159_STATION_CSS='.station-chip.minor.compact{font-size:11px;line-height:15px;}
 assert TOWN_COMPONENT_HTML_V121.count(_V159_STATION_CSS)==1
 TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(_V159_STATION_CSS,_V159_STATION_CSS+'.station-chip .commute-time{font-size:.86em;font-weight:800;letter-spacing:-.3px;}\n',1)
 
+# v161: show travel minutes AND transfer count on each station label.
+# Both originate from the same Dijkstra result, not a separate route estimate.
+_V161_STATION_TIME_OLD="   var timeLabel=commuteTime===null?'':'（'+commuteTime+'分）';"
+_V161_STATION_TIME_NEW=(
+    "   var commuteTransfers=(typeof s.commute_transfers==='number' && "
+    "isFinite(s.commute_transfers) && s.commute_transfers>=0 && "
+    "Math.floor(s.commute_transfers)===s.commute_transfers)?s.commute_transfers:null;\n"
+    "   var timeLabel=(commuteTime===null||commuteTransfers===null)?'':"
+    "'（'+commuteTime+'分-'+commuteTransfers+'回）';"
+)
+assert TOWN_COMPONENT_HTML_V121.count(_V161_STATION_TIME_OLD)==1
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(
+    _V161_STATION_TIME_OLD,_V161_STATION_TIME_NEW,1)
+
 @st.cache_resource(show_spinner=False)
 def town_component_v121():
-    folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-v159')
+    folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-v161')
     os.makedirs(folder,exist_ok=True)
     path=os.path.join(folder,'index.html')
     # Component HTML is small; create once per worker process. Never include
@@ -10992,7 +11006,7 @@ def town_component_v121():
         with open(temp_path,'w',encoding='utf-8') as output:
             output.write(TOWN_COMPONENT_HTML_V121)
         os.replace(temp_path,path)
-    return st.components.v1.declare_component('sumai_town_map_v159',path=folder)
+    return st.components.v1.declare_component('sumai_town_map_v161',path=folder)
 
 # v159: Station-to-office approximate train travel times, OFFLINE AND READ-ONLY.
 # Tokyo Metro/Toei/JR local edge minutes adapted from MIT-licensed public project:
@@ -11125,7 +11139,7 @@ def commute_network_v159():
     return dict(edges)
 
 @__import__('functools').lru_cache(maxsize=16)
-def commute_times_to_station_v159(destination):
+def commute_times_to_station_v159(destination, with_transfers=False):
     """Fast one-to-all Dijkstra; line changes cost 5 min (not current departures)."""
     destination=_commute_key(destination)
     graph=commute_network_v159()
@@ -11148,8 +11162,11 @@ def commute_times_to_station_v159(destination):
             key=(next_station,new_line)
             if key not in seen:
                 heapq.heappush(todo,(time_used+ride_time+extra,changes+int(transfer),next_station,new_line))
-    # Keep 0 for workplace itself. Do not round a 0 min journey to 1.
-    return {name:(0 if name==destination else max(1,int(math.ceil(val[0])))) for name,val in best.items()}
+    # Preserve the original fastest route and its line-change count together.
+    # The default integer-minute return is backward compatible with v159/v160.
+    result={name:(0 if name==destination else max(1,int(math.ceil(val[0]))),int(val[1]))
+            for name,val in best.items()}
+    return result if with_transfers else {name:mins for name,(mins,_changes) in result.items()}
 
 def commute_destinations_v159():
     # Offer only stations connected to Tokyo's main operating network.
@@ -11263,16 +11280,20 @@ def commute_current_destination_v160():
     return station if station in commute_lines_v160().get(line,()) else '\u8868\u793a\u3057\u306a\u3044'
 
 @st.cache_data(show_spinner=False)
-def town_station_refs_v118(commute_destination='表示しない'):
+def town_station_refs_v161(commute_destination='表示しない'):
+    """Attach travel minutes and transfer counts from the SAME fastest route."""
     majors=set(MAJOR_STATION_LABELS)
     regional=set(REGIONAL_HUB_STATION_LABELS)
-    travel=(commute_times_to_station_v159(commute_destination)
+    travel=(commute_times_to_station_v159(commute_destination, with_transfers=True)
             if commute_destination!='表示しない' else {})
-    items=[{'name':name,'lat':float(coords[0]),'lng':float(coords[1]),
+    items=[]
+    for name,coords in STATION_MAP_POINTS.items():
+        route=travel.get(_commute_key(name))
+        items.append({'name':name,'lat':float(coords[0]),'lng':float(coords[1]),
             'priority':0 if name in majors else 1 if name in regional else 2 if name in STATIONS else 3,
             'detail_priority':0 if name in majors else 1 if name in STATIONS else 2,
-            'commute_min':travel.get(_commute_key(name)) if commute_destination!='表示しない' else None}
-           for name,coords in STATION_MAP_POINTS.items()]
+            'commute_min':route[0] if route is not None else None,
+            'commute_transfers':route[1] if route is not None else None})
     items.sort(key=lambda item:(item['priority'],item['name']))
     return items,[{'name':name,'lat':float(p[0]),'lng':float(p[1])} for name,p in WARD_LABELS.items()]
 
@@ -11377,17 +11398,17 @@ def interactive_town_choropleth(group,facilities):
         state['_v118_choropleth_payload']=cached
     current_destination=commute_current_destination_v160()
     if current_destination!='表示しない':
-        st.caption(f'通勤先：{current_destination}駅｜駅名横の（数字）は電車・乗換の概算分数（徒歩・待ち時間を含まない）')
+        st.caption(f'通勤先：{current_destination}駅｜駅名横は（所要分数-乗換回数）の概算（徒歩・待ち時間を含まない）')
     if cached['ready']:
         st.caption(f"\u7740\u8272 {cached['colored_count']}\u753a\u4e01\u76ee\uff5c\u30c7\u30fc\u30bf\u306a\u3057 {cached['no_data_count']}\u753a\u4e01\u76ee\uff08\u30b0\u30ec\u30fc\uff09")
     else:
         st.caption('集計中。完了後、地図の色は自動更新されます')
     destination=commute_current_destination_v160()
-    stations,wards=town_station_refs_v118(destination)
+    stations,wards=town_station_refs_v161(destination)
     widget=town_component_v121()
     data=widget(center=list(cached['center']),zoom=14,geo=cached['geo'],
                 signature=cached['layer_signature'],stations=stations,wards=wards,
-                key='town_map_v159_'+str(reset),default=None)
+                key='town_map_v161_'+str(reset),default=None)
     if isinstance(data,dict):
         current=viewport_bounds(data)
         if current:
@@ -11763,10 +11784,10 @@ def main():
         st.session_state['commute_destination_v159']=(
             current_station if current_station!=_COMMUTE_V160_NO_STATION else '\u8868\u793a\u3057\u306a\u3044')
         if current_station!=_COMMUTE_V160_NO_STATION:
-            st.caption('\u9078\u629e\u4e2d\uff1a'+current_station+'\u99c5 \uff5c \u5730\u56f3\u4e0a\u306e\u99c5\u540d\u306b\uff08XX\u5206\uff09\u3092\u8868\u793a')
+            st.caption('\u9078\u629e\u4e2d\uff1a'+current_station+'\u99c5 \uff5c \u5730\u56f3\u4e0a\u306e\u99c5\u540d\u306b\uff08XX\u5206-X\u56de\uff09\u3092\u8868\u793a')
         st.caption('選択後、「住まいを探す」タブの地図に表示します。時刻表・待ち時間・出入口までの徒歩は含みません。'
                    '東京メトロ・都営地下鉄・山手線・中央総武線の公開時刻表を基にした参考値（一部データは旧年次）、'
-                   '私鉄等は駅間距離からの概算です。未対応駅には時間を表示しません。')
+                   '私鉄等は駅間距離からの概算です。乗換回数は路線の切替に基づく目安で、直通運転は反映しない場合があります。未対応駅には時間と乗換回数を表示しません。')
         options=physical_units([r for r in state.new_units if has_point(r) and r.get('coordinate_precision')!='town'])
         if options:
             i=st.selectbox('出発する物件',range(len(options)),format_func=lambda i:options[i]['title'])
