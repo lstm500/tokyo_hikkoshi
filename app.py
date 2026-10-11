@@ -40,7 +40,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v164"
+BUILD = "REBUILD-01-v165"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -7571,15 +7571,16 @@ def commute(origin,destination):
         for a,b in zip(stations,stations[1:]):
             minutes=meters(STATIONS[a],STATIONS[b])*1.15/1000/40*60
             edges[a].append((b,line,minutes));edges[b].append((a,line,minutes))
-    todo=[(0,origin,'',0,())];seen=set()
+    # Choose fewer train changes before considering minutes.
+    todo=[(0,0.0,origin,'',())];seen=set()
     while todo:
-        minutes,node,last,changes,path=heapq.heappop(todo)
+        changes,minutes,node,last,path=heapq.heappop(todo)
         if (node,last) in seen: continue
         seen.add((node,last))
         if node==destination: return dict(minutes=minutes,transfers=changes,path=path)
         for next_node,line,duration in edges[node]:
             change=int(bool(last) and last!=line)
-            heapq.heappush(todo,(minutes+duration+5*change,next_node,line,changes+change,path+((node,next_node,line),)))
+            heapq.heappush(todo,(changes+change,minutes+duration+5*change,next_node,line,path+((node,next_node,line),)))
     raise AppError('登録路線では経路を計算できません。')
 
 
@@ -11051,7 +11052,7 @@ TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(
 
 @st.cache_resource(show_spinner=False)
 def town_component_v121():
-    folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-v164')
+    folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-v165')
     os.makedirs(folder,exist_ok=True)
     path=os.path.join(folder,'index.html')
     # Component HTML is small; create once per worker process. Never include
@@ -11068,7 +11069,7 @@ def town_component_v121():
         with open(temp_path,'w',encoding='utf-8') as output:
             output.write(TOWN_COMPONENT_HTML_V121)
         os.replace(temp_path,path)
-    return st.components.v1.declare_component('sumai_town_map_v164',path=folder)
+    return st.components.v1.declare_component('sumai_town_map_v165',path=folder)
 
 # v159: Station-to-office approximate train travel times, OFFLINE AND READ-ONLY.
 # Tokyo Metro/Toei/JR local edge minutes adapted from MIT-licensed public project:
@@ -11305,26 +11306,33 @@ def commute_network_v162():
         link(a,b,'徒歩連絡',float(mins))
     return dict(graph)
 
-@__import__('functools').lru_cache(maxsize=16)
+@__import__('functools').lru_cache(maxsize=32)
 def commute_times_to_station_v159(destination, with_transfers=False):
-    """Fast one-to-all Dijkstra; line changes cost 5 min (not current departures)."""
+    """One-to-all routing: FIRST minimize transfers, THEN minutes; 5min/change.
+
+    Routing uses app-local approximate edges, not real timetable departures.
+    Both the one-destination and two-destination labels use this same policy.
+    """
     destination=_commute_key(destination)
     graph=commute_network_v162()
     if destination not in graph:return {}
-    # State: (station, preceding line).  Keep the best time / transfer count.
+    # State: (station, preceding line, walking connector used).
+    # Heap ordering MUST be (transfer count, total travel minutes), not
+    # (minutes, transfers). This makes Ikebukuro -> Tamachi prefer the
+    # through Yamanote line instead of the faster Saikyo + Yamanote route.
     # Track whether the previous edge was an interchange walk.
     # A walking connection already consumes the required transfer time.
     # Crucially, it MUST NOT erase the boarded line, or changing from Metro
     # to tram/another operator is incorrectly displayed as "0回".
-    todo=[(0.0,0,destination,'',False)]
+    todo=[(0,0.0,destination,'',False)]
     seen=set();best={}
     while todo:
-        time_used,changes,station,last_line,walked=heapq.heappop(todo)
+        changes,time_used,station,last_line,walked=heapq.heappop(todo)
         state=(station,last_line,walked)
         if state in seen:continue
         seen.add(state)
         old=best.get(station)
-        if old is None or (time_used,changes)<old:
+        if old is None or (changes,time_used)<(old[1],old[0]):
             best[station]=(time_used,changes)
         for next_station,line,ride_time in graph.get(station,()):
             if line=='徒歩連絡':
@@ -11340,9 +11348,9 @@ def commute_times_to_station_v159(destination, with_transfers=False):
                 new_walked=False
             key=(next_station,new_line,new_walked)
             if key not in seen:
-                heapq.heappush(todo,(time_used+ride_time+extra,changes+int(transfer),
+                heapq.heappush(todo,(changes+int(transfer),time_used+ride_time+extra,
                                      next_station,new_line,new_walked))
-    # Preserve the original fastest route and its line-change count together.
+    # Minutes and transfers are read from the SAME minimum-transfer path.
     # The default integer-minute return is backward compatible with v159/v160.
     result={name:(0 if name==destination else max(1,int(math.ceil(val[0]))),int(val[1]))
             for name,val in best.items()}
@@ -11461,7 +11469,7 @@ def commute_current_destination_v160():
     return station if station in commute_lines_v160().get(line,()) else '\u8868\u793a\u3057\u306a\u3044'
 
 def town_station_refs_v163(commute_destination='表示しない'):
-    """Attach travel minutes and transfer counts from the SAME fastest route."""
+    """Attach minutes and transfers from the SAME minimum-transfer route."""
     majors=set(MAJOR_STATION_LABELS)
     regional=set(REGIONAL_HUB_STATION_LABELS)
     travel=(commute_times_to_station_v159(commute_destination, with_transfers=True)
@@ -11634,9 +11642,9 @@ def interactive_town_choropleth(group,facilities):
         state['_v118_choropleth_payload']=cached
     destinations=commute_selected_destinations_v164()
     if len(destinations)==2:
-        st.caption(f'通勤先：1.{destinations[0]}駅／2.{destinations[1]}駅｜各駅に2行で所要時間と乗換回数を表示（概算）')
+        st.caption(f'通勤先：1.{destinations[0]}駅／2.{destinations[1]}駅｜乗換回数が少ない経路を優先（同数なら最短時間・概算）')
     elif destinations:
-        st.caption(f'通勤先：{destinations[0]}駅｜所要分数-乗換回数（概算）')
+        st.caption(f'通勤先：{destinations[0]}駅｜乗換回数が少ない経路を優先（同数なら最短時間・概算）')
     if cached['ready']:
         st.caption(f"\u7740\u8272 {cached['colored_count']}\u753a\u4e01\u76ee\uff5c\u30c7\u30fc\u30bf\u306a\u3057 {cached['no_data_count']}\u753a\u4e01\u76ee\uff08\u30b0\u30ec\u30fc\uff09")
     else:
@@ -11647,7 +11655,7 @@ def interactive_town_choropleth(group,facilities):
                 signature=cached['layer_signature'],stations=stations,wards=wards,
                 commute_destination=(destinations[0] if destinations else ''),
                 commute_destination_2=(destinations[1] if len(destinations)==2 else ''),
-                key='town_map_v164_'+str(reset),default=None)
+                key='town_map_v165_'+str(reset),default=None)
     if isinstance(data,dict):
         current=viewport_bounds(data)
         if current:
@@ -12045,7 +12053,7 @@ def main():
             st.caption(f'設定中：1. {chosen[0]}駅　2. {chosen[1]}駅｜地図上は駅名＋1駅目の時間、その下に2駅目の時間を表示')
         elif chosen:
             st.caption(f'設定中：{chosen[0]}駅｜地図上は従来の1行表示')
-        st.caption('設定後、「住まいを探す」タブの地図に反映します。所要時間・乗換回数はアプリの路線データによる概算です。'
+        st.caption('設定後、「住まいを探す」タブの地図に反映します。乗換回数最少を優先し、同数の場合に所要時間最短の経路を選びます（アプリ内路線データによる概算）。'
                    '現行時刻表・待ち時間・改札内移動・職場までの徒歩時間は含みません。')
         options=physical_units([r for r in state.new_units if has_point(r) and r.get('coordinate_precision')!='town'])
         if options:
@@ -12064,7 +12072,7 @@ def main():
                 st.dataframe([{'利用路線':line,'混雑率':str(CROWD[line][0])+'%','公表区間':CROWD[line][1],'調査時間帯':CROWD[line][2]} for line in used],hide_index=True)
                 st.caption('国土交通省2025年度の代表区間・最混雑1時間の公表値。選択した経路・方向・時刻の混雑予測ではありません。')
                 st.link_button('混雑率の原資料',CROWD_SOURCE)
-            st.caption('登録41駅・11路線による概算。時刻表・直通運転・道路の徒歩経路は使用していません。徒歩は直線距離×1.25、列車は距離から推定、乗り換えは5分です。')
+            st.caption('乗換回数最少を優先（同数なら最短時間）。登録41駅・11路線による概算。時刻表・直通運転・道路の徒歩経路は使用していません。徒歩は直線距離×1.25、列車は距離から推定、乗り換えは5分です。')
         else: st.info('物件を検索するか、保存物件を読み込むと通勤を比較できます。')
         st.subheader('地図の中心付近の施設')
         kind=st.selectbox('施設の種類',['スーパー','コンビニ','公園','病院'])
