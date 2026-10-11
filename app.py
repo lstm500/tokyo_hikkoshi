@@ -40,7 +40,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v167"
+BUILD = "REBUILD-01-v168"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -10808,7 +10808,7 @@ _V167_SUUMO_CONDITION_LABELS = {
 }
 # This single verified SEO code comes from SUUMO's actual public town page.
 # All other oz codes must come from the real SUUMO town selector, not a guess.
-_V167_VERIFIED_OZ = {'中野区|沼袋':'13114010'}
+_V167_VERIFIED_OZ = {'中野区|沼袋':'13114010', '豊島区|南長崎':'13116019'}
 
 
 def _v167_public_oz_codes(cache=None):
@@ -10826,13 +10826,12 @@ def _v167_public_oz_codes(cache=None):
     return codes
 
 
-def _v167_suumo_town_search(town_key,group,public_oz=None):
-    """Create SUUMO rental-search URL for a tapped chome and active group.
+def _v167_suumo_town_search(town_key, group, public_oz=None):
+    """SUUMO official city+town search; never expand silently to a whole ward.
 
-    sc limits city; the actual SUUMO oz, when independently verified, limits
-    town; fw additionally requests clicked chome.  It is not safe to fabricate
-    an oz from an area number or coordinates.  SUUMO may ignore/relax fw,
-    so the popup transparently asks users to check the address in the results.
+    oz must have been confirmed by the provider town-selection form or
+    independently verified public town page.  A chome is represented by its
+    actual SUUMO town, because SUUMO's town selector does not filter chome.
     """
     if group not in _V167_SUUMO_CONDITION_LABELS:return ''
     if not isinstance(town_key,str) or '|' not in town_key:return ''
@@ -10840,25 +10839,97 @@ def _v167_suumo_town_search(town_key,group,public_oz=None):
     city=_V167_WARD_TO_CODE.get(ward)
     if not city or not town or len(town)>70:return ''
     base=town_base_name(town)
-    # Sanitize non-geographic strings (including URL/control characters).
     if (not base or not re.fullmatch(r'[\w\u3040-\u30ff\u3400-\u9fff\u3005\u30fc\-]+',base)
             or not re.fullmatch(r'[\w\u3040-\u30ff\u3400-\u9fff\u3005\u30fc\-]+',town)):
         return ''
-    params=[('ar','030'),('bs','040'),('ta','13'),('sc',city),('pc','50'),('srch_navi','1')]
-    code=(public_oz or {}).get(ward+'|'+base)
-    if isinstance(code,str) and re.fullmatch(re.escape(city)+r'\d{3}',code):
-        params.append(('oz',code))
-    # SUUMO listing addresses use full-width chome digits (e.g. 沼袋３).
-    # Exact町丁目 names are sent as free text as well as a verified city/town.
-    freeword=re.sub(r'(?<=[0-9])丁目$', '', town)
-    freeword=''.join(chr(ord(c)+0xFEE0) if '0'<=c<='9' else c for c in freeword)
-    params.append(('fw',freeword))
+    code=(public_oz or _V167_VERIFIED_OZ).get(ward+'|'+base)
+    # Crucial: a missing/unverified oz MUST NOT produce a ward-wide result.
+    if not isinstance(code,str) or not re.fullmatch(re.escape(city)+r'\d{3}',code):
+        return ''
+    params=[('ar','030'),('bs','040'),('ta','13'),('sc',city),('oz',code),
+            ('cb','0.0'),('ct','9999999'),('mb','50' if group=='house' else '0'),('mt','9999999')]
     if group in DISPLAY_LAYOUT_GROUPS:
-        params.extend([('ts',SUUMO_BUILDING_TYPE_CODES['マンション']),('cn','15')])
         params.extend(('md',SUUMO_LAYOUT_CODES[layout]) for layout in DISPLAY_LAYOUT_GROUPS[group])
+        params.extend([('ts',SUUMO_BUILDING_TYPE_CODES['\u30de\u30f3\u30b7\u30e7\u30f3']),('cn','15')])
     else:
-        params.extend((name,value) for name,value in SUUMO_HOUSE_PARAMS.items() if name!='pc')
+        # Single-family homes: do not fabricate a provider-side 40-year value.
+        params.extend([('ts',SUUMO_BUILDING_TYPE_CODES['\u4e00\u6238\u5efa\u3066\u30fb\u305d\u306e\u4ed6'])])
+    # User requested up to 15 min by foot, street-address sorting, 50 buildings.
+    params.extend([('et','15'),('shkr1','03'),('shkr2','03'),('shkr3','03'),
+                   ('shkr4','03'),('sngz',''),('po1','17'),('pc','50')])
     return 'https://suumo.jp/jj/chintai/ichiran/FR301FC001/?'+urlencode(params,doseq=True)
+
+
+class _V168TownOzRegistry:
+    """Small, read-only lookup for verified SUUMO town codes.
+
+    It never modifies listing data or makes a municipality-only fallback URL.
+    Fetching is sequential and restricted to wards currently visible on the map.
+    """
+    def __init__(self):
+        self.lock=threading.RLock()
+        self.codes=dict(_V167_VERIFIED_OZ)
+        self.queued=set()
+        self.completed=set()
+        self.failed_until={}
+        self.tasks=queue.Queue()
+        self.worker=threading.Thread(target=self._run,daemon=True,
+                                     name='sumai-v168-suumo-town-lookup')
+        self.worker.start()
+
+    def snapshot(self):
+        with self.lock:return dict(self.codes)
+
+    def request(self,ward_codes):
+        now=time.monotonic()
+        with self.lock:
+            for code in ward_codes:
+                if (code in TOKYO_WARDS and code not in self.queued
+                    and code not in self.completed and now>=self.failed_until.get(code,0)):
+                    self.queued.add(code)
+                    self.tasks.put(code)
+
+    def _run(self):
+        # Direct, normal public pages only; no paid search API or proxies.
+        web=PublicWeb()
+        web.configure({})
+        while True:
+            code=self.tasks.get()
+            try:
+                regions,_,_=suumo_ward_regions(web,code)
+                found={}
+                for entry in regions:
+                    town=town_base_name(entry.get('suumo_town') or entry.get('town') or '')
+                    oz=str(((entry.get('suumo_prepared') or {}).get('base_params') or {}).get('oz',''))
+                    if town and re.fullmatch(re.escape(code)+r'\d{3}',oz):
+                        found[TOKYO_WARDS[code]+'|'+town]=oz
+                if not found:raise ValueError('SUUMO town selector returned no verified codes')
+                with self.lock:
+                    self.codes.update(found)
+                    self.completed.add(code)
+            except Exception:
+                # On provider errors, back off for ten minutes rather than retry.
+                with self.lock:self.failed_until[code]=time.monotonic()+600
+            finally:
+                with self.lock:self.queued.discard(code)
+                self.tasks.task_done()
+            # Avoid flooding the provider if a large map covers many wards.
+            if not self.tasks.empty():time.sleep(2)
+
+
+@st.cache_resource(show_spinner=False)
+def _v168_town_oz_registry():
+    return _V168TownOzRegistry()
+
+
+def _v168_visible_wards(geo):
+    counts={}
+    for feature in geo.get('features',[]):
+        name=str((feature.get('properties') or {}).get('name',''))
+        ward=name.split(' ',1)[0]
+        code=_V167_WARD_TO_CODE.get(ward)
+        if code:counts[code]=counts.get(code,0)+1
+    return [code for code,_ in sorted(counts.items(),key=lambda kv:(-kv[1],kv[0]))]
 
 
 def town_colored_shapes(groups,group,features,bounds,max_features=None,include_no_data=False,suumo_oz_codes=None):
@@ -10906,7 +10977,7 @@ def town_colored_shapes(groups,group,features,bounds,max_features=None,include_n
                           'color':'#d0d7da','count_label':'0',
                           'price_label':'n/a',
                           'suumo_url':_v167_suumo_town_search(key,group,suumo_oz_codes),
-                          'suumo_conditions':_V167_SUUMO_CONDITION_LABELS.get(group,'')}})
+                          'suumo_conditions':_V167_SUUMO_CONDITION_LABELS.get(group,''), 'suumo_town':town_base_name(key.split('|',1)[1])}})
     for key in selected:
         total,count=counts[key]
         avg=total/count
@@ -10917,7 +10988,7 @@ def town_colored_shapes(groups,group,features,bounds,max_features=None,include_n
                           'count_label':f'{count}\u4ef6',
                           'color':town_rent_gradient(avg),
                           'suumo_url':_v167_suumo_town_search(key,group,suumo_oz_codes),
-                          'suumo_conditions':_V167_SUUMO_CONDITION_LABELS.get(group,'')}})
+                          'suumo_conditions':_V167_SUUMO_CONDITION_LABELS.get(group,''), 'suumo_town':town_base_name(key.split('|',1)[1])}})
     return result,limited,len(rented)
 
 
@@ -11120,7 +11191,7 @@ TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(
 
 # v167: clickable provider link in both colored and gray polygon popups.
 _V167_POPUP_OLD = "var el=document.createElement('div');el.textContent=props.has_data===false?name+'｜この条件の保存データなし':name+'｜平均 '+avg+'｜'+count;layer.bindPopup(el);"
-_V167_POPUP_NEW = _V167_POPUP_OLD.replace('layer.bindPopup(el);', "// v167: SUUMO link belongs to each polygon and follows selected rent type.\nvar suumo=String(props.suumo_url||'');\nif(/^https:\\/\\/suumo\\.jp\\/jj\\/chintai\\/ichiran\\/FR301FC001\\/\\?/.test(suumo)){\n  var link=document.createElement('a');\n  link.className='v167-suumo-link';\n  link.textContent='SUUMOで検索 ↗';\n  link.href=suumo;link.target='_blank';link.rel='noopener noreferrer';\n  el.appendChild(document.createElement('div'));\n  el.appendChild(link);\n  var help=document.createElement('div');\n  help.className='v167-suumo-note';\n  help.textContent=String(props.suumo_conditions||'')+'｜丁目の一致は検索先で確認';\n  el.appendChild(help);\n}\nlayer.bindPopup(el);")
+_V167_POPUP_NEW = _V167_POPUP_OLD.replace('layer.bindPopup(el);', "// v167: SUUMO link belongs to each polygon and follows selected rent type.\nvar suumo=String(props.suumo_url||'');\nif(/^https:\\/\\/suumo\\.jp\\/jj\\/chintai\\/ichiran\\/FR301FC001\\/\\?/.test(suumo)){\n  var link=document.createElement('a');\n  link.className='v167-suumo-link';\n  link.textContent='SUUMOで検索 ↗';\n  link.href=suumo;link.target='_blank';link.rel='noopener noreferrer';\n  el.appendChild(document.createElement('div'));\n  el.appendChild(link);\n  var help=document.createElement('div');\n  help.className='v167-suumo-note';\n  help.textContent='SUUMO町名:'+String(props.suumo_town||'')+'｜'+String(props.suumo_conditions||'')+'｜町名を指定・駅徒歩15分以内・住所順・50件（丁目は絞れません）';\n  el.appendChild(help);\n}else{\n  var pending=document.createElement('div');\n  pending.className='v167-suumo-note';\n  pending.textContent='SUUMOの町名コードが未確認（区全体では検索しません）';\n  el.appendChild(pending);\n}\nlayer.bindPopup(el);")
 assert TOWN_COMPONENT_HTML_V121.count(_V167_POPUP_OLD)==1
 TOWN_COMPONENT_HTML_V121 = TOWN_COMPONENT_HTML_V121.replace(_V167_POPUP_OLD,_V167_POPUP_NEW,1)
 _V167_CSS = ".v167-suumo-link{display:inline-block;margin-top:8px;padding:7px 11px;background:#174a6a;border-radius:6px;color:white!important;text-decoration:none;font-weight:700;font-size:13px;touch-action:manipulation}.v167-suumo-note{font-size:10px;max-width:245px;color:#5c6670;margin-top:5px}"
@@ -11129,7 +11200,7 @@ TOWN_COMPONENT_HTML_V121 = TOWN_COMPONENT_HTML_V121.replace('</style></head>',_V
 
 @st.cache_resource(show_spinner=False)
 def town_component_v121():
-    folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-v167')
+    folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-v168')
     os.makedirs(folder,exist_ok=True)
     path=os.path.join(folder,'index.html')
     # Component HTML is small; create once per worker process. Never include
@@ -11146,7 +11217,7 @@ def town_component_v121():
         with open(temp_path,'w',encoding='utf-8') as output:
             output.write(TOWN_COMPONENT_HTML_V121)
         os.replace(temp_path,path)
-    return st.components.v1.declare_component('sumai_town_map_v167',path=folder)
+    return st.components.v1.declare_component('sumai_town_map_v168',path=folder)
 
 # v159: Station-to-office approximate train travel times, OFFLINE AND READ-ONLY.
 # Tokyo Metro/Toei/JR local edge minutes adapted from MIT-licensed public project:
@@ -11697,7 +11768,12 @@ def interactive_town_choropleth(group):
     # The stable component key preserves browser pan/zoom and avoids an iframe
     # remount; Leaflet replaces only the GeoJSON layer for changed revisions.
     summary_version=(snap.get('summary') or {}).get('updated_at','')
+    registry=_v168_town_oz_registry()
+    old_payload=state.get('_v118_choropleth_payload')
+    if isinstance(old_payload,dict):
+        registry.request(_v168_visible_wards(old_payload.get('geo') or {})[:8])
     suumo_oz_codes=_v167_public_oz_codes(state.get('ward_town_cache'))
+    suumo_oz_codes.update(registry.snapshot())
     oz_signature=hashlib.sha256(repr(sorted(suumo_oz_codes.items())).encode('utf-8')).hexdigest()[:12]
     signature=(BUILD,group,revision,reset,snap['revision'],summary_version,bool(ready),oz_signature)
     cached=state.get('_v118_choropleth_payload')
@@ -11720,6 +11796,7 @@ def interactive_town_choropleth(group):
                 'colored_count':geo['render_stats']['with_rent'],
                 'no_data_count':geo['render_stats']['without_rent'],'center':center}
         state['_v118_choropleth_payload']=cached
+        registry.request(_v168_visible_wards(geo)[:8])
     destinations=commute_selected_destinations_v164()
     if len(destinations)==2:
         st.caption(f'通勤先：1.{destinations[0]}駅／2.{destinations[1]}駅｜乗換回数が少ない経路を優先（同数なら最短時間・概算）')
@@ -11735,7 +11812,7 @@ def interactive_town_choropleth(group):
                 signature=cached['layer_signature'],stations=stations,wards=wards,
                 commute_destination=(destinations[0] if destinations else ''),
                 commute_destination_2=(destinations[1] if len(destinations)==2 else ''),
-                key='town_map_v167_'+str(reset),default=None)
+                key='town_map_v168_'+str(reset),default=None)
     if isinstance(data,dict):
         current=viewport_bounds(data)
         if current:
