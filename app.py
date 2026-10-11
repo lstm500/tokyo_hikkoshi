@@ -40,7 +40,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v162"
+BUILD = "REBUILD-01-v163"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -10980,16 +10980,23 @@ _V161_STATION_TIME_NEW=(
     "   var commuteTransfers=(typeof s.commute_transfers==='number' && "
     "isFinite(s.commute_transfers) && s.commute_transfers>=0 && "
     "Math.floor(s.commute_transfers)===s.commute_transfers)?s.commute_transfers:null;\n"
-    "   var timeLabel=(commuteTime===null||commuteTransfers===null)?'':"
+    "   var timeLabel=(commuteTime===null||commuteTransfers===null)?"
+    "(state.commuteDestination?'（未計算）':''):"
     "'（'+commuteTime+'分-'+commuteTransfers+'回）';"
 )
 assert TOWN_COMPONENT_HTML_V121.count(_V161_STATION_TIME_OLD)==1
 TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(
     _V161_STATION_TIME_OLD,_V161_STATION_TIME_NEW,1)
+# v163: expose whether a commute destination was actually selected.
+_V163_RENDER_STATIONS = ' state.stations=Array.isArray(args.stations)?args.stations:state.stations;'
+assert TOWN_COMPONENT_HTML_V121.count(_V163_RENDER_STATIONS)==1
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(
+    _V163_RENDER_STATIONS,
+    ' state.commuteDestination=String(args.commute_destination||\"\");\n'+_V163_RENDER_STATIONS,1)
 
 @st.cache_resource(show_spinner=False)
 def town_component_v121():
-    folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-v162')
+    folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-v163')
     os.makedirs(folder,exist_ok=True)
     path=os.path.join(folder,'index.html')
     # Component HTML is small; create once per worker process. Never include
@@ -11006,7 +11013,7 @@ def town_component_v121():
         with open(temp_path,'w',encoding='utf-8') as output:
             output.write(TOWN_COMPONENT_HTML_V121)
         os.replace(temp_path,path)
-    return st.components.v1.declare_component('sumai_town_map_v162',path=folder)
+    return st.components.v1.declare_component('sumai_town_map_v163',path=folder)
 
 # v159: Station-to-office approximate train travel times, OFFLINE AND READ-ONLY.
 # Tokyo Metro/Toei/JR local edge minutes adapted from MIT-licensed public project:
@@ -11398,8 +11405,7 @@ def commute_current_destination_v160():
         return st.session_state.get('commute_destination_v159','\u8868\u793a\u3057\u306a\u3044')
     return station if station in commute_lines_v160().get(line,()) else '\u8868\u793a\u3057\u306a\u3044'
 
-@st.cache_data(show_spinner=False)
-def town_station_refs_v161(commute_destination='表示しない'):
+def town_station_refs_v163(commute_destination='表示しない'):
     """Attach travel minutes and transfer counts from the SAME fastest route."""
     majors=set(MAJOR_STATION_LABELS)
     regional=set(REGIONAL_HUB_STATION_LABELS)
@@ -11414,6 +11420,15 @@ def town_station_refs_v161(commute_destination='表示しない'):
             'commute_min':route[0] if route is not None else None,
             'commute_transfers':route[1] if route is not None else None})
     items.sort(key=lambda item:(item['priority'],item['name']))
+    if commute_destination != '表示しない':
+        missing=[item['name'] for item in items
+                 if (not isinstance(item['commute_min'],int) or
+                     not isinstance(item['commute_transfers'],int))]
+        if missing:
+            # Do not silently render a partial commute map. Never fill with
+            # guessed numbers or label a missing route as 0 minutes.
+            raise AppError('通勤経路データがない駅: '+', '.join(missing[:12])
+                           + (' ほか' if len(missing)>12 else ''))
     return items,[{'name':name,'lat':float(p[0]),'lng':float(p[1])} for name,p in WARD_LABELS.items()]
 
 @st.fragment(run_every='15s')
@@ -11523,11 +11538,12 @@ def interactive_town_choropleth(group,facilities):
     else:
         st.caption('集計中。完了後、地図の色は自動更新されます')
     destination=commute_current_destination_v160()
-    stations,wards=town_station_refs_v161(destination)
+    stations,wards=town_station_refs_v163(destination)
     widget=town_component_v121()
     data=widget(center=list(cached['center']),zoom=14,geo=cached['geo'],
                 signature=cached['layer_signature'],stations=stations,wards=wards,
-                key='town_map_v162_'+str(reset),default=None)
+                commute_destination=(destination if destination!='表示しない' else ''),
+                key='town_map_v163_'+str(reset),default=None)
     if isinstance(data,dict):
         current=viewport_bounds(data)
         if current:
