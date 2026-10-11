@@ -40,7 +40,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v168"
+BUILD = "REBUILD-01-v169"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -11995,6 +11995,146 @@ def v147_replay_status():
     else:st.caption('バックグラウンドで30URLの詳細・地図・公式住所照合・Supabase保存/再読込を確認中')
 
 
+# v169: Browser-specific automatic commute destination persistence.
+# Only four railway/station selections are stored in localStorage.  No Supabase
+# row, shared server setting, device fingerprint, or login is involved.
+# Read browser storage before enabling the input widgets; never overwrite the
+# saved setting with empty session_state values while hydration is pending.
+_V169_COMMUTE_BROWSER_KEY = 'sumai-compass-commute-preferences-v1'
+_V169_COMMUTE_FIELDS = ('commute_line_v160', 'commute_station_v160',
+                        'commute_line_2_v164', 'commute_station_2_v164')
+_V169_COMMUTE_STORAGE_HTML = r'''<!doctype html><html lang="ja"><head><meta charset="utf-8">
+<style>html,body{padding:0;margin:0;height:1px;overflow:hidden}</style></head><body>
+<script>
+(function(){
+ 'use strict';
+ const KEY='sumai-compass-commute-preferences-v1';
+ let lastResponse='';
+ function host(type,additional){
+   window.parent.postMessage(Object.assign({isStreamlitMessage:true,type:type},additional||{}),'*');
+ }
+ function report(message){
+   const json=JSON.stringify(message);
+   if(json===lastResponse)return;
+   lastResponse=json;
+   host('streamlit:setComponentValue',{dataType:'json',value:message});
+ }
+ function restore(){
+   try{
+     const text=window.localStorage.getItem(KEY);
+     let prefs=null;
+     if(text!==null){try{prefs=JSON.parse(text)}catch(error){prefs=null}}
+     report({event:'loaded',available:true,prefs:prefs});
+   }catch(error){
+     report({event:'loaded',available:false,prefs:null});
+   }
+ }
+ function persist(args){
+   const prefs=args.prefs;
+   if(!prefs || typeof prefs!=='object' || Array.isArray(prefs))return;
+   const signature=String(args.signature||'');
+   try{
+     const content=JSON.stringify(prefs);
+     if(window.localStorage.getItem(KEY)!==content){
+       window.localStorage.setItem(KEY,content);
+     }
+     report({event:'saved',available:true,signature:signature});
+   }catch(error){
+     report({event:'saved',available:false,signature:signature});
+   }
+ }
+ window.addEventListener('message',function(event){
+   const message=event.data;
+   if(!message || message.type!=='streamlit:render')return;
+   const args=message.args||{};
+   if(args.action==='read')restore();
+   else if(args.action==='save')persist(args);
+ });
+ host('streamlit:componentReady',{apiVersion:1});
+ host('streamlit:setFrameHeight',{height:1});
+})();
+</script></body></html>'''
+
+@st.cache_resource(show_spinner=False)
+def v169_commute_browser_component():
+    """Create a stable custom-component origin for per-browser localStorage."""
+    folder=os.path.join(tempfile.gettempdir(),'sumai-commute-persistence-v169')
+    os.makedirs(folder,exist_ok=True)
+    path=os.path.join(folder,'index.html')
+    existing=None
+    try:
+        with open(path,'r',encoding='utf-8') as handle:existing=handle.read()
+    except OSError:pass
+    if existing != _V169_COMMUTE_STORAGE_HTML:
+        temporary=path+'.tmp-'+str(os.getpid())
+        with open(temporary,'w',encoding='utf-8') as handle:
+            handle.write(_V169_COMMUTE_STORAGE_HTML)
+        os.replace(temporary,path)
+    return st.components.v1.declare_component('sumai_commute_browser_v169',path=folder)
+
+
+def v169_validate_commute_browser_settings(value,lines):
+    """Accept only real station names on the corresponding saved railway line."""
+    if not isinstance(value,dict) or value.get('schema')!=1:
+        return None
+    result={}
+    for line_key,station_key,stored_line,stored_station in (
+        ('commute_line_v160','commute_station_v160','line1','station1'),
+        ('commute_line_2_v164','commute_station_2_v164','line2','station2')):
+        line=value.get(stored_line)
+        station=value.get(stored_station)
+        if not isinstance(line,str) or line not in lines:
+            line=_COMMUTE_V160_NO_LINE
+            station=_COMMUTE_V160_NO_STATION
+        elif not isinstance(station,str) or station not in lines[line]:
+            station=_COMMUTE_V160_NO_STATION
+        result[line_key]=line
+        result[station_key]=station
+    return result
+
+
+def v169_commute_browser_snapshot(state):
+    return {'schema':1,
+        'line1':str(state.get('commute_line_v160',_COMMUTE_V160_NO_LINE)),
+        'station1':str(state.get('commute_station_v160',_COMMUTE_V160_NO_STATION)),
+        'line2':str(state.get('commute_line_2_v164',_COMMUTE_V160_NO_LINE)),
+        'station2':str(state.get('commute_station_2_v164',_COMMUTE_V160_NO_STATION))}
+
+
+def v169_commute_autosave_sync():
+    """Hydrate once before widgets and continuously persist later selections.
+
+    Returns True only after storage was checked; browser storage failures allow
+    normal session-only use with a visible warning, rather than blocking the app.
+    """
+    state=st.session_state
+    widget=v169_commute_browser_component()
+    if not state.get('_v169_commute_browser_checked'):
+        message=widget(action='read',key='v169_commute_browser',default=None,height=1)
+        if not isinstance(message,dict) or message.get('event')!='loaded':
+            return False
+        state['_v169_commute_browser_checked']=True
+        state['_v169_commute_browser_available']=bool(message.get('available'))
+        saved=v169_validate_commute_browser_settings(
+            message.get('prefs'),commute_lines_v160())
+        if saved is not None:
+            for key,value in saved.items():state[key]=value
+            station=saved['commute_station_v160']
+            state['commute_destination_v159']=(
+                station if station!=_COMMUTE_V160_NO_STATION else '表示しない')
+        # The first full rerun mounts the Selectboxes with the restored values.
+        # No empty default state is ever sent to localStorage before this point.
+        st.rerun()
+        return False
+    prefs=v169_commute_browser_snapshot(state)
+    signature=hashlib.sha256(json.dumps(prefs,ensure_ascii=False,sort_keys=True).encode('utf-8')).hexdigest()[:16]
+    message=widget(action='save',prefs=prefs,signature=signature,
+                   key='v169_commute_browser',default=None,height=1)
+    if isinstance(message,dict) and message.get('event')=='saved' and message.get('signature')==signature:
+        state['_v169_commute_browser_available']=bool(message.get('available'))
+    return True
+
+
 def main():
     st.set_page_config(page_title='住まいコンパス｜新しい住まいを探す',page_icon='🏡',layout='wide',initial_sidebar_state='collapsed')
     st.markdown(CSS,unsafe_allow_html=True)
@@ -12003,6 +12143,7 @@ def main():
     state.setdefault('new_units',[]);state.setdefault('new_search',None);state.setdefault('new_saved_keys',[])
     state.setdefault('new_map_loaded',False);state.setdefault('address_point_cache',{})
     state.setdefault('layout_display_group','group1')
+    commute_storage_ready=v169_commute_autosave_sync()
     restore_manual_search()
     restore_automatic_collection()
     request=state.pop('new_request',None)
@@ -12158,6 +12299,12 @@ def main():
         render_memory_diagnostic_v124()
     with tabs[2]:
         st.subheader('通勤の目安')
+        if not commute_storage_ready:
+            st.caption('このブラウザーの通勤先設定を読み込み中です。')
+        elif not state.get('_v169_commute_browser_available',True):
+            st.warning('ブラウザーが保存を制限しているため、通勤先設定はこの画面を閉じると消える場合があります。')
+        else:
+            st.caption('通勤先1・2はこのブラウザーに自動保存され、次回アクセス時に復元します。')
         # Destination 1: retain the existing state keys and the v159 upgrade path.
         available_lines=commute_lines_v160()
         if 'commute_line_v160' not in st.session_state:
@@ -12175,14 +12322,14 @@ def main():
         first_line=st.selectbox(
             '① 路線（通勤先1）',line_options,
             key='commute_line_v160',on_change=_commute_line_changed_v160,
-            help='鉄道会社・路線名から選べます。')
+            help='鉄道会社・路線名から選べます。',disabled=not commute_storage_ready)
         first_station_options=[_COMMUTE_V160_NO_STATION,*available_lines.get(first_line,())]
         if st.session_state.get('commute_station_v160') not in first_station_options:
             st.session_state['commute_station_v160']=_COMMUTE_V160_NO_STATION
         first_station=st.selectbox(
             '② 駅（通勤先1）',first_station_options,
             key='commute_station_v160',
-            disabled=first_line==_COMMUTE_V160_NO_LINE)
+            disabled=(first_line==_COMMUTE_V160_NO_LINE or not commute_storage_ready))
         st.session_state['commute_destination_v159']=(
             first_station if first_station!=_COMMUTE_V160_NO_STATION else '表示しない')
 
@@ -12194,14 +12341,14 @@ def main():
         second_line=st.selectbox(
             '① 路線（通勤先2）',line_options,
             key='commute_line_2_v164',on_change=_commute_line_changed_v164_second,
-            help='2駅目が不要な場合は「路線を選択してください」のままで構いません。')
+            help='2駅目が不要な場合は「路線を選択してください」のままで構いません。',disabled=not commute_storage_ready)
         second_station_options=[_COMMUTE_V160_NO_STATION,*available_lines.get(second_line,())]
         if st.session_state.get('commute_station_2_v164') not in second_station_options:
             st.session_state['commute_station_2_v164']=_COMMUTE_V160_NO_STATION
         second_station=st.selectbox(
             '② 駅（通勤先2）',second_station_options,
             key='commute_station_2_v164',
-            disabled=second_line==_COMMUTE_V160_NO_LINE)
+            disabled=(second_line==_COMMUTE_V160_NO_LINE or not commute_storage_ready))
 
         chosen=commute_selected_destinations_v164()
         if len(chosen)==2:
