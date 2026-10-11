@@ -40,7 +40,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v165"
+BUILD = "REBUILD-01-v166"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -11592,7 +11592,7 @@ def town_choropleth_status():
 
 
 @st.fragment(run_every='8s')
-def interactive_town_choropleth(group,facilities):
+def interactive_town_choropleth(group):
     """Leaflet map persists in the browser across Streamlit fragment reruns.
 
     Only aggregate geometry and the selected group enter the map.  Do not
@@ -11844,7 +11844,6 @@ def main():
     st.markdown(f'<div class="hero"><span class="badge">SUMAI COMPASS · {BUILD}</span><h1>次の住まいを、地図から。</h1><p>掲載物件を確認し、家賃と暮らしやすさを比べます。<br>間取りと家賃帯を、取得できた情報で比較します。</p></div>',unsafe_allow_html=True)
     state=st.session_state
     state.setdefault('new_units',[]);state.setdefault('new_search',None);state.setdefault('new_saved_keys',[])
-    state.setdefault('new_facilities',[])
     state.setdefault('new_map_loaded',False);state.setdefault('address_point_cache',{})
     state.setdefault('layout_display_group','group1')
     restore_manual_search()
@@ -11858,7 +11857,7 @@ def main():
     except Exception:state.current_storage_key=None
     # Choropleth display does not auto-restore thousands of old per-listing points.
     # The Saved Data tab can still load them explicitly for detailed export.
-    tabs=st.tabs(['住まいを探す','保存データ','通勤・周辺施設','初期設定'])
+    tabs=st.tabs(['住まいを探す','保存データ','通勤','初期設定'])
     with tabs[0]:
         st.subheader('地図を動かして、探す地域を表示してください')
         selected_group=state.get('layout_display_group','group1')
@@ -11880,9 +11879,8 @@ def main():
         bounds=state.get('new_bounds')
         center=bounds_center(bounds) if bounds else state.get('new_view_center',DEFAULT_CENTER)
         radius=bounds_radius(bounds) if bounds else 1500
-        facilities=[f for f in state.new_facilities if bounds and in_rectangle((f['lat'],f['lng']),bounds)]
         town_choropleth_status()
-        interactive_town_choropleth(selected_group,facilities)
+        interactive_town_choropleth(selected_group)
         # Fragment owns its widget container directly, including partial reruns.
         background_progress()
         # Initial component defaults are not real viewport bounds. Only the browser callback makes the search ready.
@@ -12074,21 +12072,6 @@ def main():
                 st.link_button('混雑率の原資料',CROWD_SOURCE)
             st.caption('乗換回数最少を優先（同数なら最短時間）。登録41駅・11路線による概算。時刻表・直通運転・道路の徒歩経路は使用していません。徒歩は直線距離×1.25、列車は距離から推定、乗り換えは5分です。')
         else: st.info('物件を検索するか、保存物件を読み込むと通勤を比較できます。')
-        st.subheader('地図の中心付近の施設')
-        kind=st.selectbox('施設の種類',['スーパー','コンビニ','公園','病院'])
-        if st.button('地図の中心から1kmの施設を地図に追加',key='new_facilities_fetch',disabled=not bounds):
-            try:
-                state.new_facilities=fetch_facilities(center,kind);state.new_facility_center=center
-                saved=Database().save_places(state.new_facilities,kind)
-                state.new_notice=f'{len(saved)}施設を取得し、Supabaseへの保存を確認しました。';st.rerun()
-            except AppError as exc: st.error(str(exc))
-        if st.button('保存した周辺施設を読み込む',key='new_places_load'):
-            try:
-                state.new_facilities=Database().load_places(center,kind);state.new_facility_center=center
-                state.new_notice=f'{len(state.new_facilities)}施設を読み込みました。';st.rerun()
-            except AppError as exc: st.error(str(exc))
-        st.link_button('Googleマップで施設を探す','https://www.google.com/maps/search/?'+urlencode({'api':1,'query':f'{center[0]},{center[1]} '+kind}))
-        st.caption('OpenStreetMapに登録された施設。登録漏れや位置の誤差がある場合があります。')
     with tabs[3]:
         st.subheader('実URL・Supabase保存検証（追加課金なし）')
         st.caption('旧版の失敗ログから固定抽出した実URLを再検索し、住所・家賃・間取りを保存してSupabaseで読み戻します。24/30以上で合格。')
