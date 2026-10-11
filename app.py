@@ -40,7 +40,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v163"
+BUILD = "REBUILD-01-v164"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -10994,9 +10994,64 @@ TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(
     _V163_RENDER_STATIONS,
     ' state.commuteDestination=String(args.commute_destination||\"\");\n'+_V163_RENDER_STATIONS,1)
 
+# v164: an independent optional second destination. The complete dual label is
+# produced in Leaflet (including two-line collision size), not painted as an
+# image. Keep the v163 one-destination representation fully backward compatible.
+_V164_OLD_TIME = (
+    "   var timeLabel=(commuteTime===null||commuteTransfers===null)?"
+    "(state.commuteDestination?'（未計算）':''):"
+    "'（'+commuteTime+'分-'+commuteTransfers+'回）';"
+)
+_V164_NEW_TIME = """   var dual=Boolean(state.commuteDestination2);
+   var timeLabel=(commuteTime===null||commuteTransfers===null)?
+     (state.commuteDestination?'（未計算）':''):
+     '（'+(dual?'1.':'')+commuteTime+'分-'+commuteTransfers+'回）';
+   var secondMin=(typeof s.commute2_min==='number' && isFinite(s.commute2_min) && s.commute2_min>=0 && s.commute2_min<999)?Math.round(s.commute2_min):null;
+   var secondTransfers=(typeof s.commute2_transfers==='number' && isFinite(s.commute2_transfers) && s.commute2_transfers>=0 &&
+     Math.floor(s.commute2_transfers)===s.commute2_transfers)?s.commute2_transfers:null;
+   var timeLabel2=!dual?'':(secondMin===null||secondTransfers===null)?'（2.未計算）':
+     '（2.'+secondMin+'分-'+secondTransfers+'回）';"""
+assert TOWN_COMPONENT_HTML_V121.count(_V164_OLD_TIME)==1
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(_V164_OLD_TIME,_V164_NEW_TIME,1)
+_V164_OLD_COLLISION = """   var width=Math.min(252,Array.from(name).length*fontSize+Array.from(timeLabel).length*(fontSize-2)+11);
+   var height=compact?17:(major?21:19);"""
+_V164_NEW_COLLISION = """   // A dual-destination label occupies two real lines. Reserve the full area
+   // so that nearby stations are not drawn on top of either commute estimate.
+   var nameWidth=Array.from(name).length*fontSize;
+   var timeWidth=Math.max(Array.from(timeLabel).length,Array.from(timeLabel2).length)*(fontSize*.83);
+   var width=Math.min(330,nameWidth+timeWidth+19);
+   var height=dual?(compact?34:(major?41:37)):(compact?17:(major?21:19));"""
+assert TOWN_COMPONENT_HTML_V121.count(_V164_OLD_COLLISION)==1
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(_V164_OLD_COLLISION,_V164_NEW_COLLISION,1)
+_V164_OLD_MARKUP = """   var html='<span class="station-chip'+(major?'':' minor')+(compact?' compact':'')+'">'+safeLabel(name)+(timeLabel?'<span class="commute-time">'+safeLabel(timeLabel)+'</span>':'')+'</span>';"""
+_V164_NEW_MARKUP = """   var classes='station-chip'+(major?'':' minor')+(compact?' compact':'')+(dual?' dual':'');
+   var content=dual?
+     '<span class="commute-grid"><span class="station-name">'+safeLabel(name)+'</span><span class="commute-time first">'+safeLabel(timeLabel)+'</span>'+
+     '<span class="station-grid-spacer" aria-hidden="true"></span><span class="commute-time second">'+safeLabel(timeLabel2)+'</span></span>':
+     safeLabel(name)+(timeLabel?'<span class="commute-time">'+safeLabel(timeLabel)+'</span>':'');
+   var html='<span class="'+classes+'">'+content+'</span>';"""
+assert TOWN_COMPONENT_HTML_V121.count(_V164_OLD_MARKUP)==1
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(_V164_OLD_MARKUP,_V164_NEW_MARKUP,1)
+_V164_CSS = """
+.station-chip.dual{align-items:flex-start;gap:3px;line-height:1.15}
+.station-chip.dual::before{margin-top:4px}
+.station-chip.dual .commute-grid{display:grid;grid-template-columns:max-content max-content;column-gap:2px;row-gap:1px;align-items:center}
+.station-chip.dual .station-name{grid-column:1;grid-row:1}
+.station-chip.dual .commute-time.first{grid-column:2;grid-row:1}
+.station-chip.dual .station-grid-spacer{grid-column:1;grid-row:2}
+.station-chip.dual .commute-time.second{grid-column:2;grid-row:2}
+"""
+assert TOWN_COMPONENT_HTML_V121.count('</style></head>')==1
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('</style></head>',_V164_CSS+'</style></head>',1)
+_V164_OLD_DESTINATION = ' state.commuteDestination=String(args.commute_destination||"");'
+assert TOWN_COMPONENT_HTML_V121.count(_V164_OLD_DESTINATION)==1
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(
+    _V164_OLD_DESTINATION,
+    _V164_OLD_DESTINATION+'\n state.commuteDestination2=String(args.commute_destination_2||"");',1)
+
 @st.cache_resource(show_spinner=False)
 def town_component_v121():
-    folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-v163')
+    folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-v164')
     os.makedirs(folder,exist_ok=True)
     path=os.path.join(folder,'index.html')
     # Component HTML is small; create once per worker process. Never include
@@ -11013,7 +11068,7 @@ def town_component_v121():
         with open(temp_path,'w',encoding='utf-8') as output:
             output.write(TOWN_COMPONENT_HTML_V121)
         os.replace(temp_path,path)
-    return st.components.v1.declare_component('sumai_town_map_v163',path=folder)
+    return st.components.v1.declare_component('sumai_town_map_v164',path=folder)
 
 # v159: Station-to-office approximate train travel times, OFFLINE AND READ-ONLY.
 # Tokyo Metro/Toei/JR local edge minutes adapted from MIT-licensed public project:
@@ -11431,6 +11486,53 @@ def town_station_refs_v163(commute_destination='表示しない'):
                            + (' ほか' if len(missing)>12 else ''))
     return items,[{'name':name,'lat':float(p[0]),'lng':float(p[1])} for name,p in WARD_LABELS.items()]
 
+
+def _commute_line_changed_v164_second():
+    """Changing the second line must not disturb the first destination."""
+    st.session_state['commute_station_2_v164'] = _COMMUTE_V160_NO_STATION
+
+
+def commute_current_destination_v164_second():
+    line=st.session_state.get('commute_line_2_v164',_COMMUTE_V160_NO_LINE)
+    station=st.session_state.get('commute_station_2_v164',_COMMUTE_V160_NO_STATION)
+    return station if station in commute_lines_v160().get(line,()) else '表示しない'
+
+
+def commute_selected_destinations_v164():
+    """Return at most two validated destinations in registered order.
+
+    A selected second destination works on its own when the first is blank.
+    The single-destination map retains its old one-line label format.
+    """
+    first=commute_current_destination_v160()
+    second=commute_current_destination_v164_second()
+    return tuple(destination for destination in (first,second) if destination!='表示しない')
+
+
+def town_station_refs_v164(destinations):
+    """Minutes and transfers for both targets come from the same route oracle.
+
+    Never guess missing travel times. Data payloads contain no Supabase secrets.
+    """
+    destinations=tuple(destinations)
+    if len(destinations)>2:
+        raise ValueError('通勤先は2駅までです。')
+    stations,wards=town_station_refs_v163(destinations[0] if destinations else '表示しない')
+    second=(commute_times_to_station_v159(destinations[1],with_transfers=True)
+            if len(destinations)==2 else {})
+    missing=[]
+    for station in stations:
+        route=second.get(_commute_key(station['name']))
+        station['commute2_min']=route[0] if route is not None else None
+        station['commute2_transfers']=route[1] if route is not None else None
+        if len(destinations)==2 and not (isinstance(station['commute2_min'],int)
+                                           and isinstance(station['commute2_transfers'],int)):
+            missing.append(station['name'])
+    if missing:
+        raise AppError('通勤先2の経路データがない駅: '+', '.join(missing[:12])
+                       + (' ほか' if len(missing)>12 else ''))
+    return stations,wards
+
 @st.fragment(run_every='15s')
 def town_choropleth_status():
     """Poll summary/boundary readiness WITHOUT remounting the map iframe."""
@@ -11530,20 +11632,22 @@ def interactive_town_choropleth(group,facilities):
                 'colored_count':geo['render_stats']['with_rent'],
                 'no_data_count':geo['render_stats']['without_rent'],'center':center}
         state['_v118_choropleth_payload']=cached
-    current_destination=commute_current_destination_v160()
-    if current_destination!='表示しない':
-        st.caption(f'通勤先：{current_destination}駅｜駅名横は（所要分数-乗換回数）の概算（徒歩・待ち時間を含まない）')
+    destinations=commute_selected_destinations_v164()
+    if len(destinations)==2:
+        st.caption(f'通勤先：1.{destinations[0]}駅／2.{destinations[1]}駅｜各駅に2行で所要時間と乗換回数を表示（概算）')
+    elif destinations:
+        st.caption(f'通勤先：{destinations[0]}駅｜所要分数-乗換回数（概算）')
     if cached['ready']:
         st.caption(f"\u7740\u8272 {cached['colored_count']}\u753a\u4e01\u76ee\uff5c\u30c7\u30fc\u30bf\u306a\u3057 {cached['no_data_count']}\u753a\u4e01\u76ee\uff08\u30b0\u30ec\u30fc\uff09")
     else:
         st.caption('集計中。完了後、地図の色は自動更新されます')
-    destination=commute_current_destination_v160()
-    stations,wards=town_station_refs_v163(destination)
+    stations,wards=town_station_refs_v164(destinations)
     widget=town_component_v121()
     data=widget(center=list(cached['center']),zoom=14,geo=cached['geo'],
                 signature=cached['layer_signature'],stations=stations,wards=wards,
-                commute_destination=(destination if destination!='表示しない' else ''),
-                key='town_map_v163_'+str(reset),default=None)
+                commute_destination=(destinations[0] if destinations else ''),
+                commute_destination_2=(destinations[1] if len(destinations)==2 else ''),
+                key='town_map_v164_'+str(reset),default=None)
     if isinstance(data,dict):
         current=viewport_bounds(data)
         if current:
@@ -11891,10 +11995,10 @@ def main():
         render_memory_diagnostic_v124()
     with tabs[2]:
         st.subheader('通勤の目安')
-        # Restore a previously selected v159 destination when upgrading.
+        # Destination 1: retain the existing state keys and the v159 upgrade path.
         available_lines=commute_lines_v160()
         if 'commute_line_v160' not in st.session_state:
-            previously=st.session_state.get('commute_destination_v159','\u8868\u793a\u3057\u306a\u3044')
+            previously=st.session_state.get('commute_destination_v159','表示しない')
             matching_line=next((name for name,stations in available_lines.items()
                                 if previously in stations),_COMMUTE_V160_NO_LINE)
             st.session_state['commute_line_v160']=matching_line
@@ -11904,25 +12008,45 @@ def main():
         if st.session_state.get('commute_line_v160') not in line_options:
             st.session_state['commute_line_v160']=_COMMUTE_V160_NO_LINE
             st.session_state['commute_station_v160']=_COMMUTE_V160_NO_STATION
-        current_line=st.selectbox(
-            '\u2460 \u901a\u52e4\u5148\u306e\u8def\u7dda',line_options,
+        st.markdown('**通勤先1**')
+        first_line=st.selectbox(
+            '① 路線（通勤先1）',line_options,
             key='commute_line_v160',on_change=_commute_line_changed_v160,
-            help='\u9244\u9053\u4f1a\u793e\u30fb\u8def\u7dda\u540d\u3067\u691c\u7d22\u3067\u304d\u307e\u3059\u3002')
-        station_options=[_COMMUTE_V160_NO_STATION,*available_lines.get(current_line,())]
-        if st.session_state.get('commute_station_v160') not in station_options:
+            help='鉄道会社・路線名から選べます。')
+        first_station_options=[_COMMUTE_V160_NO_STATION,*available_lines.get(first_line,())]
+        if st.session_state.get('commute_station_v160') not in first_station_options:
             st.session_state['commute_station_v160']=_COMMUTE_V160_NO_STATION
-        current_station=st.selectbox(
-            '\u2461 \u901a\u52e4\u5148\u306e\u99c5',station_options,
+        first_station=st.selectbox(
+            '② 駅（通勤先1）',first_station_options,
             key='commute_station_v160',
-            disabled=current_line==_COMMUTE_V160_NO_LINE,
-            help='\u9078\u3093\u3060\u8def\u7dda\u306e\u99c5\u3060\u3051\u3092\u8868\u793a\u3057\u307e\u3059\u3002')
+            disabled=first_line==_COMMUTE_V160_NO_LINE)
         st.session_state['commute_destination_v159']=(
-            current_station if current_station!=_COMMUTE_V160_NO_STATION else '\u8868\u793a\u3057\u306a\u3044')
-        if current_station!=_COMMUTE_V160_NO_STATION:
-            st.caption('\u9078\u629e\u4e2d\uff1a'+current_station+'\u99c5 \uff5c \u5730\u56f3\u4e0a\u306e\u99c5\u540d\u306b\uff08XX\u5206-X\u56de\uff09\u3092\u8868\u793a')
-        st.caption('選択後、「住まいを探す」タブの地図に表示します。時刻表・待ち時間・出入口までの徒歩は含みません。'
-                   '東京メトロ・都営地下鉄・山手線・中央総武線の公開時刻表を基にした参考値（一部データは旧年次）、'
-                   '私鉄等は駅間距離からの概算です。乗換回数は路線の切替に基づく目安で、直通運転は反映しない場合があります。未対応駅には時間と乗換回数を表示しません。')
+            first_station if first_station!=_COMMUTE_V160_NO_STATION else '表示しない')
+
+        # Destination 2 is optional, independent of destination 1.
+        st.markdown('**通勤先2（任意）**')
+        if st.session_state.get('commute_line_2_v164') not in line_options:
+            st.session_state['commute_line_2_v164']=_COMMUTE_V160_NO_LINE
+            st.session_state['commute_station_2_v164']=_COMMUTE_V160_NO_STATION
+        second_line=st.selectbox(
+            '① 路線（通勤先2）',line_options,
+            key='commute_line_2_v164',on_change=_commute_line_changed_v164_second,
+            help='2駅目が不要な場合は「路線を選択してください」のままで構いません。')
+        second_station_options=[_COMMUTE_V160_NO_STATION,*available_lines.get(second_line,())]
+        if st.session_state.get('commute_station_2_v164') not in second_station_options:
+            st.session_state['commute_station_2_v164']=_COMMUTE_V160_NO_STATION
+        second_station=st.selectbox(
+            '② 駅（通勤先2）',second_station_options,
+            key='commute_station_2_v164',
+            disabled=second_line==_COMMUTE_V160_NO_LINE)
+
+        chosen=commute_selected_destinations_v164()
+        if len(chosen)==2:
+            st.caption(f'設定中：1. {chosen[0]}駅　2. {chosen[1]}駅｜地図上は駅名＋1駅目の時間、その下に2駅目の時間を表示')
+        elif chosen:
+            st.caption(f'設定中：{chosen[0]}駅｜地図上は従来の1行表示')
+        st.caption('設定後、「住まいを探す」タブの地図に反映します。所要時間・乗換回数はアプリの路線データによる概算です。'
+                   '現行時刻表・待ち時間・改札内移動・職場までの徒歩時間は含みません。')
         options=physical_units([r for r in state.new_units if has_point(r) and r.get('coordinate_precision')!='town'])
         if options:
             i=st.selectbox('出発する物件',range(len(options)),format_func=lambda i:options[i]['title'])
