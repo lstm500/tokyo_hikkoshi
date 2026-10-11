@@ -40,7 +40,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v161"
+BUILD = "REBUILD-01-v162"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -10989,7 +10989,7 @@ TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(
 
 @st.cache_resource(show_spinner=False)
 def town_component_v121():
-    folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-v161')
+    folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-v162')
     os.makedirs(folder,exist_ok=True)
     path=os.path.join(folder,'index.html')
     # Component HTML is small; create once per worker process. Never include
@@ -11006,7 +11006,7 @@ def town_component_v121():
         with open(temp_path,'w',encoding='utf-8') as output:
             output.write(TOWN_COMPONENT_HTML_V121)
         os.replace(temp_path,path)
-    return st.components.v1.declare_component('sumai_town_map_v161',path=folder)
+    return st.components.v1.declare_component('sumai_town_map_v162',path=folder)
 
 # v159: Station-to-office approximate train travel times, OFFLINE AND READ-ONLY.
 # Tokyo Metro/Toei/JR local edge minutes adapted from MIT-licensed public project:
@@ -11138,30 +11138,148 @@ def commute_network_v159():
         a,b=row.split();link(a,b,'徒歩連絡',5.0)
     return dict(edges)
 
+
+# v162: repair unreachable DISPLAYED stations. The existing v161 station labels
+# contain many valid stations omitted from the travel-time graph. This extension
+# adds real, ordered operating routes, with publicly listed adjacent-stop minutes
+# where available and explicitly approximate geometry-based connections elsewhere.
+# Source (MIT project, timetable approximations, not real-time):
+# https://github.com/select766/tokyo-train-time-map/blob/master/data/stations.csv
+# Tokyo Metropolitan Government route names/stations (Nippori-Toneri Liner):
+# https://www.kotsu.metro.tokyo.jp/nippori_toneri/map/
+_COMMUTE_V162_TIMED_LINES = r"""
+日暮里・舎人ライナー|日暮里 西日暮里:2 赤土小学校前:2 熊野前:2 足立小台:2 扇大橋:1 高野:2 江北:2 西新井大師西:2 谷在家:2 舎人公園:2 舎人:2 見沼代親水公園:2
+ゆりかもめ|新橋 汐留:1 竹芝:3 日の出:2 芝浦ふ頭:1 お台場海浜公園:6 台場:2 東京国際クルーズターミナル:2 テレコムセンター:2 青海:2 東京ビッグサイト:2 有明(ゆりかもめ):2 有明テニスの森:2 市場前:2 新豊洲:1 豊洲:2
+都電荒川線|面影橋 学習院下:2 鬼子母神前:1 都電雑司ヶ谷:2 東池袋四丁目:2 向原:2 大塚駅前:5 巣鴨新田:1 庚申塚:1 新庚申塚:1 西ヶ原四丁目:3 滝野川一丁目:1 飛鳥山:1 王子駅前:3 栄町:1 梶原:1 荒川車庫前:4 荒川遊園地前:1 小台:2 宮ノ前:1 熊野前:5 東尾久三丁目:1 町屋二丁目:1 町屋駅前:4 荒川七丁目:1 荒川二丁目:1 荒川区役所前:1 荒川一中前:1 三ノ輪橋:1
+埼京線|浮間舟渡 北赤羽:2 赤羽:2 十条:2 板橋:2 池袋:3 新宿:5 渋谷:6 恵比寿:2 大崎:4
+京浜東北線|赤羽 東十条:3 王子:3 上中里:1 田端:3 西日暮里:2 日暮里:1 鶯谷:2 上野:2 御徒町:2 秋葉原:2 神田:2 東京:2 有楽町:2 新橋:2 浜松町:2 田町:3 高輪ゲートウェイ:2 品川:2 大井町:3 大森:2 蒲田:5
+宇都宮線・東海道線|赤羽 尾久:4 上野:6 東京:5 新橋:2 品川:5
+常磐快速線|北千住 南千住:2 三河島:3 日暮里:2 上野:4 東京:5 新橋:2 品川:5
+常磐線各駅停車|綾瀬 亀有:2 金町:2
+横須賀線・総武快速線|西大井 品川:5 新橋:3 東京:3 新日本橋:2 馬喰町:2 錦糸町:4 新小岩:4 市川:5 船橋:6 津田沼:4
+京葉線|新木場 葛西臨海公園:3
+""".strip()
+
+# The following are REAL, running railway lines. Stops missing from the map's
+# offline coordinate dictionary are retained as route order markers, not assigned
+# fabricated positions. Adjacent known stops are bridged on that exact line,
+# with a conservative distance + number-of-intermediate-stops time estimate.
+_COMMUTE_V162_APPROX_LINES = r"""
+京王新線|新宿 初台 幡ヶ谷 笹塚
+西武有楽町線|練馬 新桜台 小竹向原
+東急多摩川線|多摩川 沼部 鵜の木 下丸子 武蔵新田 矢口渡 蒲田
+東急世田谷線|三軒茶屋 西太子堂 若林 松陰神社前 世田谷 上町 宮の坂 山下 松原 下高井戸
+東京モノレール|浜松町 天王洲アイル 大井競馬場前 流通センター 昭和島 整備場 天空橋 羽田空港第3ターミナル 羽田空港第1ターミナル 羽田空港第2ターミナル
+京急空港線|京急蒲田 糀谷 大鳥居 穴守稲荷 天空橋 羽田空港第3ターミナル 羽田空港第1・第2ターミナル
+東武亀戸線|曳舟 小村井 東あずま 亀戸水神 亀戸
+""".strip()
+
+# Distinct tram and metro stations should NOT be merged just because their names
+# resemble one another. Explicit walking links carry a finite journey time.
+_COMMUTE_V162_WALKS = (
+    ('三ノ輪','三ノ輪橋',6), ('大塚','大塚駅前',3),
+    ('王子','王子駅前',3), ('町屋','町屋駅前',3),
+    ('雑司が谷','鬼子母神前',4),
+    ('国際展示場','有明(ゆりかもめ)',5),
+    ('東京テレポート','お台場海浜公園',5),
+    # JR蒲田と京急蒲田は同一駅ではない: 連絡徒歩を区別する。
+    ('蒲田','京急蒲田',12),
+)
+
+@__import__('functools').lru_cache(maxsize=1)
+def commute_network_v162():
+    """Augment v161's graph without changing its saved data or existing routes."""
+    from collections import defaultdict
+    graph=defaultdict(list,{name:list(links) for name,links in commute_network_v159().items()})
+
+    def link(a,b,line,minutes):
+        a,b=_commute_key(a),_commute_key(b)
+        if a and b and a!=b and 0 < minutes < 150:
+            graph[a].append((b,line,float(minutes)))
+            graph[b].append((a,line,float(minutes)))
+
+    for row in _COMMUTE_V162_TIMED_LINES.splitlines():
+        if not row.strip():continue
+        line,text=row.split('|',1)
+        tokens=text.split()
+        prev=tokens[0]
+        for token in tokens[1:]:
+            nxt,mins=token.rsplit(':',1)
+            link(prev,nxt,line,float(mins))
+            prev=nxt
+
+    # Older private lines currently SKIP every edge touching an unlocated stop.
+    # Bridge only the missing intermediate runs, preserving the existing segments.
+    for data,new_line in ((_COMMUTE_APPROX_LINES,False),(_COMMUTE_V162_APPROX_LINES,True)):
+        for row in data.splitlines():
+            if not row.strip():continue
+            line,stations=row.split('|',1)
+            good=[]
+            for index,name in enumerate(stations.split()):
+                point=STATION_MAP_POINTS.get(name) or STATIONS.get(name)
+                if point is not None:
+                    good.append((index,name,point))
+            for (i,a,pa),(j,b,pb) in zip(good,good[1:]):
+                hops=j-i
+                if not new_line and hops==1:
+                    continue
+                distance=meters(pa,pb)
+                if not 90 <= distance <= 13000*hops:
+                    continue
+                # v161's 28km/h per-ride formula, adding dwell time per skipped stop.
+                minutes=max(1.5*hops,min(18.0*hops,distance*1.25/1000/28*60+0.7*hops))
+                link(a,b,line,minutes)
+
+    # Actual rail connections for stations whose coordinates are not in the
+    # label-only reference table. They are train edges, not made-up map points.
+    # Useful especially for a route via 京急蒲田 to 羽田方面.
+    for a,b,line,mins in (
+        ('品川','京急蒲田','京急本線（概算）',13.0),
+        ('京急蒲田','糀谷','京急空港線',2.5),
+    ):
+        link(a,b,line,mins)
+
+    for a,b,mins in _COMMUTE_V162_WALKS:
+        link(a,b,'徒歩連絡',float(mins))
+    return dict(graph)
+
 @__import__('functools').lru_cache(maxsize=16)
 def commute_times_to_station_v159(destination, with_transfers=False):
     """Fast one-to-all Dijkstra; line changes cost 5 min (not current departures)."""
     destination=_commute_key(destination)
-    graph=commute_network_v159()
+    graph=commute_network_v162()
     if destination not in graph:return {}
     # State: (station, preceding line).  Keep the best time / transfer count.
-    todo=[(0.0,0,destination,'')]
+    # Track whether the previous edge was an interchange walk.
+    # A walking connection already consumes the required transfer time.
+    # Crucially, it MUST NOT erase the boarded line, or changing from Metro
+    # to tram/another operator is incorrectly displayed as "0回".
+    todo=[(0.0,0,destination,'',False)]
     seen=set();best={}
     while todo:
-        time_used,changes,station,last_line=heapq.heappop(todo)
-        state=(station,last_line)
+        time_used,changes,station,last_line,walked=heapq.heappop(todo)
+        state=(station,last_line,walked)
         if state in seen:continue
         seen.add(state)
         old=best.get(station)
-        if old is None or time_used<old[0]:best[station]=(time_used,changes)
+        if old is None or (time_used,changes)<old:
+            best[station]=(time_used,changes)
         for next_station,line,ride_time in graph.get(station,()):
-            # A 5-minute pedestrian transfer includes the interchange walk.
-            transfer=(last_line!='' and last_line!=line and line!='徒歩連絡')
-            extra=5.0 if transfer else 0.0
-            new_line='' if line=='徒歩連絡' else line
-            key=(next_station,new_line)
+            if line=='徒歩連絡':
+                # Keep the previous railway line through the walkway.
+                transfer=False
+                extra=0.0
+                new_line=last_line
+                new_walked=True
+            else:
+                transfer=bool(last_line and last_line!=line)
+                extra=5.0 if transfer and not walked else 0.0
+                new_line=line
+                new_walked=False
+            key=(next_station,new_line,new_walked)
             if key not in seen:
-                heapq.heappush(todo,(time_used+ride_time+extra,changes+int(transfer),next_station,new_line))
+                heapq.heappush(todo,(time_used+ride_time+extra,changes+int(transfer),
+                                     next_station,new_line,new_walked))
     # Preserve the original fastest route and its line-change count together.
     # The default integer-minute return is backward compatible with v159/v160.
     result={name:(0 if name==destination else max(1,int(math.ceil(val[0]))),int(val[1]))
@@ -11242,7 +11360,8 @@ def commute_lines_v160():
 
     # Published-minute lines are in physical order. Private/JR legacy route
     # names are merged into this same, ordered set of options.
-    for source in (_COMMUTE_PUBLISHED_LINES,_COMMUTE_APPROX_LINES):
+    for source in (_COMMUTE_PUBLISHED_LINES,_COMMUTE_APPROX_LINES,
+                   _COMMUTE_V162_TIMED_LINES,_COMMUTE_V162_APPROX_LINES):
         for raw in source.splitlines():
             if not raw.strip():continue
             name,points=raw.split('|',1)
@@ -11408,7 +11527,7 @@ def interactive_town_choropleth(group,facilities):
     widget=town_component_v121()
     data=widget(center=list(cached['center']),zoom=14,geo=cached['geo'],
                 signature=cached['layer_signature'],stations=stations,wards=wards,
-                key='town_map_v161_'+str(reset),default=None)
+                key='town_map_v162_'+str(reset),default=None)
     if isinstance(data,dict):
         current=viewport_bounds(data)
         if current:
