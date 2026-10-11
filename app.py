@@ -40,7 +40,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v159"
+BUILD = "REBUILD-01-v160"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -11157,6 +11157,111 @@ def commute_destinations_v159():
     reachable=commute_times_to_station_v159('東京')
     return ['表示しない']+sorted(name for name in reachable if name in STATION_MAP_POINTS or name in STATIONS)
 
+
+# v160: destination selection follows the operating line, then its stations.
+# This is a presentation change only; the v159 graph and minute estimates stay
+# identical, and the existing commute_destination_v159 state remains compatible.
+_COMMUTE_V160_NO_LINE = '\u8def\u7dda\u3092\u9078\u629e\u3057\u3066\u304f\u3060\u3055\u3044'
+_COMMUTE_V160_NO_STATION = '\u99c5\u3092\u9078\u629e\u3057\u3066\u304f\u3060\u3055\u3044'
+_COMMUTE_V160_METRO = frozenset("""
+\u9280\u5ea7\u7dda \u4e38\u30ce\u5185\u7dda \u4e38\u30ce\u5185\u7dda\u652f\u7dda \u65e5\u6bd4\u8c37\u7dda \u6771\u897f\u7dda \u5343\u4ee3\u7530\u7dda
+\u6709\u697d\u753a\u7dda \u526f\u90fd\u5fc3\u7dda \u534a\u8535\u9580\u7dda \u5357\u5317\u7dda""".split())
+_COMMUTE_V160_TOEI = frozenset("""
+\u6d45\u8349\u7dda \u4e09\u7530\u7dda \u65b0\u5bbf\u7dda \u5927\u6c5f\u6238\u7dda""".split())
+_COMMUTE_V160_JR = frozenset("""
+\u5c71\u624b\u7dda \u4e2d\u592e\u7dcf\u6b66\u7dda \u4eac\u8449\u7dda \u5357\u6b66\u7dda \u4eac\u6d5c\u6771\u5317\u7dda \u57fc\u4eac\u7dda
+\u4e2d\u592e\u7dda\u5feb\u901f \u6771\u6d77\u9053\u7dda \u6a2a\u9808\u8cc0\u7dda \u7dcf\u6b66\u7dda\u5feb\u901f \u5e38\u78d0\u7dda\u5feb\u901f""".split())
+_COMMUTE_V160_LINE_ORDER = (
+    '\u5c71\u624b\u7dda','\u4eac\u6d5c\u6771\u5317\u7dda','\u57fc\u4eac\u7dda',
+    '\u4e2d\u592e\u7dda\u5feb\u901f','\u4e2d\u592e\u7dcf\u6b66\u7dda',
+    '\u6771\u6d77\u9053\u7dda','\u6a2a\u9808\u8cc0\u7dda','\u7dcf\u6b66\u7dda\u5feb\u901f',
+    '\u5e38\u78d0\u7dda\u5feb\u901f','\u4eac\u8449\u7dda','\u5357\u6b66\u7dda',
+    '\u9280\u5ea7\u7dda','\u4e38\u30ce\u5185\u7dda','\u4e38\u30ce\u5185\u7dda\u652f\u7dda',
+    '\u65e5\u6bd4\u8c37\u7dda','\u6771\u897f\u7dda','\u5343\u4ee3\u7530\u7dda',
+    '\u6709\u697d\u753a\u7dda','\u526f\u90fd\u5fc3\u7dda','\u534a\u8535\u9580\u7dda',
+    '\u5357\u5317\u7dda','\u6d45\u8349\u7dda','\u4e09\u7530\u7dda',
+    '\u65b0\u5bbf\u7dda','\u5927\u6c5f\u6238\u7dda',
+)
+
+def _commute_v160_normalized_line(raw):
+    # Internal connectors and alternate names are not separate selectable routes.
+    aliases = {
+        '\u4eac\u8449\u7dda\uff08\u6982\u7b97\uff09':'\u4eac\u8449\u7dda',
+        '\u5357\u6b66\u7dda\uff08\u5404\u505c\u6982\u7b97\uff09':'\u5357\u6b66\u7dda',
+        '\u308a\u3093\u304b\u3044\u7dda\uff08\u6982\u7b97\uff09':'\u308a\u3093\u304b\u3044\u7dda',
+        '\u6771\u6a2a\u7dda':'\u6771\u6025\u6771\u6a2a\u7dda',
+        '\u7530\u5712\u90fd\u5e02\u7dda':'\u6771\u6025\u7530\u5712\u90fd\u5e02\u7dda',
+        '\u5927\u6c5f\u6238\u7dda\u90fd\u5e81\u524d\u9023\u7d61':'\u5927\u6c5f\u6238\u7dda',
+    }
+    return aliases.get(raw,raw)
+
+def _commute_v160_line_label(name):
+    if name in _COMMUTE_V160_JR:
+        public = '\u4e2d\u592e\u30fb\u7dcf\u6b66\u7dda\uff08\u5404\u99c5\u505c\u8eca\uff09' if name=='\u4e2d\u592e\u7dcf\u6b66\u7dda' else name
+        return 'JR \uff5c '+public
+    if name in _COMMUTE_V160_METRO:
+        public = '\u4e38\u30ce\u5185\u7dda\uff08\u65b9\u5357\u753a\u65b9\u9762\uff09' if name=='\u4e38\u30ce\u5185\u7dda\u652f\u7dda' else name
+        return '\u6771\u4eac\u30e1\u30c8\u30ed \uff5c '+public
+    if name in _COMMUTE_V160_TOEI:
+        return '\u90fd\u55b6\u5730\u4e0b\u9244 \uff5c '+name
+    if name.startswith('\u6771\u6025'):
+        return name
+    return name
+
+@__import__('functools').lru_cache(maxsize=1)
+def commute_lines_v160():
+    """Ordered line names -> connected station names; no external requests."""
+    available=set(commute_destinations_v159())
+    available.discard('\u8868\u793a\u3057\u306a\u3044')
+    combined={}
+
+    def add(line, stations):
+        line=_commute_v160_normalized_line(line)
+        if line not in combined: combined[line]=[]
+        for original in stations:
+            station=_commute_key(original.split(':',1)[0])
+            if station in available and station not in combined[line]:
+                combined[line].append(station)
+
+    # Published-minute lines are in physical order. Private/JR legacy route
+    # names are merged into this same, ordered set of options.
+    for source in (_COMMUTE_PUBLISHED_LINES,_COMMUTE_APPROX_LINES):
+        for raw in source.splitlines():
+            if not raw.strip():continue
+            name,points=raw.split('|',1)
+            add(name,points.split())
+    for name,stations in LINES.items():
+        if name=='\u7dcf\u6b66\u7dda\u5feb\u901f':
+            # These real Sobu-Rapid stops were in v159 only via walk links.
+            # Make them findable without modifying the legacy route calculator.
+            stations=[stations[0],'\u65b0\u65e5\u672c\u6a4b','\u99ac\u55b0\u753a',*stations[1:]]
+        add(name,stations)
+
+    combined={key:value for key,value in combined.items() if len(value)>=2}
+    ordering={v:i for i,v in enumerate(_COMMUTE_V160_LINE_ORDER)}
+    return dict(sorted(
+        ((_commute_v160_line_label(k),v) for k,v in combined.items()),
+        key=lambda pair:(
+            0 if pair[0].startswith('JR ') else 1 if pair[0].startswith('\u6771\u4eac\u30e1\u30c8\u30ed ')
+            else 2 if pair[0].startswith('\u90fd\u55b6\u5730\u4e0b\u9244 ') else 3,
+            ordering.get(next((name for name in combined if _commute_v160_line_label(name)==pair[0]),''),999),
+            pair[0]
+        )
+    ))
+
+def _commute_line_changed_v160():
+    # Drop an old station on line changes; never leave a mismatched destination.
+    st.session_state['commute_station_v160']=_COMMUTE_V160_NO_STATION
+    st.session_state['commute_destination_v159']='\u8868\u793a\u3057\u306a\u3044'
+
+def commute_current_destination_v160():
+    line=st.session_state.get('commute_line_v160')
+    station=st.session_state.get('commute_station_v160')
+    if line is None and station is None:
+        # Upgrade-safe: keep a v159 choice until the new widgets first render.
+        return st.session_state.get('commute_destination_v159','\u8868\u793a\u3057\u306a\u3044')
+    return station if station in commute_lines_v160().get(line,()) else '\u8868\u793a\u3057\u306a\u3044'
+
 @st.cache_data(show_spinner=False)
 def town_station_refs_v118(commute_destination='表示しない'):
     majors=set(MAJOR_STATION_LABELS)
@@ -11270,14 +11375,14 @@ def interactive_town_choropleth(group,facilities):
                 'colored_count':geo['render_stats']['with_rent'],
                 'no_data_count':geo['render_stats']['without_rent'],'center':center}
         state['_v118_choropleth_payload']=cached
-    current_destination=state.get('commute_destination_v159','表示しない')
+    current_destination=commute_current_destination_v160()
     if current_destination!='表示しない':
         st.caption(f'通勤先：{current_destination}駅｜駅名横の（数字）は電車・乗換の概算分数（徒歩・待ち時間を含まない）')
     if cached['ready']:
         st.caption(f"\u7740\u8272 {cached['colored_count']}\u753a\u4e01\u76ee\uff5c\u30c7\u30fc\u30bf\u306a\u3057 {cached['no_data_count']}\u753a\u4e01\u76ee\uff08\u30b0\u30ec\u30fc\uff09")
     else:
         st.caption('集計中。完了後、地図の色は自動更新されます')
-    destination=state.get('commute_destination_v159','表示しない')
+    destination=commute_current_destination_v160()
     stations,wards=town_station_refs_v118(destination)
     widget=town_component_v121()
     data=widget(center=list(cached['center']),zoom=14,geo=cached['geo'],
@@ -11630,9 +11735,35 @@ def main():
         render_memory_diagnostic_v124()
     with tabs[2]:
         st.subheader('通勤の目安')
-        st.selectbox('通勤先の駅（地図上に各駅からの所要時間を表示）',
-                     commute_destinations_v159(),key='commute_destination_v159',
-                     help='地図の駅名の横に（XX分）を追加します。電車乗車と乗換5分の概算です。')
+        # Restore a previously selected v159 destination when upgrading.
+        available_lines=commute_lines_v160()
+        if 'commute_line_v160' not in st.session_state:
+            previously=st.session_state.get('commute_destination_v159','\u8868\u793a\u3057\u306a\u3044')
+            matching_line=next((name for name,stations in available_lines.items()
+                                if previously in stations),_COMMUTE_V160_NO_LINE)
+            st.session_state['commute_line_v160']=matching_line
+            st.session_state['commute_station_v160']=(previously if matching_line!=_COMMUTE_V160_NO_LINE
+                                                      else _COMMUTE_V160_NO_STATION)
+        line_options=[_COMMUTE_V160_NO_LINE,*available_lines]
+        if st.session_state.get('commute_line_v160') not in line_options:
+            st.session_state['commute_line_v160']=_COMMUTE_V160_NO_LINE
+            st.session_state['commute_station_v160']=_COMMUTE_V160_NO_STATION
+        current_line=st.selectbox(
+            '\u2460 \u901a\u52e4\u5148\u306e\u8def\u7dda',line_options,
+            key='commute_line_v160',on_change=_commute_line_changed_v160,
+            help='\u9244\u9053\u4f1a\u793e\u30fb\u8def\u7dda\u540d\u3067\u691c\u7d22\u3067\u304d\u307e\u3059\u3002')
+        station_options=[_COMMUTE_V160_NO_STATION,*available_lines.get(current_line,())]
+        if st.session_state.get('commute_station_v160') not in station_options:
+            st.session_state['commute_station_v160']=_COMMUTE_V160_NO_STATION
+        current_station=st.selectbox(
+            '\u2461 \u901a\u52e4\u5148\u306e\u99c5',station_options,
+            key='commute_station_v160',
+            disabled=current_line==_COMMUTE_V160_NO_LINE,
+            help='\u9078\u3093\u3060\u8def\u7dda\u306e\u99c5\u3060\u3051\u3092\u8868\u793a\u3057\u307e\u3059\u3002')
+        st.session_state['commute_destination_v159']=(
+            current_station if current_station!=_COMMUTE_V160_NO_STATION else '\u8868\u793a\u3057\u306a\u3044')
+        if current_station!=_COMMUTE_V160_NO_STATION:
+            st.caption('\u9078\u629e\u4e2d\uff1a'+current_station+'\u99c5 \uff5c \u5730\u56f3\u4e0a\u306e\u99c5\u540d\u306b\uff08XX\u5206\uff09\u3092\u8868\u793a')
         st.caption('選択後、「住まいを探す」タブの地図に表示します。時刻表・待ち時間・出入口までの徒歩は含みません。'
                    '東京メトロ・都営地下鉄・山手線・中央総武線の公開時刻表を基にした参考値（一部データは旧年次）、'
                    '私鉄等は駅間距離からの概算です。未対応駅には時間を表示しません。')
