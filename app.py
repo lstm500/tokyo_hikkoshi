@@ -40,7 +40,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v158"
+BUILD = "REBUILD-01-v159"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -10964,9 +10964,18 @@ assert TOWN_COMPONENT_HTML_V121.count(_V157_POPUP_OLD)==1
 TOWN_COMPONENT_HTML_V121 = TOWN_COMPONENT_HTML_V121.replace(_V157_POPUP_OLD,_V157_POPUP_NEW,1)
 
 
+
+_V159_STATION_OLD='   var s=visible[j],name=String(s.name||\'\');\n   if(!name)continue;\n   var p=m.latLngToContainerPoint([s.lat,s.lng]);\n   var major=s.priority===0;\n   var compact=zoom<12;\n   var fontSize=compact?(major?12:11):(major?14:12);\n   var width=Math.min(195,Array.from(name).length*fontSize+11);\n   var height=compact?17:(major?21:19);\n   // Use a precise pixel collision box matching the compact halo label.\n   if(!reserveLabel(p,width,height,boxes,size))continue;\n   count++;\n   var html=\'<span class="station-chip\'+(major?\'\':\' minor\')+(compact?\' compact\':\'\')+\'">\'+safeLabel(name)+\'</span>\';\n'
+_V159_STATION_NEW='   var s=visible[j],name=String(s.name||\'\');\n   if(!name)continue;\n   var commuteTime=(typeof s.commute_min===\'number\' && isFinite(s.commute_min) && s.commute_min>=0 && s.commute_min<999)?Math.round(s.commute_min):null;\n   var timeLabel=commuteTime===null?\'\':\'（\'+commuteTime+\'分）\';\n   var p=m.latLngToContainerPoint([s.lat,s.lng]);\n   var major=s.priority===0;\n   var compact=zoom<12;\n   var fontSize=compact?(major?12:11):(major?14:12);\n   var width=Math.min(252,Array.from(name).length*fontSize+Array.from(timeLabel).length*(fontSize-2)+11);\n   var height=compact?17:(major?21:19);\n   // Include the travel-time suffix in the measured collision box.\n   if(!reserveLabel(p,width,height,boxes,size))continue;\n   count++;\n   var html=\'<span class="station-chip\'+(major?\'\':\' minor\')+(compact?\' compact\':\'\')+\'">\'+safeLabel(name)+(timeLabel?\'<span class="commute-time">\'+safeLabel(timeLabel)+\'</span>\':\'\')+\'</span>\';\n'
+assert TOWN_COMPONENT_HTML_V121.count(_V159_STATION_OLD)==1
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(_V159_STATION_OLD,_V159_STATION_NEW,1)
+_V159_STATION_CSS='.station-chip.minor.compact{font-size:11px;line-height:15px;}\n'
+assert TOWN_COMPONENT_HTML_V121.count(_V159_STATION_CSS)==1
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(_V159_STATION_CSS,_V159_STATION_CSS+'.station-chip .commute-time{font-size:.86em;font-weight:800;letter-spacing:-.3px;}\n',1)
+
 @st.cache_resource(show_spinner=False)
 def town_component_v121():
-    folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-v157')
+    folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-v159')
     os.makedirs(folder,exist_ok=True)
     path=os.path.join(folder,'index.html')
     # Component HTML is small; create once per worker process. Never include
@@ -10983,15 +10992,181 @@ def town_component_v121():
         with open(temp_path,'w',encoding='utf-8') as output:
             output.write(TOWN_COMPONENT_HTML_V121)
         os.replace(temp_path,path)
-    return st.components.v1.declare_component('sumai_town_map_v158',path=folder)
+    return st.components.v1.declare_component('sumai_town_map_v159',path=folder)
+
+# v159: Station-to-office approximate train travel times, OFFLINE AND READ-ONLY.
+# Tokyo Metro/Toei/JR local edge minutes adapted from MIT-licensed public project:
+# https://github.com/select766/tokyo-train-time-map (data/stations.csv; older timetable data)
+# 2017-based core data, 2026 supplemented stations; current timetable NOT guaranteed.
+# The private-rail links below use distance-based ESTIMATES, not published schedules.
+# No transit API key, network request, DB update or dependency is needed.
+# Explicit edge times are the minutes from previous station -> current station.
+_COMMUTE_PUBLISHED_LINES = r"""
+銀座線|渋谷 表参道:2 外苑前:2 青山一丁目:1 赤坂見附:2 溜池山王:2 虎ノ門:2 新橋:2 銀座:2 京橋:2 日本橋:2 三越前:2 神田:2 末広町:1 上野広小路:2 上野:1 稲荷町:2 田原町:2 浅草:1
+丸ノ内線|荻窪 南阿佐ヶ谷:2 新高円寺:2 東高円寺:2 新中野:2 中野坂上:2 西新宿:2 新宿:2 新宿三丁目:2 新宿御苑前:1 四谷三丁目:2 四ツ谷:2 赤坂見附:3 国会議事堂前:2 霞ヶ関:2 銀座:3 東京:2 大手町:2 淡路町:2 御茶ノ水:1 本郷三丁目:2 後楽園:2 茗荷谷:3 新大塚:2 池袋:3
+丸ノ内線支線|中野坂上 中野新橋:2 中野富士見町:2 方南町:2
+日比谷線|中目黒 恵比寿:2 広尾:3 六本木:3 神谷町:4 虎ノ門ヒルズ:1 霞ヶ関:2 日比谷:2 銀座:2 東銀座:1 築地:2 八丁堀:2 茅場町:2 人形町:2 小伝馬町:2 秋葉原:2 仲御徒町:1 上野:2 入谷:2 三ノ輪:2 南千住:2 北千住:3
+東西線|中野 落合:3 高田馬場:3 早稲田:3 神楽坂:2 飯田橋:2 九段下:2 竹橋:2 大手町:2 日本橋:2 茅場町:1 門前仲町:3 木場:2 東陽町:1 南砂町:3 西葛西:3 葛西:2 浦安:2 南行徳:2 行徳:2 妙典:2 原木中山:3 西船橋:3
+千代田線|代々木上原 代々木公園:2 明治神宮前:2 表参道:1 乃木坂:3 赤坂:2 国会議事堂前:2 霞ヶ関:1 日比谷:2 二重橋前:2 大手町:2 新御茶ノ水:2 湯島:2 根津:2 千駄木:2 西日暮里:2 町屋:2 北千住:4 綾瀬:3 北綾瀬:4
+有楽町線|和光市 地下鉄成増:3 地下鉄赤塚:2 平和台:3 氷川台:2 小竹向原:2 千川:2 要町:2 池袋:3 東池袋:2 護国寺:2 江戸川橋:3 飯田橋:2 市ヶ谷:3 麹町:2 永田町:1 桜田門:2 有楽町:2 銀座一丁目:2 新富町:1 月島:3 豊洲:2 辰巳:2 新木場:3
+副都心線|和光市 地下鉄成増:3 地下鉄赤塚:2 平和台:3 氷川台:2 小竹向原:2 千川:2 要町:2 池袋:2 雑司が谷:3 西早稲田:3 東新宿:2 新宿三丁目:2 北参道:3 明治神宮前:2 渋谷:2
+半蔵門線|渋谷 表参道:2 青山一丁目:2 永田町:3 半蔵門:2 九段下:2 神保町:1 大手町:3 三越前:2 水天宮前:3 清澄白河:3 住吉:3 錦糸町:2 押上:2
+南北線|目黒 白金台:2 白金高輪:2 麻布十番:3 六本木一丁目:2 溜池山王:2 永田町:2 四ツ谷:2 市ヶ谷:2 飯田橋:2 後楽園:2 東大前:3 本駒込:2 駒込:2 西ヶ原:2 王子:2 王子神谷:3 志茂:2 赤羽岩淵:2
+浅草線|西馬込 馬込:1 中延:2 戸越:2 五反田:2 高輪台:2 泉岳寺:2 三田:3 大門:2 新橋:2 東銀座:2 宝町:2 日本橋:1 人形町:2 東日本橋:2 浅草橋:1 蔵前:2 浅草:2 本所吾妻橋:1 押上:2
+三田線|目黒 白金台:2 白金高輪:2 三田:3 芝公園:2 御成門:1 内幸町:2 日比谷:2 大手町:2 神保町:3 水道橋:2 春日:2 白山:2 千石:2 巣鴨:2 西巣鴨:2 新板橋:2 板橋区役所前:2 板橋本町:2 本蓮沼:1 志村坂上:2 志村三丁目:2 蓮根:2 西台:2 高島平:2 新高島平:2 西高島平:2
+新宿線|新宿 新宿三丁目:1 曙橋:2 市ヶ谷:2 九段下:3 神保町:1 小川町:2 岩本町:2 馬喰横山:1 浜町:2 森下:1 菊川:2 住吉:2 西大島:1 大島:2 東大島:2 船堀:3 一之江:2 瑞江:3 篠崎:2 本八幡:4
+大江戸線|新宿西口 東新宿:3 若松河田:2 牛込柳町:2 牛込神楽坂:2 飯田橋:2 春日:3 本郷三丁目:1 上野御徒町:3 新御徒町:1 蔵前:2 両国:3 森下:1 清澄白河:2 門前仲町:3 月島:2 勝どき:2 築地市場:3 汐留:2 大門:2 赤羽橋:3 麻布十番:2 六本木:2 青山一丁目:3 国立競技場:2 代々木:3 新宿:2 都庁前:1 西新宿五丁目:1 中野坂上:2 東中野:2 中井:2 落合南長崎:3 新江古田:2 練馬:3 豊島園:2 練馬春日町:2 光が丘:2
+大江戸線都庁前連絡|都庁前 新宿西口:1
+山手線|東京 有楽町:2 新橋:2 浜松町:2 田町:3 高輪ゲートウェイ:2 品川:2 大崎:3 五反田:2 目黒:2 恵比寿:3 渋谷:2 原宿:3 代々木:2 新宿:2 新大久保:2 高田馬場:2 目白:2 池袋:3 大塚:2 巣鴨:2 駒込:2 田端:2 西日暮里:2 日暮里:1 鶯谷:2 上野:2 御徒町:2 秋葉原:2 神田:2 東京:2
+中央総武線|津田沼 東船橋:3 船橋:2 西船橋:3 下総中山:3 本八幡:3 市川:2 小岩:3 新小岩:4 平井:2 亀戸:3 錦糸町:2 両国:3 浅草橋:2 秋葉原:2 御茶ノ水:2 水道橋:2 飯田橋:2 市ヶ谷:2 四ツ谷:2 信濃町:2 千駄ヶ谷:2 代々木:2 新宿:2 大久保:2 東中野:2 中野:3 高円寺:2 阿佐ヶ谷:2 荻窪:2 西荻窪:3 吉祥寺:2 三鷹:3
+京葉線（概算）|東京 八丁堀:3 越中島:2 潮見:3 新木場:3
+""".strip()
+
+# Supplemental operating private rail lines; station order curated, minutes
+# estimated from adjacent station coordinates (never present as timetable).
+_COMMUTE_APPROX_LINES = r"""
+西武池袋線|池袋 椎名町 東長崎 江古田 桜台 練馬 中村橋 富士見台 練馬高野台 石神井公園 大泉学園
+西武新宿線|西武新宿 高田馬場 下落合 中井 新井薬師前 沼袋 野方 都立家政 鷺ノ宮 下井草 井荻 上井草 上石神井 武蔵関
+東武東上線|池袋 北池袋 下板橋 大山 中板橋 ときわ台 上板橋 東武練馬 下赤塚 成増
+東急東横線|渋谷 代官山 中目黒 祐天寺 学芸大学 都立大学 自由が丘 田園調布 多摩川 新丸子 武蔵小杉 日吉 横浜
+東急田園都市線|渋谷 池尻大橋 三軒茶屋 駒沢大学 桜新町 用賀 二子玉川 溝の口
+東急目黒線|目黒 不動前 武蔵小山 西小山 洗足 大岡山 奥沢 田園調布 多摩川 新丸子 武蔵小杉
+東急大井町線|大井町 下神明 戸越公園 中延 荏原町 旗の台 北千束 大岡山 緑が丘 自由が丘 九品仏 尾山台 等々力 上野毛 二子玉川
+東急池上線|五反田 大崎広小路 戸越銀座 荏原中延 旗の台 長原 洗足池 石川台 雪が谷大塚 御嶽山 久が原 千鳥町 池上 蓮沼 蒲田
+京王線|新宿 笹塚 代田橋 明大前 下高井戸 桜上水 上北沢 八幡山 芦花公園 千歳烏山 仙川
+京王井の頭線|渋谷 神泉 駒場東大前 池ノ上 下北沢 新代田 東松原 明大前 永福町 西永福 浜田山 高井戸 富士見ヶ丘 久我山 吉祥寺
+小田急小田原線|新宿 南新宿 参宮橋 代々木八幡 代々木上原 東北沢 下北沢 世田谷代田 梅ヶ丘 豪徳寺 経堂 千歳船橋 祖師ヶ谷大蔵 成城学園前
+京急本線|品川 北品川 新馬場 青物横丁 鮫洲 立会川 大森海岸 平和島 大森町 梅屋敷 京急蒲田 京急川崎 横浜
+東武スカイツリーライン|浅草 とうきょうスカイツリー 曳舟 東向島 鐘ヶ淵 堀切 牛田 北千住 小菅 五反野 梅島 西新井 竹ノ塚
+京成本線|京成上野 日暮里 新三河島 町屋 千住大橋 京成関屋 堀切菖蒲園 お花茶屋 青砥 京成高砂 京成小岩
+京成押上線|押上 京成曳舟 八広 四ツ木 京成立石 青砥
+南武線（各停概算）|川崎 尻手 矢向 鹿島田 平間 向河原 武蔵小杉 武蔵中原 武蔵新城 武蔵溝ノ口 登戸 立川
+りんかい線（概算）|大崎 大井町 品川シーサイド 天王洲アイル 東京テレポート 国際展示場 東雲 新木場
+""".strip()
+
+_COMMUTE_WALK_CONNECTIONS = r"""
+赤坂見附 永田町
+溜池山王 国会議事堂前
+三越前 新日本橋
+上野広小路 仲御徒町
+上野広小路 上野御徒町
+上野広小路 御徒町
+仲御徒町 上野御徒町
+仲御徒町 御徒町
+上野御徒町 御徒町
+新宿 新宿西口
+淡路町 新御茶ノ水
+淡路町 小川町
+新御茶ノ水 小川町
+後楽園 春日
+日比谷 有楽町
+秋葉原 岩本町
+明治神宮前 原宿
+三田 田町
+大門 浜松町
+東日本橋 馬喰横山
+東日本橋 馬喰町
+馬喰横山 馬喰町
+虎ノ門ヒルズ 虎ノ門
+高輪ゲートウェイ 泉岳寺
+京成上野 上野
+西武新宿 新宿
+武蔵溝ノ口 溝の口
+京急川崎 川崎
+""".strip()
+
+# Canonical station aliases (different script conventions, same station).
+_COMMUTE_ALIASES={'霞ケ関':'霞ヶ関','霞が関':'霞ヶ関','明治神宮前〈原宿〉':'明治神宮前',
+                  '武蔵溝ノ口':'溝の口'}
+
+def _commute_key(name):
+    name=str(name or '').strip()
+    return _COMMUTE_ALIASES.get(name,name)
+
+@__import__('functools').lru_cache(maxsize=1)
+def commute_network_v159():
+    """Undirected edge graph. All route costs are transparent, approximate minutes."""
+    from collections import defaultdict
+    edges=defaultdict(list)
+    def link(a,b,line,mins):
+        a,b=_commute_key(a),_commute_key(b)
+        if a and b and a!=b and 0<mins<120:
+            edges[a].append((b,line,float(mins)))
+            edges[b].append((a,line,float(mins)))
+    for row in _COMMUTE_PUBLISHED_LINES.splitlines():
+        line,content=row.split('|',1);words=content.split()
+        previous=words[0]
+        for word in words[1:]:
+            destination,duration=word.rsplit(':',1)
+            link(previous,destination,line,float(duration))
+            previous=destination
+    for row in _COMMUTE_APPROX_LINES.splitlines():
+        line,content=row.split('|',1);words=content.split()
+        for a,b in zip(words,words[1:]):
+            pa=STATION_MAP_POINTS.get(a) or STATIONS.get(a)
+            pb=STATION_MAP_POINTS.get(b) or STATIONS.get(b)
+            if pa is None or pb is None:
+                continue   # Unknown coordinates: no invented rail travel time
+            meters_between=meters(pa,pb)
+            if not 100 <= meters_between <= 13000:
+                continue   # Implausible link, do not fabricate duration
+            estimate=max(1.5,min(18.0,meters_between*1.25/1000/28*60+0.7))
+            link(a,b,line,estimate)
+    for line,stations in LINES.items():
+        if line=='山手線':continue  # The source above has all individual stops.
+        for a,b in zip(stations,stations[1:]):
+            length=meters(STATIONS[a],STATIONS[b]);mins=max(2.0,length*1.15/1000/40*60)
+            # The 41-stop legacy express graph skips intermediate stations.
+            # Avoid interpreting Tokyo-Shinjuku straight-line time as timetable time.
+            if line=='中央線快速' and a=='東京' and b=='新宿':mins=max(14.0,mins)
+            link(a,b,line,mins)
+    for row in _COMMUTE_WALK_CONNECTIONS.splitlines():
+        a,b=row.split();link(a,b,'徒歩連絡',5.0)
+    return dict(edges)
+
+@__import__('functools').lru_cache(maxsize=16)
+def commute_times_to_station_v159(destination):
+    """Fast one-to-all Dijkstra; line changes cost 5 min (not current departures)."""
+    destination=_commute_key(destination)
+    graph=commute_network_v159()
+    if destination not in graph:return {}
+    # State: (station, preceding line).  Keep the best time / transfer count.
+    todo=[(0.0,0,destination,'')]
+    seen=set();best={}
+    while todo:
+        time_used,changes,station,last_line=heapq.heappop(todo)
+        state=(station,last_line)
+        if state in seen:continue
+        seen.add(state)
+        old=best.get(station)
+        if old is None or time_used<old[0]:best[station]=(time_used,changes)
+        for next_station,line,ride_time in graph.get(station,()):
+            # A 5-minute pedestrian transfer includes the interchange walk.
+            transfer=(last_line!='' and last_line!=line and line!='徒歩連絡')
+            extra=5.0 if transfer else 0.0
+            new_line='' if line=='徒歩連絡' else line
+            key=(next_station,new_line)
+            if key not in seen:
+                heapq.heappush(todo,(time_used+ride_time+extra,changes+int(transfer),next_station,new_line))
+    # Keep 0 for workplace itself. Do not round a 0 min journey to 1.
+    return {name:(0 if name==destination else max(1,int(math.ceil(val[0])))) for name,val in best.items()}
+
+def commute_destinations_v159():
+    # Offer only stations connected to Tokyo's main operating network.
+    # Small disconnected reference segments are excluded from selectable targets.
+    reachable=commute_times_to_station_v159('東京')
+    return ['表示しない']+sorted(name for name in reachable if name in STATION_MAP_POINTS or name in STATIONS)
 
 @st.cache_data(show_spinner=False)
-def town_station_refs_v118():
+def town_station_refs_v118(commute_destination='表示しない'):
     majors=set(MAJOR_STATION_LABELS)
     regional=set(REGIONAL_HUB_STATION_LABELS)
+    travel=(commute_times_to_station_v159(commute_destination)
+            if commute_destination!='表示しない' else {})
     items=[{'name':name,'lat':float(coords[0]),'lng':float(coords[1]),
             'priority':0 if name in majors else 1 if name in regional else 2 if name in STATIONS else 3,
-            'detail_priority':0 if name in majors else 1 if name in STATIONS else 2}
+            'detail_priority':0 if name in majors else 1 if name in STATIONS else 2,
+            'commute_min':travel.get(_commute_key(name)) if commute_destination!='表示しない' else None}
            for name,coords in STATION_MAP_POINTS.items()]
     items.sort(key=lambda item:(item['priority'],item['name']))
     return items,[{'name':name,'lat':float(p[0]),'lng':float(p[1])} for name,p in WARD_LABELS.items()]
@@ -11095,15 +11270,19 @@ def interactive_town_choropleth(group,facilities):
                 'colored_count':geo['render_stats']['with_rent'],
                 'no_data_count':geo['render_stats']['without_rent'],'center':center}
         state['_v118_choropleth_payload']=cached
+    current_destination=state.get('commute_destination_v159','表示しない')
+    if current_destination!='表示しない':
+        st.caption(f'通勤先：{current_destination}駅｜駅名横の（数字）は電車・乗換の概算分数（徒歩・待ち時間を含まない）')
     if cached['ready']:
         st.caption(f"\u7740\u8272 {cached['colored_count']}\u753a\u4e01\u76ee\uff5c\u30c7\u30fc\u30bf\u306a\u3057 {cached['no_data_count']}\u753a\u4e01\u76ee\uff08\u30b0\u30ec\u30fc\uff09")
     else:
         st.caption('集計中。完了後、地図の色は自動更新されます')
-    stations,wards=town_station_refs_v118()
+    destination=state.get('commute_destination_v159','表示しない')
+    stations,wards=town_station_refs_v118(destination)
     widget=town_component_v121()
     data=widget(center=list(cached['center']),zoom=14,geo=cached['geo'],
                 signature=cached['layer_signature'],stations=stations,wards=wards,
-                key='town_map_v158_'+str(reset),default=None)
+                key='town_map_v159_'+str(reset),default=None)
     if isinstance(data,dict):
         current=viewport_bounds(data)
         if current:
@@ -11451,6 +11630,12 @@ def main():
         render_memory_diagnostic_v124()
     with tabs[2]:
         st.subheader('通勤の目安')
+        st.selectbox('通勤先の駅（地図上に各駅からの所要時間を表示）',
+                     commute_destinations_v159(),key='commute_destination_v159',
+                     help='地図の駅名の横に（XX分）を追加します。電車乗車と乗換5分の概算です。')
+        st.caption('選択後、「住まいを探す」タブの地図に表示します。時刻表・待ち時間・出入口までの徒歩は含みません。'
+                   '東京メトロ・都営地下鉄・山手線・中央総武線の公開時刻表を基にした参考値（一部データは旧年次）、'
+                   '私鉄等は駅間距離からの概算です。未対応駅には時間を表示しません。')
         options=physical_units([r for r in state.new_units if has_point(r) and r.get('coordinate_precision')!='town'])
         if options:
             i=st.selectbox('出発する物件',range(len(options)),format_func=lambda i:options[i]['title'])
