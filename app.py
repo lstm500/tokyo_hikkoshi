@@ -40,7 +40,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v155"
+BUILD = "REBUILD-01-v157"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -10071,7 +10071,7 @@ def _v150_town_address(raw,region=None,require_chome=True):
 
 def _v150_boundary_key_exists(key):
     """Only query this app's optional read-only polygon index."""
-    path=os.path.join(tempfile.gettempdir(),'sumai-town-boundary-v123.sqlite')
+    path=os.path.join(tempfile.gettempdir(),'sumai-town-boundary-v156.sqlite')
     if not os.path.isfile(path):return False
     try:
         with sqlite3.connect('file:'+quote(path,safe='/')+'?mode=ro',uri=True,timeout=2) as conn:
@@ -10090,7 +10090,7 @@ def _v150_point_in_ring(point,ring):
 
 def _v150_polygon_confirms(point,key):
     """True/False when loaded geometry can check the marker; None if absent."""
-    path=os.path.join(tempfile.gettempdir(),'sumai-town-boundary-v123.sqlite')
+    path=os.path.join(tempfile.gettempdir(),'sumai-town-boundary-v156.sqlite')
     if not os.path.isfile(path):return None
     try:
         lat,lng=point
@@ -10380,7 +10380,7 @@ class TownSummaryWorker:
                 # Rebuild any older schema once to restore listings saved
                 # while earlier code missed in-process notifications. This also
                 # detects already-saved Shinagawa/Shibuya rows from v130-v142.
-                if (self.summary or {}).get('generated_by')!=BUILD:
+                if (self.summary or {}).get('generated_by') not in (BUILD,'REBUILD-01-v156'):
                     self.pending=True
                     self._schedule_refresh_locked(urgent=True)
                 else:
@@ -10597,19 +10597,27 @@ def current_town_summary_worker():
     return job
 
 
-def _town_ring_simplify(ring,step=0.00015):
-    """Compact ring for mobile: coarse quantization removes neighboring duplicates."""
-    out=[];prev=None
-    for p in ring:
-        if not isinstance(p,(list,tuple)) or len(p)<2:continue
-        q=(round(float(p[0])/step)*step,round(float(p[1])/step)*step)
-        if q!=prev:out.append([round(q[0],6),round(q[1],6)]);prev=q
-    if len(out)>130:
-        stride=math.ceil(len(out)/125);out=out[::stride]
+def _town_ring_simplify(ring,step=0.00002):
+    """Use the same coordinate grid for shared borders, without strided skips.
+
+    v155 sampled long rings independently to ~125 vertices and snapped to
+    ~15 m.  Neighbouring town borders consequently diverged into apparent
+    empty wedges even when both towns had saved rent observations.  Never
+    discard arbitrary intermediate vertices in an administrative boundary.
+    """
+    out=[]
+    previous=None
+    for point in ring:
+        if not isinstance(point,(list,tuple)) or len(point)<2:continue
+        lng,lat=float(point[0]),float(point[1])
+        if not(math.isfinite(lng) and math.isfinite(lat)):continue
+        snapped=(round(lng/step)*step,round(lat/step)*step)
+        if snapped!=previous:
+            out.append([round(snapped[0],6),round(snapped[1],6)])
+            previous=snapped
     if len(out)<3:return []
     if out[0]!=out[-1]:out.append(out[0])
     return out if len(out)>=4 else []
-
 
 def town_boundary_geometry(geom):
     if not isinstance(geom,dict):return None
@@ -10657,10 +10665,10 @@ def iter_town_geojson_file(path):
 
 
 class TownBoundaryStore:
-    """Tiny in-memory handle for a disk-backed read-only SQLite polygon index."""
+    """Read-only indexed polygons for both rent-covered and no-data towns."""
     def __init__(self,path):self.path=path
-    def iter_visible(self,bounds,interested):
-        if not interested:return
+    def iter_visible(self,bounds,interested=None,include_empty=False):
+        if not interested and not include_empty:return
         conn=sqlite3.connect('file:'+quote(self.path,safe='/')+'?mode=ro',uri=True,timeout=10)
         try:
             conn.execute('PRAGMA cache_size=-512')
@@ -10670,10 +10678,12 @@ class TownBoundaryStore:
                     south<=? AND north>=? AND west<=? AND east>=?""",(north,south,east,west))
             else:
                 cursor=conn.execute('SELECT town,poly FROM areas')
+            wards=frozenset(TOKYO_WARDS.values())
             for town,raw in cursor:
-                if town in interested:
-                    try:yield town,json.loads(raw)
-                    except (ValueError,TypeError):continue
+                if town.partition('|')[0] not in wards:continue
+                if not include_empty and town not in interested:continue
+                try:yield town,json.loads(raw)
+                except (ValueError,TypeError):continue
         finally:conn.close()
 
 
@@ -10681,7 +10691,7 @@ class TownBoundaryWorker:
     def __init__(self):
         self.lock=threading.Lock();self.started=False;self.running=False
         self.features=None;self.ready=False;self.error=''
-        self.cache_path=os.path.join(tempfile.gettempdir(),'sumai-town-boundary-v123.sqlite')
+        self.cache_path=os.path.join(tempfile.gettempdir(),'sumai-town-boundary-v156.sqlite')
     def start(self):
         with self.lock:
             if self.started:return
@@ -10770,41 +10780,93 @@ class TownBoundaryWorker:
 
 
 @st.cache_resource
-def town_boundary_registry():
+def town_boundary_registry(v156_geometry_revision="v156"):
     return TownBoundaryWorker()
 
 
-def town_colored_shapes(groups,group,features,bounds,max_features=700):
-    """Draw only viewport polygons; the Tokyo-wide border set remains on disk."""
+def town_colored_shapes(groups,group,features,bounds,max_features=None,include_no_data=False):
+    """Join the exact saved town summary with every polygon in the viewport.
+
+    A town without a saved observation in the selected layout is neutral gray;
+    it must never inherit a nearby town's rent. All source records remain
+    unchanged. The original three-value return contract is preserved.
+    """
     counts=(groups or {}).get(group,{})
-    found={}
+    rented={}
+    empty={}
     if hasattr(features,'iter_visible'):
-        it=features.iter_visible(bounds,counts)
+        iterator=features.iter_visible(bounds,counts,include_empty=include_no_data)
     else:
-        def old_iter():
+        def old_iterator():
             for key,area in (features or {}).items():
                 bbox=area['bbox']
-                if bounds and (bbox[0]>bounds[2] or bbox[2]<bounds[0] or bbox[1]>bounds[3] or bbox[3]<bounds[1]):continue
+                if bounds and (bbox[0]>bounds[2] or bbox[2]<bounds[0]
+                               or bbox[1]>bounds[3] or bbox[3]<bounds[1]):
+                    continue
+                if not include_no_data and key not in counts:continue
                 yield key,area['coordinates']
-        it=old_iter()
-    for key,polygons in it:
-        record=counts.get(key)
-        if not record or not record[1]:continue
-        if key not in found:found[key]=[]
-        found[key].extend(polygons)
-    selected=sorted(found,key=lambda x:(-counts[x][1],x))
-    limited=len(selected)>max_features
-    selected=selected[:max_features]
-    collection={'type':'FeatureCollection','features':[]}
+        iterator=old_iterator()
+    for key,polygons in iterator:
+        observation=counts.get(key)
+        if observation and len(observation)>1 and observation[1]>0:
+            rented.setdefault(key,[]).extend(polygons)
+        elif include_no_data:
+            empty.setdefault(key,[]).extend(polygons)
+    selected=sorted(rented)
+    limited=max_features is not None and len(selected)>max_features
+    if limited:
+        # Optional diagnostic cap; never requested by the live choropleth.
+        selected=sorted(rented,key=lambda name:(-counts[name][1],name))[:max_features]
+    result={'type':'FeatureCollection','features':[], 'render_stats':{
+        'with_rent':len(selected),'without_rent':len(empty),
+        'rent_total_in_window':len(rented)}}
+    # Unknown towns are drawn FIRST, so the authoritative rent colors remain
+    # on top, even where source geometries have shared lines or small overlaps.
+    for key in sorted(empty):
+        result['features'].append({'type':'Feature',
+            'geometry':{'type':'MultiPolygon','coordinates':empty[key]},
+            'properties':{'name':key.replace('|',' '),'has_data':False,
+                          'color':'#d0d7da','count_label':'0',
+                          'price_label':'n/a'}})
     for key in selected:
         total,count=counts[key]
         avg=total/count
-        collection['features'].append({'type':'Feature','geometry':{'type':'MultiPolygon','coordinates':found[key]},
-            'properties':{'name':key.replace('|',' '),'avg':round(avg),
-                          'price_label':f'{avg/10000:.1f}万円','count_label':f'{count}件',
+        result['features'].append({'type':'Feature',
+            'geometry':{'type':'MultiPolygon','coordinates':rented[key]},
+            'properties':{'name':key.replace('|',' '),'has_data':True,
+                          'avg':round(avg), 'price_label':f'{avg/10000:.1f}\u4e07\u5186',
+                          'count_label':f'{count}\u4ef6',
                           'color':town_rent_gradient(avg)}})
-    return collection,limited,len(found)
+    return result,limited,len(rented)
 
+
+def _v156_town_render_window(bounds,center):
+    """Prefetch a small surrounding ring instead of >10x screen area."""
+    try:
+        if bounds and len(bounds)==4:
+            south,west,north,east=map(float,bounds)
+            if all(map(math.isfinite,(south,west,north,east))) and south<north and west<east:
+                height=north-south;width=east-west
+                lat_pad=max(.004,min(.24*height,.035))
+                lon_pad=max(.004,min(.24*width,.045))
+                return (south-lat_pad,west-lon_pad,north+lat_pad,east+lon_pad)
+    except (ValueError,TypeError,OverflowError):pass
+    try:
+        lat,lng=map(float,center)
+    except (ValueError,TypeError):
+        lat,lng=DEFAULT_CENTER
+    return (lat-.031,lng-.039,lat+.031,lng+.039)
+
+
+def _v156_view_is_covered(bounds,window):
+    """A pan only reloads boundaries on leaving the prefetched window."""
+    if not bounds:return True
+    if not window or len(window)!=4:return False
+    try:
+        south,west,north,east=map(float,bounds)
+        ws,ww,wn,we=map(float,window)
+        return ws<=south<=north<=wn and ww<=west<=east<=we
+    except (ValueError,TypeError):return False
 
 def capture_map_fragment_v117():
     """Read bounds from the actual current map widget, not the v115 key.
@@ -10873,10 +10935,26 @@ TOWN_COMPONENT_HTML_V121=(
     .replace("hostMessage('streamlit:setFrameHeight',{height:480})",
              f"hostMessage('streamlit:setFrameHeight',{{height:{_V153_FRAME_HEIGHT}}})",1))
 
+# Avoid independent coarse per-polygon SVG simplification that reveals seams.
+assert 'smoothFactor:1.7' in TOWN_COMPONENT_HTML_V121
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(
+    'smoothFactor:1.7','smoothFactor:0.25',1)
+
+
+# v157 - explicitly distinguish saved-rent and no-data town polygons.
+_V157_STYLE_OLD = "fresh=L.geoJSON(geo,{smoothFactor:0.25,style:function(feature){return {color:'#606b72',weight:.7,fillColor:feature.properties.color||'#bbb',fillOpacity:.77}},"
+_V157_STYLE_NEW = "fresh=L.geoJSON(geo,{smoothFactor:0.25,style:function(feature){var p=feature.properties||{};if(p.has_data===false)return {color:'#bec7ca',weight:.35,fillColor:'#d0d7da',fillOpacity:.54};return {color:'#606b72',weight:.7,fillColor:p.color||'#bbb',fillOpacity:.81}},"
+assert TOWN_COMPONENT_HTML_V121.count(_V157_STYLE_OLD)==1
+TOWN_COMPONENT_HTML_V121 = TOWN_COMPONENT_HTML_V121.replace(_V157_STYLE_OLD,_V157_STYLE_NEW,1)
+_V157_POPUP_OLD="var el=document.createElement('div');el.textContent=name+'\uFF5C\u5E73\u5747 '+avg+'\uFF5C'+count;layer.bindPopup(el);"
+_V157_POPUP_NEW="var el=document.createElement('div');el.textContent=props.has_data===false?name+'\uFF5C\u3053\u306E\u6761\u4EF6\u306E\u4FDD\u5B58\u30C7\u30FC\u30BF\u306A\u3057':name+'\uFF5C\u5E73\u5747 '+avg+'\uFF5C'+count;layer.bindPopup(el);"
+assert TOWN_COMPONENT_HTML_V121.count(_V157_POPUP_OLD)==1
+TOWN_COMPONENT_HTML_V121 = TOWN_COMPONENT_HTML_V121.replace(_V157_POPUP_OLD,_V157_POPUP_NEW,1)
+
 
 @st.cache_resource(show_spinner=False)
 def town_component_v121():
-    folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-v155')
+    folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-v157')
     os.makedirs(folder,exist_ok=True)
     path=os.path.join(folder,'index.html')
     # Component HTML is small; create once per worker process. Never include
@@ -10893,7 +10971,7 @@ def town_component_v121():
         with open(temp_path,'w',encoding='utf-8') as output:
             output.write(TOWN_COMPONENT_HTML_V121)
         os.replace(temp_path,path)
-    return st.components.v1.declare_component('sumai_town_map_v155',path=folder)
+    return st.components.v1.declare_component('sumai_town_map_v157',path=folder)
 
 @st.cache_data(show_spinner=False)
 def town_station_refs_v118():
@@ -10954,7 +11032,7 @@ def town_choropleth_status():
         st.caption('町丁目家賃：集計の開始待ち')
 
 
-@st.fragment(run_every='15s')
+@st.fragment(run_every='8s')
 def interactive_town_choropleth(group,facilities):
     """Leaflet map persists in the browser across Streamlit fragment reruns.
 
@@ -10985,30 +11063,33 @@ def interactive_town_choropleth(group,facilities):
     summary_version=(snap.get('summary') or {}).get('updated_at','')
     signature=(BUILD,group,revision,reset,snap['revision'],summary_version,bool(ready))
     cached=state.get('_v118_choropleth_payload')
-    if not isinstance(cached,dict) or cached.get('signature')!=signature:
-        bounds=state.get('new_bounds')
-        center=bounds_center(bounds) if bounds else state.get('new_view_center',DEFAULT_CENTER)
-        if bounds and len(bounds)==4:
-            south,west,north,east=map(float,bounds)
-            lat_pad=max(.018,(north-south)*1.1);lng_pad=max(.018,(east-west)*1.1)
-            window=(south-lat_pad,west-lng_pad,north+lat_pad,east+lng_pad)
-        else:window=(center[0]-.045,center[1]-.065,center[0]+.045,center[1]+.065)
+    bounds=state.get('new_bounds')
+    center=bounds_center(bounds) if bounds else state.get('new_view_center',DEFAULT_CENTER)
+    needs_update=(not isinstance(cached,dict)
+                  or cached.get('signature')!=signature
+                  or not _v156_view_is_covered(bounds,cached.get('window')))
+    if needs_update:
+        window=_v156_town_render_window(bounds,center)
         groups=(snap['summary'] or {}).get('groups') or {}
-        geo,limited,count=town_colored_shapes(groups,group,shapes if ready else {},window)
-        cached={'signature':signature,'geo':geo,'limited':limited,'ready':bool(ready and snap['ready']),
-                'colored_count':len(geo['features']),'center':center}
+        geo,limited,count=town_colored_shapes(groups,group,shapes if ready else {},window,include_no_data=True)
+        # The window MUST be part of the Leaflet data revision: keeping the
+        # same component key preserves the map position while replacing colors.
+        payload_key=hashlib.sha256(repr((signature,window)).encode('utf-8')).hexdigest()[:20]
+        cached={'signature':signature,'layer_signature':payload_key,
+                'window':window,'geo':geo,'limited':limited,
+                'ready':bool(ready and snap['ready']),
+                'colored_count':geo['render_stats']['with_rent'],
+                'no_data_count':geo['render_stats']['without_rent'],'center':center}
         state['_v118_choropleth_payload']=cached
-    if cached['limited']:
-        st.caption('広域表示：上位700町丁目。移動後は「表示範囲を更新」を押してください')
-    elif cached['ready']:
-        st.caption(f"着色：{cached['colored_count']}町丁目")
+    if cached['ready']:
+        st.caption(f"\u7740\u8272 {cached['colored_count']}\u753a\u4e01\u76ee\uff5c\u30c7\u30fc\u30bf\u306a\u3057 {cached['no_data_count']}\u753a\u4e01\u76ee\uff08\u30b0\u30ec\u30fc\uff09")
     else:
         st.caption('集計中。完了後、地図の色は自動更新されます')
     stations,wards=town_station_refs_v118()
     widget=town_component_v121()
     data=widget(center=list(cached['center']),zoom=14,geo=cached['geo'],
-                signature='|'.join(map(str,signature)),stations=stations,wards=wards,
-                key='town_map_v155_'+str(reset),default=None)
+                signature=cached['layer_signature'],stations=stations,wards=wards,
+                key='town_map_v157_'+str(reset),default=None)
     if isinstance(data,dict):
         current=viewport_bounds(data)
         if current:
