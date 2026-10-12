@@ -1,2 +1,10 @@
-streamlit
-supabase
+# 住まいコンパス (REBUILD-01-v179)
+# Streamlit Cloud: place this file next to app.py in the GitHub repository.
+streamlit>=1.50,<2
+requests>=2.32,<3
+beautifulsoup4>=4.13,<5
+folium>=0.18,<1
+branca>=0.8,<1
+streamlit-folium==0.24.0
+numpy>=1.26,<3
+Pillow>=10,<12
