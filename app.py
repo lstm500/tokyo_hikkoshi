@@ -52,7 +52,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v183"
+BUILD = "REBUILD-01-v184"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -11431,9 +11431,159 @@ _V182_SEND_NEW="},zoom:state.map.getZoom(),jump_applied:state.lastJumpToken||nul
 assert TOWN_COMPONENT_HTML_V121.count(_V182_SEND_OLD)==1
 TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(_V182_SEND_OLD,_V182_SEND_NEW,1)
 
+
+# v184: search lives INSIDE the same stable Leaflet iframe.  A click moves
+# its map immediately, then asks Python only for the exact polygon boundary.
+# It is not blocked by the external Streamlit form or unrelated page reruns.
+_V184_SEARCH_CSS = """
+html,body{height:auto!important;min-height:0!important;overflow:hidden!important}
+#town-search-panel{box-sizing:border-box;width:100%;padding:12px 13px 14px;background:#fff;border-top:1px solid #d5dfdc;font-family:inherit;color:#173a5e}
+#town-search-panel label{display:block;font-size:13px;font-weight:750;margin:0 0 6px}
+#town-query{width:100%;box-sizing:border-box;height:40px;border:1px solid #b9c7c3;border-radius:7px;background:#fff;color:#173a5e;padding:7px 10px;font-size:16px}
+#town-submit,#town-confirm{display:block;width:100%;box-sizing:border-box;margin-top:9px;min-height:40px;border:1px solid #a5b8b0;border-radius:7px;background:#fff;color:#173a5e;font-size:14px;font-weight:650;cursor:pointer;touch-action:manipulation}
+#town-submit:active,#town-confirm:active{background:#dfe9e6}
+#town-select{width:100%;height:40px;margin-top:9px;border:1px solid #b9c7c3;border-radius:7px;font-size:15px;background:white;color:#173a5e}
+#town-search-status{font-size:12px;line-height:1.35;color:#49616b;margin-top:7px;min-height:0}
+#town-options[hidden]{display:none!important}
+"""
+_V184_SEARCH_DOM = """<div id=\"town-search-panel\"><label for=\"town-query\">地名を検索して地図を移動</label><input id=\"town-query\" type=\"search\" autocomplete=\"off\" placeholder=\"例：中落合、豊島区南長崎3丁目\"/><button type=\"button\" id=\"town-submit\">検索した地域へ移動</button><div id=\"town-options\" hidden><label for=\"town-select\">該当する地域を選択</label><select id=\"town-select\"></select><button type=\"button\" id=\"town-confirm\">選んだ地域に移動</button></div><div id=\"town-search-status\" role=\"status\" aria-live=\"polite\"></div></div>"""
+assert TOWN_COMPONENT_HTML_V121.count('</style></head>')==1
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('</style></head>',_V184_SEARCH_CSS+'</style></head>',1)
+assert TOWN_COMPONENT_HTML_V121.count('<div id="map"></div>')==1
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('<div id="map"></div>','<div id="map"></div>'+_V184_SEARCH_DOM,1)
+assert TOWN_COMPONENT_HTML_V121.count("{height:"+str(_V153_FRAME_HEIGHT)+"}")==1
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace("{height:"+str(_V153_FRAME_HEIGHT)+"}","{height:Math.max(615,document.documentElement.scrollHeight)}",1)
+
+_V184_CLIENT_SEARCH_JS = r"""
+function setTownStatus(message){
+ var node=document.getElementById('town-search-status');
+ if(node)node.textContent=message||'';
+}
+function normalizeTownQuery(value){
+ var text=String(value||'');
+ try{text=text.normalize('NFKC')}catch(e){}
+ var digits={'一':1,'二':2,'三':3,'四':4,'五':5,'六':6,'七':7,'八':8,'九':9};
+ text=text.replace(/([一二三四五六七八九十]+)丁目/g,function(all,part){
+   if(part.indexOf('十')>=0){var halves=part.split('十');return ((digits[halves[0]]||1)*10+(digits[halves[1]]||0))+'丁目';}
+   return (digits[part]||part)+'丁目';
+ });
+ return text.replace(/[\s\u3000、,，。・/／]/g,'').replace(/^東京都/,'').replace(/^東京/,'');
+}
+function townCandidates(raw){
+ var wanted=normalizeTownQuery(raw);
+ if(!wanted)return [];
+ var ward='';
+ var wards=state.searchDistricts||[];
+ var sorted=wards.slice().sort(function(a,b){return b.length-a.length});
+ for(var i=0;i<sorted.length;i++){
+   if(wanted.indexOf(sorted[i])===0){ward=sorted[i];wanted=wanted.slice(ward.length);break;}
+ }
+ if(!wanted&&ward){
+   var w=(state.searchWardBounds||[]).find(function(x){return x.ward===ward});
+   return w?[{ward:ward,name:ward,kind:'ward',label:ward,bounds:w.bounds,rank:0}]:[];
+ }
+ if(/.+[0-9]{1,2}$/.test(wanted))wanted+='丁目';
+ var specific=/[0-9]+丁目$/.test(wanted);
+ var matched=new Map();
+ (state.searchCatalog||[]).forEach(function(area){
+   if(ward&&area.ward!==ward)return;
+   var name=specific?area.town:area.base;
+   if(!name)return;
+   var rank=name===wanted?0:(name.indexOf(wanted)===0?1:(name.includes(wanted)?2:99));
+   if(rank===99)return;
+   var id=area.ward+'|'+name+'|'+(specific?'chome':'town');
+   var entry=matched.get(id),b=area.bounds;
+   if(entry){
+     entry.rank=Math.min(entry.rank,rank);
+     entry.bounds=[Math.min(entry.bounds[0],b[0]),Math.min(entry.bounds[1],b[1]),Math.max(entry.bounds[2],b[2]),Math.max(entry.bounds[3],b[3])];
+     entry.size++;
+   }else{
+     matched.set(id,{ward:area.ward,name:name,kind:specific?'chome':'town',label:area.ward+' '+name,bounds:b.slice(),rank:rank,size:1});
+   }
+ });
+ var results=Array.from(matched.values()).sort(function(a,b){return a.rank-b.rank||a.ward.localeCompare(b.ward,'ja')||a.name.localeCompare(b.name,'ja')});
+ if(results.length&&results[0].rank===0)results=results.filter(function(x){return x.rank===0});
+ results=results.slice(0,80);
+ results.forEach(function(x){if(x.size>1&&x.kind==='town')x.label+='（全'+x.size+'区域）'});
+ return results;
+}
+function townSendSelection(place){
+ if(!state.map){setTownStatus('地図を読み込み中です。');return;}
+ var b=place.bounds.map(Number);
+ if(b.length!==4 || !b.every(Number.isFinite) || !(b[0]<b[2]&&b[1]<b[3])){
+   setTownStatus('選択地域の範囲が不正です。');return;
+ }
+ // Pan and zoom immediately in the BROWSER, before any Streamlit rerun.
+ // The dashed temporary rectangle is not a claim about the true boundary.
+ if(state.provisionalFocus){state.map.removeLayer(state.provisionalFocus);state.provisionalFocus=null;}
+ state.map.invalidateSize();
+ state.map.fitBounds([[b[0],b[1]],[b[2],b[3]]],{padding:[25,25],maxZoom:16,animate:false});
+ if(state.focusLayer){state.map.removeLayer(state.focusLayer);state.focusLayer=null;}
+ state.provisionalFocus=L.rectangle([[b[0],b[1]],[b[2],b[3]]],{color:'#dd8a0c',weight:2,dashArray:'6 6',fillOpacity:0,interactive:false}).addTo(state.map);
+ var ticket=String(Date.now())+'_'+Math.random().toString(36).slice(2,11);
+ state.searchPendingTicket=ticket;
+ state.sentBounds='';
+ setTownStatus('「'+place.label+'」へ移動しました。正確な境界線を読み込み中…');
+ var mapBounds=state.map.getBounds();
+ hostMessage('streamlit:setComponentValue',{dataType:'json',value:{
+   event:'town_search_v184',ticket:ticket,ward:place.ward,name:place.name,kind:place.kind,
+   bounds:{_southWest:{lat:mapBounds.getSouth(),lng:mapBounds.getWest()},_northEast:{lat:mapBounds.getNorth(),lng:mapBounds.getEast()}},
+   zoom:state.map.getZoom(),jump_applied:state.lastJumpToken||null
+ }});
+}
+function submitTownQuery(){
+ var input=document.getElementById('town-query');
+ var placeChoices=townCandidates(input&&input.value);
+ var area=document.getElementById('town-options');
+ var select=document.getElementById('town-select');
+ area.hidden=true;
+ if(!placeChoices.length){
+   setTownStatus((state.searchCatalog||[]).length?'該当する地域が見つかりません。区名や町名を確認してください。':'町丁目境界を準備中です。地図の読込後に再度検索してください。');
+   return;
+ }
+ if(placeChoices.length===1){townSendSelection(placeChoices[0]);return;}
+ state.searchChoices=placeChoices;
+ select.replaceChildren();
+ placeChoices.forEach(function(place,index){var option=document.createElement('option');option.value=String(index);option.textContent=place.label;select.appendChild(option)});
+ area.hidden=false;
+ setTownStatus('候補が'+placeChoices.length+'件あります。移動先を選択してください。');
+ setHeight();
+}
+function initTownSearch(){
+ if(state.searchUiInitialized)return;
+ state.searchUiInitialized=true;
+ document.getElementById('town-submit').addEventListener('click',submitTownQuery);
+ document.getElementById('town-query').addEventListener('keydown',function(e){
+   if(e.key==='Enter'){e.preventDefault();submitTownQuery()}
+ });
+ document.getElementById('town-confirm').addEventListener('click',function(){
+   var index=Number(document.getElementById('town-select').value);
+   var choice=(state.searchChoices||[])[index];
+   if(choice){document.getElementById('town-options').hidden=true;townSendSelection(choice)}
+ });
+}
+"""
+assert TOWN_COMPONENT_HTML_V121.count('function render(args){')==1
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('function render(args){',_V184_CLIENT_SEARCH_JS+'\nfunction render(args){',1)
+assert TOWN_COMPONENT_HTML_V121.count(' state.stations=Array.isArray(args.stations)?')==1
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(
+    ' state.stations=Array.isArray(args.stations)?',
+    " initTownSearch();\n state.searchCatalog=Array.isArray(args.search_catalog)?args.search_catalog:[];\n state.searchDistricts=Array.isArray(args.search_district_names)?args.search_district_names:[];\n state.searchWardBounds=Array.isArray(args.search_ward_bounds)?args.search_ward_bounds:[];\n if(args.search_error && args.search_error.ticket===state.searchPendingTicket){\n   state.searchPendingTicket=null;\n   if(state.provisionalFocus){state.map.removeLayer(state.provisionalFocus);state.provisionalFocus=null;}\n   setTownStatus(String(args.search_error.message||'地域境界の取得に失敗しました。'));\n   setTimeout(emitBounds,100);\n }\n state.stations=Array.isArray(args.stations)?",1)
+assert TOWN_COMPONENT_HTML_V121.count('function emitBounds(){if(!state.map)return;')==1
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('function emitBounds(){if(!state.map)return;', 'function emitBounds(){if(!state.map||state.searchPendingTicket)return;',1)
+# On exact polygon render, remove provisional bbox and release viewport messages.
+old="       state.focusLayer=focus.addTo(state.map);\n       state.lastJumpToken=String(target.id);"
+new="""       state.focusLayer=focus.addTo(state.map);
+       if(state.provisionalFocus){state.map.removeLayer(state.provisionalFocus);state.provisionalFocus=null;}
+       state.searchPendingTicket=null;
+       setTownStatus('「'+String(target.label||'地域')+'」へ移動し、町域の境界を赤線で表示しました。');
+       state.lastJumpToken=String(target.id);"""
+assert TOWN_COMPONENT_HTML_V121.count(old)==1
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(old,new,1)
+
 @st.cache_resource(show_spinner=False)
 def town_component_v121():
-    folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-v183')
+    folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-v184')
     os.makedirs(folder,exist_ok=True)
     path=os.path.join(folder,'index.html')
     # Component HTML is small; create once per worker process. Never include
@@ -11450,7 +11600,7 @@ def town_component_v121():
         with open(temp_path,'w',encoding='utf-8') as output:
             output.write(TOWN_COMPONENT_HTML_V121)
         os.replace(temp_path,path)
-    return st.components.v1.declare_component('sumai_town_map_v183',path=folder)
+    return st.components.v1.declare_component('sumai_town_map_v184',path=folder)
 
 # v159: Station-to-office approximate train travel times, OFFLINE AND READ-ONLY.
 # Tokyo Metro/Toei/JR local edge minutes adapted from MIT-licensed public project:
@@ -12185,6 +12335,37 @@ def _v182_request_town_jump(state,choice,boundary_path):
     state['new_view_center']=bounds_center(box)
 
 
+@st.cache_data(show_spinner=False,ttl=3600)
+def town_search_catalog_v184(db_path,db_mtime):
+    """Small 23-ward bbox index from the EXISTING read-only town geometry DB."""
+    rows=[];wards=[]
+    with sqlite3.connect('file:'+quote(db_path,safe='/')+'?mode=ro',uri=True,timeout=8) as conn:
+        for key,s,w,n,e in conn.execute('SELECT town,south,west,north,east FROM areas'):
+            if not isinstance(key,str) or '|' not in key:continue
+            ward,town=key.split('|',1)
+            if ward not in TOKYO_WARDS.values():continue
+            try:
+                box=[float(s),float(w),float(n),float(e)]
+            except (TypeError,ValueError,OverflowError):continue
+            if not all(map(math.isfinite,box)) or not(34<=box[0]<box[2]<=37 and 138<=box[1]<box[3]<=141):continue
+            rows.append({'ward':ward,'town':address_key(town),
+                         'base':address_key(town_base_name(town)),'bounds':box})
+        try:
+            ward_records=conn.execute('SELECT ward,south,west,north,east FROM ward_areas')
+            for ward,s,w,n,e in ward_records:
+                if ward not in TOKYO_WARDS.values():continue
+                try:
+                    bounds=[float(s),float(w),float(n),float(e)]
+                except (TypeError,ValueError,OverflowError):continue
+                if all(map(math.isfinite,bounds)) and 34<=bounds[0]<bounds[2]<=37 and 138<=bounds[1]<bounds[3]<=141:
+                    wards.append({'ward':ward,'bounds':bounds})
+        except sqlite3.OperationalError:
+            # Some existing boundary caches do not contain the optional ward table.
+            # Town search must still work using the areas table.
+            pass
+    return rows,wards
+
+
 @st.fragment
 def interactive_town_choropleth(group):
     """Leaflet map persists in the browser across Streamlit fragment reruns.
@@ -12254,16 +12435,46 @@ def interactive_town_choropleth(group):
         st.caption(f"着色 {cached['colored_count']}町丁目｜保存家賃のない地域は背景地図のまま表示")
     else:
         st.caption('保存物件の再集計を押すと、家賃の色分けをバックグラウンドで作成します')
+    search_catalog=[];search_ward_bounds=[]
+    if ready and isinstance(shapes,TownBoundaryStore):
+        try:
+            search_catalog,search_ward_bounds=town_search_catalog_v184(shapes.path,os.stat(shapes.path).st_mtime_ns)
+        except (OSError,sqlite3.Error,ValueError,TypeError):
+            pass
     stations,wards=town_station_refs_v164(destinations)
     widget=town_component_v121()
     data=widget(center=list(cached['center']),zoom=14,geo=cached['geo'],
                 signature=cached['layer_signature'],stations=stations,wards=wards,
+                search_catalog=search_catalog,search_district_names=list(TOKYO_WARDS.values()),
+                search_ward_bounds=search_ward_bounds,
+                search_error=state.get('_v184_search_error'),
                 commute_destination=(destinations[0] if destinations else ''),
                 commute_destination_2=(destinations[1] if len(destinations)==2 else ''),
                 jump=state.get('_v182_map_jump'),
-                key='town_map_v183_'+str(reset)+'_'+str((state.get('_v182_map_jump') or {}).get('id') or 'initial'),default=None)
+                key='town_map_v184_'+str(reset),default=None)
     if isinstance(data,dict):
         current=viewport_bounds(data)
+        if data.get('event')=='town_search_v184':
+            ticket=str(data.get('ticket') or '')[:100]
+            if ticket and ticket!=state.get('_v184_last_search_ticket'):
+                state['_v184_last_search_ticket']=ticket
+                state['_v184_search_error']=None
+                name=str(data.get('name') or '')[:90]
+                ward=str(data.get('ward') or '')[:30]
+                kind=str(data.get('kind') or '')
+                options=_v182_town_search_matches((ward if kind=='ward' else ward+name),shapes.path) if ready and isinstance(shapes,TownBoundaryStore) else []
+                choice=next((x for x in options if x['ward']==ward and x.get('name',x.get('label'))==name and
+                            x['kind']==('ward' if kind=='ward' else 'town')),None)
+                if choice is not None and (kind=='ward' or kind=='town' or kind=='chome'):
+                    try:
+                        _v182_request_town_jump(state,choice,shapes.path)
+                    except ValueError as exc:
+                        state['_v184_search_error']={'ticket':ticket,'message':str(exc)}
+                else:
+                    state['_v184_search_error']={'ticket':ticket,'message':'検索した町域の境界を取得できませんでした。'}
+                if current:
+                    state['new_bounds']=current;state['new_view_center']=bounds_center(current)
+                st.rerun(scope='fragment')
         command=state.get('_v182_map_jump')
         confirmed=not command or data.get('jump_applied')==command.get('id')
         if command and confirmed:
@@ -12273,60 +12484,15 @@ def interactive_town_choropleth(group):
             state['new_map']=data
 
 
-def town_location_search_panel_v183():
-    """Independent search form; one submitted location causes one app rerun."""
+def town_location_search_panel_v184():
+    """Map reset remains external; searching is now inside the Leaflet iframe."""
     state=st.session_state
-    boundaries=town_boundary_registry();boundaries.start()
-    shapes,ready,busy,error=boundaries.snapshot()
-    # Town navigation is UI-only and does not start any property collection.
-    # The search source is the same geometry SQLite used to color the map;
-    # even regions without rent data can be searched.
-    with st.form('v181_town_location_form'):
-        st.text_input('地名を検索して地図を移動',key='v181_town_location_text',
-                      placeholder='例：南長崎、豊島区南長崎3丁目')
-        location_submit=st.form_submit_button('検索した地域へ移動',use_container_width=True)
-    if location_submit:
-        term=str(state.get('v181_town_location_text') or '').strip()
-        state['_v181_location_search_note']=''
-        if not term:
-            state['_v181_location_search_matches']=[]
-            state['_v181_location_search_note']='町名を入力してください。'
-        elif not ready or not isinstance(shapes,TownBoundaryStore):
-            state['_v181_location_search_matches']=[]
-            state['_v181_location_search_note']='町丁目境界の読み込み完了後に検索してください。'
-        else:
-            options=_v182_town_search_matches(term,shapes.path)
-            if len(options)==1:
-                try:
-                    _v182_request_town_jump(state,options[0],shapes.path)
-                    st.rerun()
-                except ValueError as exc:st.warning(str(exc))
-            elif options:
-                state['_v181_location_search_matches']=options
-                state['_v181_location_search_note']='複数候補があります。移動する地域を確認して選択してください。'
-            else:
-                state['_v181_location_search_matches']=[]
-                state['_v181_location_search_note']='該当する町名が見つかりません。町名の一部、または区名＋町名で検索してください。'
-    matches=state.get('_v181_location_search_matches') or []
-    if matches:
-        labels=[entry['label'] for entry in matches]
-        chosen=st.selectbox('移動先を選択',labels,key='v181_town_choice')
-        if st.button('選んだ地域に移動',key='v181_town_choice_go',use_container_width=True):
-            result=next(item for item in matches if item['label']==chosen)
-            try:
-                _v182_request_town_jump(state,result,shapes.path)
-                st.rerun()
-            except ValueError as exc:st.warning(str(exc))
-    if state.get('_v181_location_search_note'):
-        st.caption(state['_v181_location_search_note'])
-    cmd=state.get('_v182_map_jump')
-    if cmd and state.get('_v182_map_jump_confirmed')==cmd['id']:
-        st.caption('地図移動完了｜'+cmd['label']+'（赤い線で輪郭を表示中）')
     if st.button('地図を再初期化',key='reset_v118_map'):
         state.pop('_v182_map_jump',None)
         state.pop('_v182_map_jump_confirmed',None)
         state.pop('_v181_map_jump',None)
         state.pop('_v118_choropleth_payload',None)
+        state.pop('_v184_search_error',None)
         state['_v118_map_reset_count']=int(state.get('_v118_map_reset_count',0))+1
         st.rerun()
 
@@ -13095,7 +13261,7 @@ def main():
         radius=bounds_radius(bounds) if bounds else 1500
         town_choropleth_status()
         interactive_town_choropleth(selected_group)
-        town_location_search_panel_v183()
+        town_location_search_panel_v184()
         # Only the map is a fragment; the search is an ordinary form.
         background_progress()
         # Initial component defaults are not real viewport bounds. Only the browser callback makes the search ready.
