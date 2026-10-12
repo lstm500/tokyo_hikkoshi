@@ -52,7 +52,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v187"
+BUILD = "REBUILD-01-v188"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -12661,6 +12661,7 @@ def interactive_town_choropleth(group):
     observed map-whitening failure when bounds callbacks cause a rerun.
     """
     state=st.session_state
+    group=state.get('layout_display_group',group)
     # Only this explicit user action launches the asynchronous DB aggregation.
     if st.button('保存物件を再集計',key='recompute_v143_town_map'):
         job=current_town_summary_worker()
@@ -12673,6 +12674,24 @@ def interactive_town_choropleth(group):
     if st.button('表示範囲を更新（地図移動後のみ）',key='refresh_v118_town_map'):
         state['_v118_map_revision']=int(state.get('_v118_map_revision',0))+1
         st.rerun(scope='fragment')
+    # Layout controls live next to the map instead of above map diagnostics.
+    if group not in ('group0','group1','group2','house'):group='group1';state.layout_display_group='group1'
+    if st.button('ワンルーム・1K・1DK',key='layout_group0_v174',type='primary' if group=='group0' else 'secondary',use_container_width=True):
+        if state.layout_display_group!='group0':state.layout_display_group='group0';st.rerun(scope='fragment')
+    if group=='group0':st.caption('マンション・築15年以内')
+    g1,g2,g3=st.columns(3)
+    with g1:
+        if st.button('1LDK・2K・2DK',key='layout_group1',type='primary' if group=='group1' else 'secondary',use_container_width=True):
+            if state.layout_display_group!='group1':state.layout_display_group='group1';st.rerun(scope='fragment')
+        if group=='group1':st.caption('マンション・築15年以内')
+    with g2:
+        if st.button('2LDK・3K・3DK',key='layout_group2',type='primary' if group=='group2' else 'secondary',use_container_width=True):
+            if state.layout_display_group!='group2':state.layout_display_group='group2';st.rerun(scope='fragment')
+        if group=='group2':st.caption('マンション・築15年以内')
+    with g3:
+        if st.button('一戸建て',key='layout_group_house',type='primary' if group=='house' else 'secondary',use_container_width=True):
+            if state.layout_display_group!='house':state.layout_display_group='house';st.rerun(scope='fragment')
+        if group=='house':st.caption('築40年以内・50㎡以上')
     reset=int(state.get('_v118_map_reset_count',0))
     revision=int(state.get('_v118_map_revision',0))
     store=current_town_summary_worker();snap=store.snapshot()
@@ -13524,28 +13543,9 @@ def main():
     with tabs[0]:
         st.subheader('地図を動かして、探す地域を表示してください')
         selected_group=state.get('layout_display_group','group1')
-        if selected_group not in ('group0','group1','group2','house'):selected_group='group1';state.layout_display_group='group1'
-        if st.button('ワンルーム・1K・1DK',key='layout_group0_v174',type='primary' if selected_group=='group0' else 'secondary',use_container_width=True):
-            if state.layout_display_group!='group0':state.layout_display_group='group0';st.rerun()
-        if selected_group=='group0':st.caption('マンション・築15年以内')
-        g1,g2,g3=st.columns(3)
-        with g1:
-            if st.button('1LDK・2K・2DK',key='layout_group1',type='primary' if selected_group=='group1' else 'secondary',use_container_width=True):
-                if state.layout_display_group!='group1':state.layout_display_group='group1';st.rerun()
-            if selected_group=='group1':st.caption('マンション・築15年以内')
-        with g2:
-            if st.button('2LDK・3K・3DK',key='layout_group2',type='primary' if selected_group=='group2' else 'secondary',use_container_width=True):
-                if state.layout_display_group!='group2':state.layout_display_group='group2';st.rerun()
-            if selected_group=='group2':st.caption('マンション・築15年以内')
-        with g3:
-            if st.button('一戸建て',key='layout_group_house',type='primary' if selected_group=='house' else 'secondary',use_container_width=True):
-                if state.layout_display_group!='house':state.layout_display_group='house';st.rerun()
-            if selected_group=='house':st.caption('築40年以内・50㎡以上')
-        selected_group=state.get('layout_display_group','group1')
         bounds=state.get('new_bounds')
         center=bounds_center(bounds) if bounds else state.get('new_view_center',DEFAULT_CENTER)
         radius=bounds_radius(bounds) if bounds else 1500
-        town_choropleth_status()
         interactive_town_choropleth(selected_group)
         town_location_search_panel_v184()
         # Only the map is a fragment; the search is an ordinary form.
@@ -13591,6 +13591,8 @@ def main():
                 with st.expander('今回検索した地名・丁目'):
                     for label in result['conditions']['regions']: st.write(label)
         st.caption('町丁目別の集計対象は保存済みの募集データです。件数と平均家賃は区・町丁目単位で集計します。')
+        # Detailed 23-ward coverage and aggregation status are low-priority UI.
+        town_choropleth_status()
     with tabs[1]:
         st.caption('物件と家賃の集計は共通のSupabaseに保存し、全利用者で同じデータを参照します。通勤設定は共有しません。')
         if state.get('saved_map_restore_message'):st.caption(state.saved_map_restore_message)
