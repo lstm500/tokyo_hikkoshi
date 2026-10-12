@@ -40,7 +40,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v172"
+BUILD = "REBUILD-01-v173"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -5763,8 +5763,8 @@ def suumo_collect(web,region,bounds,munis,emit):
                     address=location.get('inferred_address','') if location else ''
                     if not town_chome_key(address):
                         reject_listing(web,'SUUMO',url,'address.town_chome','location_failure',
-                            'SUUMO所在地・物件地図とも地図区域の町丁目を確認できない',location,
-                            '掲載所在地または物件マーカーから地図の町丁目を特定');emit('rejected',1);return
+                            'SUUMO所在地・物件地図とも対象の町丁目・正式町名を確認できない',location,
+                            '掲載所在地または物件マーカーから町丁目・正式町名を特定');emit('rejected',1);return
 
                     # Rent, layout, inferred address and acquisition time survive Database.save_units().
                     row=partial_listing('SUUMO',url,'SUUMO掲載募集',address,layout,rent,None,None,region,bounds,location,None,age,ym,'')
@@ -5904,7 +5904,7 @@ def suumo_house_collect(web,region,bounds,munis,emit):
                     address=location.get('inferred_address','') if location else ''
                     if not town_chome_key(address):
                         reject_listing(web,'SUUMO',url,'address.town_chome','location_failure',
-                            '一戸建ての掲載所在地・物件マーカーから地図区域を特定できない',location,
+                            '一戸建ての掲載所在地・物件マーカーから町丁目・正式町名を特定できない',location,
                             '地図上の町丁目');emit('rejected',1);return
                     row=partial_listing('SUUMO',url,'SUUMO一戸建て掲載募集',address,layout,rent,None,area,region,bounds,location,'一戸建て',age,ym,'',dwelling_type='house')
                     if not row:
@@ -10041,7 +10041,7 @@ TOWN_GEOJSON_BACKUP = 'https://raw.githubusercontent.com/frogcat/japan-small-are
 TOWN_WARD_GEOJSON_URL = ('https://raw.githubusercontent.com/smartnews-smri/japan-topography/'
                           'main/data/municipality/geojson/s0010/N03-21_13_210101.json')
 TOWN_WARD_GEOJSON_LIMIT = 2 * 1024 * 1024
-TOWN_BOUNDARY_CACHE_PATH = os.path.join(tempfile.gettempdir(),'sumai-town-boundary-v171.sqlite')
+TOWN_BOUNDARY_CACHE_PATH = os.path.join(tempfile.gettempdir(),'sumai-town-boundary-v173.sqlite')
 TOWN_GEOMETRY_LIMIT = 36 * 1024 * 1024
 TOWN_GROUPS = ('group1','group2','house')
 # Breakpoints follow the prior rent-band legend: pale blue -> blue -> green
@@ -10076,22 +10076,34 @@ def town_chome_key(text):
     # have the same suffix.  The map geometry remains the final authority:
     # an unrecognized key cannot color an unrelated ward/town polygon.
     match=re.match(r'^([^/0-9－−ー-]{1,40}?)(\d{1,2})(?=$|[-－−ー]|番)',rest)
-    if match:return ward+'|'+match.group(1)+match.group(2)+'丁目'
+    if match:
+        # 千代田区の一番町・三番町などは丁目のない正式町名。
+        # 後続の街区番号を架空の丁目に変換してはならない。
+        if match.group(1).endswith('番町'):return ward+'|'+match.group(1)
+        return ward+'|'+match.group(1)+match.group(2)+'丁目'
     # A town with no chome can appear on a map only if the boundary dataset
     # actually contains exactly this key; no street number is guessed.
-    if re.fullmatch(r'[^/\d\-－番地号]{2,30}',rest):return ward+'|'+rest
+    if re.fullmatch(r'[^/\d\-－]{2,30}',rest) and not re.search(r'(?:番地?|号)$',rest):return ward+'|'+rest
     return None
 
 
-def _v150_town_address(raw,region=None,require_chome=True):
-    """Read a real source location to the map's level; never invent a lot."""
+def _v150_town_address(raw,region=None,require_chome=True,official_reverse_verified=False):
+    """Validate a provider town without fabricating a chome or lot number.
+
+    A published non-chome town (e.g. Chiyoda Ichibancho) is valid when its
+    polygon exists OR the listing's own map marker independently resolves to
+    that exact official GSI town. A missing asynchronous polygon cache is NOT
+    evidence that the official town does not exist. Without either proof, a
+    broad address such as Nishishinjuku must not masquerade as a map chome.
+    """
     candidate=normal(raw).replace(' ','').replace('　','')
     key=town_chome_key(candidate)
     if not key:return None
     ward,town=key.split('|',1)
     if require_chome and '丁目' not in town:
-        # For non-chome locations require proof that the polygon exists.
-        if not _v150_boundary_key_exists(key):return None
+        # Non-chome source names need independent proof: existing town polygon
+        # or the exact official reverse result from THIS listing's map marker.
+        if not official_reverse_verified and not _v150_boundary_key_exists(key):return None
     if region:
         code=str(region.get('code') or '')
         if code in TOKYO_WARDS and TOKYO_WARDS[code]!=ward:return None
@@ -10139,6 +10151,20 @@ def _v150_polygon_confirms(point,key):
 def _v150_suumo_location(web,detail_soup,detail_url,bounds,munis,region,fields):
     """Provider-published town first, map marker -> town second; no JHJ 404."""
     source=fields.get('source_address') or fields.get('address') or ''
+    # A published address from another ward/town is an explicit conflict.
+    # Never allow a surrounding map to overrule the provider's labelled town.
+    if source:
+        published=address_key(source).replace(' ','').replace('　','').removeprefix('東京都')
+        source_ward=next((w for w in sorted(TOKYO_WARDS.values(),key=len,reverse=True)
+                          if published.startswith(w)),None)
+        requested_ward=TOKYO_WARDS.get(str(region.get('code') or ''))
+        if source_ward and requested_ward:
+            expected=normal(region.get('town') or '')
+            if source_ward!=requested_ward or (expected and not town_matches(expected,source)):
+                trace(web,'v173_published_region_conflict',{
+                    'url':detail_url,'published_address':source,'requested_ward':requested_ward,
+                    'requested_town':expected,'decision':'not_saved'},'WARNING','location')
+                return None
     town_address=_v150_town_address(source,region)
     if town_address:
         trace(web,'v150_published_town_verified',{'url':detail_url,'published_address':source,
@@ -10177,15 +10203,27 @@ def _v150_suumo_location(web,detail_soup,detail_url,bounds,munis,region,fields):
         if region.get('town') and not town_matches(region['town'],place.get('town','')):
             failures.append('town_mismatch');continue
         ward=TOKYO_WARDS.get(str(region.get('code'))) or ''
-        address=_v150_town_address('東京都'+ward+str(place.get('town') or ''),region)
+        # GSI is independent of SUUMO's town picker. Since the municipality
+        # and requested town already matched above, an exact official non-chome
+        # result is conclusive even when the polygon cache is not yet built.
+        official_address='東京都'+ward+str(place.get('town') or '')
+        address=_v150_town_address(official_address,region,official_reverse_verified=True)
         if not address:
             failures.append('reverse_town_below_map_granularity');continue
-        geometry=_v150_polygon_confirms(marker,town_chome_key(address))
+        verified_key=town_chome_key(address)
+        geometry=_v150_polygon_confirms(marker,verified_key)
         if geometry is False:
-            failures.append('marker_outside_town_polygon');continue
-        trace(web,'v150_map_town_verified',{'url':detail_url,'map_url':target,
-            'map_town_key':town_chome_key(address),'position_kind':marker_kind,
-            'polygon_check':geometry,'building_street_number_claimed':False},stage='location')
+            # A town that does not have a loaded polygon is NOT evidence that
+            # the marker is outside it. Only reject when a polygon for this
+            # precise town is actually available and contradicts the marker.
+            if '丁目' in verified_key.split('|',1)[1] or _v150_boundary_key_exists(verified_key):
+                failures.append('marker_outside_town_polygon');continue
+            geometry=None
+        trace(web,'v173_map_town_verified',{'url':detail_url,'map_url':target,
+            'map_town_key':verified_key,'position_kind':marker_kind,
+            'polygon_check':geometry,'polygon_available':_v150_boundary_key_exists(verified_key),
+            'official_gsi_town':str(place.get('town') or ''),
+            'building_street_number_claimed':False},stage='location')
         return {'inferred_address':address,'latitude':float(marker[0]),
                 'longitude':float(marker[1]),'coordinate_precision':'listing_map',
                 'location_method':'SUUMO物件マーカー→GSI逆ジオコーダ→町丁目',
