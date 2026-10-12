@@ -40,7 +40,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v171"
+BUILD = "REBUILD-01-v172"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -11057,9 +11057,9 @@ def town_coverage_audit(groups,boundary_keys,group):
 def town_colored_shapes(groups,group,features,bounds,max_features=None,include_no_data=False,suumo_oz_codes=None):
     """Join the exact saved town summary with every polygon in the viewport.
 
-    A town without a saved observation in the selected layout is neutral gray;
-    it must never inherit a nearby town's rent. All source records remain
-    unchanged. The original three-value return contract is preserved.
+    Only polygons with positive saved-rent counts are painted by the live map.
+    Optional empty-town geometry is for diagnostics; it must never inherit a
+    neighboring town's rent. Stored source records are unchanged.
     """
     counts=(groups or {}).get(group,{})
     rented={}
@@ -11343,9 +11343,25 @@ _V171_EACH_NEW=_V171_EACH_OLD.replace(
 assert TOWN_COMPONENT_HTML_V121.count(_V171_EACH_OLD)==1
 TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(_V171_EACH_OLD,_V171_EACH_NEW,1)
 
+# v172: never shade unobserved towns or ward underlays. Keep real rent colors.
+_V172_STYLE_OLD = _V171_STYLE_NEW
+_V172_STYLE_NEW = _V172_STYLE_OLD.replace(
+    "if(p.ward_backdrop)return {color:'transparent',weight:0,fillColor:'#b7c0c3',fillOpacity:.26};if(p.has_data===false)return {color:'#bec7ca',weight:.35,fillColor:'#d0d7da',fillOpacity:.54};",
+    "if(p.has_data!==true)return {color:'transparent',weight:0,fillOpacity:0};")
+assert _V172_STYLE_NEW != _V172_STYLE_OLD
+assert TOWN_COMPONENT_HTML_V121.count(_V172_STYLE_OLD) == 1
+TOWN_COMPONENT_HTML_V121 = TOWN_COMPONENT_HTML_V121.replace(_V172_STYLE_OLD, _V172_STYLE_NEW, 1)
+_V172_EACH_OLD = _V171_EACH_NEW
+_V172_EACH_NEW = _V172_EACH_OLD.replace(
+    "if(props.ward_backdrop){layer.options.interactive=false;return;}",
+    "if(props.has_data!==true){layer.options.interactive=false;return;}")
+assert _V172_EACH_NEW != _V172_EACH_OLD
+assert TOWN_COMPONENT_HTML_V121.count(_V172_EACH_OLD) == 1
+TOWN_COMPONENT_HTML_V121 = TOWN_COMPONENT_HTML_V121.replace(_V172_EACH_OLD, _V172_EACH_NEW, 1)
+
 @st.cache_resource(show_spinner=False)
 def town_component_v121():
-    folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-v168')
+    folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-v172')
     os.makedirs(folder,exist_ok=True)
     path=os.path.join(folder,'index.html')
     # Component HTML is small; create once per worker process. Never include
@@ -11362,7 +11378,7 @@ def town_component_v121():
         with open(temp_path,'w',encoding='utf-8') as output:
             output.write(TOWN_COMPONENT_HTML_V121)
         os.replace(temp_path,path)
-    return st.components.v1.declare_component('sumai_town_map_v168',path=folder)
+    return st.components.v1.declare_component('sumai_town_map_v172',path=folder)
 
 # v159: Station-to-office approximate train travel times, OFFLINE AND READ-ONLY.
 # Tokyo Metro/Toei/JR local edge minutes adapted from MIT-licensed public project:
@@ -11941,7 +11957,7 @@ def interactive_town_choropleth(group):
     if needs_update:
         window=_v156_town_render_window(bounds,center)
         groups=(snap['summary'] or {}).get('groups') or {}
-        geo,limited,count=town_colored_shapes(groups,group,shapes if ready else {},window,include_no_data=True,
+        geo,limited,count=town_colored_shapes(groups,group,shapes if ready else {},window,include_no_data=False,
                                               suumo_oz_codes=suumo_oz_codes)
         # The window MUST be part of the Leaflet data revision: keeping the
         # same component key preserves the map position while replacing colors.
@@ -11959,8 +11975,7 @@ def interactive_town_choropleth(group):
     elif destinations:
         st.caption(f'通勤先：{destinations[0]}駅｜乗換回数が少ない経路を優先（同数なら最短時間・概算）')
     if cached['ready']:
-        st.caption(f"\u7740\u8272 {cached['colored_count']}\u753a\u4e01\u76ee\uff5c\u30c7\u30fc\u30bf\u306a\u3057 {cached['no_data_count']}\u753a\u4e01\u76ee\uff08\u30b0\u30ec\u30fc\uff09"
-                   f"｜区境界の灰色補完 {cached['geo']['render_stats']['wards_gray_backdrop']}区")
+        st.caption(f"着色 {cached['colored_count']}町丁目｜保存家賃のない地域は背景地図のまま表示")
     else:
         st.caption('集計中。完了後、地図の色は自動更新されます')
     stations,wards=town_station_refs_v164(destinations)
@@ -11969,7 +11984,7 @@ def interactive_town_choropleth(group):
                 signature=cached['layer_signature'],stations=stations,wards=wards,
                 commute_destination=(destinations[0] if destinations else ''),
                 commute_destination_2=(destinations[1] if len(destinations)==2 else ''),
-                key='town_map_v168_'+str(reset),default=None)
+                key='town_map_v172_'+str(reset),default=None)
     if isinstance(data,dict):
         current=viewport_bounds(data)
         if current:
