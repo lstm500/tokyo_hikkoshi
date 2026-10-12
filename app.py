@@ -40,7 +40,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v175"
+BUILD = "REBUILD-01-v176"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -632,13 +632,11 @@ CROWD = {
     '南武線':(156,'武蔵中原 → 武蔵小杉','7:30〜8:30'),
     '田園都市線':(138,'池尻大橋 → 渋谷','7:50〜8:50'),
 }
-BANDS = (100000,125000,150000,175000,200000,225000,250000,275000,300000,350000,400000)
-# Perceptual rent scale. The five bands up to 200,000 yen deliberately use clearly
-# separated hues (navy -> blue -> cyan -> green -> yellow). Above 200,000 yen the
-# scale stays in a warm orange-to-burgundy family so the lower-price differences remain
-# immediately readable on the grayscale base map.
-COLORS = ("#17357A","#0067D9","#00A9D6","#00A870","#E8B900","#F39A1F",
-          "#F06B24","#E94A35","#D9342B","#BC2733","#941D3B","#65102F")
+# Legacy point-map scale; the active町丁目 map uses the continuous TOWN_GRADIENT below.
+# Include compact 1R/1K/1DK rents without changing rent or storage data.
+BANDS = (30000,50000,70000,90000,120000,150000,175000,200000,250000,300000,350000,400000,450000)
+COLORS = ("#d0efff","#b0dffa","#69bfe9","#398bdc","#2283ba","#1b998a",
+          "#4eac5b","#b9bf2b","#eb9824","#c73731","#98232b","#641820","#330a1a","#330a1a")
 RENT_BAND_LABELS = (f'{BANDS[0]/10000:g}万円以下',) + tuple(
     f'{lower/10000:g}〜{upper/10000:g}万円' for lower,upper in zip(BANDS,BANDS[1:])
 ) + (f'{BANDS[-1]/10000:g}万円超',)
@@ -7207,8 +7205,8 @@ def display_diagnostic_downloads(report,units=None,bounds=None,load=None):
 
 
 def rent_color(price):
-    """Monthly rent plus management fees; each threshold belongs to the lower band."""
-    return COLORS[sum(price>cut for cut in BANDS)]
+    """Use the same 3万～45万 continuous scale as the active town map."""
+    return town_rent_gradient(price)
 
 
 def mesh(rows,center,radius,interpolate=False,bounds=None):
@@ -10060,12 +10058,14 @@ TOWN_WARD_GEOJSON_LIMIT = 2 * 1024 * 1024
 TOWN_BOUNDARY_CACHE_PATH = os.path.join(tempfile.gettempdir(),'sumai-town-boundary-v173.sqlite')
 TOWN_GEOMETRY_LIMIT = 36 * 1024 * 1024
 TOWN_GROUPS = ('group0','group1','group2','house')
-# Breakpoints follow the prior rent-band legend: pale blue -> blue -> green
-# -> yellow -> red -> near-black burgundy (yen per month).
+# Continuous rent scale: 3万円 (low / 1R) to 45万円 (high).
+# Separate hues distinguish compact-home rents; higher-priced colors remain
+# green -> yellow -> red -> dark burgundy as in the existing map.
 TOWN_GRADIENT = (
-    (80000,(208,239,255)),
-    (125000,(36,121,210)),
-    (175000,(24,164,114)),
+    (30000,(208,239,255)),
+    (60000,(105,191,233)),
+    (90000,(36,121,210)),
+    (150000,(24,164,114)),
     (200000,(238,199,27)),
     (275000,(225,59,53)),
     (450000,(51,10,26)),
@@ -10261,7 +10261,7 @@ def town_layout_group(row):
 
 
 def town_rent_gradient(price):
-    """Rent-band aligned, continuously interpolated six-stop heat colors."""
+    """Continuously interpolated rent colors from 3万円 to 45万円."""
     value=float(price)
     if value<=TOWN_GRADIENT[0][0]:rgb=TOWN_GRADIENT[0][1]
     elif value>=TOWN_GRADIENT[-1][0]:rgb=TOWN_GRADIENT[-1][1]
@@ -11245,12 +11245,12 @@ def _v153_attached_rent_legend():
         f'<span style="position:absolute;left:{(price-low)/(high-low)*100:.4f}%;'
         'transform:translateX(-50%);top:0;white-space:nowrap">'
         f'{price//10000}</span>'
-        for price in range(100000,450000,50000))
+        for price in range(50000,450000,50000))
     return ('<div id="rent-scale" aria-label="町丁目別の平均家賃の色分け">'
             '<div class="rent-scale-title">町丁目別・平均家賃（万円）</div>'
             f'<div class="rent-scale-bar" style="background:linear-gradient(90deg,{gradient})"></div>'
             f'<div class="rent-scale-ticks">{ticks}</div>'
-            '<div class="rent-scale-limits"><span>8万円以下</span><span>45万円以上</span></div>'
+            '<div class="rent-scale-limits"><span>3万円以下</span><span>45万円以上</span></div>'
             '</div>')
 
 _V153_LEGEND_HEIGHT = 64
@@ -11419,7 +11419,7 @@ TOWN_COMPONENT_HTML_V121 = TOWN_COMPONENT_HTML_V121.replace(_V172_EACH_OLD, _V17
 
 @st.cache_resource(show_spinner=False)
 def town_component_v121():
-    folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-v172')
+    folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-v176')
     os.makedirs(folder,exist_ok=True)
     path=os.path.join(folder,'index.html')
     # Component HTML is small; create once per worker process. Never include
@@ -11436,7 +11436,7 @@ def town_component_v121():
         with open(temp_path,'w',encoding='utf-8') as output:
             output.write(TOWN_COMPONENT_HTML_V121)
         os.replace(temp_path,path)
-    return st.components.v1.declare_component('sumai_town_map_v172',path=folder)
+    return st.components.v1.declare_component('sumai_town_map_v176',path=folder)
 
 # v159: Station-to-office approximate train travel times, OFFLINE AND READ-ONLY.
 # Tokyo Metro/Toei/JR local edge minutes adapted from MIT-licensed public project:
