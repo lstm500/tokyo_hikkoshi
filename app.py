@@ -52,7 +52,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v185"
+BUILD = "REBUILD-01-v186"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -11402,8 +11402,8 @@ _V182_NEW_JUMP = """ updateOverlay(args.geo,args.signature);
      try{
        var focus=L.geoJSON(target.geo,{pane:'townSearchFocusPane',interactive:false,
          smoothFactor:1.0,style:function(){return {
-           color:'#d10040',weight:4.5,opacity:1,fillOpacity:0,
-           dashArray:'10 5',lineCap:'round',lineJoin:'round',interactive:false
+           color:'#195d72',weight:2,opacity:.88,fillColor:'#69adb8',fillOpacity:.12,
+           dashArray:null,lineCap:'round',lineJoin:'round',interactive:false
          }}});
        if(!focus.getLayers().length)throw new Error('検索地域の境界データがありません');
        if(state.focusLayer)state.map.removeLayer(state.focusLayer);
@@ -11519,7 +11519,7 @@ function townSendSelection(place){
  state.map.invalidateSize();
  state.map.fitBounds([[b[0],b[1]],[b[2],b[3]]],{padding:[25,25],maxZoom:16,animate:false});
  if(state.focusLayer){state.map.removeLayer(state.focusLayer);state.focusLayer=null;}
- state.provisionalFocus=L.rectangle([[b[0],b[1]],[b[2],b[3]]],{color:'#dd8a0c',weight:2,dashArray:'6 6',fillOpacity:0,interactive:false}).addTo(state.map);
+ state.provisionalFocus=L.rectangle([[b[0],b[1]],[b[2],b[3]]],{color:'#719da6',weight:1.5,dashArray:'4 4',fillColor:'#c0dfe2',fillOpacity:.08,interactive:false}).addTo(state.map);
  var ticket=String(Date.now())+'_'+Math.random().toString(36).slice(2,11);
  state.searchPendingTicket=ticket;
  state.sentBounds='';
@@ -11576,7 +11576,7 @@ old="       state.focusLayer=focus.addTo(state.map);\n       state.lastJumpToken
 new="""       state.focusLayer=focus.addTo(state.map);
        if(state.provisionalFocus){state.map.removeLayer(state.provisionalFocus);state.provisionalFocus=null;}
        state.searchPendingTicket=null;
-       setTownStatus('「'+String(target.label||'地域')+'」へ移動し、町域の境界を赤線で表示しました。');
+       setTownStatus('「'+String(target.label||'地域')+'」へ移動し、町域の外周を表示しました。');
        state.lastJumpToken=String(target.id);"""
 assert TOWN_COMPONENT_HTML_V121.count(old)==1
 TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(old,new,1)
@@ -11720,6 +11720,60 @@ async function v185Init(){
    }
  }
 }
+// v186: a calm unified silhouette, rather than thick dashed strokes on every chome.
+// An SVG filter sees the COMBINED alpha of all selected polygons, so common
+// internal chome borders do not receive an outline.  No external JS library.
+function v186SimpleFocus(geo){
+ return L.geoJSON(geo,{pane:'townSearchFocusPane',interactive:false,smoothFactor:.7,
+   style:function(){return {color:'#195d72',weight:2,opacity:.88,
+     fillColor:'#69adb8',fillOpacity:.12,dashArray:null,lineCap:'round',lineJoin:'round'};}});
+}
+function v186MakeFocus(geo){
+ if(!L.svg||typeof SVGFilterElement==='undefined')return v186SimpleFocus(geo);
+ var renderer=state._v186FocusRenderer;
+ if(!renderer){renderer=L.svg({pane:'townSearchFocusPane',padding:.25});state._v186FocusRenderer=renderer;}
+ var layer=L.geoJSON(geo,{renderer:renderer,pane:'townSearchFocusPane',interactive:false,
+   smoothFactor:.6,style:function(){return {stroke:false,weight:0,
+     fillColor:'#17576d',fillOpacity:1,fillRule:'evenodd'};}});
+ layer._v186Renderer=renderer;
+ return layer;
+}
+function v186UseUnifiedStyle(layer){
+ // Called AFTER the layer is added; Leaflet only then constructs the SVG.
+ var renderer=layer&&layer._v186Renderer;
+ if(!renderer||!renderer._container||!renderer._rootGroup)return false;
+ var svg=renderer._container,root=renderer._rootGroup;
+ if(root.getAttribute('data-v186-focus-style')==='1')return true;
+ var ns='http://www.w3.org/2000/svg';
+ state._v186FocusSerial=(state._v186FocusSerial||0)+1;
+ var id='sumai-town-focus-v186-'+String(state._v186FocusSerial);
+ function svgTag(tag,attributes,parent){
+   var el=document.createElementNS(ns,tag);
+   Object.keys(attributes||{}).forEach(function(name){el.setAttribute(name,String(attributes[name]))});
+   if(parent)parent.appendChild(el);
+   return el;
+ }
+ var defs=svgTag('defs',{},null);
+ var f=svgTag('filter',{id:id,x:'-15%',y:'-20%',width:'130%',height:'140%',
+   'color-interpolation-filters':'sRGB'},defs);
+ svgTag('feMorphology',{'in':'SourceAlpha',operator:'dilate',radius:'4',result:'wide'},f);
+ svgTag('feComposite',{'in':'wide',in2:'SourceAlpha',operator:'out',result:'haloMask'},f);
+ svgTag('feFlood',{'flood-color':'#ffffff','flood-opacity':'.9',result:'haloColor'},f);
+ svgTag('feComposite',{'in':'haloColor',in2:'haloMask',operator:'in',result:'halo'},f);
+ svgTag('feMorphology',{'in':'SourceAlpha',operator:'dilate',radius:'2',result:'thin'},f);
+ svgTag('feComposite',{'in':'thin',in2:'SourceAlpha',operator:'out',result:'lineMask'},f);
+ svgTag('feFlood',{'flood-color':'#15566e','flood-opacity':'.94',result:'lineColor'},f);
+ svgTag('feComposite',{'in':'lineColor',in2:'lineMask',operator:'in',result:'line'},f);
+ svgTag('feFlood',{'flood-color':'#3a9ca8','flood-opacity':'.11',result:'tintColor'},f);
+ svgTag('feComposite',{'in':'tintColor',in2:'SourceAlpha',operator:'in',result:'fill'},f);
+ var merge=svgTag('feMerge',{},f);
+ ['halo','fill','line'].forEach(function(key){svgTag('feMergeNode',{'in':key},merge)});
+ svg.insertBefore(defs,svg.firstChild);
+ root.setAttribute('filter','url(#'+id+')');
+ root.setAttribute('pointer-events','none');
+ root.setAttribute('data-v186-focus-style','1');
+ return true;
+}
 function v185TownFocus(place){
  if(!state._v185Loaded||!state.map)return false;
  var selected=[],features=[];
@@ -11739,18 +11793,28 @@ function v185TownFocus(place){
    south=Math.min(south,b[0]);west=Math.min(west,b[1]);north=Math.max(north,b[2]);east=Math.max(east,b[3]);
  });
  try{
-   var outline=L.geoJSON({type:'FeatureCollection',features:features},{pane:'townSearchFocusPane',interactive:false,
-     smoothFactor:1,style:function(){return {color:'#d10040',weight:4.5,opacity:1,fillOpacity:0,dashArray:'10 5',lineJoin:'round'}}});
+   var geometry={type:'FeatureCollection',features:features};
+   var outline=v186MakeFocus(geometry);
    if(!outline.getLayers().length)return false;
    if(state.focusLayer)state.map.removeLayer(state.focusLayer);
    if(state.provisionalFocus){state.map.removeLayer(state.provisionalFocus);state.provisionalFocus=null}
    state.focusLayer=outline.addTo(state.map);
+   if(outline._v186Renderer){
+     try{
+       if(!v186UseUnifiedStyle(outline))throw new Error('SVG renderer unavailable');
+     }catch(styleError){
+       // Older browsers still get a legible solid, translucent border.
+       state.map.removeLayer(outline);
+       outline=v186SimpleFocus(geometry);
+       state.focusLayer=outline.addTo(state.map);
+     }
+   }
    state._v185FocusActive=true;
    state.lastJumpToken='local-'+String(Date.now());
    state.sentBounds='';
    state.map.invalidateSize();
    state.map.fitBounds([[south,west],[north,east]],{padding:[24,24],maxZoom:16,animate:false});
-   setTownStatus('「'+place.label+'」に移動し、地域を赤線で囲みました。');
+   setTownStatus('「'+place.label+'」に移動し、町域の外周を表示しました。');
    setTimeout(function(){emitBounds()},80);
    return true;
  }catch(err){setTownStatus('輪郭表示エラー：'+String(err&&err.message||err));return false}
@@ -11794,7 +11858,7 @@ TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(needle,"if(!state._v18
 
 @st.cache_resource(show_spinner=False)
 def town_component_v121():
-    _asset_revision='v185-indexed-geo'
+    _asset_revision='v186-soft-unified-focus'
     folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-v184')
     os.makedirs(folder,exist_ok=True)
     path=os.path.join(folder,'index.html')
