@@ -40,7 +40,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v176"
+BUILD = "REBUILD-01-v177"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -12228,9 +12228,11 @@ def v147_replay_status():
 # v170 DATA ISOLATION:
 # Public real-estate listings, town-rent summaries, and acquisition progress
 # remain exclusively in the existing shared Supabase namespace, unchanged.
-# Commute destinations are local-first and backed up per anonymous recovery ID
-# inside existing Supabase housing_searches_v1 (status=personal_commute).
-# The ID is a random browser secret kept in the URL query and browser storage.
+# Commute destinations are automatically persisted across redeploys for the
+# same browser and application origin. Each browser carries a stable anonymous
+# private ID in local storage; Supabase is the secondary backup for that ID.
+# A legacy v174 commute_ref query is imported invisibly and then cleared.
+# Neither setup, recovery-code copying, nor URL editing is required.
 # Property data stays in rental_listing rows, never in personal backups.
 # A browser can hold multiple named local profiles without a login; personal
 # records are isolated from shared rental_listing and map summary records.
@@ -12342,12 +12344,17 @@ def _v174_commute_url_token():
 
 
 def _v174_record_client_token(state,message):
+    """Keep the stable browser ID; silently consume a legacy URL ID once stored.
+
+    Never advertise or require a recovery code.  Deleting the old URL argument
+    happens only when the client confirms that its persistent storage works.
+    """
     token=_v174_commute_token(message.get('client_token'))
     if not token:return None
     state['_v174_commute_token']=token
-    if _v174_commute_url_token()!=token:
-        try:st.query_params[_V174_PERSONAL_TOKEN_QUERY]=token
-        except Exception:pass
+    if message.get('available') is True and _v174_commute_url_token():
+        try:del st.query_params[_V174_PERSONAL_TOKEN_QUERY]
+        except (AttributeError,KeyError,TypeError):pass
     return token
 
 _V170_PERSONAL_STORAGE_HTML = r"""<!doctype html><html lang="ja"><head><meta charset="utf-8">
@@ -12360,20 +12367,23 @@ _V170_PERSONAL_STORAGE_HTML = r"""<!doctype html><html lang="ja"><head><meta cha
  const MAX_PROFILES=12;
  const CLIENT_TOKEN_KEY='sumai-compass-commute-recovery-token-v174';
  const STORAGE_HISTORY_PREFIX='sumai-compass-personal-commute-v2-owner-';
+ let persistentStorageAvailable=true;
  let lastResponse='';
  const memoryStore={};
  function getStored(key){
    try{return window.localStorage.getItem(key);}
-   catch(error){return Object.prototype.hasOwnProperty.call(memoryStore,key)?memoryStore[key]:null;}
+   catch(error){persistentStorageAvailable=false;
+     return Object.prototype.hasOwnProperty.call(memoryStore,key)?memoryStore[key]:null;}
  }
  function setStored(key,value){
    memoryStore[key]=String(value);
    try{window.localStorage.setItem(key,String(value));return true;}
-   catch(error){return false;}
+   catch(error){persistentStorageAvailable=false;return false;}
  }
  function removeStored(key){
    delete memoryStore[key];
-   try{window.localStorage.removeItem(key);}catch(error){}
+   try{window.localStorage.removeItem(key);}
+   catch(error){persistentStorageAvailable=false;}
  }
  function host(type,extra){
    window.parent.postMessage(Object.assign({isStreamlitMessage:true,type:type},extra||{}),'*');
@@ -12454,8 +12464,8 @@ _V170_PERSONAL_STORAGE_HTML = r"""<!doctype html><html lang="ja"><head><meta cha
    return token;
  }
  function stateReport(event,request,data,token,extra){
-   report(Object.assign({event:event,available:true,request_id:request,
-      client_token:token,backup:normalize(data)},summary(data),extra||{}));
+   report(Object.assign({event:event,available:persistentStorageAvailable,
+      request_id:request,client_token:token,backup:normalize(data)},summary(data),extra||{}));
  }
  function fallback(event,request){
    report({event:event,available:false,request_id:String(request||''),
@@ -12855,7 +12865,7 @@ def main():
         elif not state.get('_v170_commute_available',True):
             st.warning('ブラウザーが保存を制限しているため、通勤設定の永続保存・利用者切り替えは利用できません。')
         else:
-            st.caption('通勤設定は利用者別に自動保存し、同じ復元URLから更新後も復元します。物件データは全員共通です。')
+            st.caption('通勤設定はこのブラウザーに自動保存し、クラウドにもバックアップします。更新後も自動復元します。物件データは全員共通です。')
         if state.get('_v174_commute_backup_error'):
             st.warning('通勤設定のクラウドバックアップに失敗しました。ブラウザー内の保存は維持します。')
         if state.pop('_v170_commute_error',None):
@@ -12882,26 +12892,7 @@ def main():
                                                     'request_id':str(state['_v170_commute_nonce'])}
                     st.rerun()
                 else:st.warning('利用者名を入力してください。')
-        st.caption('通勤先1・2は選択中の利用者ごとに保存します。復元ID付きの現在のURLは第三者に共有しないでください。')
-        with st.expander('復元コードを確認・入力（端末変更やURL変更時）'):
-            existing_token=state.get('_v174_commute_token') or _v174_commute_url_token()
-            if existing_token:
-                st.caption('現在の復元コード（コピーして保管してください）')
-                st.code(existing_token,language=None)
-            st.text_input('以前の復元コード',key='v174_restore_token_input',max_chars=40,
-                          placeholder='40文字の復元コード',disabled=not commute_storage_ready)
-            if st.button('以前の設定を復元',key='v174_restore_personal_settings',
-                         disabled=not commute_storage_ready):
-                restored_token=_v174_commute_token(state.get('v174_restore_token_input'))
-                if not restored_token:
-                    st.warning('40文字の復元コードを入力してください。')
-                else:
-                    st.query_params[_V174_PERSONAL_TOKEN_QUERY]=restored_token
-                    state['_v170_commute_loaded']=False
-                    state.pop('_v174_commute_token',None)
-                    state.pop('_v174_commute_pending_restore',None)
-                    state.pop('_v174_commute_last_saved',None)
-                    st.rerun()
+        st.caption('通勤先1・2は選択中の利用者ごとに自動保存します。保存・復元操作は不要です。')
         # Destination 1: retain the existing state keys and the v159 upgrade path.
         available_lines=commute_lines_v160()
         if 'commute_line_v160' not in st.session_state:
