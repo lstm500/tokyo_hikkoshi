@@ -33,14 +33,26 @@ from datetime import datetime, timezone, timedelta
 from email.utils import parsedate_to_datetime
 from urllib.parse import urlencode, urljoin, urlparse, parse_qs, quote
 
-from branca.element import MacroElement, Template
+# The active town map is Leaflet-based and does not require branca or folium.
+# Keep branca optional: Streamlit Cloud can run this app without the legacy
+# point-map dependencies installed in its requirements.txt.
+try:
+    from branca.element import MacroElement, Template
+except ModuleNotFoundError as exc:
+    if exc.name not in ('branca', 'branca.element'):
+        raise
+    # Only the unused legacy point-map classes refer to these names at import
+    # time. Folium (which requires branca) is imported inside that legacy path.
+    MacroElement = object
+    def Template(source):
+        return source
 # folium is loaded only by the legacy point-map fallback, not the active town map.
 import requests
 import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v177"
+BUILD = "REBUILD-01-v179"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -11417,9 +11429,33 @@ assert _V172_EACH_NEW != _V172_EACH_OLD
 assert TOWN_COMPONENT_HTML_V121.count(_V172_EACH_OLD) == 1
 TOWN_COMPONENT_HTML_V121 = TOWN_COMPONENT_HTML_V121.replace(_V172_EACH_OLD, _V172_EACH_NEW, 1)
 
+# v178: time / official-reference crowd rate / transfer count in the map label.
+# Do not misrepresent a per-line busiest segment rate as a measured station-pair rate.
+_V178_LABEL_OLD=_V164_NEW_TIME
+_V178_LABEL_NEW="""   var dual=Boolean(state.commuteDestination2);
+   var pct=(typeof s.commute_crowding_pct==='number'&&isFinite(s.commute_crowding_pct)&&s.commute_crowding_pct>=0)?Math.round(s.commute_crowding_pct):null;
+   var crowdLabel=pct===null?'不明':('参考'+pct+'%');
+   var timeLabel=(commuteTime===null||commuteTransfers===null)?
+      (state.commuteDestination?'1.未計算':''):
+      '1.'+commuteTime+'分（'+crowdLabel+'）-'+commuteTransfers+'回';
+   var secondMin=(typeof s.commute2_min==='number' && isFinite(s.commute2_min) && s.commute2_min>=0 && s.commute2_min<999)?Math.round(s.commute2_min):null;
+   var secondTransfers=(typeof s.commute2_transfers==='number' && isFinite(s.commute2_transfers) && s.commute2_transfers>=0 &&
+     Math.floor(s.commute2_transfers)===s.commute2_transfers)?s.commute2_transfers:null;
+   var secondPct=(typeof s.commute2_crowding_pct==='number'&&isFinite(s.commute2_crowding_pct)&&s.commute2_crowding_pct>=0)?Math.round(s.commute2_crowding_pct):null;
+   var secondCrowd=secondPct===null?'不明':('参考'+secondPct+'%');
+   var timeLabel2=!dual?'':(secondMin===null||secondTransfers===null)?'2.未計算':
+     '2.'+secondMin+'分（'+secondCrowd+'）-'+secondTransfers+'回';"""
+assert TOWN_COMPONENT_HTML_V121.count(_V178_LABEL_OLD)==1
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(_V178_LABEL_OLD,_V178_LABEL_NEW,1)
+# Keep collision detection aware of the longer reference-rate labels.
+_V178_WIDTH_OLD='   var width=Math.min(330,nameWidth+timeWidth+19);'
+_V178_WIDTH_NEW='   var width=Math.min(460,nameWidth+timeWidth+19);'
+assert TOWN_COMPONENT_HTML_V121.count(_V178_WIDTH_OLD)==1
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(_V178_WIDTH_OLD,_V178_WIDTH_NEW,1)
+
 @st.cache_resource(show_spinner=False)
 def town_component_v121():
-    folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-v176')
+    folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-v178')
     os.makedirs(folder,exist_ok=True)
     path=os.path.join(folder,'index.html')
     # Component HTML is small; create once per worker process. Never include
@@ -11436,7 +11472,7 @@ def town_component_v121():
         with open(temp_path,'w',encoding='utf-8') as output:
             output.write(TOWN_COMPONENT_HTML_V121)
         os.replace(temp_path,path)
-    return st.components.v1.declare_component('sumai_town_map_v176',path=folder)
+    return st.components.v1.declare_component('sumai_town_map_v178',path=folder)
 
 # v159: Station-to-office approximate train travel times, OFFLINE AND READ-ONLY.
 # Tokyo Metro/Toei/JR local edge minutes adapted from MIT-licensed public project:
@@ -11835,11 +11871,114 @@ def commute_current_destination_v160():
         return st.session_state.get('commute_destination_v159','\u8868\u793a\u3057\u306a\u3044')
     return station if station in commute_lines_v160().get(line,()) else '\u8868\u793a\u3057\u306a\u3044'
 
+# v178: 2025年度最混雑1時間の路線別代表区間。国土交通省の公表値。
+# https://www.mlit.go.jp/report/press/content/002015142.pdf (資料3-1～3-4)
+# 注意: 各駅間の実測値ではない。代表区間値を経路上の乗車時間で加重した
+# 「参考混雑率」を表示する。データ欠落区間があれば数値を示さない。
+_COMMUTE_CROWD_2025_V178 = {
+    '山手線':(136,'新大久保→新宿（内回り）'),
+    '京浜東北線':(158,'川口→赤羽'),
+    '埼京線':(167,'板橋→池袋'),
+    '中央線快速':(158,'中野→新宿'),
+    '中央総武線':(151,'錦糸町→両国'),
+    '東海道線':(159,'川崎→品川'),
+    '横須賀線':(138,'武蔵小杉→西大井'),
+    '総武線快速':(160,'新小岩→錦糸町'),
+    '常磐線快速':(142,'三河島→日暮里'),
+    '南武線':(156,'武蔵中原→武蔵小杉'),
+    '南武線（各停概算）':(156,'武蔵中原→武蔵小杉'),
+    '京葉線（概算）':(123,'葛西臨海公園→新木場'),
+    '銀座線':(153,'赤坂見附→溜池山王'),
+    '丸ノ内線':(154,'新大塚→茗荷谷'),
+    '日比谷線':(163,'三ノ輪→入谷'),
+    '東西線':(160,'木場→門前仲町'),
+    '千代田線':(150,'町屋→西日暮里'),
+    '有楽町線':(153,'東池袋→護国寺'),
+    '半蔵門線':(111,'渋谷→表参道'),
+    '副都心線':(117,'要町→池袋'),
+    '南北線':(156,'駒込→本駒込'),
+    '浅草線':(123,'本所吾妻橋→浅草'),
+    '三田線':(146,'西巣鴨→巣鴨'),
+    '新宿線':(152,'西大島→住吉'),
+    '大江戸線':(147,'中井→東中野'),
+    '東武スカイツリーライン':(142,'小菅→北千住'),
+    '東武東上線':(131,'北池袋→池袋'),
+    '西武池袋線':(130,'椎名町→池袋'),
+    '西武新宿線':(148,'下落合→高田馬場'),
+    '京成本線':(137,'大神宮下→京成船橋'),
+    '京成押上線':(157,'京成曳舟→押上'),
+    '京王線':(145,'下高井戸→明大前'),
+    '京王井の頭線':(125,'池ノ上→駒場東大前'),
+    '小田急小田原線':(150,'世田谷代田→下北沢'),
+    '東急東横線':(124,'祐天寺→中目黒'),
+    '東横線':(124,'祐天寺→中目黒'),
+    '東急田園都市線':(138,'池尻大橋→渋谷'),
+    '田園都市線':(138,'池尻大橋→渋谷'),
+    '東急目黒線':(133,'不動前→目黒'),
+    '東急大井町線':(118,'九品仏→自由が丘'),
+    '東急池上線':(130,'大崎広小路→五反田'),
+    '東急多摩川線':(112,'矢口渡→蒲田'),
+    '京急本線':(120,'戸部→横浜'),
+    '京急本線（概算）':(120,'戸部→横浜'),
+    'りんかい線（概算）':(118,'大井町→品川シーサイド'),
+}
+_COMMUTE_CROWD_SOURCE_V178 = 'https://www.mlit.go.jp/report/press/content/002015142.pdf'
+
+
+@__import__('functools').lru_cache(maxsize=16)
+def commute_reference_crowd_v178(destination):
+    """Return route minutes, transfers and approximate crowd indicator by station.
+
+    This uses exactly the v159 transfer-first Dijkstra cost function. The rail
+    segments are weighted by their actual route edge times, but each segment's
+    *crowding* is only that line's published busiest-section reference.
+    A missing rail-line rate yields None (not a fabricated route average).
+    """
+    destination=_commute_key(destination)
+    graph=commute_network_v162()
+    if destination not in graph:return {}
+    # Preserve original five-field ordering: (transfers, minutes, station,
+    # previous line, walked). Later fields never change path priority.
+    pending=[(0,0.0,destination,'',False,0.0,0.0,0.0)]
+    visited=set();best={}
+    while pending:
+        transfers,elapsed,station,last_line,walked,total_weight,covered,rail_minutes=heapq.heappop(pending)
+        key=(station,last_line,walked)
+        if key in visited:continue
+        visited.add(key)
+        previous=best.get(station)
+        if previous is None or (transfers,elapsed)<(previous[1],previous[0]):
+            best[station]=(elapsed,transfers,total_weight,covered,rail_minutes)
+        for neighbor,line,minutes in graph.get(station,()):
+            if line=='徒歩連絡':
+                change=False;extra=0.0
+                next_line=last_line;next_walked=True
+                new_weight=total_weight;new_covered=covered;new_rail=rail_minutes
+            else:
+                change=bool(last_line and last_line!=line)
+                extra=5.0 if change and not walked else 0.0
+                next_line=line;next_walked=False
+                rate=_COMMUTE_CROWD_2025_V178.get(line)
+                new_weight=total_weight+(minutes*rate[0] if rate is not None else 0.0)
+                new_covered=covered+(minutes if rate is not None else 0.0)
+                new_rail=rail_minutes+minutes
+            next_key=(neighbor,next_line,next_walked)
+            if next_key not in visited:
+                heapq.heappush(pending,(transfers+int(change),elapsed+minutes+extra,
+                                        neighbor,next_line,next_walked,new_weight,new_covered,new_rail))
+    output={}
+    for name,(elapsed,transfers,weighted,covered,rail) in best.items():
+        # All train edges must have an official reference, including transfer legs.
+        rate=int(math.floor(weighted/covered+0.5)) if rail>0 and abs(covered-rail)<1e-6 else None
+        output[name]=(0 if name==destination else max(1,int(math.ceil(elapsed))),int(transfers),rate)
+    return output
+
+
 def town_station_refs_v163(commute_destination='表示しない'):
     """Attach minutes and transfers from the SAME minimum-transfer route."""
     majors=set(MAJOR_STATION_LABELS)
     regional=set(REGIONAL_HUB_STATION_LABELS)
-    travel=(commute_times_to_station_v159(commute_destination, with_transfers=True)
+    travel=(commute_reference_crowd_v178(commute_destination)
             if commute_destination!='表示しない' else {})
     items=[]
     for name,coords in STATION_MAP_POINTS.items():
@@ -11848,7 +11987,8 @@ def town_station_refs_v163(commute_destination='表示しない'):
             'priority':0 if name in majors else 1 if name in regional else 2 if name in STATIONS else 3,
             'detail_priority':0 if name in majors else 1 if name in STATIONS else 2,
             'commute_min':route[0] if route is not None else None,
-            'commute_transfers':route[1] if route is not None else None})
+            'commute_transfers':route[1] if route is not None else None,
+            'commute_crowding_pct':route[2] if route is not None else None})
     items.sort(key=lambda item:(item['priority'],item['name']))
     if commute_destination != '表示しない':
         missing=[item['name'] for item in items
@@ -11893,13 +12033,14 @@ def town_station_refs_v164(destinations):
     if len(destinations)>2:
         raise ValueError('通勤先は2駅までです。')
     stations,wards=town_station_refs_v163(destinations[0] if destinations else '表示しない')
-    second=(commute_times_to_station_v159(destinations[1],with_transfers=True)
+    second=(commute_reference_crowd_v178(destinations[1])
             if len(destinations)==2 else {})
     missing=[]
     for station in stations:
         route=second.get(_commute_key(station['name']))
         station['commute2_min']=route[0] if route is not None else None
         station['commute2_transfers']=route[1] if route is not None else None
+        station['commute2_crowding_pct']=route[2] if route is not None else None
         if len(destinations)==2 and not (isinstance(station['commute2_min'],int)
                                            and isinstance(station['commute2_transfers'],int)):
             missing.append(station['name'])
@@ -12032,6 +12173,8 @@ def interactive_town_choropleth(group):
         st.caption(f'通勤先：1.{destinations[0]}駅／2.{destinations[1]}駅｜乗換回数が少ない経路を優先（同数なら最短時間・概算）')
     elif destinations:
         st.caption(f'通勤先：{destinations[0]}駅｜乗換回数が少ない経路を優先（同数なら最短時間・概算）')
+    if destinations:
+        st.caption('混雑率は国土交通省2025年度の路線別「最混雑区間」を乗車時間で加重した参考値。実際の各駅間・時間帯の平均ではありません。公表値がない路線を含む経路は「不明」です。')
     if cached['ready']:
         st.caption(f"着色 {cached['colored_count']}町丁目｜保存家賃のない地域は背景地図のまま表示")
     else:
@@ -12943,6 +13086,7 @@ def main():
             st.caption(f'設定中：1. {chosen[0]}駅　2. {chosen[1]}駅｜地図上は駅名＋1駅目の時間、その下に2駅目の時間を表示')
         elif chosen:
             st.caption(f'設定中：{chosen[0]}駅｜地図上は従来の1行表示')
+        st.caption('地図には「1.35分（参考136%）-2回」の形式で表示します。混雑率は国土交通省2025年度の路線代表最混雑区間から計算した参考値です。')
         st.caption('設定後、「住まいを探す」タブの地図に反映します。乗換回数最少を優先し、同数の場合に所要時間最短の経路を選びます（アプリ内路線データによる概算）。'
                    '現行時刻表・待ち時間・改札内移動・職場までの徒歩時間は含みません。')
         options=physical_units([r for r in state.new_units if has_point(r) and r.get('coordinate_precision')!='town'])
