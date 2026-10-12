@@ -40,7 +40,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v169"
+BUILD = "REBUILD-01-v170"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -11995,23 +11995,29 @@ def v147_replay_status():
     else:st.caption('バックグラウンドで30URLの詳細・地図・公式住所照合・Supabase保存/再読込を確認中')
 
 
-# v169: Browser-specific automatic commute destination persistence.
-# Only four railway/station selections are stored in localStorage.  No Supabase
-# row, shared server setting, device fingerprint, or login is involved.
-# Read browser storage before enabling the input widgets; never overwrite the
-# saved setting with empty session_state values while hydration is pending.
+# v170 DATA ISOLATION:
+# Public real-estate listings, town-rent summaries, and acquisition progress
+# remain exclusively in the existing shared Supabase namespace, unchanged.
+# Personal commute destinations are saved only inside the visitor's browser.
+# A browser can hold multiple named local profiles without a login; switching
+# never copies station settings to the shared property database.
+# Legacy v169 single-browser preferences are imported into the default profile.
+# This is per browser/profile, NOT a secure identity or cross-device cloud sync.
+_V170_PERSONAL_STORAGE_KEY = 'sumai-compass-personal-commute-v2'
 _V169_COMMUTE_BROWSER_KEY = 'sumai-compass-commute-preferences-v1'
-_V169_COMMUTE_FIELDS = ('commute_line_v160', 'commute_station_v160',
-                        'commute_line_2_v164', 'commute_station_2_v164')
-_V169_COMMUTE_STORAGE_HTML = r'''<!doctype html><html lang="ja"><head><meta charset="utf-8">
+_V170_COMMUTE_FIELDS = ('commute_line_v160','commute_station_v160',
+                        'commute_line_2_v164','commute_station_2_v164')
+_V170_PERSONAL_STORAGE_HTML = r"""<!doctype html><html lang="ja"><head><meta charset="utf-8">
 <style>html,body{padding:0;margin:0;height:1px;overflow:hidden}</style></head><body>
 <script>
 (function(){
  'use strict';
- const KEY='sumai-compass-commute-preferences-v1';
+ const KEY='sumai-compass-personal-commute-v2';
+ const LEGACY='sumai-compass-commute-preferences-v1';
+ const MAX_PROFILES=12;
  let lastResponse='';
- function host(type,additional){
-   window.parent.postMessage(Object.assign({isStreamlitMessage:true,type:type},additional||{}),'*');
+ function host(type,extra){
+   window.parent.postMessage(Object.assign({isStreamlitMessage:true,type:type},extra||{}),'*');
  }
  function report(message){
    const json=JSON.stringify(message);
@@ -12019,64 +12025,124 @@ _V169_COMMUTE_STORAGE_HTML = r'''<!doctype html><html lang="ja"><head><meta char
    lastResponse=json;
    host('streamlit:setComponentValue',{dataType:'json',value:message});
  }
- function restore(){
-   try{
-     const text=window.localStorage.getItem(KEY);
-     let prefs=null;
-     if(text!==null){try{prefs=JSON.parse(text)}catch(error){prefs=null}}
-     report({event:'loaded',available:true,prefs:prefs});
-   }catch(error){
-     report({event:'loaded',available:false,prefs:null});
-   }
+ function has(obj,key){return Object.prototype.hasOwnProperty.call(obj,key);}
+ function safePrefs(p){
+   if(!p||typeof p!=='object'||Array.isArray(p)||p.schema!==1)return null;
+   const keys=['line1','station1','line2','station2'];
+   if(!keys.every(k=>typeof p[k]==='string'&&p[k].length<=120))return null;
+   return {schema:1,line1:p.line1,station1:p.station1,line2:p.line2,station2:p.station2};
  }
- function persist(args){
-   const prefs=args.prefs;
-   if(!prefs || typeof prefs!=='object' || Array.isArray(prefs))return;
-   const signature=String(args.signature||'');
+ function blankData(){return {schema:2,active:'primary',profiles:{primary:{name:'このブラウザー',prefs:null}}};}
+ function normalize(raw){
+   const result=blankData();
+   if(!raw||raw.schema!==2||!raw.profiles||typeof raw.profiles!=='object')return result;
+   if(raw.profiles.primary){result.profiles.primary.prefs=safePrefs(raw.profiles.primary.prefs);}
+   for(const [id,item] of Object.entries(raw.profiles)){
+     if(id==='primary'||Object.keys(result.profiles).length>=MAX_PROFILES)continue;
+     if(!/^p_[a-f0-9]{20,40}$/.test(id)||!item||typeof item.name!=='string')continue;
+     const name=item.name.trim().slice(0,24);
+     if(!name)continue;
+     result.profiles[id]={name:name,prefs:safePrefs(item.prefs)};
+   }
+   if(typeof raw.active==='string'&&has(result.profiles,raw.active))result.active=raw.active;
+   return result;
+ }
+ function load(){
+   let value=window.localStorage.getItem(KEY);
+   if(value!==null){
+     try{return normalize(JSON.parse(value));}
+     catch(error){return blankData();}
+   }
+   const data=blankData();
+   const legacy=window.localStorage.getItem(LEGACY);
+   if(legacy!==null){
+     try{data.profiles.primary.prefs=safePrefs(JSON.parse(legacy));}
+     catch(error){}
+   }
+   window.localStorage.setItem(KEY,JSON.stringify(data));
+   return data;
+ }
+ function summary(data){
+   return {active:data.active,profiles:Object.entries(data.profiles).map(([id,p])=>({id:id,name:p.name})),
+     prefs:data.profiles[data.active].prefs};
+ }
+ function write(data){window.localStorage.setItem(KEY,JSON.stringify(data));}
+ function fallback(event,request){
+   report({event:event,available:false,request_id:String(request||''),
+       active:'primary',profiles:[{id:'primary',name:'このブラウザー'}],prefs:null});
+ }
+ function handle(args){
+   const action=String(args.action||'read');
+   const request=String(args.request_id||'');
    try{
-     const content=JSON.stringify(prefs);
-     if(window.localStorage.getItem(KEY)!==content){
-       window.localStorage.setItem(KEY,content);
+     const data=load();
+     if(action==='read'){
+       report(Object.assign({event:'loaded',available:true,request_id:request},summary(data)));return;
      }
-     report({event:'saved',available:true,signature:signature});
-   }catch(error){
-     report({event:'saved',available:false,signature:signature});
-   }
+     if(action==='switch'){
+       const id=String(args.profile_id||'');
+       if(!has(data.profiles,id)){
+         report(Object.assign({event:'invalid_profile',available:true,request_id:request},summary(data)));return;
+       }
+       data.active=id;write(data);
+       report(Object.assign({event:'switched',available:true,request_id:request},summary(data)));return;
+     }
+     if(action==='create'){
+       const name=String(args.name||'').trim().slice(0,24);
+       if(!name||Object.keys(data.profiles).length>=MAX_PROFILES){
+         report(Object.assign({event:'create_denied',available:true,request_id:request},summary(data)));return;
+       }
+       const bytes=new Uint8Array(16);window.crypto.getRandomValues(bytes);
+       let id='p_'+Array.from(bytes,x=>x.toString(16).padStart(2,'0')).join('');
+       if(has(data.profiles,id)){id='p_'+Array.from(window.crypto.getRandomValues(bytes),x=>x.toString(16).padStart(2,'0')).join('');}
+       data.profiles[id]={name:name,prefs:null};data.active=id;write(data);
+       report(Object.assign({event:'created',available:true,request_id:request},summary(data)));return;
+     }
+     if(action==='save'){
+       const id=String(args.profile_id||'');
+       if(id!==data.active||!has(data.profiles,id)){
+         report(Object.assign({event:'stale_profile',available:true},summary(data)));return;
+       }
+       const prefs=safePrefs(args.prefs);
+       if(!prefs){report({event:'invalid_prefs',available:true});return;}
+       const old=JSON.stringify(data.profiles[id].prefs);
+       if(old!==JSON.stringify(prefs)){
+         data.profiles[id].prefs=prefs;write(data);
+       }
+       report({event:'saved',available:true,signature:String(args.signature||''),profile_id:id});
+       return;
+     }
+   }catch(error){fallback(action==='read'?'loaded':'failed',request);}
  }
- window.addEventListener('message',function(event){
-   const message=event.data;
-   if(!message || message.type!=='streamlit:render')return;
-   const args=message.args||{};
-   if(args.action==='read')restore();
-   else if(args.action==='save')persist(args);
+ window.addEventListener('message',event=>{
+   if(!event.data||event.data.type!=='streamlit:render')return;
+   handle(event.data.args||{});
  });
  host('streamlit:componentReady',{apiVersion:1});
  host('streamlit:setFrameHeight',{height:1});
 })();
-</script></body></html>'''
+</script></body></html>"""
 
 @st.cache_resource(show_spinner=False)
-def v169_commute_browser_component():
-    """Create a stable custom-component origin for per-browser localStorage."""
-    folder=os.path.join(tempfile.gettempdir(),'sumai-commute-persistence-v169')
+def v170_personal_commute_component():
+    """Browser-owned settings UI; separate from every Supabase data path."""
+    folder=os.path.join(tempfile.gettempdir(),'sumai-personal-commute-v170')
     os.makedirs(folder,exist_ok=True)
     path=os.path.join(folder,'index.html')
-    existing=None
+    previous=None
     try:
-        with open(path,'r',encoding='utf-8') as handle:existing=handle.read()
+        with open(path,'r',encoding='utf-8') as handle:previous=handle.read()
     except OSError:pass
-    if existing != _V169_COMMUTE_STORAGE_HTML:
+    if previous!=_V170_PERSONAL_STORAGE_HTML:
         temporary=path+'.tmp-'+str(os.getpid())
-        with open(temporary,'w',encoding='utf-8') as handle:
-            handle.write(_V169_COMMUTE_STORAGE_HTML)
+        with open(temporary,'w',encoding='utf-8') as handle:handle.write(_V170_PERSONAL_STORAGE_HTML)
         os.replace(temporary,path)
-    return st.components.v1.declare_component('sumai_commute_browser_v169',path=folder)
+    return st.components.v1.declare_component('sumai_personal_commute_v170',path=folder)
 
 
-def v169_validate_commute_browser_settings(value,lines):
-    """Accept only real station names on the corresponding saved railway line."""
-    if not isinstance(value,dict) or value.get('schema')!=1:
-        return None
+def v170_validate_personal_commute(value,lines):
+    """Check station-line membership before putting browser data in session_state."""
+    if not isinstance(value,dict) or value.get('schema')!=1:return None
     result={}
     for line_key,station_key,stored_line,stored_station in (
         ('commute_line_v160','commute_station_v160','line1','station1'),
@@ -12093,45 +12159,95 @@ def v169_validate_commute_browser_settings(value,lines):
     return result
 
 
-def v169_commute_browser_snapshot(state):
+def v170_commute_snapshot(state):
+    """Only selected railway/station names; never property or other users' data."""
     return {'schema':1,
-        'line1':str(state.get('commute_line_v160',_COMMUTE_V160_NO_LINE)),
-        'station1':str(state.get('commute_station_v160',_COMMUTE_V160_NO_STATION)),
-        'line2':str(state.get('commute_line_2_v164',_COMMUTE_V160_NO_LINE)),
-        'station2':str(state.get('commute_station_2_v164',_COMMUTE_V160_NO_STATION))}
+            'line1':str(state.get('commute_line_v160',_COMMUTE_V160_NO_LINE)),
+            'station1':str(state.get('commute_station_v160',_COMMUTE_V160_NO_STATION)),
+            'line2':str(state.get('commute_line_2_v164',_COMMUTE_V160_NO_LINE)),
+            'station2':str(state.get('commute_station_2_v164',_COMMUTE_V160_NO_STATION))}
 
 
-def v169_commute_autosave_sync():
-    """Hydrate once before widgets and continuously persist later selections.
+def v170_apply_browser_profile(state,message):
+    """Adopt exactly the active local profile; erase the previous profile's values."""
+    raw_profiles=message.get('profiles') or []
+    profiles=[]
+    for item in raw_profiles[:12]:
+        if not isinstance(item,dict):continue
+        ident=item.get('id');name=item.get('name')
+        if isinstance(ident,str) and (ident=='primary' or re.fullmatch(r'p_[0-9a-f]{20,40}',ident)) and isinstance(name,str):
+            profiles.append({'id':ident,'name':name[:24]})
+    if not any(p['id']=='primary' for p in profiles):profiles.insert(0,{'id':'primary','name':'このブラウザー'})
+    ids={p['id'] for p in profiles}
+    active=message.get('active')
+    if active not in ids:active='primary'
+    state['_v170_commute_profiles']=profiles
+    state['_v170_commute_active']=active
+    state['v170_commute_person_selector']=active
+    restored=v170_validate_personal_commute(message.get('prefs'),commute_lines_v160())
+    if restored is None:
+        restored={k:(_COMMUTE_V160_NO_LINE if 'line_' in k else _COMMUTE_V160_NO_STATION)
+                  for k in _V170_COMMUTE_FIELDS}
+    for key,value in restored.items():state[key]=value
+    first=restored['commute_station_v160']
+    state['commute_destination_v159']=first if first!=_COMMUTE_V160_NO_STATION else '表示しない'
 
-    Returns True only after storage was checked; browser storage failures allow
-    normal session-only use with a visible warning, rather than blocking the app.
+
+def v170_commute_profile_changed():
+    """Streamlit selectbox callback runs before main() and the personal sync."""
+    state=st.session_state
+    target=state.get('v170_commute_person_selector')
+    if target and target!=state.get('_v170_commute_active'):
+        state['_v170_commute_pending']={'action':'switch','profile_id':target,
+                                      'request_id':str(state.get('_v170_commute_nonce',0)+1)}
+        state['_v170_commute_nonce']=state.get('_v170_commute_nonce',0)+1
+
+
+def v170_commute_autosave_sync():
+    """Read personal settings before drawing widgets; save only into this browser.
+
+    A profile switch is acknowledged by the browser BEFORE its new station
+    choices are installed.  This prevents a different person's destinations
+    from being written into the newly selected profile.
     """
     state=st.session_state
-    widget=v169_commute_browser_component()
-    if not state.get('_v169_commute_browser_checked'):
-        message=widget(action='read',key='v169_commute_browser',default=None,height=1)
-        if not isinstance(message,dict) or message.get('event')!='loaded':
-            return False
-        state['_v169_commute_browser_checked']=True
-        state['_v169_commute_browser_available']=bool(message.get('available'))
-        saved=v169_validate_commute_browser_settings(
-            message.get('prefs'),commute_lines_v160())
-        if saved is not None:
-            for key,value in saved.items():state[key]=value
-            station=saved['commute_station_v160']
-            state['commute_destination_v159']=(
-                station if station!=_COMMUTE_V160_NO_STATION else '表示しない')
-        # The first full rerun mounts the Selectboxes with the restored values.
-        # No empty default state is ever sent to localStorage before this point.
+    widget=v170_personal_commute_component()
+    if not state.get('_v170_commute_loaded'):
+        message=widget(action='read',key='v170_browser_personal_prefs',default=None,height=1)
+        if not isinstance(message,dict) or message.get('event')!='loaded':return False
+        state['_v170_commute_loaded']=True
+        state['_v170_commute_available']=bool(message.get('available'))
+        v170_apply_browser_profile(state,message)
         st.rerun()
         return False
-    prefs=v169_commute_browser_snapshot(state)
+    pending=state.get('_v170_commute_pending')
+    if pending:
+        kwargs={k:v for k,v in pending.items() if k in ('action','profile_id','name','request_id')}
+        message=widget(**kwargs,key='v170_browser_personal_prefs',default=None,height=1)
+        if isinstance(message,dict) and message.get('request_id')==pending['request_id']:
+            state['_v170_commute_pending']=None
+            state['_v170_commute_available']=bool(message.get('available'))
+            if message.get('event') in ('switched','created'):
+                v170_apply_browser_profile(state,message)
+                if message.get('event')=='created':state['v170_person_new_name']=''
+            else:
+                state['_v170_commute_error']='利用者の切り替え・追加に失敗しました。'
+                if message.get('active'):
+                    v170_apply_browser_profile(state,message)
+            st.rerun()
+        return False
+    active=state.get('_v170_commute_active','primary')
+    prefs=v170_commute_snapshot(state)
     signature=hashlib.sha256(json.dumps(prefs,ensure_ascii=False,sort_keys=True).encode('utf-8')).hexdigest()[:16]
-    message=widget(action='save',prefs=prefs,signature=signature,
-                   key='v169_commute_browser',default=None,height=1)
-    if isinstance(message,dict) and message.get('event')=='saved' and message.get('signature')==signature:
-        state['_v169_commute_browser_available']=bool(message.get('available'))
+    message=widget(action='save',profile_id=active,prefs=prefs,signature=signature,
+                   key='v170_browser_personal_prefs',default=None,height=1)
+    if isinstance(message,dict):
+        if message.get('event')=='stale_profile':
+            state['_v170_commute_loaded']=False
+            st.rerun()
+            return False
+        if message.get('event')=='saved' and message.get('signature')==signature and message.get('profile_id')==active:
+            state['_v170_commute_available']=bool(message.get('available'))
     return True
 
 
@@ -12143,7 +12259,7 @@ def main():
     state.setdefault('new_units',[]);state.setdefault('new_search',None);state.setdefault('new_saved_keys',[])
     state.setdefault('new_map_loaded',False);state.setdefault('address_point_cache',{})
     state.setdefault('layout_display_group','group1')
-    commute_storage_ready=v169_commute_autosave_sync()
+    commute_storage_ready=v170_commute_autosave_sync()
     restore_manual_search()
     restore_automatic_collection()
     request=state.pop('new_request',None)
@@ -12223,6 +12339,7 @@ def main():
                     for label in result['conditions']['regions']: st.write(label)
         st.caption('町丁目別の集計対象は保存済みの募集データです。件数と平均家賃は区・町丁目単位で集計します。')
     with tabs[1]:
+        st.caption('物件と家賃の集計は共通のSupabaseに保存し、全利用者で同じデータを参照します。通勤設定は共有しません。')
         if state.get('saved_map_restore_message'):st.caption(state.saved_map_restore_message)
         automatic_collection_panel()
         st.subheader('保存した物件')
@@ -12300,11 +12417,36 @@ def main():
     with tabs[2]:
         st.subheader('通勤の目安')
         if not commute_storage_ready:
-            st.caption('このブラウザーの通勤先設定を読み込み中です。')
-        elif not state.get('_v169_commute_browser_available',True):
-            st.warning('ブラウザーが保存を制限しているため、通勤先設定はこの画面を閉じると消える場合があります。')
+            st.caption('このブラウザー専用の通勤設定を読み込み・切り替え中です。')
+        elif not state.get('_v170_commute_available',True):
+            st.warning('ブラウザーが保存を制限しているため、通勤設定の永続保存・利用者切り替えは利用できません。')
         else:
-            st.caption('通勤先1・2はこのブラウザーに自動保存され、次回アクセス時に復元します。')
+            st.caption('通勤設定は各ブラウザー・利用者ごとに自動保存します。物件データは全員共通です。')
+        if state.pop('_v170_commute_error',None):
+            st.warning('利用者プロファイルの操作に失敗しました。')
+        profiles=state.get('_v170_commute_profiles',[{'id':'primary','name':'このブラウザー'}])
+        profile_ids=[p['id'] for p in profiles]
+        current_profile=state.get('_v170_commute_active','primary')
+        if state.get('v170_commute_person_selector') not in profile_ids:
+            state['v170_commute_person_selector']=current_profile
+        st.selectbox('通勤設定の利用者（このブラウザー内）',profile_ids,
+                     format_func=lambda ident:next((p['name'] for p in profiles if p['id']==ident),ident),
+                     key='v170_commute_person_selector',on_change=v170_commute_profile_changed,
+                     disabled=(not commute_storage_ready or not state.get('_v170_commute_available',True)))
+        with st.expander('同じ端末を複数人で使う場合：利用者を追加'):
+            st.text_input('新しい利用者名',key='v170_person_new_name',max_chars=24,
+                          placeholder='例：本人・家族',disabled=not commute_storage_ready)
+            if st.button('利用者を追加（通勤先は未設定から開始）',key='v170_create_person',
+                         disabled=(not commute_storage_ready or not state.get('_v170_commute_available',True)
+                                   or len(profile_ids)>=12)):
+                name=str(state.get('v170_person_new_name','')).strip()
+                if name:
+                    state['_v170_commute_nonce']=state.get('_v170_commute_nonce',0)+1
+                    state['_v170_commute_pending']={'action':'create','name':name,
+                                                    'request_id':str(state['_v170_commute_nonce'])}
+                    st.rerun()
+                else:st.warning('利用者名を入力してください。')
+        st.caption('通勤先1・2は選択中の利用者にだけ保存します。別の端末・ブラウザーには自動同期しません。')
         # Destination 1: retain the existing state keys and the v159 upgrade path.
         available_lines=commute_lines_v160()
         if 'commute_line_v160' not in st.session_state:
