@@ -52,7 +52,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v179"
+BUILD = "REBUILD-01-v180"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -11436,15 +11436,15 @@ _V178_LABEL_NEW="""   var dual=Boolean(state.commuteDestination2);
    var pct=(typeof s.commute_crowding_pct==='number'&&isFinite(s.commute_crowding_pct)&&s.commute_crowding_pct>=0)?Math.round(s.commute_crowding_pct):null;
    var crowdLabel=pct===null?'不明':('参考'+pct+'%');
    var timeLabel=(commuteTime===null||commuteTransfers===null)?
-      (state.commuteDestination?'1.未計算':''):
-      '1.'+commuteTime+'分（'+crowdLabel+'）-'+commuteTransfers+'回';
+      (state.commuteDestination?'①未計算':''):
+      '①'+commuteTime+'分（'+crowdLabel+'）-'+commuteTransfers+'回';
    var secondMin=(typeof s.commute2_min==='number' && isFinite(s.commute2_min) && s.commute2_min>=0 && s.commute2_min<999)?Math.round(s.commute2_min):null;
    var secondTransfers=(typeof s.commute2_transfers==='number' && isFinite(s.commute2_transfers) && s.commute2_transfers>=0 &&
      Math.floor(s.commute2_transfers)===s.commute2_transfers)?s.commute2_transfers:null;
    var secondPct=(typeof s.commute2_crowding_pct==='number'&&isFinite(s.commute2_crowding_pct)&&s.commute2_crowding_pct>=0)?Math.round(s.commute2_crowding_pct):null;
    var secondCrowd=secondPct===null?'不明':('参考'+secondPct+'%');
-   var timeLabel2=!dual?'':(secondMin===null||secondTransfers===null)?'2.未計算':
-     '2.'+secondMin+'分（'+secondCrowd+'）-'+secondTransfers+'回';"""
+   var timeLabel2=!dual?'':(secondMin===null||secondTransfers===null)?'②未計算':
+     '②'+secondMin+'分（'+secondCrowd+'）-'+secondTransfers+'回';"""
 assert TOWN_COMPONENT_HTML_V121.count(_V178_LABEL_OLD)==1
 TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(_V178_LABEL_OLD,_V178_LABEL_NEW,1)
 # Keep collision detection aware of the longer reference-rate labels.
@@ -11862,6 +11862,7 @@ def _commute_line_changed_v160():
     # Drop an old station on line changes; never leave a mismatched destination.
     st.session_state['commute_station_v160']=_COMMUTE_V160_NO_STATION
     st.session_state['commute_destination_v159']='\u8868\u793a\u3057\u306a\u3044'
+    _v180_commit_commute_change()
 
 def commute_current_destination_v160():
     line=st.session_state.get('commute_line_v160')
@@ -12005,6 +12006,7 @@ def town_station_refs_v163(commute_destination='表示しない'):
 def _commute_line_changed_v164_second():
     """Changing the second line must not disturb the first destination."""
     st.session_state['commute_station_2_v164'] = _COMMUTE_V160_NO_STATION
+    _v180_commit_commute_change()
 
 
 def commute_current_destination_v164_second():
@@ -12452,9 +12454,62 @@ def _v174_save_personal_backup(token,backup):
         'summary':{'backup':cleaned,'saved_at':now}})
 
 
+def _v180_commute_backup_for_current(state):
+    """Merge only this user's active commute fields into its existing profile set."""
+    previous=_v174_commute_backup(state.get('_v180_browser_backup'))
+    if previous is None:
+        previous={'schema':2,'active':'primary','updated_at':0,
+                  'profiles':{'primary':{'name':'このブラウザー','prefs':None}}}
+    active=state.get('_v170_commute_active','primary')
+    if active not in previous['profiles']:
+        # Never create an unapproved profile or leak one person's fields to another.
+        return None
+    previous['profiles'][active]['prefs']=v170_commute_snapshot(state)
+    previous['updated_at']=max(int(time.time_ns()//1000000),int(previous.get('updated_at') or 0)+1)
+    return _v174_commute_backup(previous)
+
+
+def _v180_commit_commute_change():
+    """Immediately save and READ BACK changes when an actual selection changes."""
+    state=st.session_state
+    if not state.get('_v170_commute_loaded') or state.get('_v170_commute_pending'):
+        return False
+    token=_v174_commute_token(state.get('_v174_commute_token'))
+    if not token:
+        state['_v174_commute_backup_error']='保存先のブラウザー識別情報を確認できません。'
+        return False
+    backup=_v180_commute_backup_for_current(state)
+    if backup is None:
+        state['_v174_commute_backup_error']='通勤設定の利用者が確定していません。'
+        return False
+    state['_v180_browser_backup']=backup
+    state['_v180_pending_backup']=backup
+    try:
+        _v174_save_personal_backup(token,backup)
+        verified=_v174_read_personal_backup(token)
+        if verified != backup:
+            raise AppError('保存後の再読込で通勤先が一致しません。')
+    except Exception as exc:
+        state['_v174_commute_backup_error']=str(exc)[:180] if isinstance(exc,AppError) else type(exc).__name__
+        return False
+    signature=hashlib.sha256(json.dumps(backup,ensure_ascii=False,sort_keys=True,
+                      separators=(',',':')).encode('utf-8')).hexdigest()
+    state['_v174_commute_last_saved']=(token,signature)
+    state['_v180_confirmed_backup']=(token,backup)
+    state['_v180_pending_backup']=None
+    state['_v174_commute_backup_error']=''
+    return True
+
+
 def _v174_cloud_sync(state,token,backup):
     cleaned=_v174_commute_backup(backup)
     if not token or cleaned is None:return False
+    last=state.get('_v180_confirmed_backup')
+    if (isinstance(last,tuple) and len(last)==2 and last[0]==token
+            and isinstance(last[1],dict)
+            and int(last[1].get('updated_at') or 0)>int(cleaned.get('updated_at') or 0)):
+        # A late iframe callback must never overwrite the newer verified DB row.
+        return True
     fingerprint=hashlib.sha256(json.dumps(cleaned,ensure_ascii=False,
                             sort_keys=True,separators=(',',':')).encode('utf-8')).hexdigest()
     if state.get('_v174_commute_last_saved')==(token,fingerprint):return True
@@ -12509,6 +12564,7 @@ _V170_PERSONAL_STORAGE_HTML = r"""<!doctype html><html lang="ja"><head><meta cha
  const LEGACY='sumai-compass-commute-preferences-v1';
  const MAX_PROFILES=12;
  const CLIENT_TOKEN_KEY='sumai-compass-commute-recovery-token-v174';
+ const COOKIE_TOKEN_KEY='sumai_compass_commute_device_v180';
  const STORAGE_HISTORY_PREFIX='sumai-compass-personal-commute-v2-owner-';
  let persistentStorageAvailable=true;
  let lastResponse='';
@@ -12584,9 +12640,27 @@ _V170_PERSONAL_STORAGE_HTML = r"""<!doctype html><html lang="ja"><head><meta cha
    setStored(KEY,JSON.stringify(data));
  }
  function validToken(v){return typeof v==='string' && /^[a-f0-9]{40}$/.test(v);}
+ function cookieToken(){
+   try{
+     const item=document.cookie.split(';').map(x=>x.trim()).find(x=>x.startsWith(COOKIE_TOKEN_KEY+'='));
+     const v=item?decodeURIComponent(item.slice(COOKIE_TOKEN_KEY.length+1)):'';
+     return validToken(v)?v:'';
+   }catch(error){return '';}
+ }
+ function persistToken(token){
+   const stored=setStored(CLIENT_TOKEN_KEY,token);
+   let cookieSaved=false;
+   try{
+     document.cookie=COOKIE_TOKEN_KEY+'='+encodeURIComponent(token)+'; Max-Age=31536000; Path=/; SameSite=Lax'+
+       (location.protocol==='https:'?'; Secure':'');
+     cookieSaved=cookieToken()===token;
+   }catch(error){}
+   if(!stored && cookieSaved)persistentStorageAvailable=true;
+   return stored||cookieSaved;
+ }
  function recoveryToken(args){
    const fromUrl=String(args.restore_token||'');
-   let token=getStored(CLIENT_TOKEN_KEY)||'';
+   let token=getStored(CLIENT_TOKEN_KEY)||cookieToken()||'';
    if(validToken(fromUrl) && token!==fromUrl){
      // Never mix two persons' browser profiles when following a different
      // private recovery URL. A legacy v170 store has no token yet; import it.
@@ -12597,17 +12671,22 @@ _V170_PERSONAL_STORAGE_HTML = r"""<!doctype html><html lang="ja"><head><meta cha
        if(destination===null)removeStored(KEY);
        else setStored(KEY,destination);
      }
-     token=fromUrl;setStored(CLIENT_TOKEN_KEY,token);
+     token=fromUrl;persistToken(token);
    }
    if(!validToken(token)){
      const bytes=new Uint8Array(20);window.crypto.getRandomValues(bytes);
      token=Array.from(bytes,x=>x.toString(16).padStart(2,'0')).join('');
-     setStored(CLIENT_TOKEN_KEY,token);
+     persistToken(token);
+   }else if(!cookieToken()){
+     persistToken(token);
    }
+   // The anonymous browser cookie can restore the Supabase backup even when
+   // iframe localStorage is blocked by a privacy setting.
+   if(cookieToken()===token)persistentStorageAvailable=true;
    return token;
  }
  function stateReport(event,request,data,token,extra){
-   report(Object.assign({event:event,available:persistentStorageAvailable,
+   report(Object.assign({event:event,available:(persistentStorageAvailable||cookieToken()===token),
       request_id:request,client_token:token,backup:normalize(data)},summary(data),extra||{}));
  }
  function fallback(event,request){
@@ -12740,6 +12819,8 @@ def v170_apply_browser_profile(state,message):
     state['_v170_commute_profiles']=profiles
     state['_v170_commute_active']=active
     state['v170_commute_person_selector']=active
+    backup=_v174_commute_backup(message.get('backup'))
+    if backup is not None:state['_v180_browser_backup']=backup
     restored=v170_validate_personal_commute(message.get('prefs'),commute_lines_v160())
     if restored is None:
         restored={k:(_COMMUTE_V160_NO_LINE if 'line_' in k else _COMMUTE_V160_NO_STATION)
@@ -13010,7 +13091,7 @@ def main():
         else:
             st.caption('通勤設定はこのブラウザーに自動保存し、クラウドにもバックアップします。更新後も自動復元します。物件データは全員共通です。')
         if state.get('_v174_commute_backup_error'):
-            st.warning('通勤設定のクラウドバックアップに失敗しました。ブラウザー内の保存は維持します。')
+            st.warning('通勤設定をクラウドに保存・確認できていません。通信状態またはSupabaseの接続設定を確認してください。')
         if state.pop('_v170_commute_error',None):
             st.warning('利用者プロファイルの操作に失敗しました。')
         profiles=state.get('_v170_commute_profiles',[{'id':'primary','name':'このブラウザー'}])
@@ -13059,7 +13140,7 @@ def main():
             st.session_state['commute_station_v160']=_COMMUTE_V160_NO_STATION
         first_station=st.selectbox(
             '② 駅（通勤先1）',first_station_options,
-            key='commute_station_v160',
+            key='commute_station_v160',on_change=_v180_commit_commute_change,
             disabled=(first_line==_COMMUTE_V160_NO_LINE or not commute_storage_ready))
         st.session_state['commute_destination_v159']=(
             first_station if first_station!=_COMMUTE_V160_NO_STATION else '表示しない')
@@ -13078,15 +13159,15 @@ def main():
             st.session_state['commute_station_2_v164']=_COMMUTE_V160_NO_STATION
         second_station=st.selectbox(
             '② 駅（通勤先2）',second_station_options,
-            key='commute_station_2_v164',
+            key='commute_station_2_v164',on_change=_v180_commit_commute_change,
             disabled=(second_line==_COMMUTE_V160_NO_LINE or not commute_storage_ready))
 
         chosen=commute_selected_destinations_v164()
         if len(chosen)==2:
-            st.caption(f'設定中：1. {chosen[0]}駅　2. {chosen[1]}駅｜地図上は駅名＋1駅目の時間、その下に2駅目の時間を表示')
+            st.caption(f'設定中：① {chosen[0]}駅　② {chosen[1]}駅｜地図上は駅名＋1駅目の時間、その下に2駅目の時間を表示')
         elif chosen:
             st.caption(f'設定中：{chosen[0]}駅｜地図上は従来の1行表示')
-        st.caption('地図には「1.35分（参考136%）-2回」の形式で表示します。混雑率は国土交通省2025年度の路線代表最混雑区間から計算した参考値です。')
+        st.caption('地図には「①35分（参考136%）-2回」の形式で表示します。混雑率は国土交通省2025年度の路線代表最混雑区間から計算した参考値です。')
         st.caption('設定後、「住まいを探す」タブの地図に反映します。乗換回数最少を優先し、同数の場合に所要時間最短の経路を選びます（アプリ内路線データによる概算）。'
                    '現行時刻表・待ち時間・改札内移動・職場までの徒歩時間は含みません。')
         options=physical_units([r for r in state.new_units if has_point(r) and r.get('coordinate_precision')!='town'])
