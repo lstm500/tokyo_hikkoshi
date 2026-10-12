@@ -52,7 +52,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v186"
+BUILD = "REBUILD-01-v187"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -11856,9 +11856,19 @@ needle="if(target && target.id && Array.isArray(target.bounds)"
 assert TOWN_COMPONENT_HTML_V121.count(needle)==1
 TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(needle,"if(!state._v185FocusActive && target && target.id && Array.isArray(target.bounds)",1)
 
+# v187: keep a wider neighborhood in view after a town/chome lookup.
+# The region still fits within the viewport; large wards can automatically use
+# a wider zoom. Apply to all three client-side search navigation paths (normal,
+# provisional/fallback, and a delayed server jump). Manual +/- zoom is unchanged.
+_V187_SEARCH_FIT_OLD = 'maxZoom:16,animate:false'
+assert TOWN_COMPONENT_HTML_V121.count(_V187_SEARCH_FIT_OLD) == 3
+TOWN_COMPONENT_HTML_V121 = TOWN_COMPONENT_HTML_V121.replace(
+    _V187_SEARCH_FIT_OLD,'maxZoom:14,animate:false')
+assert TOWN_COMPONENT_HTML_V121.count('maxZoom:14,animate:false') == 3
+
 @st.cache_resource(show_spinner=False)
 def town_component_v121():
-    _asset_revision='v186-soft-unified-focus'
+    _asset_revision='v187-neighborhood-zoom14'
     folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-v184')
     os.makedirs(folder,exist_ok=True)
     path=os.path.join(folder,'index.html')
