@@ -52,7 +52,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v181"
+BUILD = "REBUILD-01-v182"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -11475,9 +11475,60 @@ _V181_RENDER_REPLACEMENT = """ updateOverlay(args.geo,args.signature);
 TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(
     _V181_RENDER_ANCHOR,_V181_RENDER_REPLACEMENT,1)
 
+# v182: the search selection carries verified polygon geometry, not just bbox.
+# Outlines live in a dedicated Leaflet pane and never alter rent fill colors.
+_V182_FOCUS_PANE_ANCHOR = " state.map.createPane('stationNamePane');"
+assert TOWN_COMPONENT_HTML_V121.count(_V182_FOCUS_PANE_ANCHOR)==1
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(
+    _V182_FOCUS_PANE_ANCHOR,
+    " state.map.createPane('townSearchFocusPane');state.map.getPane('townSearchFocusPane').style.zIndex='650';"+
+    "state.map.getPane('townSearchFocusPane').style.pointerEvents='none';\n"+
+    _V182_FOCUS_PANE_ANCHOR,1)
+_V182_OLD_JUMP = _V181_RENDER_REPLACEMENT
+_V182_NEW_JUMP = """ updateOverlay(args.geo,args.signature);
+ // The selected district's real geometry is independent of rent observations.
+ // A new command gets processed exactly once; rerendering alone does not pan.
+ var target=args.jump;
+ if(target && target.id && Array.isArray(target.bounds) && target.bounds.length===4 &&
+    String(target.id)!==state.lastJumpToken){
+   var box=target.bounds.map(Number);
+   if(box.every(Number.isFinite) && box[0]>=34 && box[2]<=37 && box[1]>=138 && box[3]<=141 &&
+      box[0]<box[2] && box[1]<box[3]){
+     try{
+       var focus=L.geoJSON(target.geo,{pane:'townSearchFocusPane',interactive:false,
+         smoothFactor:1.0,style:function(){return {
+           color:'#d10040',weight:4.5,opacity:1,fillOpacity:0,
+           dashArray:'10 5',lineCap:'round',lineJoin:'round',interactive:false
+         }}});
+       if(!focus.getLayers().length)throw new Error('検索地域の境界データがありません');
+       if(state.focusLayer)state.map.removeLayer(state.focusLayer);
+       state.focusLayer=focus.addTo(state.map);
+       state.lastJumpToken=String(target.id);
+       state.sentBounds='';
+       // Avoid an animated viewport callback racing a Streamlit fragment rerun.
+       state.map.invalidateSize();
+       state.map.once('moveend',function(){emitBounds()});
+       state.map.fitBounds([[box[0],box[1]],[box[2],box[3]]],
+          {padding:[24,24],maxZoom:16,animate:false});
+       setTimeout(function(){emitBounds()},120);
+     }catch(err){note('地名検索の表示に失敗しました: '+(err&&err.message||'エラー'));}
+   }
+ }
+ redrawStations();"""
+assert TOWN_COMPONENT_HTML_V121.count(_V182_OLD_JUMP)==1
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(_V182_OLD_JUMP,_V182_NEW_JUMP,1)
+_V182_EMIT_OLD="var key=arr.map(function(v){return v.toFixed(5)}).join(',')+'|'+state.map.getZoom();"
+_V182_EMIT_NEW="var key=arr.map(function(v){return v.toFixed(5)}).join(',')+'|'+state.map.getZoom()+'|'+(state.lastJumpToken||'');"
+assert TOWN_COMPONENT_HTML_V121.count(_V182_EMIT_OLD)==1
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(_V182_EMIT_OLD,_V182_EMIT_NEW,1)
+_V182_SEND_OLD="},zoom:state.map.getZoom()}});"
+_V182_SEND_NEW="},zoom:state.map.getZoom(),jump_applied:state.lastJumpToken||null}});"
+assert TOWN_COMPONENT_HTML_V121.count(_V182_SEND_OLD)==1
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(_V182_SEND_OLD,_V182_SEND_NEW,1)
+
 @st.cache_resource(show_spinner=False)
 def town_component_v121():
-    folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-v181')
+    folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-v182')
     os.makedirs(folder,exist_ok=True)
     path=os.path.join(folder,'index.html')
     # Component HTML is small; create once per worker process. Never include
@@ -11494,7 +11545,7 @@ def town_component_v121():
         with open(temp_path,'w',encoding='utf-8') as output:
             output.write(TOWN_COMPONENT_HTML_V121)
         os.replace(temp_path,path)
-    return st.components.v1.declare_component('sumai_town_map_v181',path=folder)
+    return st.components.v1.declare_component('sumai_town_map_v182',path=folder)
 
 # v159: Station-to-office approximate train travel times, OFFLINE AND READ-ONLY.
 # Tokyo Metro/Toei/JR local edge minutes adapted from MIT-licensed public project:
@@ -12134,76 +12185,115 @@ def town_choropleth_status():
         st.caption('町丁目家賃：集計の開始待ち')
 
 
-def _v181_town_search_matches(query, boundary_path, limit=15):
-    """Resolve Japanese town names from the existing read-only 23-ward map.
+def _v182_town_search_matches(query, boundary_path, limit=100):
+    """Search all 23 wards by town, optional ward, and optional chome.
 
-    A bare base name (e.g. 南長崎) groups every matching chome in one ward;
-    a numbered 丁目 stays precise. No geocoding request or fake town center.
-    Unqualified ambiguous names are returned as choices, never auto-guessed.
+    Unqualified exact names do not guess between wards. A base-town search
+    groups ALL chome polygons in one ward and a chome search targets only that
+    chome. Prefix and substring matches are fallback choices if no exact match.
     """
-    wanted=address_key(query).replace(' ', '').replace('　', '').replace('/', '')
-    wanted=wanted.removeprefix('東京都')
-    if not wanted or len(wanted)>80:
+    wanted=address_key(normal(query)).replace(' ','').replace('　','')
+    wanted=re.sub(r'[、,，。・/／]', '',wanted)
+    wanted=wanted.removeprefix('東京都').removeprefix('東京')
+    if not wanted or len(wanted)>80 or not boundary_path or not os.path.isfile(boundary_path):return []
+    selected_ward=next((w for w in sorted(TOKYO_WARDS.values(),key=len,reverse=True)
+                        if wanted.startswith(w)),None)
+    if selected_ward:wanted=wanted[len(selected_ward):]
+    # Full district requests can be used to zoom to a ward too.
+    if not wanted and selected_ward:
+        try:
+            with sqlite3.connect('file:'+quote(boundary_path,safe='/')+'?mode=ro',uri=True,timeout=5) as conn:
+                record=conn.execute('SELECT south,west,north,east FROM ward_areas WHERE ward=?',(selected_ward,)).fetchone()
+            if record and 34<=record[0]<record[2]<=37 and 138<=record[1]<record[3]<=141:
+                return [{'label':selected_ward,'bounds':list(map(float,record)),
+                         'ward':selected_ward,'kind':'ward','keys':[],'rank':0}]
+        except (sqlite3.Error,OSError,TypeError,ValueError):pass
         return []
-    ward=next((w for w in sorted(TOKYO_WARDS.values(),key=len,reverse=True)
-               if wanted.startswith(w)),None)
-    if ward:wanted=wanted[len(ward):]
-    if not wanted and not ward:return []
-    if not boundary_path or not os.path.isfile(boundary_path):return []
+    # A suffix like 南長崎3 is an optional abbreviation for 南長崎3丁目.
+    if re.fullmatch(r'.+?[0-9]{1,2}',wanted):wanted+='丁目'
+    specific=bool(re.search(r'[0-9]+丁目$',wanted))
     try:
-        with sqlite3.connect('file:'+quote(boundary_path,safe='/')+'?mode=ro',uri=True,timeout=4) as conn:
-            if not wanted and ward:
-                try:
-                    row=conn.execute('SELECT south,west,north,east FROM ward_areas WHERE ward=?',(ward,)).fetchone()
-                except sqlite3.Error:row=None
-                if row and row[0]<row[2] and row[1]<row[3]:
-                    return [{'label':ward,'bounds':list(map(float,row))}]
-                return []
+        with sqlite3.connect('file:'+quote(boundary_path,safe='/')+'?mode=ro',uri=True,timeout=8) as conn:
             records=conn.execute('SELECT town,south,west,north,east FROM areas').fetchall()
-    except (sqlite3.Error,OSError):
-        return []
-    has_chome=bool(re.search(r'\d+丁目',wanted))
-    # Offer a chome-specific destination when the user explicitly writes it;
-    # the normal base-name search navigates to the entire neighborhood.
+    except (sqlite3.Error,OSError):return []
     groups={}
     for key,south,west,north,east in records:
         if not isinstance(key,str) or '|' not in key:continue
-        key_ward,town=key.split('|',1)
-        if key_ward not in TOKYO_WARDS.values() or ward and key_ward!=ward:continue
-        name=address_key(town) if has_chome else town_base_name(town)
+        ward,town=key.split('|',1)
+        if ward not in TOKYO_WARDS.values() or selected_ward and ward!=selected_ward:continue
+        full_name=address_key(town)
+        town_name=town_base_name(town)
+        target=full_name if specific else address_key(town_name)
         if not wanted:continue
-        if name==wanted:rank=0
-        elif name.startswith(wanted):rank=1
-        elif wanted in name:rank=2
+        if target==wanted:rank=0
+        elif target.startswith(wanted):rank=1
+        elif wanted in target:rank=2
         else:continue
         try:
-            b=(float(south),float(west),float(north),float(east))
-            if not all(map(math.isfinite,b)) or not(34<=b[0]<b[2]<=37 and 138<=b[1]<b[3]<=141):continue
-        except (ValueError,TypeError):continue
-        label=key_ward+' '+name
-        old=groups.get(label)
-        if old:
-            old['rank']=min(old['rank'],rank)
-            current=old['bounds']
-            old['bounds']=[min(current[0],b[0]),min(current[1],b[1]),
-                           max(current[2],b[2]),max(current[3],b[3])]
+            box=[float(south),float(west),float(north),float(east)]
+            if not all(map(math.isfinite,box)) or not(34<=box[0]<box[2]<=37 and 138<=box[1]<box[3]<=141):continue
+        except (TypeError,ValueError):continue
+        identifier=(ward,target)
+        entry=groups.get(identifier)
+        if entry:
+            entry['rank']=min(entry['rank'],rank)
+            b=entry['bounds']
+            entry['bounds']=[min(b[0],box[0]),min(b[1],box[1]),
+                             max(b[2],box[2]),max(b[3],box[3])]
+            if key not in entry['keys']:entry['keys'].append(key)
         else:
-            groups[label]={'label':label,'bounds':list(b),'rank':rank}
+            groups[identifier]={'ward':ward,'name':target,'label':ward+' '+target,
+                                'bounds':box,'kind':'town','rank':rank,'keys':[key]}
     if not groups:return []
-    ordered=sorted(groups.values(),key=lambda item:(item['rank'],item['label']))
-    # Prefer exact names over fuzzy substrings so 長崎 does not resolve to 南長崎.
-    if ordered[0]['rank']==0:ordered=[item for item in ordered if item['rank']==0]
-    return [{'label':item['label'],'bounds':item['bounds']} for item in ordered[:limit]]
+    ordered=sorted(groups.values(),key=lambda x:(x['rank'],x['ward'],x['name']))
+    # Exact matches across multiple wards are ALL choices; fuzzy matches are
+    # candidates only when no exact town name exists.
+    if ordered[0]['rank']==0:ordered=[x for x in ordered if x['rank']==0]
+    for item in ordered:
+        if not specific and len(item['keys'])>1:
+            item['label']+='（全'+str(len(item['keys']))+'区域）'
+    return ordered[:limit]
 
 
-def _v181_request_town_jump(state,choice):
-    bounds=choice.get('bounds',()) if isinstance(choice,dict) else ()
-    if len(bounds)!=4 or not all(isinstance(v,(int,float)) and math.isfinite(v) for v in bounds):
-        raise ValueError('検索結果の位置情報が不正です。')
-    state['_v181_jump_sequence']=int(state.get('_v181_jump_sequence',0))+1
-    state['_v181_map_jump']={'id':state['_v181_jump_sequence'],'bounds':list(bounds)}
+def _v182_town_selection_geometry(choice, boundary_path):
+    """Read the *actual* town/ward perimeter even when rent data is absent."""
+    features=[]
+    try:
+        with sqlite3.connect('file:'+quote(boundary_path,safe='/')+'?mode=ro',uri=True,timeout=8) as conn:
+            if choice.get('kind')=='ward':
+                row=conn.execute('SELECT poly FROM ward_areas WHERE ward=?',(choice.get('ward'),)).fetchone()
+                rows=[(choice['ward'],row[0])] if row else []
+            else:
+                keys=choice.get('keys') or []
+                if not keys or len(keys)>450:raise ValueError('地名検索の区域数が不正です。')
+                placeholders=','.join('?' for _ in keys)
+                rows=conn.execute('SELECT town,poly FROM areas WHERE town IN ('+placeholders+')',keys).fetchall()
+        for key,poly in rows:
+            polygons=json.loads(poly)
+            if not isinstance(polygons,list) or not polygons:continue
+            features.append({'type':'Feature','properties':{'name':key},
+                             'geometry':{'type':'MultiPolygon','coordinates':polygons}})
+    except (sqlite3.Error,OSError,json.JSONDecodeError,TypeError) as exc:
+        raise ValueError('選択した地域の境界を読み込めません。') from exc
+    if not features:raise ValueError('選択地域の輪郭を取得できません。')
+    return {'type':'FeatureCollection','features':features}
+
+
+def _v182_request_town_jump(state,choice,boundary_path):
+    box=choice.get('bounds') if isinstance(choice,dict) else None
+    if not isinstance(box,(tuple,list)) or len(box)!=4 or not all(isinstance(v,(int,float)) and math.isfinite(v) for v in box):
+        raise ValueError('検索した地域の座標が不正です。')
+    outline=_v182_town_selection_geometry(choice,boundary_path)
+    # Preserve the command through polling and component rerenders until its
+    # browser acknowledgment is seen; never silently assume the map moved.
+    token=str(time.monotonic_ns())
+    state['_v182_map_jump']={'id':token,'bounds':list(box),'geo':outline,'label':choice['label']}
+    state['_v182_map_jump_confirmed']=None
+    state['_v182_town_selected']=choice['label']
     state['_v181_location_search_matches']=[]
-    state['_v181_location_search_note']='「'+str(choice.get('label',''))+'」へ移動します。'
+    state['_v181_location_search_note']='「'+choice['label']+'」を地図上で囲み、表示位置を移動します。'
+    state['new_bounds']=tuple(box)
+    state['new_view_center']=bounds_center(box)
 
 
 @st.fragment(run_every='8s')
@@ -12281,11 +12371,15 @@ def interactive_town_choropleth(group):
                 signature=cached['layer_signature'],stations=stations,wards=wards,
                 commute_destination=(destinations[0] if destinations else ''),
                 commute_destination_2=(destinations[1] if len(destinations)==2 else ''),
-                jump=state.get('_v181_map_jump'),
-                key='town_map_v172_'+str(reset),default=None)
+                jump=state.get('_v182_map_jump'),
+                key='town_map_v182_'+str(reset)+'_'+str((state.get('_v182_map_jump') or {}).get('id') or 'initial'),default=None)
     if isinstance(data,dict):
         current=viewport_bounds(data)
-        if current:
+        command=state.get('_v182_map_jump')
+        confirmed=not command or data.get('jump_applied')==command.get('id')
+        if command and confirmed:
+            state['_v182_map_jump_confirmed']=command['id']
+        if current and confirmed:
             state['new_bounds']=current;state['new_view_center']=bounds_center(current)
             state['new_map']=data
     # Town navigation is UI-only and does not start any property collection.
@@ -12305,27 +12399,36 @@ def interactive_town_choropleth(group):
             state['_v181_location_search_matches']=[]
             state['_v181_location_search_note']='町丁目境界の読み込み完了後に検索してください。'
         else:
-            options=_v181_town_search_matches(term,shapes.path)
+            options=_v182_town_search_matches(term,shapes.path)
             if len(options)==1:
-                _v181_request_town_jump(state,options[0])
-                st.rerun(scope='fragment')
+                try:
+                    _v182_request_town_jump(state,options[0],shapes.path)
+                    st.rerun(scope='fragment')
+                except ValueError as exc:st.warning(str(exc))
             elif options:
                 state['_v181_location_search_matches']=options
-                state['_v181_location_search_note']='同名・部分一致の候補から地域を選んでください。'
+                state['_v181_location_search_note']='複数候補があります。移動する地域を確認して選択してください。'
             else:
                 state['_v181_location_search_matches']=[]
-                state['_v181_location_search_note']='該当する町名が見つかりません。東京23区の地名を入力してください。'
+                state['_v181_location_search_note']='該当する町名が見つかりません。町名の一部、または区名＋町名で検索してください。'
     matches=state.get('_v181_location_search_matches') or []
     if matches:
         labels=[entry['label'] for entry in matches]
         chosen=st.selectbox('移動先を選択',labels,key='v181_town_choice')
         if st.button('選んだ地域に移動',key='v181_town_choice_go',use_container_width=True):
             result=next(item for item in matches if item['label']==chosen)
-            _v181_request_town_jump(state,result)
-            st.rerun(scope='fragment')
+            try:
+                _v182_request_town_jump(state,result,shapes.path)
+                st.rerun(scope='fragment')
+            except ValueError as exc:st.warning(str(exc))
     if state.get('_v181_location_search_note'):
         st.caption(state['_v181_location_search_note'])
+    cmd=state.get('_v182_map_jump')
+    if cmd and state.get('_v182_map_jump_confirmed')==cmd['id']:
+        st.caption('地図移動完了｜'+cmd['label']+'（赤い線で輪郭を表示中）')
     if st.button('地図を再初期化',key='reset_v118_map'):
+        state.pop('_v182_map_jump',None)
+        state.pop('_v182_map_jump_confirmed',None)
         state.pop('_v181_map_jump',None)
         state.pop('_v118_choropleth_payload',None)
         state['_v118_map_reset_count']=reset+1
