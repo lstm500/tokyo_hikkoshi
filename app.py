@@ -40,7 +40,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v173"
+BUILD = "REBUILD-01-v174"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -223,14 +223,14 @@ UNIT_TABLE = "housing_units_v1"
 SEARCH_TABLE = "housing_searches_v1"
 PLACE_TABLE = "housing_places_v1"
 ADDRESS_POINT_KIND = "saved_address_point_v1"
-GROUPS = {"1K・1L・1DK": ("1K", "1L", "1DK"), "1LDK・2DK": ("1LDK", "2DK"),
+GROUPS = {"ワンルーム・1K・1DK": ("1R", "1K", "1DK"), "1LDK・2DK": ("1LDK", "2DK"),
           "2LDK・3DK": ("2LDK", "3DK"), "3LDK": ("3LDK",)}
 LAYOUTS = tuple(x for group in GROUPS.values() for x in group)
-SUUMO_LAYOUT_GROUPS = (("1LDK", "2K", "2DK"), ("2LDK", "3K", "3DK"))
+SUUMO_LAYOUT_GROUPS = (("1R", "1K", "1DK"), ("1LDK", "2K", "2DK"), ("2LDK", "3K", "3DK"))
 SUUMO_LAYOUTS = tuple(x for group in SUUMO_LAYOUT_GROUPS for x in group)
-SUUMO_LAYOUT_CODES = {"1LDK":"04","2K":"05","2DK":"06","2LDK":"07","3K":"08","3DK":"09"}
+SUUMO_LAYOUT_CODES = {"1R":"01","1K":"02","1DK":"03","1LDK":"04","2K":"05","2DK":"06","2LDK":"07","3K":"08","3DK":"09"}
 HOMES_LAYOUT_GROUPS = (("1LDK", "2K", "2DK"), ("2LDK", "3K", "3DK"))
-DISPLAY_LAYOUT_GROUPS = {"group1": ("1LDK", "2K", "2DK"), "group2": ("2LDK", "3K", "3DK")}
+DISPLAY_LAYOUT_GROUPS = {"group0": ("1R", "1K", "1DK"), "group1": ("1LDK", "2K", "2DK"), "group2": ("2LDK", "3K", "3DK")}
 HOMES_LAYOUTS = tuple(x for group in HOMES_LAYOUT_GROUPS for x in group)
 HOUSE_MAX_AGE = 40
 HOUSE_MIN_AREA = 50.0
@@ -764,7 +764,7 @@ def town_matches(town,address):
 def parsed_layout(raw,rough=True):
     value=normal(raw).upper().replace('　',' ').strip()
     match=re.match(r'^(\d+(?:LDK|SLDK|SDK|DK|SK|LK|K|L|R))(?=$|[\s(（+/])',value)
-    return (re.sub(r'^(\d+)S(LDK|DK|K)$',r'\1\2',match[1]) if rough else match[1]) if match else '1R' if value=='ワンルーム' else None
+    return (re.sub(r'^(\d+)S(LDK|DK|K)$',r'\1\2',match[1]) if rough else match[1]) if match else '1R' if re.match(r'^ワンルーム(?=$|[\s(（+/])',value) else None
 
 
 def resolve_layout(web,raw,requested=None,url=''):
@@ -3708,6 +3708,7 @@ def suumo_prepare_region(web,region):
     trace(web,'suumo_city_selected',{'municipality_code':region['code'],'city':region.get('city_name',''),'source':'表示地図から作成した市区郡・町名リスト'},stage='search_conditions')
 
     city_reply=web.fetch(search,params=city_params);city_soup=BeautifulSoup(city_reply.text,'html.parser')
+    observed_layout_inputs=discover_layout_inputs(city_soup,'SUUMO')
     selector=_suumo_town_selector(city_soup,city_reply.text,wanted,city_reply.url)
     canonical_url=_suumo_canonical_city_url(city_soup,city_reply.url,city_reply.text)
     if not selector:
@@ -3763,7 +3764,10 @@ def suumo_prepare_region(web,region):
         'selection_method':method,
         'mansion':('ts',SUUMO_BUILDING_TYPE_CODES['マンション']),
         'age15':('cn','15'),
-        'layout_filters':{layout:('md',code) for layout,code in SUUMO_LAYOUT_CODES.items()},
+        'layout_filters':{layout:('md',
+               observed_layout_inputs[layout][1] if layout in observed_layout_inputs
+               and observed_layout_inputs[layout][0]=='md' else code)
+               for layout,code in SUUMO_LAYOUT_CODES.items()},
     }
     cache[key]=result
     trace(web,'suumo_filters_ready',{'city':region.get('city_name',''),'town':wanted,'selection_method':method,
@@ -3775,7 +3779,10 @@ def suumo_group_params(prepared,layouts,page=1):
     params=dict(prepared['base_params'])
     params['ts']=SUUMO_BUILDING_TYPE_CODES['マンション']  # 建物の種類：マンション（アパートは除外）
     params['cn']='15'                # 築年数：15年以内
-    params['md']=[SUUMO_LAYOUT_CODES[x] for x in layouts]
+    # Prefer the site's currently observed public form values when available.
+    # Never omit the 1R/1K/1DK codes added to the same verified layout set.
+    fields=prepared.get('layout_filters') or {}
+    params['md']=[fields[x][1] if x in fields and fields[x][0]=='md' else SUUMO_LAYOUT_CODES[x] for x in layouts]
     params['pc']='50'
     # SUUMO SEO town pages paginate in the path (pnz1N.html).
     # A form-control town selection can still use FR301, so retain its public page parameter there.
@@ -5810,7 +5817,7 @@ def suumo_house_collect(web,region,bounds,munis,emit):
     prepared=suumo_prepare_region(web,region);filter_params=dict(prepared['base_params']);filter_params.update(SUUMO_HOUSE_PARAMS)
     current_url=prepared['url'];current_params=filter_params;seen_pages=set();seen_urls=set();seen_ids=set();list_type_by_url={};list_name_by_url={};list_age_by_url={};page_number=1;found=0
     collection_towns=[town_base_name(region.get('town',''))];scope=dict(getattr(DIAG_CONTEXT,'scope',{}))
-    emit('message','SUUMO条件3｜一戸建て・その他（アパート除外）｜築40年以内｜50㎡以上')
+    emit('message','SUUMO条件4｜一戸建て・その他（アパート除外）｜築40年以内｜50㎡以上')
     trace(web,'suumo_building_type_filter',{'selected':'一戸建て・その他','ts':filter_params['ts'],
         'excluded':'アパート','age_years_checked_in_detail':HOUSE_MAX_AGE,
         'min_area_sqm':HOUSE_MIN_AREA},stage='search_conditions')
@@ -9609,6 +9616,15 @@ def start_automatic_collection(ward_codes,interval_minutes=0,town_codes=None,*,r
             prior_wards=[];prior_filters={}
         same_scope=(prior_wards==wards and prior_filters==filters)
         summary=dict(previous_summary) if same_scope and not restart_all else {}
+        if same_scope and not restart_all and summary.get('layout_collection_revision')!='studio_1r_1k_1dk_v174':
+            # Layout coverage expanded: formerly completed towns did not search
+            # 1R/1K/1DK. Revisit each town once without deleting saved listings.
+            for progress_key in ('cycle_completed_indices','cycle_attempted_indices',
+                                 'incomplete_task_indices'):
+                summary[progress_key]=[]
+            summary['next_task_index']=0
+            summary.pop('cycle_reset_pending',None)
+        summary['layout_collection_revision']='studio_1r_1k_1dk_v174'
         if same_scope and not restart_all:
             # Preserve attempted/failed markers so a restart does not hammer the
             # same incomplete town when other towns were never attempted.
@@ -9919,7 +9935,7 @@ def automatic_collection_panel():
     filters=st.session_state['automatic_town_filters']
     collection_wards,chosen_filters=automatic_collection_ward_filter_ui(ward_codes,filters,busy)
     st.caption('取得順：'+(' → '.join(TOKYO_WARDS[code] for code in collection_wards) if collection_wards else '区を選択してください'))
-    st.caption('SUUMOのみで町ごとに最後のページまで検索します。マンションは築15年以内、1LDK/2K/2DK・2LDK/3K/3DK、一戸建て・その他は築40年以内・50㎡以上を対象とします。')
+    st.caption('SUUMOのみで町ごとに最後のページまで検索します。マンションは築15年以内、ワンルーム/1K/1DK・1LDK/2K/2DK・2LDK/3K/3DK、一戸建て・その他は築40年以内・50㎡以上を対象とします。')
     manual=active_job();manual_busy=bool(manual and not manual.snapshot()['finished'])
     cannot_start=busy or manual_busy or not collection_wards
     if st.button('選択した区で自動収集を開始・再開',key='automatic_start',disabled=cannot_start):
@@ -10043,7 +10059,7 @@ TOWN_WARD_GEOJSON_URL = ('https://raw.githubusercontent.com/smartnews-smri/japan
 TOWN_WARD_GEOJSON_LIMIT = 2 * 1024 * 1024
 TOWN_BOUNDARY_CACHE_PATH = os.path.join(tempfile.gettempdir(),'sumai-town-boundary-v173.sqlite')
 TOWN_GEOMETRY_LIMIT = 36 * 1024 * 1024
-TOWN_GROUPS = ('group1','group2','house')
+TOWN_GROUPS = ('group0','group1','group2','house')
 # Breakpoints follow the prior rent-band legend: pale blue -> blue -> green
 # -> yellow -> red -> near-black burgundy (yen per month).
 TOWN_GRADIENT = (
@@ -10238,6 +10254,7 @@ def _v150_suumo_location(web,detail_soup,detail_url,bounds,munis,region,fields):
 def town_layout_group(row):
     if listing_dwelling_type(row)=='house':return 'house'
     layout=parsed_layout(row.get('layout'))
+    if layout in DISPLAY_LAYOUT_GROUPS['group0']:return 'group0'
     if layout in DISPLAY_LAYOUT_GROUPS['group1']:return 'group1'
     if layout in DISPLAY_LAYOUT_GROUPS['group2']:return 'group2'
     return None
@@ -10391,7 +10408,7 @@ class TownSummaryWorker:
     snapshot and then the persistent Leaflet layer receives a new revision.
     """
     def __init__(self,db):
-        self.db=db;self.lock=threading.RLock();self.running=False;self.progress=0;self.total_pages=None;self.total_records=None;self.scanned_records=0;self.page_size=160
+        self.db=db;self.build=BUILD;self.lock=threading.RLock();self.running=False;self.progress=0;self.total_pages=None;self.total_records=None;self.scanned_records=0;self.page_size=160
         self.ready=False;self.summary=None;self.message='';self.error='';self.thread=None
         self.initialized=False
         self.revision=0
@@ -10658,7 +10675,9 @@ def current_town_summary_worker():
     jobs,lock=town_summary_registry_v143();db=Database();key=manual_registry_key(db)+'|town-v143'
     with lock:
         job=jobs.get(key)
-        if job is None:
+        if job is None or (getattr(job,'build',None)!=BUILD and not job.snapshot()['running']):
+            # A hot-deployed version must rebuild summaries with its new layout groups.
+            # Keep an older, actively running worker until its scan has finished.
             job=TownSummaryWorker(db);jobs[key]=job
     job.initialize()
     job.refresh_on_startup()
@@ -10937,6 +10956,7 @@ def town_boundary_registry(v171_geometry_revision="v171"):
 # by this external link.  The website owns the final search semantics.
 _V167_WARD_TO_CODE = {name:code for code,name in TOKYO_WARDS.items()}
 _V167_SUUMO_CONDITION_LABELS = {
+    'group0':'ワンルーム・1K・1DK｜マンション・築15年以内',
     'group1':'1LDK・2K・2DK｜マンション・築15年以内',
     'group2':'2LDK・3K・3DK｜マンション・築15年以内',
     'house':'一戸建て・その他｜50㎡以上（築40年以内は掲載先で確認）',
@@ -12208,15 +12228,128 @@ def v147_replay_status():
 # v170 DATA ISOLATION:
 # Public real-estate listings, town-rent summaries, and acquisition progress
 # remain exclusively in the existing shared Supabase namespace, unchanged.
-# Personal commute destinations are saved only inside the visitor's browser.
-# A browser can hold multiple named local profiles without a login; switching
-# never copies station settings to the shared property database.
+# Commute destinations are local-first and backed up per anonymous recovery ID
+# inside existing Supabase housing_searches_v1 (status=personal_commute).
+# The ID is a random browser secret kept in the URL query and browser storage.
+# Property data stays in rental_listing rows, never in personal backups.
+# A browser can hold multiple named local profiles without a login; personal
+# records are isolated from shared rental_listing and map summary records.
 # Legacy v169 single-browser preferences are imported into the default profile.
-# This is per browser/profile, NOT a secure identity or cross-device cloud sync.
+# This is not account-authenticated: anyone possessing a recovery URL can use it.
 _V170_PERSONAL_STORAGE_KEY = 'sumai-compass-personal-commute-v2'
+_V174_PERSONAL_TOKEN_QUERY = 'commute_ref'
+_V174_PERSONAL_RECORD_PREFIX = 'personal-commute.v174.'
 _V169_COMMUTE_BROWSER_KEY = 'sumai-compass-commute-preferences-v1'
 _V170_COMMUTE_FIELDS = ('commute_line_v160','commute_station_v160',
                         'commute_line_2_v164','commute_station_2_v164')
+
+
+def _v174_commute_token(text):
+    value=str(text or '').lower()
+    return value if re.fullmatch(r'[0-9a-f]{40}',value) else None
+
+
+def _v174_commute_backup(value):
+    """Bounded, validated user/profile record; never accept client Supabase commands."""
+    if not isinstance(value,dict) or value.get('schema')!=2:return None
+    profiles=value.get('profiles')
+    if not isinstance(profiles,dict) or len(profiles)>12 or 'primary' not in profiles:return None
+    clean={}
+    for key,item in profiles.items():
+        if not isinstance(key,str) or not (key=='primary' or re.fullmatch(r'p_[0-9a-f]{20,40}',key)):
+            return None
+        if not isinstance(item,dict) or not isinstance(item.get('name'),str):return None
+        name=item['name'].strip()[:24]
+        if not name:return None
+        prefs=item.get('prefs');valid=None
+        if prefs is not None:
+            if not isinstance(prefs,dict) or prefs.get('schema')!=1:return None
+            keys=('line1','station1','line2','station2')
+            if not all(isinstance(prefs.get(k),str) and len(prefs[k])<=120 for k in keys):return None
+            valid={'schema':1,**{k:prefs[k] for k in keys}}
+        clean[key]={'name':name,'prefs':valid}
+    active=value.get('active')
+    if active not in clean:return None
+    try:stamp=int(value.get('updated_at') or 0)
+    except (ValueError,TypeError):stamp=0
+    if stamp<0 or stamp>100000000000000:stamp=0
+    return {'schema':2,'profiles':clean,'active':active,'updated_at':stamp}
+
+
+def _v174_backup_nonempty(backup):
+    return bool(backup and (len(backup['profiles'])>1 or any(
+        isinstance(profile.get('prefs'),dict) and any(
+            profile['prefs'].get(field) not in (_COMMUTE_V160_NO_LINE,_COMMUTE_V160_NO_STATION,'')
+            for field in ('station1','station2'))
+        for profile in backup['profiles'].values())))
+
+
+def _v174_personal_record_id(token):
+    return _V174_PERSONAL_RECORD_PREFIX+hashlib.sha256(token.encode('ascii')).hexdigest()
+
+
+def _v174_read_personal_backup(token):
+    db=Database()
+    rows=db.call('GET',SEARCH_TABLE,{'namespace':'eq.'+db.namespace,
+                  'id':'eq.'+_v174_personal_record_id(token),
+                  'status':'eq.personal_commute','select':'summary','limit':1})
+    if not isinstance(rows,list):raise AppError('通勤バックアップの応答形式が不正です。')
+    return _v174_commute_backup((rows[0].get('summary') or {}).get('backup')) if rows else None
+
+
+def _v174_save_personal_backup(token,backup):
+    cleaned=_v174_commute_backup(backup)
+    if cleaned is None:raise AppError('通勤設定の保存形式が不正です。')
+    now=utc_now()
+    Database().save_search({'id':_v174_personal_record_id(token),
+        'status':'personal_commute','started_at':now,'finished_at':now,
+        'conditions':{'record_type':'personal_commute','schema':2},
+        'summary':{'backup':cleaned,'saved_at':now}})
+
+
+def _v174_cloud_sync(state,token,backup):
+    cleaned=_v174_commute_backup(backup)
+    if not token or cleaned is None:return False
+    fingerprint=hashlib.sha256(json.dumps(cleaned,ensure_ascii=False,
+                            sort_keys=True,separators=(',',':')).encode('utf-8')).hexdigest()
+    if state.get('_v174_commute_last_saved')==(token,fingerprint):return True
+    try:
+        _v174_save_personal_backup(token,cleaned)
+    except Exception as exc:
+        state['_v174_commute_backup_error']=str(exc)[:180] if isinstance(exc,AppError) else type(exc).__name__
+        return False
+    state['_v174_commute_last_saved']=(token,fingerprint)
+    state['_v174_commute_backup_error']=''
+    return True
+
+
+def _v174_cloud_restore_if_newer(state,token,local_backup):
+    try:remote=_v174_read_personal_backup(token)
+    except Exception as exc:
+        state['_v174_commute_backup_error']=str(exc)[:180] if isinstance(exc,AppError) else type(exc).__name__
+        return None
+    if remote is not None and (not _v174_backup_nonempty(local_backup)
+             or remote['updated_at']>int(local_backup.get('updated_at') or 0)):
+        return remote
+    if _v174_backup_nonempty(local_backup):
+        _v174_cloud_sync(state,token,local_backup)
+    return None
+
+
+def _v174_commute_url_token():
+    try:return _v174_commute_token(st.query_params.get(_V174_PERSONAL_TOKEN_QUERY))
+    except (AttributeError,TypeError,ValueError):return None
+
+
+def _v174_record_client_token(state,message):
+    token=_v174_commute_token(message.get('client_token'))
+    if not token:return None
+    state['_v174_commute_token']=token
+    if _v174_commute_url_token()!=token:
+        try:st.query_params[_V174_PERSONAL_TOKEN_QUERY]=token
+        except Exception:pass
+    return token
+
 _V170_PERSONAL_STORAGE_HTML = r"""<!doctype html><html lang="ja"><head><meta charset="utf-8">
 <style>html,body{padding:0;margin:0;height:1px;overflow:hidden}</style></head><body>
 <script>
@@ -12225,7 +12358,23 @@ _V170_PERSONAL_STORAGE_HTML = r"""<!doctype html><html lang="ja"><head><meta cha
  const KEY='sumai-compass-personal-commute-v2';
  const LEGACY='sumai-compass-commute-preferences-v1';
  const MAX_PROFILES=12;
+ const CLIENT_TOKEN_KEY='sumai-compass-commute-recovery-token-v174';
+ const STORAGE_HISTORY_PREFIX='sumai-compass-personal-commute-v2-owner-';
  let lastResponse='';
+ const memoryStore={};
+ function getStored(key){
+   try{return window.localStorage.getItem(key);}
+   catch(error){return Object.prototype.hasOwnProperty.call(memoryStore,key)?memoryStore[key]:null;}
+ }
+ function setStored(key,value){
+   memoryStore[key]=String(value);
+   try{window.localStorage.setItem(key,String(value));return true;}
+   catch(error){return false;}
+ }
+ function removeStored(key){
+   delete memoryStore[key];
+   try{window.localStorage.removeItem(key);}catch(error){}
+ }
  function host(type,extra){
    window.parent.postMessage(Object.assign({isStreamlitMessage:true,type:type},extra||{}),'*');
  }
@@ -12242,11 +12391,12 @@ _V170_PERSONAL_STORAGE_HTML = r"""<!doctype html><html lang="ja"><head><meta cha
    if(!keys.every(k=>typeof p[k]==='string'&&p[k].length<=120))return null;
    return {schema:1,line1:p.line1,station1:p.station1,line2:p.line2,station2:p.station2};
  }
- function blankData(){return {schema:2,active:'primary',profiles:{primary:{name:'このブラウザー',prefs:null}}};}
+ function blankData(){return {schema:2,updated_at:0,active:'primary',profiles:{primary:{name:'このブラウザー',prefs:null}}};}
  function normalize(raw){
    const result=blankData();
    if(!raw||raw.schema!==2||!raw.profiles||typeof raw.profiles!=='object')return result;
    if(raw.profiles.primary){result.profiles.primary.prefs=safePrefs(raw.profiles.primary.prefs);}
+   if(Number.isSafeInteger(raw.updated_at)&&raw.updated_at>=0)result.updated_at=raw.updated_at;
    for(const [id,item] of Object.entries(raw.profiles)){
      if(id==='primary'||Object.keys(result.profiles).length>=MAX_PROFILES)continue;
      if(!/^p_[a-f0-9]{20,40}$/.test(id)||!item||typeof item.name!=='string')continue;
@@ -12258,25 +12408,55 @@ _V170_PERSONAL_STORAGE_HTML = r"""<!doctype html><html lang="ja"><head><meta cha
    return result;
  }
  function load(){
-   let value=window.localStorage.getItem(KEY);
+   let value=getStored(KEY);
    if(value!==null){
      try{return normalize(JSON.parse(value));}
      catch(error){return blankData();}
    }
    const data=blankData();
-   const legacy=window.localStorage.getItem(LEGACY);
+   const legacy=getStored(LEGACY);
    if(legacy!==null){
      try{data.profiles.primary.prefs=safePrefs(JSON.parse(legacy));}
      catch(error){}
    }
-   window.localStorage.setItem(KEY,JSON.stringify(data));
+   setStored(KEY,JSON.stringify(data));
    return data;
  }
  function summary(data){
    return {active:data.active,profiles:Object.entries(data.profiles).map(([id,p])=>({id:id,name:p.name})),
      prefs:data.profiles[data.active].prefs};
  }
- function write(data){window.localStorage.setItem(KEY,JSON.stringify(data));}
+ function write(data){
+   data.updated_at=Date.now();
+   setStored(KEY,JSON.stringify(data));
+ }
+ function validToken(v){return typeof v==='string' && /^[a-f0-9]{40}$/.test(v);}
+ function recoveryToken(args){
+   const fromUrl=String(args.restore_token||'');
+   let token=getStored(CLIENT_TOKEN_KEY)||'';
+   if(validToken(fromUrl) && token!==fromUrl){
+     // Never mix two persons' browser profiles when following a different
+     // private recovery URL. A legacy v170 store has no token yet; import it.
+     if(validToken(token)){
+       const current=getStored(KEY);
+       if(current!==null)setStored(STORAGE_HISTORY_PREFIX+token,current);
+       const destination=getStored(STORAGE_HISTORY_PREFIX+fromUrl);
+       if(destination===null)removeStored(KEY);
+       else setStored(KEY,destination);
+     }
+     token=fromUrl;setStored(CLIENT_TOKEN_KEY,token);
+   }
+   if(!validToken(token)){
+     const bytes=new Uint8Array(20);window.crypto.getRandomValues(bytes);
+     token=Array.from(bytes,x=>x.toString(16).padStart(2,'0')).join('');
+     setStored(CLIENT_TOKEN_KEY,token);
+   }
+   return token;
+ }
+ function stateReport(event,request,data,token,extra){
+   report(Object.assign({event:event,available:true,request_id:request,
+      client_token:token,backup:normalize(data)},summary(data),extra||{}));
+ }
  function fallback(event,request){
    report({event:event,available:false,request_id:String(request||''),
        active:'primary',profiles:[{id:'primary',name:'このブラウザー'}],prefs:null});
@@ -12285,33 +12465,46 @@ _V170_PERSONAL_STORAGE_HTML = r"""<!doctype html><html lang="ja"><head><meta cha
    const action=String(args.action||'read');
    const request=String(args.request_id||'');
    try{
-     const data=load();
+     const token=recoveryToken(args);
+     let data=load();
      if(action==='read'){
-       report(Object.assign({event:'loaded',available:true,request_id:request},summary(data)));return;
+       stateReport('loaded',request,data,token);return;
+     }
+     if(action==='restore'){
+       if(!args.backup || args.backup.schema!==2 || !args.backup.profiles ||
+          !args.backup.profiles.primary){
+         stateReport('restore_denied',request,data,token);return;
+       }
+       data=normalize(args.backup);write(data);
+       // Keep the cloud's modification time so another browser is not
+       // automatically treated as newer just because restoration occurred.
+       data.updated_at=Number(args.backup.updated_at)||0;
+       setStored(KEY,JSON.stringify(data));
+       stateReport('restored',request,data,token);return;
      }
      if(action==='switch'){
        const id=String(args.profile_id||'');
        if(!has(data.profiles,id)){
-         report(Object.assign({event:'invalid_profile',available:true,request_id:request},summary(data)));return;
+         stateReport('invalid_profile',request,data,token);return;
        }
        data.active=id;write(data);
-       report(Object.assign({event:'switched',available:true,request_id:request},summary(data)));return;
+       stateReport('switched',request,data,token);return;
      }
      if(action==='create'){
        const name=String(args.name||'').trim().slice(0,24);
        if(!name||Object.keys(data.profiles).length>=MAX_PROFILES){
-         report(Object.assign({event:'create_denied',available:true,request_id:request},summary(data)));return;
+         stateReport('create_denied',request,data,token);return;
        }
        const bytes=new Uint8Array(16);window.crypto.getRandomValues(bytes);
        let id='p_'+Array.from(bytes,x=>x.toString(16).padStart(2,'0')).join('');
        if(has(data.profiles,id)){id='p_'+Array.from(window.crypto.getRandomValues(bytes),x=>x.toString(16).padStart(2,'0')).join('');}
        data.profiles[id]={name:name,prefs:null};data.active=id;write(data);
-       report(Object.assign({event:'created',available:true,request_id:request},summary(data)));return;
+       stateReport('created',request,data,token);return;
      }
      if(action==='save'){
        const id=String(args.profile_id||'');
        if(id!==data.active||!has(data.profiles,id)){
-         report(Object.assign({event:'stale_profile',available:true},summary(data)));return;
+         stateReport('stale_profile',request,data,token);return;
        }
        const prefs=safePrefs(args.prefs);
        if(!prefs){report({event:'invalid_prefs',available:true});return;}
@@ -12319,7 +12512,7 @@ _V170_PERSONAL_STORAGE_HTML = r"""<!doctype html><html lang="ja"><head><meta cha
        if(old!==JSON.stringify(prefs)){
          data.profiles[id].prefs=prefs;write(data);
        }
-       report({event:'saved',available:true,signature:String(args.signature||''),profile_id:id});
+       stateReport('saved',request,data,token,{signature:String(args.signature||''),profile_id:id});
        return;
      }
    }catch(error){fallback(action==='read'?'loaded':'failed',request);}
@@ -12334,8 +12527,8 @@ _V170_PERSONAL_STORAGE_HTML = r"""<!doctype html><html lang="ja"><head><meta cha
 </script></body></html>"""
 
 @st.cache_resource(show_spinner=False)
-def v170_personal_commute_component():
-    """Browser-owned settings UI; separate from every Supabase data path."""
+def v174_personal_commute_component():
+    """v174 component reloads assets without changing browser storage origin."""
     folder=os.path.join(tempfile.gettempdir(),'sumai-personal-commute-v170')
     os.makedirs(folder,exist_ok=True)
     path=os.path.join(folder,'index.html')
@@ -12414,31 +12607,55 @@ def v170_commute_profile_changed():
 
 
 def v170_commute_autosave_sync():
-    """Read personal settings before drawing widgets; save only into this browser.
-
-    A profile switch is acknowledged by the browser BEFORE its new station
-    choices are installed.  This prevents a different person's destinations
-    from being written into the newly selected profile.
-    """
+    """Restore browser state, back it up per recovery URL, and prevent stale writes."""
     state=st.session_state
-    widget=v170_personal_commute_component()
+    widget=v174_personal_commute_component()
+    token=state.get('_v174_commute_token') or _v174_commute_url_token()
     if not state.get('_v170_commute_loaded'):
-        message=widget(action='read',key='v170_browser_personal_prefs',default=None,height=1)
+        message=widget(action='read',restore_token=token or '',
+                       key='v170_browser_personal_prefs',default=None,height=1)
         if not isinstance(message,dict) or message.get('event')!='loaded':return False
+        token=_v174_record_client_token(state,message)
         state['_v170_commute_loaded']=True
         state['_v170_commute_available']=bool(message.get('available'))
+        local=_v174_commute_backup(message.get('backup'))
+        if token and local is not None:
+            remote=_v174_cloud_restore_if_newer(state,token,local)
+            if remote is not None:
+                state['_v174_commute_pending_restore']=remote
+                st.rerun()
+                return False
         v170_apply_browser_profile(state,message)
         st.rerun()
+        return False
+    pending_restore=state.get('_v174_commute_pending_restore')
+    if pending_restore is not None:
+        message=widget(action='restore',backup=pending_restore,restore_token=token or '',
+                       key='v170_browser_personal_prefs',default=None,height=1)
+        if isinstance(message,dict) and message.get('event')=='restored':
+            token=_v174_record_client_token(state,message)
+            state.pop('_v174_commute_pending_restore',None)
+            v170_apply_browser_profile(state,message)
+            if token:
+                cleaned=_v174_commute_backup(message.get('backup'))
+                if cleaned:
+                    sig=hashlib.sha256(json.dumps(cleaned,ensure_ascii=False,
+                                sort_keys=True,separators=(',',':')).encode('utf-8')).hexdigest()
+                    state['_v174_commute_last_saved']=(token,sig)
+            st.rerun()
         return False
     pending=state.get('_v170_commute_pending')
     if pending:
         kwargs={k:v for k,v in pending.items() if k in ('action','profile_id','name','request_id')}
-        message=widget(**kwargs,key='v170_browser_personal_prefs',default=None,height=1)
+        message=widget(**kwargs,restore_token=token or '',
+                       key='v170_browser_personal_prefs',default=None,height=1)
         if isinstance(message,dict) and message.get('request_id')==pending['request_id']:
             state['_v170_commute_pending']=None
             state['_v170_commute_available']=bool(message.get('available'))
+            token=_v174_record_client_token(state,message)
             if message.get('event') in ('switched','created'):
                 v170_apply_browser_profile(state,message)
+                if token:_v174_cloud_sync(state,token,message.get('backup'))
                 if message.get('event')=='created':state['v170_person_new_name']=''
             else:
                 state['_v170_commute_error']='利用者の切り替え・追加に失敗しました。'
@@ -12449,15 +12666,19 @@ def v170_commute_autosave_sync():
     active=state.get('_v170_commute_active','primary')
     prefs=v170_commute_snapshot(state)
     signature=hashlib.sha256(json.dumps(prefs,ensure_ascii=False,sort_keys=True).encode('utf-8')).hexdigest()[:16]
-    message=widget(action='save',profile_id=active,prefs=prefs,signature=signature,
+    message=widget(action='save',restore_token=token or '',profile_id=active,
+                   prefs=prefs,signature=signature,
                    key='v170_browser_personal_prefs',default=None,height=1)
     if isinstance(message,dict):
         if message.get('event')=='stale_profile':
             state['_v170_commute_loaded']=False
             st.rerun()
             return False
-        if message.get('event')=='saved' and message.get('signature')==signature and message.get('profile_id')==active:
+        if (message.get('event')=='saved' and message.get('signature')==signature
+                and message.get('profile_id')==active):
             state['_v170_commute_available']=bool(message.get('available'))
+            token=_v174_record_client_token(state,message)
+            if token:_v174_cloud_sync(state,token,message.get('backup'))
     return True
 
 
@@ -12485,7 +12706,10 @@ def main():
     with tabs[0]:
         st.subheader('地図を動かして、探す地域を表示してください')
         selected_group=state.get('layout_display_group','group1')
-        if selected_group not in ('group1','group2','house'):selected_group='group1';state.layout_display_group='group1'
+        if selected_group not in ('group0','group1','group2','house'):selected_group='group1';state.layout_display_group='group1'
+        if st.button('ワンルーム・1K・1DK',key='layout_group0_v174',type='primary' if selected_group=='group0' else 'secondary',use_container_width=True):
+            if state.layout_display_group!='group0':state.layout_display_group='group0';st.rerun()
+        if selected_group=='group0':st.caption('マンション・築15年以内')
         g1,g2,g3=st.columns(3)
         with g1:
             if st.button('1LDK・2K・2DK',key='layout_group1',type='primary' if selected_group=='group1' else 'secondary',use_container_width=True):
@@ -12631,7 +12855,9 @@ def main():
         elif not state.get('_v170_commute_available',True):
             st.warning('ブラウザーが保存を制限しているため、通勤設定の永続保存・利用者切り替えは利用できません。')
         else:
-            st.caption('通勤設定は各ブラウザー・利用者ごとに自動保存します。物件データは全員共通です。')
+            st.caption('通勤設定は利用者別に自動保存し、同じ復元URLから更新後も復元します。物件データは全員共通です。')
+        if state.get('_v174_commute_backup_error'):
+            st.warning('通勤設定のクラウドバックアップに失敗しました。ブラウザー内の保存は維持します。')
         if state.pop('_v170_commute_error',None):
             st.warning('利用者プロファイルの操作に失敗しました。')
         profiles=state.get('_v170_commute_profiles',[{'id':'primary','name':'このブラウザー'}])
@@ -12656,7 +12882,26 @@ def main():
                                                     'request_id':str(state['_v170_commute_nonce'])}
                     st.rerun()
                 else:st.warning('利用者名を入力してください。')
-        st.caption('通勤先1・2は選択中の利用者にだけ保存します。別の端末・ブラウザーには自動同期しません。')
+        st.caption('通勤先1・2は選択中の利用者ごとに保存します。復元ID付きの現在のURLは第三者に共有しないでください。')
+        with st.expander('復元コードを確認・入力（端末変更やURL変更時）'):
+            existing_token=state.get('_v174_commute_token') or _v174_commute_url_token()
+            if existing_token:
+                st.caption('現在の復元コード（コピーして保管してください）')
+                st.code(existing_token,language=None)
+            st.text_input('以前の復元コード',key='v174_restore_token_input',max_chars=40,
+                          placeholder='40文字の復元コード',disabled=not commute_storage_ready)
+            if st.button('以前の設定を復元',key='v174_restore_personal_settings',
+                         disabled=not commute_storage_ready):
+                restored_token=_v174_commute_token(state.get('v174_restore_token_input'))
+                if not restored_token:
+                    st.warning('40文字の復元コードを入力してください。')
+                else:
+                    st.query_params[_V174_PERSONAL_TOKEN_QUERY]=restored_token
+                    state['_v170_commute_loaded']=False
+                    state.pop('_v174_commute_token',None)
+                    state.pop('_v174_commute_pending_restore',None)
+                    state.pop('_v174_commute_last_saved',None)
+                    st.rerun()
         # Destination 1: retain the existing state keys and the v159 upgrade path.
         available_lines=commute_lines_v160()
         if 'commute_line_v160' not in st.session_state:
@@ -12789,7 +13034,7 @@ analyze public.housing_searches_v1;'''
         st.caption('旧アプリの物件や検索状態を使用しません。旧テーブルのデータは削除しません。')
         st.caption(f'実行中の版：{BUILD}')
     with st.expander('取得・集計の範囲'):
-        st.write('SUUMOのみで検索します。マンションは築15年以内、1LDK/2K/2DKまたは2LDK/3K/3DK。一戸建て・その他は築40年以内・50㎡以上。地図の色分けに必要な町丁目はSUUMO掲載所在地を優先し、不足時のみ物件固有地図から照合します。')
+        st.write('SUUMOのみで検索します。マンションは築15年以内、ワンルーム/1K/1DK・1LDK/2K/2DK・2LDK/3K/3DK。一戸建て・その他は築40年以内・50㎡以上。地図の色分けに必要な町丁目はSUUMO掲載所在地を優先し、不足時のみ物件固有地図から照合します。')
         st.caption('住所照合：SUUMOの所在地を市区・町丁目に正規化。町丁目を特定できない場合だけ物件固有のマーカーから国土地理院の逆ジオコーディングを利用します。番地を作りません。')
         st.write('データベースへ保存する募集項目は家賃・間取り・種別・町丁目（既存の詳細住所は保持）・取得日時です。UTCで保存し画面はJST表示します。管理費・面積・築年数・画像・緯度経度は募集データに保存しません。')
         st.write('募集情報は既存SupabaseのJSON領域を利用し、追加SQLは不要です。過去のschema 3〜7は書き換えず、集計時に町丁目へ正規化。新規schema 8のデータと同じ区域で表示します。')
