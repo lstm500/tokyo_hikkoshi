@@ -40,7 +40,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v170"
+BUILD = "REBUILD-01-v171"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -9395,7 +9395,7 @@ class AutomaticCollection:
                     # the queue checkpoint must use the original GLOBAL index.
                     total=len(plan)
                     actual_index=int(conditions.get('auto_controller_index',index) or 0)%total
-                    success=status in ('completed','partial') and not incomplete and not self.stop_event.is_set()
+                    success=status=='completed' and not incomplete and not self.stop_event.is_set()
                     self.summary.pop('next_run_at',None)
                     if status=='cancelled' or self.stop_event.is_set():
                         self.message='取得・保存処理を中止しました。'
@@ -9882,9 +9882,13 @@ def automatic_collection_panel():
     # Category choice is an additive shortcut. The final ward multiselect is
     # authoritative: users may remove/add any individual ward afterwards.
     try:default_wards=automatic_ward_codes(saved)
-    except AppError:default_wards=['13116']
+    except AppError:default_wards=[]
     if 'automatic_wards' not in st.session_state:
-        st.session_state['automatic_wards']=default_wards
+        # v171: a fresh 23-ward run must not silently inherit an old one-ward
+        # selection. Keep the actual scope unchanged while a job is running.
+        st.session_state['automatic_wards']=default_wards if busy else list(TOKYO_WARDS)
+    if busy and len(default_wards)<len(TOKYO_WARDS):
+        st.warning(f'現在の収集設定は{len(default_wards)}/23区です。中止後、23区を選択して開始すると対象を拡大できます。')
     st.session_state.setdefault('automatic_area_categories',[])
     st.session_state.setdefault('automatic_applied_area_categories',[])
     st.multiselect('区のカテゴリー（一括追加）',list(TOKYO_WARD_CATEGORIES),
@@ -9893,9 +9897,16 @@ def automatic_collection_panel():
     with st.expander('区カテゴリーの内訳を確認',expanded=False):
         for label,codes in TOKYO_WARD_CATEGORIES.items():
             st.caption(label+'：'+'・'.join(TOKYO_WARDS[code] for code in codes))
+    if st.button('東京23区をすべて選択',key='automatic_select_all_23_v171',disabled=busy):
+        st.session_state['automatic_wards']=list(TOKYO_WARDS)
+        st.rerun(scope='fragment')
     ward_codes=st.multiselect('自動収集する区（複数選択）',list(TOKYO_WARDS),
                               format_func=lambda code:TOKYO_WARDS[code],
                               key='automatic_wards',disabled=busy)
+    missing_codes=[code for code in TOKYO_WARDS if code not in ward_codes]
+    st.caption(f'選択した区：{len(ward_codes)}/23区')
+    if missing_codes:
+        st.warning('23区全体の収集ではありません。未選択：'+ '・'.join(TOKYO_WARDS[code] for code in missing_codes))
     reset=st.session_state.pop('_automatic_reset_town_selection',[])
     if isinstance(reset,str):reset=[reset]
     for code in reset:
@@ -10024,6 +10035,13 @@ TOWN_DIRTY_POLL_SECONDS = 60.0
 
 TOWN_GEOJSON_URL = 'https://frogcat.github.io/japan-small-area/13.json'
 TOWN_GEOJSON_BACKUP = 'https://raw.githubusercontent.com/frogcat/japan-small-area/master/docs/13.json'
+# A separate 2021 municipality boundary is a gray BACKDROP ONLY. It is never
+# used to infer or invent rent. The legacy 2015 census town polygons remain
+# authoritative for colored town/chome averages.
+TOWN_WARD_GEOJSON_URL = ('https://raw.githubusercontent.com/smartnews-smri/japan-topography/'
+                          'main/data/municipality/geojson/s0010/N03-21_13_210101.json')
+TOWN_WARD_GEOJSON_LIMIT = 2 * 1024 * 1024
+TOWN_BOUNDARY_CACHE_PATH = os.path.join(tempfile.gettempdir(),'sumai-town-boundary-v171.sqlite')
 TOWN_GEOMETRY_LIMIT = 36 * 1024 * 1024
 TOWN_GROUPS = ('group1','group2','house')
 # Breakpoints follow the prior rent-band legend: pale blue -> blue -> green
@@ -10084,7 +10102,7 @@ def _v150_town_address(raw,region=None,require_chome=True):
 
 def _v150_boundary_key_exists(key):
     """Only query this app's optional read-only polygon index."""
-    path=os.path.join(tempfile.gettempdir(),'sumai-town-boundary-v156.sqlite')
+    path=TOWN_BOUNDARY_CACHE_PATH
     if not os.path.isfile(path):return False
     try:
         with sqlite3.connect('file:'+quote(path,safe='/')+'?mode=ro',uri=True,timeout=2) as conn:
@@ -10103,7 +10121,7 @@ def _v150_point_in_ring(point,ring):
 
 def _v150_polygon_confirms(point,key):
     """True/False when loaded geometry can check the marker; None if absent."""
-    path=os.path.join(tempfile.gettempdir(),'sumai-town-boundary-v156.sqlite')
+    path=TOWN_BOUNDARY_CACHE_PATH
     if not os.path.isfile(path):return None
     try:
         lat,lng=point
@@ -10679,7 +10697,39 @@ def iter_town_geojson_file(path):
 
 class TownBoundaryStore:
     """Read-only indexed polygons for both rent-covered and no-data towns."""
-    def __init__(self,path):self.path=path
+    def __init__(self,path):
+        self.path=path
+        self._town_index=None
+        self._town_index_lock=threading.Lock()
+
+    def coverage_keys(self):
+        """The database's exact available chome keys, cached once per process."""
+        with self._town_index_lock:
+            if self._town_index is None:
+                with sqlite3.connect('file:'+quote(self.path,safe='/')+'?mode=ro',uri=True,timeout=10) as conn:
+                    self._town_index=frozenset(key for (key,) in conn.execute('SELECT DISTINCT town FROM areas'))
+            return self._town_index
+
+    def iter_ward_visible(self,bounds):
+        """Gray underlay for every Tokyo ward, including areas missing from 2015 polygons."""
+        conn=sqlite3.connect('file:'+quote(self.path,safe='/')+'?mode=ro',uri=True,timeout=10)
+        try:
+            if bounds and len(bounds)==4:
+                south,west,north,east=map(float,bounds)
+                rows=conn.execute('''SELECT ward,poly FROM ward_areas WHERE south<=? AND north>=? AND west<=? AND east>=?''',
+                                  (north,south,east,west))
+            else:
+                rows=conn.execute('SELECT ward,poly FROM ward_areas')
+            for ward,raw in rows:
+                if ward not in TOKYO_WARDS.values():continue
+                try:yield ward,json.loads(raw)
+                except (ValueError,TypeError):continue
+        except sqlite3.OperationalError:
+            # The town database may be usable even if the additional ward
+            # boundary source was unavailable during initial download.
+            return
+        finally:conn.close()
+
     def iter_visible(self,bounds,interested=None,include_empty=False):
         if not interested and not include_empty:return
         conn=sqlite3.connect('file:'+quote(self.path,safe='/')+'?mode=ro',uri=True,timeout=10)
@@ -10704,7 +10754,8 @@ class TownBoundaryWorker:
     def __init__(self):
         self.lock=threading.Lock();self.started=False;self.running=False
         self.features=None;self.ready=False;self.error=''
-        self.cache_path=os.path.join(tempfile.gettempdir(),'sumai-town-boundary-v156.sqlite')
+        self.cache_path=TOWN_BOUNDARY_CACHE_PATH
+        self.background_error=''
     def start(self):
         with self.lock:
             if self.started:return
@@ -10717,7 +10768,11 @@ class TownBoundaryWorker:
                 try:
                     with sqlite3.connect(self.cache_path) as conn:
                         verified=conn.execute("SELECT COUNT(*) FROM areas").fetchone()[0]
-                    if verified>0:
+                        try:
+                            ward_verified=conn.execute('SELECT COUNT(DISTINCT ward) FROM ward_areas').fetchone()[0]
+                        except sqlite3.Error:
+                            ward_verified=0
+                    if verified>0 and ward_verified==len(TOKYO_WARDS):
                         # Only a metadata check was performed; do not evict
                         # the polygon database needed for viewport queries.
                         with self.lock:
@@ -10777,13 +10832,55 @@ class TownBoundaryWorker:
                     count=conn.execute('SELECT COUNT(*) FROM areas').fetchone()[0]
                     if not count:raise ValueError('東京23区の町丁目境界が見つかりません。')
                     conn.execute('CREATE INDEX areas_bbox ON areas(south,north,west,east)')
+                    conn.execute('''CREATE TABLE ward_areas(ward TEXT PRIMARY KEY,
+                        south REAL, west REAL, north REAL, east REAL, poly TEXT NOT NULL)''')
+                    # This source has separate surveyed municipality boundaries
+                    # for all 23 wards (N03_007 is the official municipality code).
+                    # It is not substituted for town rent observations.
+                    try:
+                        with requests.get(TOWN_WARD_GEOJSON_URL,timeout=(6,25),stream=True,
+                                          headers={'User-Agent':'SumaiCompassTownMap/1.0'}) as response:
+                            response.raise_for_status()
+                            parts=[];total_bytes=0
+                            for chunk in response.iter_content(65536):
+                                if not chunk:continue
+                                total_bytes+=len(chunk)
+                                if total_bytes>TOWN_WARD_GEOJSON_LIMIT:
+                                    raise ValueError('23区境界データがサイズ上限を超えました。')
+                                parts.append(chunk)
+                        source_wards=json.loads(b''.join(parts).decode('utf-8-sig'))
+                        if source_wards.get('type')!='FeatureCollection' or not isinstance(source_wards.get('features'),list):
+                            raise ValueError('23区境界の応答形式が不正です。')
+                        ward_polygons={}
+                        for item in source_wards['features']:
+                            props=item.get('properties') or {}
+                            code=str(props.get('N03_007') or '')
+                            if code not in TOKYO_WARDS or normal(props.get('N03_004'))!=TOKYO_WARDS[code]:continue
+                            geometry=town_boundary_geometry(item.get('geometry'))
+                            if geometry is None:continue
+                            polygons=geometry['coordinates'] if geometry['type']=='MultiPolygon' else [geometry['coordinates']]
+                            if polygons:ward_polygons.setdefault(TOKYO_WARDS[code],[]).extend(polygons)
+                        if len(ward_polygons)!=len(TOKYO_WARDS):
+                            raise ValueError(f'23区境界が不足: {len(ward_polygons)}/{len(TOKYO_WARDS)}区')
+                        for ward,polys in ward_polygons.items():
+                            coords=[pt for poly in polys for ring in poly for pt in ring]
+                            conn.execute('INSERT INTO ward_areas VALUES(?,?,?,?,?,?)',
+                                         (ward,min(p[1] for p in coords),min(p[0] for p in coords),
+                                          max(p[1] for p in coords),max(p[0] for p in coords),
+                                          json.dumps(polys,ensure_ascii=False,separators=(',',':'))))
+                        conn.execute('CREATE INDEX ward_areas_bbox ON ward_areas(south,north,west,east)')
+                    except (requests.RequestException,ValueError,TypeError,KeyError,OSError,sqlite3.Error) as exc:
+                        # Optional 23-ward gray fill must never take the town
+                        # map offline if this independent source is unavailable.
+                        conn.execute('DELETE FROM ward_areas')
+                        self.background_error='23区の灰色補完を取得できません: '+str(exc)[:240]
                     conn.commit()
                 finally:conn.close()
                 os.replace(target,self.cache_path)
             _v126_work_finished('town-boundary')
             with self.lock:
                 self.features=TownBoundaryStore(self.cache_path)
-                self.ready=True;self.error=''
+                self.ready=True;self.error=self.background_error
         except Exception as exc:
             with self.lock:self.error=str(exc)
         finally:
@@ -10793,7 +10890,7 @@ class TownBoundaryWorker:
 
 
 @st.cache_resource
-def town_boundary_registry(v156_geometry_revision="v156"):
+def town_boundary_registry(v171_geometry_revision="v171"):
     return TownBoundaryWorker()
 
 
@@ -10932,6 +11029,31 @@ def _v168_visible_wards(geo):
     return [code for code,_ in sorted(counts.items(),key=lambda kv:(-kv[1],kv[0]))]
 
 
+
+def town_coverage_audit(groups,boundary_keys,group):
+    """Cross-check saved rent keys against official polygon keys for all 23 wards.
+
+    The absence of a qualifying listing does NOT prove a skipped acquisition;
+    keep geometry, saved data and search progress separate in the UI.
+    """
+    boundaries=frozenset(boundary_keys or ())
+    counts=((groups or {}).get(group) or {})
+    stored={key for key,value in counts.items()
+            if isinstance(value,(list,tuple)) and len(value)>=2 and value[1]>0}
+    missing=sorted(stored-boundaries)
+    rows=[]
+    for code,ward in TOKYO_WARDS.items():
+        prefix=ward+'|'
+        known=sum(1 for key in boundaries if key.startswith(prefix))
+        colored=sum(1 for key in stored if key.startswith(prefix) and key in boundaries)
+        unmatched=sum(1 for key in missing if key.startswith(prefix))
+        rows.append({'区':ward,'境界の町丁目':known,'家賃表示':colored,
+                     '保存家賃なし':max(0,known-colored),'保存済み・境界不一致':unmatched})
+    return {'wards':rows,'stored_without_geometry':missing,
+            'geometry_keys':len(boundaries),'colored_town_keys':len(stored&boundaries),
+            'missing_rent_towns':len(boundaries-stored)}
+
+
 def town_colored_shapes(groups,group,features,bounds,max_features=None,include_no_data=False,suumo_oz_codes=None):
     """Join the exact saved town summary with every polygon in the viewport.
 
@@ -10967,7 +11089,17 @@ def town_colored_shapes(groups,group,features,bounds,max_features=None,include_n
         selected=sorted(rented,key=lambda name:(-counts[name][1],name))[:max_features]
     result={'type':'FeatureCollection','features':[], 'render_stats':{
         'with_rent':len(selected),'without_rent':len(empty),
-        'rent_total_in_window':len(rented)}}
+        'rent_total_in_window':len(rented),'wards_gray_backdrop':0}}
+    # Administrative shapes are a neutral *underlay* to prevent unexplained
+    # white gaps where the 2015 census town geometry has no polygon.
+    # Never assign a rent or count to a ward on the basis of neighboring data.
+    if hasattr(features,'iter_ward_visible') and include_no_data:
+        for ward,polygons in features.iter_ward_visible(bounds):
+            result['features'].append({'type':'Feature',
+                'geometry':{'type':'MultiPolygon','coordinates':polygons},
+                'properties':{'name':ward,'ward_backdrop':True,
+                              'color':'#b7c0c3','has_data':None}})
+            result['render_stats']['wards_gray_backdrop']+=1
     # Unknown towns are drawn FIRST, so the authoritative rent colors remain
     # on top, even where source geometries have shared lines or small overlaps.
     for key in sorted(empty):
@@ -11197,6 +11329,19 @@ TOWN_COMPONENT_HTML_V121 = TOWN_COMPONENT_HTML_V121.replace(_V167_POPUP_OLD,_V16
 _V167_CSS = ".v167-suumo-link{display:inline-block;margin-top:8px;padding:7px 11px;background:#174a6a;border-radius:6px;color:white!important;text-decoration:none;font-weight:700;font-size:13px;touch-action:manipulation}.v167-suumo-note{font-size:10px;max-width:245px;color:#5c6670;margin-top:5px}"
 assert TOWN_COMPONENT_HTML_V121.count('</style></head>')==1
 TOWN_COMPONENT_HTML_V121 = TOWN_COMPONENT_HTML_V121.replace('</style></head>',_V167_CSS+'</style></head>',1)
+
+# v171: layer administrative underlay below towns without inventing rent.
+_V171_STYLE_OLD = _V157_STYLE_NEW
+_V171_STYLE_NEW = _V171_STYLE_OLD.replace(
+    "if(p.has_data===false)return",
+    "if(p.ward_backdrop)return {color:'transparent',weight:0,fillColor:'#b7c0c3',fillOpacity:.26};if(p.has_data===false)return")
+assert TOWN_COMPONENT_HTML_V121.count(_V171_STYLE_OLD)==1
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(_V171_STYLE_OLD,_V171_STYLE_NEW,1)
+_V171_EACH_OLD="onEachFeature:function(feature,layer){var props=feature.properties||{},name=String(props.name||''),avg=String(props.price_label||''),count=String(props.count_label||'');"
+_V171_EACH_NEW=_V171_EACH_OLD.replace(
+    "props=feature.properties||{},name=", "props=feature.properties||{};if(props.ward_backdrop){layer.options.interactive=false;return;}var name=")
+assert TOWN_COMPONENT_HTML_V121.count(_V171_EACH_OLD)==1
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(_V171_EACH_OLD,_V171_EACH_NEW,1)
 
 @st.cache_resource(show_spinner=False)
 def town_component_v121():
@@ -11721,7 +11866,7 @@ def town_choropleth_status():
             st.caption(f"町丁目家賃 {done}/--ページ")
     if busy:st.caption('境界データ読込中')
     if snap['error']:st.warning('平均家賃の集計：'+snap['error'])
-    if error:st.warning('境界取得：'+error+'。不明な区域は塗りません。')
+    if error:st.warning('境界の一部未取得：'+error+'。町丁目の保存家賃表示は継続します。')
     if snap['ready'] and not snap['running']:
         result=snap.get('summary') or {}
         updated=result.get('updated_at')
@@ -11735,6 +11880,17 @@ def town_choropleth_status():
         st.caption(f"地図集計対象：{int(result.get('listing_count') or 0):,}件"
                    f"｜品川区 {ward_saved_count('品川区'):,}件"
                    f"｜渋谷区 {ward_saved_count('渋谷区'):,}件")
+        if ready and hasattr(shapes,'coverage_keys'):
+            report=town_coverage_audit(group_totals,shapes.coverage_keys(),
+                         state.get('layout_display_group','group1'))
+            if report['stored_without_geometry']:
+                st.warning(f"保存された家賃が地図境界に一致しない地域：{len(report['stored_without_geometry'])}町丁目。下の詳細から確認できます。")
+            with st.expander('東京23区・保存家賃の地図反映状況'):
+                st.caption('家賃表示＝境界と保存済み家賃が一致する町丁目。保存家賃なし＝未収集とは限らず、対象物件が0件の地域も含みます。')
+                st.dataframe(report['wards'],hide_index=True,use_container_width=True)
+                if report['stored_without_geometry']:
+                    st.code('\n'.join(report['stored_without_geometry'][:100]),language=None)
+        if ready:st.caption('区境界：国土交通省 国土数値情報（2021年）、町丁目：e-Stat国勢調査（2015年）')
     elif not snap['running'] and not snap['ready'] and not snap['error']:
         st.caption('町丁目家賃：集計の開始待ち')
 
@@ -11803,7 +11959,8 @@ def interactive_town_choropleth(group):
     elif destinations:
         st.caption(f'通勤先：{destinations[0]}駅｜乗換回数が少ない経路を優先（同数なら最短時間・概算）')
     if cached['ready']:
-        st.caption(f"\u7740\u8272 {cached['colored_count']}\u753a\u4e01\u76ee\uff5c\u30c7\u30fc\u30bf\u306a\u3057 {cached['no_data_count']}\u753a\u4e01\u76ee\uff08\u30b0\u30ec\u30fc\uff09")
+        st.caption(f"\u7740\u8272 {cached['colored_count']}\u753a\u4e01\u76ee\uff5c\u30c7\u30fc\u30bf\u306a\u3057 {cached['no_data_count']}\u753a\u4e01\u76ee\uff08\u30b0\u30ec\u30fc\uff09"
+                   f"｜区境界の灰色補完 {cached['geo']['render_stats']['wards_gray_backdrop']}区")
     else:
         st.caption('集計中。完了後、地図の色は自動更新されます')
     stations,wards=town_station_refs_v164(destinations)
