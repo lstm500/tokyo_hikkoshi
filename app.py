@@ -52,7 +52,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v184"
+BUILD = "REBUILD-01-v185"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -11581,8 +11581,220 @@ new="""       state.focusLayer=focus.addTo(state.map);
 assert TOWN_COMPONENT_HTML_V121.count(old)==1
 TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(old,new,1)
 
+# v185 direct client-side, persistent geography index.
+_V185_LOCAL_SEARCH_JS = r'''
+// v185: client-owned town lookup.  The 2015 e-Stat area source is fetched
+// once, reduced to Tokyo's 23 wards and stored in IndexedDB.  On next page
+// open and after app.py deployments, a local index drives instant lookup,
+// exact geometry highlights and fitBounds without a Streamlit round trip.
+// This is deliberately independent of the rent aggregation worker.
+var _v185_oldInit=initTownSearch;
+var _v185_oldSubmit=submitTownQuery;
+var _v185_oldSelect=townSendSelection;
+function v185Db(){
+ return new Promise(function(resolve,reject){
+   if(!window.indexedDB){reject(new Error('IndexedDB unsupported'));return;}
+   var req=indexedDB.open('sumai_town_2015_cache',1);
+   req.onupgradeneeded=function(){if(!req.result.objectStoreNames.contains('geo'))req.result.createObjectStore('geo')};
+   req.onsuccess=function(){resolve(req.result)};
+   req.onerror=function(){reject(req.error||new Error('IndexedDB open failed'))};
+   req.onblocked=function(){reject(new Error('IndexedDB blocked'))};
+ });
+}
+async function v185ReadCache(){
+ var db=await v185Db();
+ try{return await new Promise(function(resolve,reject){
+   var req=db.transaction('geo','readonly').objectStore('geo').get('tokyo-23-2015-v1');
+   req.onsuccess=function(){resolve(req.result||null)};
+   req.onerror=function(){reject(req.error||new Error('IndexedDB read failed'))};
+ });}finally{db.close()}
+}
+async function v185WriteCache(rows){
+ var db=await v185Db();
+ try{await new Promise(function(resolve,reject){
+   var tx=db.transaction('geo','readwrite');
+   tx.objectStore('geo').put(rows,'tokyo-23-2015-v1');
+   tx.oncomplete=resolve;
+   tx.onerror=function(){reject(tx.error||new Error('IndexedDB write failed'))};
+   tx.onabort=function(){reject(tx.error||new Error('IndexedDB write aborted'))};
+ });}finally{db.close()}
+}
+function v185Bounds(geometry){
+ var all=[];
+ function walk(value){
+   if(!Array.isArray(value))return;
+   if(value.length>=2&&typeof value[0]==='number'&&typeof value[1]==='number'){
+     var x=value[0],y=value[1];
+     if(Number.isFinite(x)&&Number.isFinite(y)&&x>=138&&x<=141&&y>=34&&y<=37)all.push([x,y]);
+   }else value.forEach(walk);
+ }
+ walk(geometry&&geometry.coordinates);
+ if(!all.length)return null;
+ var s=90,w=180,n=-90,e=-180;
+ all.forEach(function(p){s=Math.min(s,p[1]);w=Math.min(w,p[0]);n=Math.max(n,p[1]);e=Math.max(e,p[0])});
+ return s<n&&w<e?[s,w,n,e]:null;
+}
+function v185NormalizeSource(doc){
+ if(!doc||!Array.isArray(doc.features))throw new Error('境界データ形式に問題があります');
+ var allowed=new Set(state.searchDistricts||[]);
+ var result=[];
+ doc.features.forEach(function(feature){
+   var fullname=String((feature.properties||{}).fullname||'').split('/');
+   var ward=fullname[1]||'',town=normalizeTownQuery(fullname[2]||'');
+   if(!allowed.has(ward)||!town||!feature.geometry)return;
+   result.push({w:ward,t:town,g:feature.geometry});
+ });
+ if(result.length<2000)throw new Error('東京23区の境界データが不足しています');
+ return result;
+}
+function v185Install(rows){
+ if(!Array.isArray(rows)||rows.length<100)throw new Error('境界索引が不正です');
+ var catalog=[],geo=new Map(),wardBounds=new Map(),valid=0;
+ rows.forEach(function(f){
+   if(!f||!f.w||!f.t||!f.g)return;
+   var b=v185Bounds(f.g);
+   if(!b)return;
+   var base=f.t.replace(/[0-9]{1,2}丁目$/,'');
+   catalog.push({ward:f.w,town:f.t,base:base,bounds:b});
+   var id=f.w+'|'+f.t;
+   if(!geo.has(id))geo.set(id,[]);
+   geo.get(id).push(f.g);
+   var old=wardBounds.get(f.w);
+   wardBounds.set(f.w,old?[Math.min(old[0],b[0]),Math.min(old[1],b[1]),Math.max(old[2],b[2]),Math.max(old[3],b[3])]:b.slice());
+   valid++;
+ });
+ if(valid<100)throw new Error('町丁目境界が見つかりません');
+ state._v185Geometry=geo;
+ state._v185Loaded=true;
+ state._v185Loading=false;
+ state.searchCatalog=catalog;
+ state.searchWardBounds=Array.from(wardBounds,function(p){return {ward:p[0],bounds:p[1]}});
+ if(state._v185DeferredQuery!==null&&state._v185DeferredQuery!==undefined){
+   var pending=state._v185DeferredQuery;
+   state._v185DeferredQuery=null;
+   var q=document.getElementById('town-query');
+   if(q){q.value=pending;setTimeout(function(){submitTownQuery()},0)}
+ }else if(document.getElementById('town-search-status').textContent.includes('準備中')){
+   setTownStatus('町丁目境界を読み込みました。検索できます。');
+ }
+}
+async function v185FetchSource(url,ms){
+ var ac=new AbortController(),timer=setTimeout(function(){ac.abort()},ms);
+ try{
+   var res=await fetch(url,{signal:ac.signal,cache:'force-cache'});
+   if(!res.ok)throw new Error('HTTP '+res.status);
+   return v185NormalizeSource(await res.json());
+ }finally{clearTimeout(timer)}
+}
+async function v185Init(){
+ if(state._v185Started)return;
+ state._v185Started=true;
+ state._v185Loading=true;
+ state._v185DeferredQuery=null;
+ try{
+   var saved=null;
+   try{saved=await v185ReadCache()}catch(err){state._v185CacheWarning=String(err)}
+   if(saved&&saved.length>=2000){v185Install(saved);return;}
+   // Initial pre-registration, only when browser has no dataset.
+   var urls=['https://frogcat.github.io/japan-small-area/13.json',
+             'https://raw.githubusercontent.com/frogcat/japan-small-area/master/docs/13.json'];
+   var lastError='';
+   for(var i=0;i<urls.length;i++){
+     try{
+       var items=await v185FetchSource(urls[i],i===0?9500:10500);
+       v185Install(items);
+       try{await v185WriteCache(items)}catch(err){state._v185CacheWarning=String(err)}
+       return;
+     }catch(err){lastError=String(err&&err.message||err)}
+   }
+   throw new Error('町丁目境界の初回取得に失敗しました（'+lastError+'）。ネットワークを確認してください。');
+ }catch(err){
+   state._v185Loading=false;
+   state._v185Failed=String(err&&err.message||err);
+   if(state._v185DeferredQuery!==null){
+     var pending=state._v185DeferredQuery;state._v185DeferredQuery=null;
+     if((state.searchCatalog||[]).length){
+       var input=document.getElementById('town-query');if(input)input.value=pending;
+       setTimeout(function(){_v185_oldSubmit()},0);
+     }else setTownStatus(state._v185Failed);
+   }
+ }
+}
+function v185TownFocus(place){
+ if(!state._v185Loaded||!state.map)return false;
+ var selected=[],features=[];
+ var wk=String(place.ward||''),nm=String(place.name||'');
+ (state.searchCatalog||[]).forEach(function(area){
+   if(area.ward!==wk)return;
+   if(place.kind==='ward'||(place.kind==='town'?area.base===nm:area.town===nm)){
+     selected.push(area);
+     (state._v185Geometry.get(area.ward+'|'+area.town)||[]).forEach(function(g){
+       features.push({type:'Feature',properties:{name:area.ward+area.town},geometry:g});
+     });
+   }
+ });
+ if(!features.length)return false;
+ var south=90,west=180,north=-90,east=-180;
+ selected.forEach(function(area){var b=area.bounds;
+   south=Math.min(south,b[0]);west=Math.min(west,b[1]);north=Math.max(north,b[2]);east=Math.max(east,b[3]);
+ });
+ try{
+   var outline=L.geoJSON({type:'FeatureCollection',features:features},{pane:'townSearchFocusPane',interactive:false,
+     smoothFactor:1,style:function(){return {color:'#d10040',weight:4.5,opacity:1,fillOpacity:0,dashArray:'10 5',lineJoin:'round'}}});
+   if(!outline.getLayers().length)return false;
+   if(state.focusLayer)state.map.removeLayer(state.focusLayer);
+   if(state.provisionalFocus){state.map.removeLayer(state.provisionalFocus);state.provisionalFocus=null}
+   state.focusLayer=outline.addTo(state.map);
+   state._v185FocusActive=true;
+   state.lastJumpToken='local-'+String(Date.now());
+   state.sentBounds='';
+   state.map.invalidateSize();
+   state.map.fitBounds([[south,west],[north,east]],{padding:[24,24],maxZoom:16,animate:false});
+   setTownStatus('「'+place.label+'」に移動し、地域を赤線で囲みました。');
+   setTimeout(function(){emitBounds()},80);
+   return true;
+ }catch(err){setTownStatus('輪郭表示エラー：'+String(err&&err.message||err));return false}
+}
+initTownSearch=function(){_v185_oldInit();v185Init()};
+submitTownQuery=function(){
+ if(!state._v185Loaded&&state._v185Loading){
+   var node=document.getElementById('town-query');
+   state._v185DeferredQuery=String(node&&node.value||'');
+   setTownStatus('初回のみ町丁目境界を登録中です。完了後、自動的に移動します。');
+   return;
+ }
+ if(!state._v185Loaded&&state._v185Failed&&!(state.searchCatalog||[]).length){
+   var retryInput=document.getElementById('town-query');
+   var retryQuery=String(retryInput&&retryInput.value||'');
+   state._v185Started=false;state._v185Failed=null;
+   v185Init();state._v185DeferredQuery=retryQuery;
+   setTownStatus('町丁目境界の登録を再試行しています。完了後、自動的に移動します。');
+   return;
+ }
+ _v185_oldSubmit();
+};
+townSendSelection=function(place){
+ if(state._v185Loaded){
+   if(!v185TownFocus(place))setTownStatus('指定地域の輪郭が見つかりません。');
+   return;
+ }
+ _v185_oldSelect(place);
+};
+'''
+assert TOWN_COMPONENT_HTML_V121.count('function render(args){')==1
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('function render(args){', _V185_LOCAL_SEARCH_JS+'\nfunction render(args){',1)
+# Later fragment responses must not erase the self-contained browser lookup.
+needle=" state.searchCatalog=Array.isArray(args.search_catalog)?args.search_catalog:[];"
+assert TOWN_COMPONENT_HTML_V121.count(needle)==1
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(needle," if(!state._v185Loaded)state.searchCatalog=Array.isArray(args.search_catalog)?args.search_catalog:[];",1)
+# A stale server jump must not override a successful instant browser search.
+needle="if(target && target.id && Array.isArray(target.bounds)"
+assert TOWN_COMPONENT_HTML_V121.count(needle)==1
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(needle,"if(!state._v185FocusActive && target && target.id && Array.isArray(target.bounds)",1)
+
 @st.cache_resource(show_spinner=False)
 def town_component_v121():
+    _asset_revision='v185-indexed-geo'
     folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-v184')
     os.makedirs(folder,exist_ok=True)
     path=os.path.join(folder,'index.html')
