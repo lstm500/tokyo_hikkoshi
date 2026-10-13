@@ -55,7 +55,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v185"
+BUILD = "REBUILD-01-v186"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -725,6 +725,14 @@ button:disabled{background:#e3e9e3!important;color:#607369!important;opacity:1!i
 .unit{background:#fff;border-radius:16px;padding:18px;margin-bottom:12px;border:1px solid #e0e4da}
 .unit h3{font-size:18px;margin:0 0 8px}.unit a{color:#286b5d}
 @media(max-width:600px){.hero{padding:18px}.hero h1{font-size:26px}.block-container{padding-top:1rem}}
+/* v186: suppress toast overlays retained by a prior app deployment.
+   Only button colour and the separate diagnostics log confirm taps. */
+[data-testid="stToast"],
+[data-testid="stToastContainer"],
+[data-testid="stToastMessage"],
+[data-testid*="stToast"],
+[data-baseweb="toast"],
+.stToast { display:none!important; }
 /* v183: immediate, accessible tap/focus feedback on ALL app buttons. */
 .stApp [data-testid="stButton"] button:not(:disabled):is(:active,:focus:not(:focus-visible)),
 .stApp [data-testid="stDownloadButton"] button:not(:disabled):is(:active,:focus:not(:focus-visible)),
