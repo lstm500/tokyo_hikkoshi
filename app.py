@@ -55,7 +55,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v183"
+BUILD = "REBUILD-01-v185"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -812,10 +812,8 @@ def _v183_button(label, *args, **kwargs):
         ident = str(key if key is not None else label)
         if st.session_state.pop('_v183_callback_pressed', None) != ident:
             _v183_record_press(label, key)
-        try:
-            st.toast('操作を受け付けました：' + str(label)[:45], icon='⏳')
-        except Exception:
-            pass  # The CSS acknowledgement still works in narrow fragments.
+        # Use button's active/focus colour as the only acknowledgement.
+        # Avoid stacking notifications during Streamlit reruns or fast taps.
     return clicked
 
 
@@ -13272,7 +13270,7 @@ def main():
     except Exception:state.current_storage_key=None
     # Choropleth display does not auto-restore thousands of old per-listing points.
     # The Saved Data tab can still load them explicitly for detailed export.
-    tabs=st.tabs(['住まいを探す','保存データ','通勤','初期設定'])
+    tabs=st.tabs(['住まいを探す','保存データ','通勤','設定','初期設定'])
     with tabs[0]:
         st.subheader('地図を動かして、探す地域を表示してください')
         selected_group=state.get('layout_display_group','group1')
@@ -13527,6 +13525,7 @@ def main():
         else: st.info('物件を検索するか、保存物件を読み込むと通勤を比較できます。')
     with tabs[3]:
         _v183_performance_panel()
+    with tabs[4]:
         st.subheader('実URL・Supabase保存検証（追加課金なし）')
         st.caption('旧版の失敗ログから固定抽出した実URLを再検索し、住所・家賃・間取りを保存してSupabaseで読み戻します。24/30以上で合格。')
         groups={'詳細住所確定失敗 30 URL':'map.address_inference',
