@@ -52,7 +52,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v188"
+BUILD = "REBUILD-01-v182"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -10367,25 +10367,39 @@ def _town_change_key(db):
 
 
 def notify_town_summary_saved(db):
-    """Mark the map as stale after a verified save, without polling or scanning.
+    """Record fully read-back-verified writes in memory AND in this DB namespace.
 
-    Recomputing the map is EXCLUSIVELY user-initiated. No additional Supabase
-    request is generated per save batch. Existing rental listings are intact.
+    v131-v142 only sent an in-process signal: a restart or another process
+    could miss it and continue displaying an old persisted color map forever.
+    Here a single tiny, upserted search record identifies the latest batch.
+    Full listings and their existing retention are not changed.
     """
     key=_town_change_key(db)
     with _TOWN_SAVE_CHANGE_LOCK:
-        item=_TOWN_SAVE_CHANGES.setdefault(key, {'sequence':0,'worker':None})
-        item['sequence']+=1
-        seq=item['sequence']
-        worker=item['worker']
+        entry=_TOWN_SAVE_CHANGES.setdefault(key, {'sequence':0,'worker':None})
+        entry['sequence']+=1
+        sequence=entry['sequence']
+        worker=entry['worker']
+    # First notify the local worker so a transient marker-write failure cannot
+    # suppress already-verified listings from its local map.
     if worker is not None:
-        worker.on_listing_saved(seq)
-    return None
+        worker.on_listing_saved(sequence)
+    marker=hashlib.sha256(os.urandom(24)).hexdigest()[:32]
+    now=utc_now()
+    db.save_search({'id':TOWN_DIRTY_MARKER_ID,'status':'town_rent_dirty',
+        'started_at':now,'finished_at':now,
+        'conditions':{'schema':1,'scope':'rental_listing','source':'confirmed_save'},
+        'summary':{'token':marker,'changed_at':now}})
+    return marker
 
 
 def notify_town_collection_finished(db):
-    """Finishing property collection no longer starts a map recomputation."""
-    return None
+    """Promptly finish queued changes after the last manual/automatic save."""
+    with _TOWN_SAVE_CHANGE_LOCK:
+        entry=_TOWN_SAVE_CHANGES.get(_town_change_key(db))
+        worker=entry.get('worker') if entry else None
+    if worker is not None:
+        worker.flush_saved_changes()
 
 
 def attach_town_summary_worker(worker):
@@ -10399,10 +10413,11 @@ def attach_town_summary_worker(worker):
 
 
 class TownSummaryWorker:
-    """One namespace snapshot, recomputed only after a manual button click.
+    """One namespace snapshot, automatically refreshed after verified saves.
 
-    The worker reads the persisted summary on start-up, without scanning
-    listings. Manual aggregation runs on a background thread.
+    Changes are coalesced: a running collector never triggers one full database
+    scan per listing.  One bounded SQLite aggregation updates the town-map
+    snapshot and then the persistent Leaflet layer receives a new revision.
     """
     def __init__(self,db):
         self.db=db;self.build=BUILD;self.lock=threading.RLock();self.running=False;self.progress=0;self.total_pages=None;self.total_records=None;self.scanned_records=0;self.page_size=160
@@ -10430,26 +10445,103 @@ class TownSummaryWorker:
         if not isinstance(rows,list):raise AppError('地図更新通知の読込形式が不正です。')
         payload=(rows[0].get('summary') or {}) if rows else {}
         return str(payload.get('token') or '') if isinstance(payload,dict) else ''
+    def _poll_source_marker(self):
+        try:
+            remote=self.read_source_marker()
+            with self.lock:
+                current=str((self.summary or {}).get('source_marker') or '')
+                if self.ready and remote and remote!=current:
+                    self.pending=True
+                    self._retry_count=0
+                    self._schedule_refresh_locked(urgent=True)
+        except Exception as exc:
+            with self.lock:self.error='自動更新通知の確認に失敗しました: '+str(exc)
+        finally:
+            with self.lock:self._marker_probe_running=False
     def poll_source_marker(self,force=False):
-        # Kept for compatibility; never schedule background polling.
-        return False
+        """Background-only check: map rendering never waits on a DB request."""
+        with self.lock:
+            now=time.monotonic()
+            if self._marker_probe_running or (not force and now-self._last_marker_probe<TOWN_DIRTY_POLL_SECONDS):return False
+            self._last_marker_probe=now
+            self._marker_probe_running=True
+        thread=threading.Thread(target=self._poll_source_marker,daemon=True,
+                                name='town-map-durable-change-check')
+        thread.start()
+        return True
     def refresh_on_startup(self):
-        # Read existing persisted summary only; do not scan rental listings.
-        return False
+        """Catch up once from earlier builds; never repeat a scan on each page view."""
+        with self.lock:
+            if self._startup_scan_requested:return False
+            self._startup_scan_requested=True
+            if self.ready:
+                # Rebuild any older schema once to restore listings saved
+                # while earlier code missed in-process notifications. This also
+                # detects already-saved Shinagawa/Shibuya rows from v130-v142.
+                if (self.summary or {}).get('generated_by') not in (BUILD,'REBUILD-01-v156'):
+                    self.pending=True
+                    self._schedule_refresh_locked(urgent=True)
+                else:
+                    self.poll_source_marker(force=True)
+                return False
+        return self.start()
+    def _check_unsummarized_writes(self):
+        stamp=(self.summary or {}).get('updated_at')
+        if not stamp:
+            with self.lock:
+                self.pending=True
+                self._schedule_refresh_locked(urgent=True)
+            return
+        try:
+            rows=self.db.call('GET',SEARCH_TABLE,{
+                'namespace':'eq.'+self.db.namespace,'status':'eq.rental_listing',
+                'and':'(id.gte.listing.,id.lt.listing/)',
+                'started_at':'gte.'+str(stamp),'select':'id','limit':1})
+            if not isinstance(rows,list):raise AppError('保存物件の更新有無を確認できません。')
+            if rows:
+                with self.lock:
+                    self.pending=True
+                    self._schedule_refresh_locked(urgent=True)
+        except AppError as exc:
+            with self.lock:
+                self.error='保存物件の最終更新確認に失敗: '+str(exc)
+                self.pending=True
+                self._schedule_refresh_locked()
     def _schedule_refresh_locked(self,urgent=False):
-        # No timers or automatic retries. A manual click is always required.
-        return False
+        """Lock must be held; at most one application-only timer per namespace."""
+        if urgent:self._urgent_after_scan=True
+        if self.running or not self.pending or self._retry_count>2:return False
+        if self._refresh_timer is not None:
+            if not urgent:return False
+            self._refresh_timer.cancel()
+            self._refresh_timer=None
+        since=time.monotonic()-self._last_scan_started
+        delay=1.0 if urgent else max(TOWN_AUTO_REFRESH_DEBOUNCE,TOWN_AUTO_REFRESH_MIN_GAP-since)
+        # Failures are retried at most twice and never in a tight loop.
+        if self._retry_count:delay=max(delay,TOWN_AUTO_REFRESH_MIN_GAP)
+        timer=threading.Timer(delay,self._run_pending_refresh)
+        timer.daemon=True
+        timer.name='town-map-auto-refresh-delay'
+        self._refresh_timer=timer
+        timer.start()
+        return True
     def _run_pending_refresh(self):
-        return None
+        with self.lock:
+            self._refresh_timer=None
+            if not self.pending or self.running:return
+        self.start()
     def on_listing_saved(self,sequence):
         with self.lock:
             if sequence<=self.saved_sequence:return
             self.saved_sequence=sequence
             self.pending=True
             self._last_saved_at=utc_now()
+            self._retry_count=0
+            self._schedule_refresh_locked()
     def flush_saved_changes(self):
-        # A finished search cannot trigger a map refresh.
-        return None
+        with self.lock:
+            if not self.pending:return
+            self._schedule_refresh_locked(urgent=True)
     def initialize(self):
         with self.lock:
             if self.initialized:return
@@ -10561,7 +10653,9 @@ class TownSummaryWorker:
                 # A listing saved DURING the scan might have been missed;
                 # it is necessarily carried forward to another refresh.
                 if self.saved_sequence>self.scan_sequence:self.pending=True
-            # Completed a manual scan. Never queue an automatic catch-up scan.
+            # Also catch writes from other app processes during the scan.
+            # Polling is asynchronous so no second DB request delays render.
+            self.poll_source_marker(force=True)
             _v126_work_finished('town-summary')
         except Exception as exc:
             with self.lock:
@@ -10571,8 +10665,8 @@ class TownSummaryWorker:
         finally:
             with self.lock:
                 self.running=False
-                # Save activity during a scan is flagged as pending for the
-                # NEXT manual click; no automatic catch-up/retry.
+                if self.pending:
+                    self._schedule_refresh_locked(urgent=self._urgent_after_scan and self._retry_count==0)
     def snapshot(self):
         with self.lock:return {'summary':self.summary,'ready':self.ready,'running':self.running,
                                'progress':self.progress,'total_pages':self.total_pages,
@@ -10582,7 +10676,7 @@ class TownSummaryWorker:
 
 
 @st.cache_resource
-def town_summary_registry_v183():
+def town_summary_registry_v143():
     # A new cache identity is essential: Streamlit preserves st.cache_resource
     # objects over source hot-reloads. The unchanged v131 key reused an old
     # already-initialized worker, permanently skipping new startup refreshes.
@@ -10590,7 +10684,7 @@ def town_summary_registry_v183():
 
 
 def current_town_summary_worker():
-    jobs,lock=town_summary_registry_v183();db=Database();key=manual_registry_key(db)+'|town-v183'
+    jobs,lock=town_summary_registry_v143();db=Database();key=manual_registry_key(db)+'|town-v143'
     with lock:
         job=jobs.get(key)
         if job is None or (getattr(job,'build',None)!=BUILD and not job.snapshot()['running']):
@@ -10598,6 +10692,7 @@ def current_town_summary_worker():
             # Keep an older, actively running worker until its scan has finished.
             job=TownSummaryWorker(db);jobs[key]=job
     job.initialize()
+    job.refresh_on_startup()
     attach_town_summary_worker(job)
     return job
 
@@ -11339,7 +11434,7 @@ TOWN_COMPONENT_HTML_V121 = TOWN_COMPONENT_HTML_V121.replace(_V172_EACH_OLD, _V17
 _V178_LABEL_OLD=_V164_NEW_TIME
 _V178_LABEL_NEW="""   var dual=Boolean(state.commuteDestination2);
    var pct=(typeof s.commute_crowding_pct==='number'&&isFinite(s.commute_crowding_pct)&&s.commute_crowding_pct>=0)?Math.round(s.commute_crowding_pct):null;
-   var crowdLabel=pct===null?'不明':('参考'+pct+'%');
+   var crowdLabel=pct===null?'不明':('混雑'+pct+'%');
    var timeLabel=(commuteTime===null||commuteTransfers===null)?
       (state.commuteDestination?'①未計算':''):
       '①'+commuteTime+'分（'+crowdLabel+'）-'+commuteTransfers+'回';
@@ -11347,7 +11442,7 @@ _V178_LABEL_NEW="""   var dual=Boolean(state.commuteDestination2);
    var secondTransfers=(typeof s.commute2_transfers==='number' && isFinite(s.commute2_transfers) && s.commute2_transfers>=0 &&
      Math.floor(s.commute2_transfers)===s.commute2_transfers)?s.commute2_transfers:null;
    var secondPct=(typeof s.commute2_crowding_pct==='number'&&isFinite(s.commute2_crowding_pct)&&s.commute2_crowding_pct>=0)?Math.round(s.commute2_crowding_pct):null;
-   var secondCrowd=secondPct===null?'不明':('参考'+secondPct+'%');
+   var secondCrowd=secondPct===null?'不明':('混雑'+secondPct+'%');
    var timeLabel2=!dual?'':(secondMin===null||secondTransfers===null)?'②未計算':
      '②'+secondMin+'分（'+secondCrowd+'）-'+secondTransfers+'回';"""
 assert TOWN_COMPONENT_HTML_V121.count(_V178_LABEL_OLD)==1
@@ -11358,518 +11453,11 @@ _V178_WIDTH_NEW='   var width=Math.min(460,nameWidth+timeWidth+19);'
 assert TOWN_COMPONENT_HTML_V121.count(_V178_WIDTH_OLD)==1
 TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(_V178_WIDTH_OLD,_V178_WIDTH_NEW,1)
 
-# v181: A one-shot map navigation command, applied inside the existing
-# Leaflet component. Browser map identity, saved commute settings and rent
-# overlays remain intact; normal moveend sends the new viewport to Python.
-_V181_RENDER_ANCHOR = " updateOverlay(args.geo,args.signature);\n redrawStations();"
-assert TOWN_COMPONENT_HTML_V121.count(_V181_RENDER_ANCHOR)==1
-_V181_RENDER_REPLACEMENT = """ updateOverlay(args.geo,args.signature);
- var target=args.jump;
- if(target && Array.isArray(target.bounds) && target.bounds.length===4){
-   var token=String(target.id||'');
-   var b=target.bounds.map(Number);
-   if(token && token!==state.lastJumpToken && b.every(Number.isFinite) &&
-      b[0]>=34 && b[2]<=37 && b[1]>=138 && b[3]<=141 &&
-      b[0]<b[2] && b[1]<b[3]){
-     state.lastJumpToken=token;
-     state.map.fitBounds([[b[0],b[1]],[b[2],b[3]]],
-       {padding:[30,30],maxZoom:16,animate:true,duration:0.55});
-   }
- }
- redrawStations();"""
-TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(
-    _V181_RENDER_ANCHOR,_V181_RENDER_REPLACEMENT,1)
-
-# v182: the search selection carries verified polygon geometry, not just bbox.
-# Outlines live in a dedicated Leaflet pane and never alter rent fill colors.
-_V182_FOCUS_PANE_ANCHOR = " state.map.createPane('stationNamePane');"
-assert TOWN_COMPONENT_HTML_V121.count(_V182_FOCUS_PANE_ANCHOR)==1
-TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(
-    _V182_FOCUS_PANE_ANCHOR,
-    " state.map.createPane('townSearchFocusPane');state.map.getPane('townSearchFocusPane').style.zIndex='650';"+
-    "state.map.getPane('townSearchFocusPane').style.pointerEvents='none';\n"+
-    _V182_FOCUS_PANE_ANCHOR,1)
-_V182_OLD_JUMP = _V181_RENDER_REPLACEMENT
-_V182_NEW_JUMP = """ updateOverlay(args.geo,args.signature);
- // The selected district's real geometry is independent of rent observations.
- // A new command gets processed exactly once; rerendering alone does not pan.
- var target=args.jump;
- if(target && target.id && Array.isArray(target.bounds) && target.bounds.length===4 &&
-    String(target.id)!==state.lastJumpToken){
-   var box=target.bounds.map(Number);
-   if(box.every(Number.isFinite) && box[0]>=34 && box[2]<=37 && box[1]>=138 && box[3]<=141 &&
-      box[0]<box[2] && box[1]<box[3]){
-     try{
-       var focus=L.geoJSON(target.geo,{pane:'townSearchFocusPane',interactive:false,
-         smoothFactor:1.0,style:function(){return {
-           color:'#195d72',weight:2,opacity:.88,fillColor:'#69adb8',fillOpacity:.12,
-           dashArray:null,lineCap:'round',lineJoin:'round',interactive:false
-         }}});
-       if(!focus.getLayers().length)throw new Error('検索地域の境界データがありません');
-       if(state.focusLayer)state.map.removeLayer(state.focusLayer);
-       state.focusLayer=focus.addTo(state.map);
-       state.lastJumpToken=String(target.id);
-       state.sentBounds='';
-       // Avoid an animated viewport callback racing a Streamlit fragment rerun.
-       state.map.invalidateSize();
-       state.map.once('moveend',function(){emitBounds()});
-       state.map.fitBounds([[box[0],box[1]],[box[2],box[3]]],
-          {padding:[24,24],maxZoom:16,animate:false});
-       setTimeout(function(){emitBounds()},120);
-     }catch(err){note('地名検索の表示に失敗しました: '+(err&&err.message||'エラー'));}
-   }
- }
- redrawStations();"""
-assert TOWN_COMPONENT_HTML_V121.count(_V182_OLD_JUMP)==1
-TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(_V182_OLD_JUMP,_V182_NEW_JUMP,1)
-_V182_EMIT_OLD="var key=arr.map(function(v){return v.toFixed(5)}).join(',')+'|'+state.map.getZoom();"
-_V182_EMIT_NEW="var key=arr.map(function(v){return v.toFixed(5)}).join(',')+'|'+state.map.getZoom()+'|'+(state.lastJumpToken||'');"
-assert TOWN_COMPONENT_HTML_V121.count(_V182_EMIT_OLD)==1
-TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(_V182_EMIT_OLD,_V182_EMIT_NEW,1)
-_V182_SEND_OLD="},zoom:state.map.getZoom()}});"
-_V182_SEND_NEW="},zoom:state.map.getZoom(),jump_applied:state.lastJumpToken||null}});"
-assert TOWN_COMPONENT_HTML_V121.count(_V182_SEND_OLD)==1
-TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(_V182_SEND_OLD,_V182_SEND_NEW,1)
-
-
-# v184: search lives INSIDE the same stable Leaflet iframe.  A click moves
-# its map immediately, then asks Python only for the exact polygon boundary.
-# It is not blocked by the external Streamlit form or unrelated page reruns.
-_V184_SEARCH_CSS = """
-html,body{height:auto!important;min-height:0!important;overflow:hidden!important}
-#town-search-panel{box-sizing:border-box;width:100%;padding:12px 13px 14px;background:#fff;border-top:1px solid #d5dfdc;font-family:inherit;color:#173a5e}
-#town-search-panel label{display:block;font-size:13px;font-weight:750;margin:0 0 6px}
-#town-query{width:100%;box-sizing:border-box;height:40px;border:1px solid #b9c7c3;border-radius:7px;background:#fff;color:#173a5e;padding:7px 10px;font-size:16px}
-#town-submit,#town-confirm{display:block;width:100%;box-sizing:border-box;margin-top:9px;min-height:40px;border:1px solid #a5b8b0;border-radius:7px;background:#fff;color:#173a5e;font-size:14px;font-weight:650;cursor:pointer;touch-action:manipulation}
-#town-submit:active,#town-confirm:active{background:#dfe9e6}
-#town-select{width:100%;height:40px;margin-top:9px;border:1px solid #b9c7c3;border-radius:7px;font-size:15px;background:white;color:#173a5e}
-#town-search-status{font-size:12px;line-height:1.35;color:#49616b;margin-top:7px;min-height:0}
-#town-options[hidden]{display:none!important}
-"""
-_V184_SEARCH_DOM = """<div id=\"town-search-panel\"><label for=\"town-query\">地名を検索して地図を移動</label><input id=\"town-query\" type=\"search\" autocomplete=\"off\" placeholder=\"例：中落合、豊島区南長崎3丁目\"/><button type=\"button\" id=\"town-submit\">検索した地域へ移動</button><div id=\"town-options\" hidden><label for=\"town-select\">該当する地域を選択</label><select id=\"town-select\"></select><button type=\"button\" id=\"town-confirm\">選んだ地域に移動</button></div><div id=\"town-search-status\" role=\"status\" aria-live=\"polite\"></div></div>"""
-assert TOWN_COMPONENT_HTML_V121.count('</style></head>')==1
-TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('</style></head>',_V184_SEARCH_CSS+'</style></head>',1)
-assert TOWN_COMPONENT_HTML_V121.count('<div id="map"></div>')==1
-TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('<div id="map"></div>','<div id="map"></div>'+_V184_SEARCH_DOM,1)
-assert TOWN_COMPONENT_HTML_V121.count("{height:"+str(_V153_FRAME_HEIGHT)+"}")==1
-TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace("{height:"+str(_V153_FRAME_HEIGHT)+"}","{height:Math.max(615,document.documentElement.scrollHeight)}",1)
-
-_V184_CLIENT_SEARCH_JS = r"""
-function setTownStatus(message){
- var node=document.getElementById('town-search-status');
- if(node)node.textContent=message||'';
-}
-function normalizeTownQuery(value){
- var text=String(value||'');
- try{text=text.normalize('NFKC')}catch(e){}
- var digits={'一':1,'二':2,'三':3,'四':4,'五':5,'六':6,'七':7,'八':8,'九':9};
- text=text.replace(/([一二三四五六七八九十]+)丁目/g,function(all,part){
-   if(part.indexOf('十')>=0){var halves=part.split('十');return ((digits[halves[0]]||1)*10+(digits[halves[1]]||0))+'丁目';}
-   return (digits[part]||part)+'丁目';
- });
- return text.replace(/[\s\u3000、,，。・/／]/g,'').replace(/^東京都/,'').replace(/^東京/,'');
-}
-function townCandidates(raw){
- var wanted=normalizeTownQuery(raw);
- if(!wanted)return [];
- var ward='';
- var wards=state.searchDistricts||[];
- var sorted=wards.slice().sort(function(a,b){return b.length-a.length});
- for(var i=0;i<sorted.length;i++){
-   if(wanted.indexOf(sorted[i])===0){ward=sorted[i];wanted=wanted.slice(ward.length);break;}
- }
- if(!wanted&&ward){
-   var w=(state.searchWardBounds||[]).find(function(x){return x.ward===ward});
-   return w?[{ward:ward,name:ward,kind:'ward',label:ward,bounds:w.bounds,rank:0}]:[];
- }
- if(/.+[0-9]{1,2}$/.test(wanted))wanted+='丁目';
- var specific=/[0-9]+丁目$/.test(wanted);
- var matched=new Map();
- (state.searchCatalog||[]).forEach(function(area){
-   if(ward&&area.ward!==ward)return;
-   var name=specific?area.town:area.base;
-   if(!name)return;
-   var rank=name===wanted?0:(name.indexOf(wanted)===0?1:(name.includes(wanted)?2:99));
-   if(rank===99)return;
-   var id=area.ward+'|'+name+'|'+(specific?'chome':'town');
-   var entry=matched.get(id),b=area.bounds;
-   if(entry){
-     entry.rank=Math.min(entry.rank,rank);
-     entry.bounds=[Math.min(entry.bounds[0],b[0]),Math.min(entry.bounds[1],b[1]),Math.max(entry.bounds[2],b[2]),Math.max(entry.bounds[3],b[3])];
-     entry.size++;
-   }else{
-     matched.set(id,{ward:area.ward,name:name,kind:specific?'chome':'town',label:area.ward+' '+name,bounds:b.slice(),rank:rank,size:1});
-   }
- });
- var results=Array.from(matched.values()).sort(function(a,b){return a.rank-b.rank||a.ward.localeCompare(b.ward,'ja')||a.name.localeCompare(b.name,'ja')});
- if(results.length&&results[0].rank===0)results=results.filter(function(x){return x.rank===0});
- results=results.slice(0,80);
- results.forEach(function(x){if(x.size>1&&x.kind==='town')x.label+='（全'+x.size+'区域）'});
- return results;
-}
-function townSendSelection(place){
- if(!state.map){setTownStatus('地図を読み込み中です。');return;}
- var b=place.bounds.map(Number);
- if(b.length!==4 || !b.every(Number.isFinite) || !(b[0]<b[2]&&b[1]<b[3])){
-   setTownStatus('選択地域の範囲が不正です。');return;
- }
- // Pan and zoom immediately in the BROWSER, before any Streamlit rerun.
- // The dashed temporary rectangle is not a claim about the true boundary.
- if(state.provisionalFocus){state.map.removeLayer(state.provisionalFocus);state.provisionalFocus=null;}
- state.map.invalidateSize();
- state.map.fitBounds([[b[0],b[1]],[b[2],b[3]]],{padding:[25,25],maxZoom:16,animate:false});
- if(state.focusLayer){state.map.removeLayer(state.focusLayer);state.focusLayer=null;}
- state.provisionalFocus=L.rectangle([[b[0],b[1]],[b[2],b[3]]],{color:'#719da6',weight:1.5,dashArray:'4 4',fillColor:'#c0dfe2',fillOpacity:.08,interactive:false}).addTo(state.map);
- var ticket=String(Date.now())+'_'+Math.random().toString(36).slice(2,11);
- state.searchPendingTicket=ticket;
- state.sentBounds='';
- setTownStatus('「'+place.label+'」へ移動しました。正確な境界線を読み込み中…');
- var mapBounds=state.map.getBounds();
- hostMessage('streamlit:setComponentValue',{dataType:'json',value:{
-   event:'town_search_v184',ticket:ticket,ward:place.ward,name:place.name,kind:place.kind,
-   bounds:{_southWest:{lat:mapBounds.getSouth(),lng:mapBounds.getWest()},_northEast:{lat:mapBounds.getNorth(),lng:mapBounds.getEast()}},
-   zoom:state.map.getZoom(),jump_applied:state.lastJumpToken||null
- }});
-}
-function submitTownQuery(){
- var input=document.getElementById('town-query');
- var placeChoices=townCandidates(input&&input.value);
- var area=document.getElementById('town-options');
- var select=document.getElementById('town-select');
- area.hidden=true;
- if(!placeChoices.length){
-   setTownStatus((state.searchCatalog||[]).length?'該当する地域が見つかりません。区名や町名を確認してください。':'町丁目境界を準備中です。地図の読込後に再度検索してください。');
-   return;
- }
- if(placeChoices.length===1){townSendSelection(placeChoices[0]);return;}
- state.searchChoices=placeChoices;
- select.replaceChildren();
- placeChoices.forEach(function(place,index){var option=document.createElement('option');option.value=String(index);option.textContent=place.label;select.appendChild(option)});
- area.hidden=false;
- setTownStatus('候補が'+placeChoices.length+'件あります。移動先を選択してください。');
- setHeight();
-}
-function initTownSearch(){
- if(state.searchUiInitialized)return;
- state.searchUiInitialized=true;
- document.getElementById('town-submit').addEventListener('click',submitTownQuery);
- document.getElementById('town-query').addEventListener('keydown',function(e){
-   if(e.key==='Enter'){e.preventDefault();submitTownQuery()}
- });
- document.getElementById('town-confirm').addEventListener('click',function(){
-   var index=Number(document.getElementById('town-select').value);
-   var choice=(state.searchChoices||[])[index];
-   if(choice){document.getElementById('town-options').hidden=true;townSendSelection(choice)}
- });
-}
-"""
-assert TOWN_COMPONENT_HTML_V121.count('function render(args){')==1
-TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('function render(args){',_V184_CLIENT_SEARCH_JS+'\nfunction render(args){',1)
-assert TOWN_COMPONENT_HTML_V121.count(' state.stations=Array.isArray(args.stations)?')==1
-TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(
-    ' state.stations=Array.isArray(args.stations)?',
-    " initTownSearch();\n state.searchCatalog=Array.isArray(args.search_catalog)?args.search_catalog:[];\n state.searchDistricts=Array.isArray(args.search_district_names)?args.search_district_names:[];\n state.searchWardBounds=Array.isArray(args.search_ward_bounds)?args.search_ward_bounds:[];\n if(args.search_error && args.search_error.ticket===state.searchPendingTicket){\n   state.searchPendingTicket=null;\n   if(state.provisionalFocus){state.map.removeLayer(state.provisionalFocus);state.provisionalFocus=null;}\n   setTownStatus(String(args.search_error.message||'地域境界の取得に失敗しました。'));\n   setTimeout(emitBounds,100);\n }\n state.stations=Array.isArray(args.stations)?",1)
-assert TOWN_COMPONENT_HTML_V121.count('function emitBounds(){if(!state.map)return;')==1
-TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('function emitBounds(){if(!state.map)return;', 'function emitBounds(){if(!state.map||state.searchPendingTicket)return;',1)
-# On exact polygon render, remove provisional bbox and release viewport messages.
-old="       state.focusLayer=focus.addTo(state.map);\n       state.lastJumpToken=String(target.id);"
-new="""       state.focusLayer=focus.addTo(state.map);
-       if(state.provisionalFocus){state.map.removeLayer(state.provisionalFocus);state.provisionalFocus=null;}
-       state.searchPendingTicket=null;
-       setTownStatus('「'+String(target.label||'地域')+'」へ移動し、町域の外周を表示しました。');
-       state.lastJumpToken=String(target.id);"""
-assert TOWN_COMPONENT_HTML_V121.count(old)==1
-TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(old,new,1)
-
-# v185 direct client-side, persistent geography index.
-_V185_LOCAL_SEARCH_JS = r'''
-// v185: client-owned town lookup.  The 2015 e-Stat area source is fetched
-// once, reduced to Tokyo's 23 wards and stored in IndexedDB.  On next page
-// open and after app.py deployments, a local index drives instant lookup,
-// exact geometry highlights and fitBounds without a Streamlit round trip.
-// This is deliberately independent of the rent aggregation worker.
-var _v185_oldInit=initTownSearch;
-var _v185_oldSubmit=submitTownQuery;
-var _v185_oldSelect=townSendSelection;
-function v185Db(){
- return new Promise(function(resolve,reject){
-   if(!window.indexedDB){reject(new Error('IndexedDB unsupported'));return;}
-   var req=indexedDB.open('sumai_town_2015_cache',1);
-   req.onupgradeneeded=function(){if(!req.result.objectStoreNames.contains('geo'))req.result.createObjectStore('geo')};
-   req.onsuccess=function(){resolve(req.result)};
-   req.onerror=function(){reject(req.error||new Error('IndexedDB open failed'))};
-   req.onblocked=function(){reject(new Error('IndexedDB blocked'))};
- });
-}
-async function v185ReadCache(){
- var db=await v185Db();
- try{return await new Promise(function(resolve,reject){
-   var req=db.transaction('geo','readonly').objectStore('geo').get('tokyo-23-2015-v1');
-   req.onsuccess=function(){resolve(req.result||null)};
-   req.onerror=function(){reject(req.error||new Error('IndexedDB read failed'))};
- });}finally{db.close()}
-}
-async function v185WriteCache(rows){
- var db=await v185Db();
- try{await new Promise(function(resolve,reject){
-   var tx=db.transaction('geo','readwrite');
-   tx.objectStore('geo').put(rows,'tokyo-23-2015-v1');
-   tx.oncomplete=resolve;
-   tx.onerror=function(){reject(tx.error||new Error('IndexedDB write failed'))};
-   tx.onabort=function(){reject(tx.error||new Error('IndexedDB write aborted'))};
- });}finally{db.close()}
-}
-function v185Bounds(geometry){
- var all=[];
- function walk(value){
-   if(!Array.isArray(value))return;
-   if(value.length>=2&&typeof value[0]==='number'&&typeof value[1]==='number'){
-     var x=value[0],y=value[1];
-     if(Number.isFinite(x)&&Number.isFinite(y)&&x>=138&&x<=141&&y>=34&&y<=37)all.push([x,y]);
-   }else value.forEach(walk);
- }
- walk(geometry&&geometry.coordinates);
- if(!all.length)return null;
- var s=90,w=180,n=-90,e=-180;
- all.forEach(function(p){s=Math.min(s,p[1]);w=Math.min(w,p[0]);n=Math.max(n,p[1]);e=Math.max(e,p[0])});
- return s<n&&w<e?[s,w,n,e]:null;
-}
-function v185NormalizeSource(doc){
- if(!doc||!Array.isArray(doc.features))throw new Error('境界データ形式に問題があります');
- var allowed=new Set(state.searchDistricts||[]);
- var result=[];
- doc.features.forEach(function(feature){
-   var fullname=String((feature.properties||{}).fullname||'').split('/');
-   var ward=fullname[1]||'',town=normalizeTownQuery(fullname[2]||'');
-   if(!allowed.has(ward)||!town||!feature.geometry)return;
-   result.push({w:ward,t:town,g:feature.geometry});
- });
- if(result.length<2000)throw new Error('東京23区の境界データが不足しています');
- return result;
-}
-function v185Install(rows){
- if(!Array.isArray(rows)||rows.length<100)throw new Error('境界索引が不正です');
- var catalog=[],geo=new Map(),wardBounds=new Map(),valid=0;
- rows.forEach(function(f){
-   if(!f||!f.w||!f.t||!f.g)return;
-   var b=v185Bounds(f.g);
-   if(!b)return;
-   var base=f.t.replace(/[0-9]{1,2}丁目$/,'');
-   catalog.push({ward:f.w,town:f.t,base:base,bounds:b});
-   var id=f.w+'|'+f.t;
-   if(!geo.has(id))geo.set(id,[]);
-   geo.get(id).push(f.g);
-   var old=wardBounds.get(f.w);
-   wardBounds.set(f.w,old?[Math.min(old[0],b[0]),Math.min(old[1],b[1]),Math.max(old[2],b[2]),Math.max(old[3],b[3])]:b.slice());
-   valid++;
- });
- if(valid<100)throw new Error('町丁目境界が見つかりません');
- state._v185Geometry=geo;
- state._v185Loaded=true;
- state._v185Loading=false;
- state.searchCatalog=catalog;
- state.searchWardBounds=Array.from(wardBounds,function(p){return {ward:p[0],bounds:p[1]}});
- if(state._v185DeferredQuery!==null&&state._v185DeferredQuery!==undefined){
-   var pending=state._v185DeferredQuery;
-   state._v185DeferredQuery=null;
-   var q=document.getElementById('town-query');
-   if(q){q.value=pending;setTimeout(function(){submitTownQuery()},0)}
- }else if(document.getElementById('town-search-status').textContent.includes('準備中')){
-   setTownStatus('町丁目境界を読み込みました。検索できます。');
- }
-}
-async function v185FetchSource(url,ms){
- var ac=new AbortController(),timer=setTimeout(function(){ac.abort()},ms);
- try{
-   var res=await fetch(url,{signal:ac.signal,cache:'force-cache'});
-   if(!res.ok)throw new Error('HTTP '+res.status);
-   return v185NormalizeSource(await res.json());
- }finally{clearTimeout(timer)}
-}
-async function v185Init(){
- if(state._v185Started)return;
- state._v185Started=true;
- state._v185Loading=true;
- state._v185DeferredQuery=null;
- try{
-   var saved=null;
-   try{saved=await v185ReadCache()}catch(err){state._v185CacheWarning=String(err)}
-   if(saved&&saved.length>=2000){v185Install(saved);return;}
-   // Initial pre-registration, only when browser has no dataset.
-   var urls=['https://frogcat.github.io/japan-small-area/13.json',
-             'https://raw.githubusercontent.com/frogcat/japan-small-area/master/docs/13.json'];
-   var lastError='';
-   for(var i=0;i<urls.length;i++){
-     try{
-       var items=await v185FetchSource(urls[i],i===0?9500:10500);
-       v185Install(items);
-       try{await v185WriteCache(items)}catch(err){state._v185CacheWarning=String(err)}
-       return;
-     }catch(err){lastError=String(err&&err.message||err)}
-   }
-   throw new Error('町丁目境界の初回取得に失敗しました（'+lastError+'）。ネットワークを確認してください。');
- }catch(err){
-   state._v185Loading=false;
-   state._v185Failed=String(err&&err.message||err);
-   if(state._v185DeferredQuery!==null){
-     var pending=state._v185DeferredQuery;state._v185DeferredQuery=null;
-     if((state.searchCatalog||[]).length){
-       var input=document.getElementById('town-query');if(input)input.value=pending;
-       setTimeout(function(){_v185_oldSubmit()},0);
-     }else setTownStatus(state._v185Failed);
-   }
- }
-}
-// v186: a calm unified silhouette, rather than thick dashed strokes on every chome.
-// An SVG filter sees the COMBINED alpha of all selected polygons, so common
-// internal chome borders do not receive an outline.  No external JS library.
-function v186SimpleFocus(geo){
- return L.geoJSON(geo,{pane:'townSearchFocusPane',interactive:false,smoothFactor:.7,
-   style:function(){return {color:'#195d72',weight:2,opacity:.88,
-     fillColor:'#69adb8',fillOpacity:.12,dashArray:null,lineCap:'round',lineJoin:'round'};}});
-}
-function v186MakeFocus(geo){
- if(!L.svg||typeof SVGFilterElement==='undefined')return v186SimpleFocus(geo);
- var renderer=state._v186FocusRenderer;
- if(!renderer){renderer=L.svg({pane:'townSearchFocusPane',padding:.25});state._v186FocusRenderer=renderer;}
- var layer=L.geoJSON(geo,{renderer:renderer,pane:'townSearchFocusPane',interactive:false,
-   smoothFactor:.6,style:function(){return {stroke:false,weight:0,
-     fillColor:'#17576d',fillOpacity:1,fillRule:'evenodd'};}});
- layer._v186Renderer=renderer;
- return layer;
-}
-function v186UseUnifiedStyle(layer){
- // Called AFTER the layer is added; Leaflet only then constructs the SVG.
- var renderer=layer&&layer._v186Renderer;
- if(!renderer||!renderer._container||!renderer._rootGroup)return false;
- var svg=renderer._container,root=renderer._rootGroup;
- if(root.getAttribute('data-v186-focus-style')==='1')return true;
- var ns='http://www.w3.org/2000/svg';
- state._v186FocusSerial=(state._v186FocusSerial||0)+1;
- var id='sumai-town-focus-v186-'+String(state._v186FocusSerial);
- function svgTag(tag,attributes,parent){
-   var el=document.createElementNS(ns,tag);
-   Object.keys(attributes||{}).forEach(function(name){el.setAttribute(name,String(attributes[name]))});
-   if(parent)parent.appendChild(el);
-   return el;
- }
- var defs=svgTag('defs',{},null);
- var f=svgTag('filter',{id:id,x:'-15%',y:'-20%',width:'130%',height:'140%',
-   'color-interpolation-filters':'sRGB'},defs);
- svgTag('feMorphology',{'in':'SourceAlpha',operator:'dilate',radius:'4',result:'wide'},f);
- svgTag('feComposite',{'in':'wide',in2:'SourceAlpha',operator:'out',result:'haloMask'},f);
- svgTag('feFlood',{'flood-color':'#ffffff','flood-opacity':'.9',result:'haloColor'},f);
- svgTag('feComposite',{'in':'haloColor',in2:'haloMask',operator:'in',result:'halo'},f);
- svgTag('feMorphology',{'in':'SourceAlpha',operator:'dilate',radius:'2',result:'thin'},f);
- svgTag('feComposite',{'in':'thin',in2:'SourceAlpha',operator:'out',result:'lineMask'},f);
- svgTag('feFlood',{'flood-color':'#15566e','flood-opacity':'.94',result:'lineColor'},f);
- svgTag('feComposite',{'in':'lineColor',in2:'lineMask',operator:'in',result:'line'},f);
- svgTag('feFlood',{'flood-color':'#3a9ca8','flood-opacity':'.11',result:'tintColor'},f);
- svgTag('feComposite',{'in':'tintColor',in2:'SourceAlpha',operator:'in',result:'fill'},f);
- var merge=svgTag('feMerge',{},f);
- ['halo','fill','line'].forEach(function(key){svgTag('feMergeNode',{'in':key},merge)});
- svg.insertBefore(defs,svg.firstChild);
- root.setAttribute('filter','url(#'+id+')');
- root.setAttribute('pointer-events','none');
- root.setAttribute('data-v186-focus-style','1');
- return true;
-}
-function v185TownFocus(place){
- if(!state._v185Loaded||!state.map)return false;
- var selected=[],features=[];
- var wk=String(place.ward||''),nm=String(place.name||'');
- (state.searchCatalog||[]).forEach(function(area){
-   if(area.ward!==wk)return;
-   if(place.kind==='ward'||(place.kind==='town'?area.base===nm:area.town===nm)){
-     selected.push(area);
-     (state._v185Geometry.get(area.ward+'|'+area.town)||[]).forEach(function(g){
-       features.push({type:'Feature',properties:{name:area.ward+area.town},geometry:g});
-     });
-   }
- });
- if(!features.length)return false;
- var south=90,west=180,north=-90,east=-180;
- selected.forEach(function(area){var b=area.bounds;
-   south=Math.min(south,b[0]);west=Math.min(west,b[1]);north=Math.max(north,b[2]);east=Math.max(east,b[3]);
- });
- try{
-   var geometry={type:'FeatureCollection',features:features};
-   var outline=v186MakeFocus(geometry);
-   if(!outline.getLayers().length)return false;
-   if(state.focusLayer)state.map.removeLayer(state.focusLayer);
-   if(state.provisionalFocus){state.map.removeLayer(state.provisionalFocus);state.provisionalFocus=null}
-   state.focusLayer=outline.addTo(state.map);
-   if(outline._v186Renderer){
-     try{
-       if(!v186UseUnifiedStyle(outline))throw new Error('SVG renderer unavailable');
-     }catch(styleError){
-       // Older browsers still get a legible solid, translucent border.
-       state.map.removeLayer(outline);
-       outline=v186SimpleFocus(geometry);
-       state.focusLayer=outline.addTo(state.map);
-     }
-   }
-   state._v185FocusActive=true;
-   state.lastJumpToken='local-'+String(Date.now());
-   state.sentBounds='';
-   state.map.invalidateSize();
-   state.map.fitBounds([[south,west],[north,east]],{padding:[24,24],maxZoom:16,animate:false});
-   setTownStatus('「'+place.label+'」に移動し、町域の外周を表示しました。');
-   setTimeout(function(){emitBounds()},80);
-   return true;
- }catch(err){setTownStatus('輪郭表示エラー：'+String(err&&err.message||err));return false}
-}
-initTownSearch=function(){_v185_oldInit();v185Init()};
-submitTownQuery=function(){
- if(!state._v185Loaded&&state._v185Loading){
-   var node=document.getElementById('town-query');
-   state._v185DeferredQuery=String(node&&node.value||'');
-   setTownStatus('初回のみ町丁目境界を登録中です。完了後、自動的に移動します。');
-   return;
- }
- if(!state._v185Loaded&&state._v185Failed&&!(state.searchCatalog||[]).length){
-   var retryInput=document.getElementById('town-query');
-   var retryQuery=String(retryInput&&retryInput.value||'');
-   state._v185Started=false;state._v185Failed=null;
-   v185Init();state._v185DeferredQuery=retryQuery;
-   setTownStatus('町丁目境界の登録を再試行しています。完了後、自動的に移動します。');
-   return;
- }
- _v185_oldSubmit();
-};
-townSendSelection=function(place){
- if(state._v185Loaded){
-   if(!v185TownFocus(place))setTownStatus('指定地域の輪郭が見つかりません。');
-   return;
- }
- _v185_oldSelect(place);
-};
-'''
-assert TOWN_COMPONENT_HTML_V121.count('function render(args){')==1
-TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('function render(args){', _V185_LOCAL_SEARCH_JS+'\nfunction render(args){',1)
-# Later fragment responses must not erase the self-contained browser lookup.
-needle=" state.searchCatalog=Array.isArray(args.search_catalog)?args.search_catalog:[];"
-assert TOWN_COMPONENT_HTML_V121.count(needle)==1
-TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(needle," if(!state._v185Loaded)state.searchCatalog=Array.isArray(args.search_catalog)?args.search_catalog:[];",1)
-# A stale server jump must not override a successful instant browser search.
-needle="if(target && target.id && Array.isArray(target.bounds)"
-assert TOWN_COMPONENT_HTML_V121.count(needle)==1
-TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(needle,"if(!state._v185FocusActive && target && target.id && Array.isArray(target.bounds)",1)
-
-# v187: keep a wider neighborhood in view after a town/chome lookup.
-# The region still fits within the viewport; large wards can automatically use
-# a wider zoom. Apply to all three client-side search navigation paths (normal,
-# provisional/fallback, and a delayed server jump). Manual +/- zoom is unchanged.
-_V187_SEARCH_FIT_OLD = 'maxZoom:16,animate:false'
-assert TOWN_COMPONENT_HTML_V121.count(_V187_SEARCH_FIT_OLD) == 3
-TOWN_COMPONENT_HTML_V121 = TOWN_COMPONENT_HTML_V121.replace(
-    _V187_SEARCH_FIT_OLD,'maxZoom:14,animate:false')
-assert TOWN_COMPONENT_HTML_V121.count('maxZoom:14,animate:false') == 3
-
+# v182: unique name and static folder force the browser to fetch the updated
+# map script instead of keeping a previously mounted/cached v178 iframe.
 @st.cache_resource(show_spinner=False)
 def town_component_v121():
-    _asset_revision='v187-neighborhood-zoom14'
-    folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-v184')
+    folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-v182')
     os.makedirs(folder,exist_ok=True)
     path=os.path.join(folder,'index.html')
     # Component HTML is small; create once per worker process. Never include
@@ -11886,7 +11474,7 @@ def town_component_v121():
         with open(temp_path,'w',encoding='utf-8') as output:
             output.write(TOWN_COMPONENT_HTML_V121)
         os.replace(temp_path,path)
-    return st.components.v1.declare_component('sumai_town_map_v184',path=folder)
+    return st.components.v1.declare_component('sumai_town_map_v182',path=folder)
 
 # v159: Station-to-office approximate train travel times, OFFLINE AND READ-ONLY.
 # Tokyo Metro/Toei/JR local edge minutes adapted from MIT-licensed public project:
@@ -12465,20 +12053,29 @@ def town_station_refs_v164(destinations):
                        + (' ほか' if len(missing)>12 else ''))
     return stations,wards
 
-@st.fragment(run_every='6s')
+@st.fragment(run_every='15s')
 def town_choropleth_status():
-    """Read-only progress for an exclusively manual, background map job."""
+    """Poll summary/boundary readiness WITHOUT remounting the map iframe."""
     state=st.session_state
     store=current_town_summary_worker()
     snap=store.snapshot()
-    if state.get('_v183_manual_refresh_wait') and not snap['running']:
-        state['_v183_manual_refresh_wait']=False
-        if snap['ready'] and snap['revision']>state.get('_v183_manual_start_revision',-1):
-            # The map and its controls are outside this progress fragment.
-            # One normal rerun delivers the new summary to its Leaflet iframe.
-            st.rerun()
-    boundary_worker=town_boundary_registry();boundary_worker.start()
-    shapes,ready,busy,error=boundary_worker.snapshot()
+    # Persisted, per-namespace change marker makes out-of-process saves visible.
+    # Background polling is rate-limited to one tiny DB record per 60 seconds.
+    store.poll_source_marker()
+    automatic=get_automatic_collection()
+    active=bool(automatic and automatic.snapshot().get('running'))
+    if state.get('_v117_was_collecting') and not active and not snap['running']:
+        # The save hook already queued an update: avoid a second full scan.
+        if snap.get('pending'):
+            store.flush_saved_changes();snap=store.snapshot()
+        elif automatic is not None and getattr(automatic,'build',None)!=BUILD:
+            # An older collector may still be running after a code deployment.
+            store.start();snap=store.snapshot()
+    state['_v117_was_collecting']=active
+    boundaries=town_boundary_registry();boundaries.start()
+    shapes,ready,busy,error=boundaries.snapshot()
+    if snap['pending'] and not snap['running']:
+        st.caption('追加・更新された物件の地図反映を予約済み（自動更新）')
     if snap['running']:
         done=snap['progress'];total=snap.get('total_pages')
         if isinstance(total,int) and total>0:
@@ -12486,173 +12083,38 @@ def town_choropleth_status():
             st.progress(min(1.0,done/total))
         else:
             st.caption(f"町丁目家賃 {done}/--ページ")
-    elif snap['pending']:
-        st.caption('保存物件に未反映の更新があります。地図上の「保存物件を再集計」を押すと反映します。')
-    if busy:st.caption('地図の町丁目境界を読み込み中')
+    if busy:st.caption('境界データ読込中')
     if snap['error']:st.warning('平均家賃の集計：'+snap['error'])
-    if error:st.warning('境界の一部未取得：'+error)
+    if error:st.warning('境界の一部未取得：'+error+'。町丁目の保存家賃表示は継続します。')
     if snap['ready'] and not snap['running']:
         result=snap.get('summary') or {}
         updated=result.get('updated_at')
-        st.caption('町丁目家賃：保存済み集計' + ('｜更新 '+acquisition_time_jst(updated) if updated else ''))
+        st.caption('町丁目家賃：集計済み' + ('｜更新 '+acquisition_time_jst(updated) if updated else ''))
+        # Distinguish a stale snapshot from the absence of saved listings.
         group_totals=result.get('groups') or {}
+        def ward_saved_count(ward):
+            return sum(int(v[1]) for nodes in group_totals.values()
+                       if isinstance(nodes,dict) for k,v in nodes.items()
+                       if str(k).startswith(ward+'|') and isinstance(v,(list,tuple)) and len(v)>1)
+        st.caption(f"地図集計対象：{int(result.get('listing_count') or 0):,}件"
+                   f"｜品川区 {ward_saved_count('品川区'):,}件"
+                   f"｜渋谷区 {ward_saved_count('渋谷区'):,}件")
         if ready and hasattr(shapes,'coverage_keys'):
             report=town_coverage_audit(group_totals,shapes.coverage_keys(),
                          state.get('layout_display_group','group1'))
             if report['stored_without_geometry']:
-                st.warning(f"保存家賃が地図境界に一致しない地域：{len(report['stored_without_geometry'])}町丁目")
+                st.warning(f"保存された家賃が地図境界に一致しない地域：{len(report['stored_without_geometry'])}町丁目。下の詳細から確認できます。")
             with st.expander('東京23区・保存家賃の地図反映状況'):
+                st.caption('家賃表示＝境界と保存済み家賃が一致する町丁目。保存家賃なし＝未収集とは限らず、対象物件が0件の地域も含みます。')
                 st.dataframe(report['wards'],hide_index=True,use_container_width=True)
                 if report['stored_without_geometry']:
                     st.code('\n'.join(report['stored_without_geometry'][:100]),language=None)
-        if ready:st.caption('区境界：国土交通省（2021年）／町丁目：e-Stat国勢調査（2015年）')
+        if ready:st.caption('区境界：国土交通省 国土数値情報（2021年）、町丁目：e-Stat国勢調査（2015年）')
     elif not snap['running'] and not snap['ready'] and not snap['error']:
-        st.caption('町丁目家賃：まだ集計されていません。「保存物件を再集計」を押してください。')
+        st.caption('町丁目家賃：集計の開始待ち')
 
 
-def _v182_town_search_matches(query, boundary_path, limit=100):
-    """Search all 23 wards by town, optional ward, and optional chome.
-
-    Unqualified exact names do not guess between wards. A base-town search
-    groups ALL chome polygons in one ward and a chome search targets only that
-    chome. Prefix and substring matches are fallback choices if no exact match.
-    """
-    wanted=address_key(normal(query)).replace(' ','').replace('　','')
-    wanted=re.sub(r'[、,，。・/／]', '',wanted)
-    wanted=wanted.removeprefix('東京都').removeprefix('東京')
-    if not wanted or len(wanted)>80 or not boundary_path or not os.path.isfile(boundary_path):return []
-    selected_ward=next((w for w in sorted(TOKYO_WARDS.values(),key=len,reverse=True)
-                        if wanted.startswith(w)),None)
-    if selected_ward:wanted=wanted[len(selected_ward):]
-    # Full district requests can be used to zoom to a ward too.
-    if not wanted and selected_ward:
-        try:
-            with sqlite3.connect('file:'+quote(boundary_path,safe='/')+'?mode=ro',uri=True,timeout=5) as conn:
-                record=conn.execute('SELECT south,west,north,east FROM ward_areas WHERE ward=?',(selected_ward,)).fetchone()
-            if record and 34<=record[0]<record[2]<=37 and 138<=record[1]<record[3]<=141:
-                return [{'label':selected_ward,'bounds':list(map(float,record)),
-                         'ward':selected_ward,'kind':'ward','keys':[],'rank':0}]
-        except (sqlite3.Error,OSError,TypeError,ValueError):pass
-        return []
-    # A suffix like 南長崎3 is an optional abbreviation for 南長崎3丁目.
-    if re.fullmatch(r'.+?[0-9]{1,2}',wanted):wanted+='丁目'
-    specific=bool(re.search(r'[0-9]+丁目$',wanted))
-    try:
-        with sqlite3.connect('file:'+quote(boundary_path,safe='/')+'?mode=ro',uri=True,timeout=8) as conn:
-            records=conn.execute('SELECT town,south,west,north,east FROM areas').fetchall()
-    except (sqlite3.Error,OSError):return []
-    groups={}
-    for key,south,west,north,east in records:
-        if not isinstance(key,str) or '|' not in key:continue
-        ward,town=key.split('|',1)
-        if ward not in TOKYO_WARDS.values() or selected_ward and ward!=selected_ward:continue
-        full_name=address_key(town)
-        town_name=town_base_name(town)
-        target=full_name if specific else address_key(town_name)
-        if not wanted:continue
-        if target==wanted:rank=0
-        elif target.startswith(wanted):rank=1
-        elif wanted in target:rank=2
-        else:continue
-        try:
-            box=[float(south),float(west),float(north),float(east)]
-            if not all(map(math.isfinite,box)) or not(34<=box[0]<box[2]<=37 and 138<=box[1]<box[3]<=141):continue
-        except (TypeError,ValueError):continue
-        identifier=(ward,target)
-        entry=groups.get(identifier)
-        if entry:
-            entry['rank']=min(entry['rank'],rank)
-            b=entry['bounds']
-            entry['bounds']=[min(b[0],box[0]),min(b[1],box[1]),
-                             max(b[2],box[2]),max(b[3],box[3])]
-            if key not in entry['keys']:entry['keys'].append(key)
-        else:
-            groups[identifier]={'ward':ward,'name':target,'label':ward+' '+target,
-                                'bounds':box,'kind':'town','rank':rank,'keys':[key]}
-    if not groups:return []
-    ordered=sorted(groups.values(),key=lambda x:(x['rank'],x['ward'],x['name']))
-    # Exact matches across multiple wards are ALL choices; fuzzy matches are
-    # candidates only when no exact town name exists.
-    if ordered[0]['rank']==0:ordered=[x for x in ordered if x['rank']==0]
-    for item in ordered:
-        if not specific and len(item['keys'])>1:
-            item['label']+='（全'+str(len(item['keys']))+'区域）'
-    return ordered[:limit]
-
-
-def _v182_town_selection_geometry(choice, boundary_path):
-    """Read the *actual* town/ward perimeter even when rent data is absent."""
-    features=[]
-    try:
-        with sqlite3.connect('file:'+quote(boundary_path,safe='/')+'?mode=ro',uri=True,timeout=8) as conn:
-            if choice.get('kind')=='ward':
-                row=conn.execute('SELECT poly FROM ward_areas WHERE ward=?',(choice.get('ward'),)).fetchone()
-                rows=[(choice['ward'],row[0])] if row else []
-            else:
-                keys=choice.get('keys') or []
-                if not keys or len(keys)>450:raise ValueError('地名検索の区域数が不正です。')
-                placeholders=','.join('?' for _ in keys)
-                rows=conn.execute('SELECT town,poly FROM areas WHERE town IN ('+placeholders+')',keys).fetchall()
-        for key,poly in rows:
-            polygons=json.loads(poly)
-            if not isinstance(polygons,list) or not polygons:continue
-            features.append({'type':'Feature','properties':{'name':key},
-                             'geometry':{'type':'MultiPolygon','coordinates':polygons}})
-    except (sqlite3.Error,OSError,json.JSONDecodeError,TypeError) as exc:
-        raise ValueError('選択した地域の境界を読み込めません。') from exc
-    if not features:raise ValueError('選択地域の輪郭を取得できません。')
-    return {'type':'FeatureCollection','features':features}
-
-
-def _v182_request_town_jump(state,choice,boundary_path):
-    box=choice.get('bounds') if isinstance(choice,dict) else None
-    if not isinstance(box,(tuple,list)) or len(box)!=4 or not all(isinstance(v,(int,float)) and math.isfinite(v) for v in box):
-        raise ValueError('検索した地域の座標が不正です。')
-    outline=_v182_town_selection_geometry(choice,boundary_path)
-    # Preserve the command through polling and component rerenders until its
-    # browser acknowledgment is seen; never silently assume the map moved.
-    token=str(time.monotonic_ns())
-    state['_v182_map_jump']={'id':token,'bounds':list(box),'geo':outline,'label':choice['label']}
-    state['_v182_map_jump_confirmed']=None
-    state['_v182_town_selected']=choice['label']
-    state['_v181_location_search_matches']=[]
-    state['_v181_location_search_note']='「'+choice['label']+'」を地図上で囲み、表示位置を移動します。'
-    state['new_bounds']=tuple(box)
-    state['new_view_center']=bounds_center(box)
-
-
-@st.cache_data(show_spinner=False,ttl=3600)
-def town_search_catalog_v184(db_path,db_mtime):
-    """Small 23-ward bbox index from the EXISTING read-only town geometry DB."""
-    rows=[];wards=[]
-    with sqlite3.connect('file:'+quote(db_path,safe='/')+'?mode=ro',uri=True,timeout=8) as conn:
-        for key,s,w,n,e in conn.execute('SELECT town,south,west,north,east FROM areas'):
-            if not isinstance(key,str) or '|' not in key:continue
-            ward,town=key.split('|',1)
-            if ward not in TOKYO_WARDS.values():continue
-            try:
-                box=[float(s),float(w),float(n),float(e)]
-            except (TypeError,ValueError,OverflowError):continue
-            if not all(map(math.isfinite,box)) or not(34<=box[0]<box[2]<=37 and 138<=box[1]<box[3]<=141):continue
-            rows.append({'ward':ward,'town':address_key(town),
-                         'base':address_key(town_base_name(town)),'bounds':box})
-        try:
-            ward_records=conn.execute('SELECT ward,south,west,north,east FROM ward_areas')
-            for ward,s,w,n,e in ward_records:
-                if ward not in TOKYO_WARDS.values():continue
-                try:
-                    bounds=[float(s),float(w),float(n),float(e)]
-                except (TypeError,ValueError,OverflowError):continue
-                if all(map(math.isfinite,bounds)) and 34<=bounds[0]<bounds[2]<=37 and 138<=bounds[1]<bounds[3]<=141:
-                    wards.append({'ward':ward,'bounds':bounds})
-        except sqlite3.OperationalError:
-            # Some existing boundary caches do not contain the optional ward table.
-            # Town search must still work using the areas table.
-            pass
-    return rows,wards
-
-
-@st.fragment
+@st.fragment(run_every='8s')
 def interactive_town_choropleth(group):
     """Leaflet map persists in the browser across Streamlit fragment reruns.
 
@@ -12661,44 +12123,25 @@ def interactive_town_choropleth(group):
     observed map-whitening failure when bounds callbacks cause a rerun.
     """
     state=st.session_state
-    group=state.get('layout_display_group',group)
-    # Only this explicit user action launches the asynchronous DB aggregation.
-    if st.button('保存物件を再集計',key='recompute_v143_town_map'):
+    # Optional one-tap repair; regular saves refresh automatically. Keep
+    # controls vertical so their Japanese labels stay legible on Android.
+    if st.button('保存物件を再集計（通常は自動更新）',key='recompute_v143_town_map'):
         job=current_town_summary_worker()
-        previous=job.snapshot()
-        if not previous['running']:
-            if job.start():
-                state['_v183_manual_refresh_wait']=True
-                state['_v183_manual_start_revision']=previous['revision']
+        if not job.snapshot()['running']:
+            job.start()
         st.rerun(scope='fragment')
     if st.button('表示範囲を更新（地図移動後のみ）',key='refresh_v118_town_map'):
         state['_v118_map_revision']=int(state.get('_v118_map_revision',0))+1
         st.rerun(scope='fragment')
-    # Layout controls live next to the map instead of above map diagnostics.
-    if group not in ('group0','group1','group2','house'):group='group1';state.layout_display_group='group1'
-    if st.button('ワンルーム・1K・1DK',key='layout_group0_v174',type='primary' if group=='group0' else 'secondary',use_container_width=True):
-        if state.layout_display_group!='group0':state.layout_display_group='group0';st.rerun(scope='fragment')
-    if group=='group0':st.caption('マンション・築15年以内')
-    g1,g2,g3=st.columns(3)
-    with g1:
-        if st.button('1LDK・2K・2DK',key='layout_group1',type='primary' if group=='group1' else 'secondary',use_container_width=True):
-            if state.layout_display_group!='group1':state.layout_display_group='group1';st.rerun(scope='fragment')
-        if group=='group1':st.caption('マンション・築15年以内')
-    with g2:
-        if st.button('2LDK・3K・3DK',key='layout_group2',type='primary' if group=='group2' else 'secondary',use_container_width=True):
-            if state.layout_display_group!='group2':state.layout_display_group='group2';st.rerun(scope='fragment')
-        if group=='group2':st.caption('マンション・築15年以内')
-    with g3:
-        if st.button('一戸建て',key='layout_group_house',type='primary' if group=='house' else 'secondary',use_container_width=True):
-            if state.layout_display_group!='house':state.layout_display_group='house';st.rerun(scope='fragment')
-        if group=='house':st.caption('築40年以内・50㎡以上')
     reset=int(state.get('_v118_map_reset_count',0))
     revision=int(state.get('_v118_map_revision',0))
     store=current_town_summary_worker();snap=store.snapshot()
+    store.poll_source_marker()
     boundary_worker=town_boundary_registry();boundary_worker.start()
     shapes,ready,busy,error=boundary_worker.snapshot()
-    # Only a successful MANUAL aggregate invalidates cached rent colors.
-    # The stable component key preserves browser pan/zoom.
+    # A new successful aggregate automatically invalidates the cached colors.
+    # The stable component key preserves browser pan/zoom and avoids an iframe
+    # remount; Leaflet replaces only the GeoJSON layer for changed revisions.
     summary_version=(snap.get('summary') or {}).get('updated_at','')
     registry=_v168_town_oz_registry()
     old_payload=state.get('_v118_choropleth_payload')
@@ -12739,67 +12182,23 @@ def interactive_town_choropleth(group):
     if cached['ready']:
         st.caption(f"着色 {cached['colored_count']}町丁目｜保存家賃のない地域は背景地図のまま表示")
     else:
-        st.caption('保存物件の再集計を押すと、家賃の色分けをバックグラウンドで作成します')
-    search_catalog=[];search_ward_bounds=[]
-    if ready and isinstance(shapes,TownBoundaryStore):
-        try:
-            search_catalog,search_ward_bounds=town_search_catalog_v184(shapes.path,os.stat(shapes.path).st_mtime_ns)
-        except (OSError,sqlite3.Error,ValueError,TypeError):
-            pass
+        st.caption('集計中。完了後、地図の色は自動更新されます')
     stations,wards=town_station_refs_v164(destinations)
     widget=town_component_v121()
     data=widget(center=list(cached['center']),zoom=14,geo=cached['geo'],
                 signature=cached['layer_signature'],stations=stations,wards=wards,
-                search_catalog=search_catalog,search_district_names=list(TOKYO_WARDS.values()),
-                search_ward_bounds=search_ward_bounds,
-                search_error=state.get('_v184_search_error'),
                 commute_destination=(destinations[0] if destinations else ''),
                 commute_destination_2=(destinations[1] if len(destinations)==2 else ''),
-                jump=state.get('_v182_map_jump'),
-                key='town_map_v184_'+str(reset),default=None)
+                key='town_map_v172_'+str(reset),default=None)
     if isinstance(data,dict):
         current=viewport_bounds(data)
-        if data.get('event')=='town_search_v184':
-            ticket=str(data.get('ticket') or '')[:100]
-            if ticket and ticket!=state.get('_v184_last_search_ticket'):
-                state['_v184_last_search_ticket']=ticket
-                state['_v184_search_error']=None
-                name=str(data.get('name') or '')[:90]
-                ward=str(data.get('ward') or '')[:30]
-                kind=str(data.get('kind') or '')
-                options=_v182_town_search_matches((ward if kind=='ward' else ward+name),shapes.path) if ready and isinstance(shapes,TownBoundaryStore) else []
-                choice=next((x for x in options if x['ward']==ward and x.get('name',x.get('label'))==name and
-                            x['kind']==('ward' if kind=='ward' else 'town')),None)
-                if choice is not None and (kind=='ward' or kind=='town' or kind=='chome'):
-                    try:
-                        _v182_request_town_jump(state,choice,shapes.path)
-                    except ValueError as exc:
-                        state['_v184_search_error']={'ticket':ticket,'message':str(exc)}
-                else:
-                    state['_v184_search_error']={'ticket':ticket,'message':'検索した町域の境界を取得できませんでした。'}
-                if current:
-                    state['new_bounds']=current;state['new_view_center']=bounds_center(current)
-                st.rerun(scope='fragment')
-        command=state.get('_v182_map_jump')
-        confirmed=not command or data.get('jump_applied')==command.get('id')
-        if command and confirmed:
-            state['_v182_map_jump_confirmed']=command['id']
-        if current and confirmed:
+        if current:
             state['new_bounds']=current;state['new_view_center']=bounds_center(current)
             state['new_map']=data
-
-
-def town_location_search_panel_v184():
-    """Map reset remains external; searching is now inside the Leaflet iframe."""
-    state=st.session_state
     if st.button('地図を再初期化',key='reset_v118_map'):
-        state.pop('_v182_map_jump',None)
-        state.pop('_v182_map_jump_confirmed',None)
-        state.pop('_v181_map_jump',None)
         state.pop('_v118_choropleth_payload',None)
-        state.pop('_v184_search_error',None)
-        state['_v118_map_reset_count']=int(state.get('_v118_map_reset_count',0))+1
-        st.rerun()
+        state['_v118_map_reset_count']=reset+1
+        st.rerun(scope='fragment')
 
 
 # V147: REAL-URL REPLAY.  This mode uses the SAME fetch/parse/map-address/
@@ -13543,12 +12942,30 @@ def main():
     with tabs[0]:
         st.subheader('地図を動かして、探す地域を表示してください')
         selected_group=state.get('layout_display_group','group1')
+        if selected_group not in ('group0','group1','group2','house'):selected_group='group1';state.layout_display_group='group1'
+        if st.button('ワンルーム・1K・1DK',key='layout_group0_v174',type='primary' if selected_group=='group0' else 'secondary',use_container_width=True):
+            if state.layout_display_group!='group0':state.layout_display_group='group0';st.rerun()
+        if selected_group=='group0':st.caption('マンション・築15年以内')
+        g1,g2,g3=st.columns(3)
+        with g1:
+            if st.button('1LDK・2K・2DK',key='layout_group1',type='primary' if selected_group=='group1' else 'secondary',use_container_width=True):
+                if state.layout_display_group!='group1':state.layout_display_group='group1';st.rerun()
+            if selected_group=='group1':st.caption('マンション・築15年以内')
+        with g2:
+            if st.button('2LDK・3K・3DK',key='layout_group2',type='primary' if selected_group=='group2' else 'secondary',use_container_width=True):
+                if state.layout_display_group!='group2':state.layout_display_group='group2';st.rerun()
+            if selected_group=='group2':st.caption('マンション・築15年以内')
+        with g3:
+            if st.button('一戸建て',key='layout_group_house',type='primary' if selected_group=='house' else 'secondary',use_container_width=True):
+                if state.layout_display_group!='house':state.layout_display_group='house';st.rerun()
+            if selected_group=='house':st.caption('築40年以内・50㎡以上')
+        selected_group=state.get('layout_display_group','group1')
         bounds=state.get('new_bounds')
         center=bounds_center(bounds) if bounds else state.get('new_view_center',DEFAULT_CENTER)
         radius=bounds_radius(bounds) if bounds else 1500
+        town_choropleth_status()
         interactive_town_choropleth(selected_group)
-        town_location_search_panel_v184()
-        # Only the map is a fragment; the search is an ordinary form.
+        # Fragment owns its widget container directly, including partial reruns.
         background_progress()
         # Initial component defaults are not real viewport bounds. Only the browser callback makes the search ready.
         bounds=state.get('new_bounds')
@@ -13591,8 +13008,6 @@ def main():
                 with st.expander('今回検索した地名・丁目'):
                     for label in result['conditions']['regions']: st.write(label)
         st.caption('町丁目別の集計対象は保存済みの募集データです。件数と平均家賃は区・町丁目単位で集計します。')
-        # Detailed 23-ward coverage and aggregation status are low-priority UI.
-        town_choropleth_status()
     with tabs[1]:
         st.caption('物件と家賃の集計は共通のSupabaseに保存し、全利用者で同じデータを参照します。通勤設定は共有しません。')
         if state.get('saved_map_restore_message'):st.caption(state.saved_map_restore_message)
@@ -13622,13 +13037,16 @@ def main():
                          disabled=bool(active_saved_load() and not active_saved_load().snapshot()['finished'])):
                 try:start_saved_load(bounds,state.get('address_point_cache'),force_full=True)
                 except AppError as exc:st.error(str(exc))
-            st.caption('地図の集計は「住まいを探す」タブの「保存物件を再集計」で開始します。')
+            if st.button('町丁目の家賃集計をやり直す',key='refresh_town_aggregate',
+                         disabled=current_town_summary_worker().snapshot()['running']):
+                current_town_summary_worker().start()
+            st.caption('再読込は一覧の修復用です。地図の再集計は別処理です。')
             upload=st.file_uploader('このアプリのCSVを追加する',type=['csv'])
             if st.button('CSVの物件をSupabaseへ保存',disabled=upload is None or bool(active_job() and not active_job().snapshot()['finished']),key='new_import'):
                 try:
                     rows=read_csv(upload.getvalue());saved=Database().save_units(rows)
                     state.new_map_loaded=False;state.new_units=[];state.new_saved_keys=[]
-                    state.new_notice=f'CSVから{len(saved)}件を保存しました。地図反映には「保存物件を再集計」を押してください。';st.rerun()
+                    state.new_notice=f'CSVから{len(saved)}件を保存しました。町丁目集計も更新します。';current_town_summary_worker().start();st.rerun()
                 except AppError as exc: st.error(str(exc))
             if st.button('画面上の未保存物件を再保存',key='new_retry_save',disabled=not state.new_units or bool(active_job() and not active_job().snapshot()['finished'])):
                 try:
@@ -13751,7 +13169,7 @@ def main():
             st.caption(f'設定中：① {chosen[0]}駅　② {chosen[1]}駅｜地図上は駅名＋1駅目の時間、その下に2駅目の時間を表示')
         elif chosen:
             st.caption(f'設定中：{chosen[0]}駅｜地図上は従来の1行表示')
-        st.caption('地図には「①35分（参考136%）-2回」の形式で表示します。混雑率は国土交通省2025年度の路線代表最混雑区間から計算した参考値です。')
+        st.caption('地図には「①35分（混雑136%）-2回」の形式で表示します。混雑率は国土交通省2025年度の路線代表最混雑区間から計算した参考値です。')
         st.caption('設定後、「住まいを探す」タブの地図に反映します。乗換回数最少を優先し、同数の場合に所要時間最短の経路を選びます（アプリ内路線データによる概算）。'
                    '現行時刻表・待ち時間・改札内移動・職場までの徒歩時間は含みません。')
         options=physical_units([r for r in state.new_units if has_point(r) and r.get('coordinate_precision')!='town'])
