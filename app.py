@@ -9,6 +9,9 @@ from __future__ import annotations
 
 import base64
 import concurrent.futures as futures
+import functools
+import secrets
+import contextvars
 import csv
 import hashlib
 import heapq
@@ -52,7 +55,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v182"
+BUILD = "REBUILD-01-v183"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -722,7 +725,329 @@ button:disabled{background:#e3e9e3!important;color:#607369!important;opacity:1!i
 .unit{background:#fff;border-radius:16px;padding:18px;margin-bottom:12px;border:1px solid #e0e4da}
 .unit h3{font-size:18px;margin:0 0 8px}.unit a{color:#286b5d}
 @media(max-width:600px){.hero{padding:18px}.hero h1{font-size:26px}.block-container{padding-top:1rem}}
+/* v183: immediate, accessible tap/focus feedback on ALL app buttons. */
+.stApp [data-testid="stButton"] button:not(:disabled):is(:active,:focus:not(:focus-visible)),
+.stApp [data-testid="stDownloadButton"] button:not(:disabled):is(:active,:focus:not(:focus-visible)),
+.stApp [data-testid="stFormSubmitButton"] button:not(:disabled):is(:active,:focus:not(:focus-visible)),
+.stApp [data-testid="stLinkButton"] a:not([aria-disabled="true"]):is(:active,:focus:not(:focus-visible)),
+.stApp [data-testid="stNumberInput"] button:not(:disabled):is(:active,:focus:not(:focus-visible)),
+.stApp button[role="tab"]:is(:active,:focus:not(:focus-visible)),
+.stApp [data-testid="stExpander"] summary:is(:active,:focus:not(:focus-visible)){
+ background:#156f6a!important;color:white!important;
+ border-color:#0b615f!important;outline:2px solid #0b615f!important;
+ outline-offset:1px!important;box-shadow:0 0 0 3px rgba(20,111,106,.2)!important;
+ transition:background-color .09s ease!important;
+}
+.stApp [data-testid="stButton"] button:not(:disabled):is(:active,:focus:not(:focus-visible)) *,
+.stApp [data-testid="stDownloadButton"] button:not(:disabled):is(:active,:focus:not(:focus-visible)) *,
+.stApp [data-testid="stFormSubmitButton"] button:not(:disabled):is(:active,:focus:not(:focus-visible)) *{
+ color:white!important;
+}
+.stApp [data-testid="stButton"] button:not(:disabled):is(:active,:focus:not(:focus-visible))::after,
+.stApp [data-testid="stDownloadButton"] button:not(:disabled):is(:active,:focus:not(:focus-visible))::after,
+.stApp [data-testid="stFormSubmitButton"] button:not(:disabled):is(:active,:focus:not(:focus-visible))::after{
+ content:" ✓";white-space:nowrap;font-weight:900;margin-left:5px;
+}
+.stApp button:focus-visible,.stApp a:focus-visible{outline:3px solid #156f6a!important;outline-offset:2px!important}
 </style>'''
+
+
+# v183: UI responsiveness measurements. Data collection is asynchronous and
+# never blocks a button on Supabase writes. No form values, URLs, or secrets
+# are recorded; only button labels/keys and elapsed server-side times.
+_V183_ORIGINAL_BUTTON = st.button
+_V183_SCOPE = contextvars.ContextVar('sumai_perf_scope', default='main')
+_V183_LIMIT = 350
+_V183_INSTALLED = False
+
+
+def _v183_record_press(label, key=None, scope=None):
+    state = st.session_state
+    actual_scope = scope or _V183_SCOPE.get()
+    items = state.setdefault('_v183_perf_records', [])
+    previous = state.get('_v183_perf_pending')
+    if isinstance(previous, dict):
+        # A second action cannot silently overwrite an unfinished measurement.
+        _v183_finish_action(previous.get('scope', 'main'), note='次の操作が開始')
+    sequence = int(state.get('_v183_perf_seq', 0)) + 1
+    state['_v183_perf_seq'] = sequence
+    record = {
+        'seq': sequence,
+        'time_jst': datetime.now(timezone(timedelta(hours=9))).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3],
+        'build': BUILD,
+        'button': str(label)[:100],
+        'key': str(key if key is not None else label)[:100],
+        'status': '処理中',
+        'server_ms': None,
+        'scope': actual_scope,
+    }
+    items.append(record)
+    if len(items) > _V183_LIMIT:
+        del items[:-_V183_LIMIT]
+    state['_v183_perf_pending'] = {
+        'seq': sequence, 'scope': actual_scope, 'started': time.perf_counter(),
+        'rerun': False,
+    }
+    return record
+
+
+def _v183_button(label, *args, **kwargs):
+    """Preserve original Streamlit semantics while measuring every st.button."""
+    callback = kwargs.get('on_click')
+    key = kwargs.get('key')
+    ident = str(key if key is not None else label)
+    st.session_state.setdefault('_v183_button_scopes', {})[ident] = _V183_SCOPE.get()
+    if callable(callback):
+        wrapped_kwargs = dict(kwargs)
+        @functools.wraps(callback)
+        def tracked_callback(*cb_args, **cb_kwargs):
+            prior_scope = st.session_state.get('_v183_button_scopes', {}).get(ident, _V183_SCOPE.get())
+            _v183_record_press(label, key, scope=prior_scope)
+            st.session_state['_v183_callback_pressed'] = str(key if key is not None else label)
+            return callback(*cb_args, **cb_kwargs)
+        wrapped_kwargs['on_click'] = tracked_callback
+        kwargs = wrapped_kwargs
+    clicked = _V183_ORIGINAL_BUTTON(label, *args, **kwargs)
+    if clicked:
+        ident = str(key if key is not None else label)
+        if st.session_state.pop('_v183_callback_pressed', None) != ident:
+            _v183_record_press(label, key)
+        try:
+            st.toast('操作を受け付けました：' + str(label)[:45], icon='⏳')
+        except Exception:
+            pass  # The CSS acknowledgement still works in narrow fragments.
+    return clicked
+
+
+def _v183_install_button_feedback():
+    global _V183_INSTALLED
+    if not _V183_INSTALLED:
+        st.button = _v183_button
+        _V183_INSTALLED = True
+
+
+class _V183PerfWriter:
+    """Serialize and coalesce cloud snapshots off the Streamlit rerun thread."""
+    def __init__(self):
+        self.lock = threading.RLock()
+        self.pending = {}
+        self.progress = {}
+        self.running = False
+
+    def submit(self, ident, config, rows):
+        with self.lock:
+            self.pending[ident] = (dict(config), list(rows))
+            if self.running:
+                return
+            self.running = True
+            threading.Thread(target=self._work, name='sumai-ui-perf', daemon=True).start()
+
+    def _work(self):
+        while True:
+            # Coalesce rapid button operations; never add an HTTP call to a click.
+            time.sleep(0.35)
+            with self.lock:
+                if not self.pending:
+                    self.running = False
+                    return
+                batch = self.pending
+                self.pending = {}
+            for ident, (config, rows) in batch.items():
+                try:
+                    database = Database(config=config)
+                    now = utc_now()
+                    payload = {
+                        'id': ident,
+                        'status': 'ui_performance_log',
+                        'started_at': now, 'finished_at': now,
+                        'conditions': {'schema': 1, 'purpose': 'ui_button_latency', 'build': BUILD},
+                        'summary': {'records': rows[-_V183_LIMIT:], 'count': len(rows),
+                                    'metric': 'server_event_to_render_end_ms', 'saved_at': now},
+                    }
+                    database.save_search(payload)
+                    confirmed = database.call('GET', SEARCH_TABLE, {
+                        'namespace': 'eq.' + database.namespace,
+                        'id': 'eq.' + ident, 'select': 'id,summary', 'limit': 1,
+                    })
+                    if (not isinstance(confirmed, list) or len(confirmed) != 1 or
+                        not isinstance(confirmed[0].get('summary'), dict) or
+                        confirmed[0]['summary'].get('count') != len(rows)):
+                        raise AppError('ログの保存後確認ができません。')
+                    outcome = {'count': len(rows), 'error': '', 'saved_at': now}
+                except Exception as exc:
+                    outcome = {'count': 0, 'error': str(exc)[:180], 'saved_at': ''}
+                with self.lock:
+                    self.progress[ident] = outcome
+
+    def status(self, ident):
+        with self.lock:
+            return dict(self.progress.get(ident, {})), ident in self.pending
+
+
+@st.cache_resource(show_spinner=False)
+def _v183_perf_writer():
+    return _V183PerfWriter()
+
+
+def _v183_log_identity():
+    state = st.session_state
+    token = str(state.get('_v174_commute_token') or '')
+    if not re.fullmatch(r'[0-9a-f]{40}', token):
+        return None
+    if '_v183_perf_session' not in state:
+        state['_v183_perf_session'] = secrets.token_hex(8)
+    profile = str(state.get('_v170_commute_active') or 'primary')
+    owner = hashlib.sha256((token + ':' + profile).encode('utf-8')).hexdigest()[:20]
+    return 'ui_perf.' + owner + '.' + state['_v183_perf_session']
+
+
+def _v183_queue_cloud_save():
+    state = st.session_state
+    ident = _v183_log_identity()
+    if not ident:
+        return
+    try:
+        db = Database()
+        config = {'SUPABASE_URL': db.url, 'SUPABASE_SECRET_KEY': db.key,
+                  'SUPABASE_NAMESPACE': db.namespace}
+        _v183_perf_writer().submit(ident, config, state.get('_v183_perf_records', []))
+    except Exception as exc:
+        state['_v183_perf_save_error'] = type(exc).__name__ + ': ' + str(exc)[:120]
+
+
+def _v183_finish_action(scope='main', exception=None, note=None):
+    state = st.session_state
+    pending = state.get('_v183_perf_pending')
+    if not isinstance(pending, dict):
+        return
+    if scope not in (pending['scope'], 'main'):
+        return
+    # st.rerun() does not mean content was generated. Finish on next full render.
+    if exception is not None and type(exception).__name__ in ('RerunException', 'StopException'):
+        pending['rerun'] = True
+        return
+    item = next((r for r in reversed(state.get('_v183_perf_records', []))
+                 if r.get('seq') == pending['seq']), None)
+    if item is None:
+        state.pop('_v183_perf_pending', None)
+        return
+    item['server_ms'] = round(max(0., (time.perf_counter() - pending['started']) * 1000), 1)
+    item['status'] = '失敗' if exception is not None else ('中断' if note else '画面生成終了')
+    if exception is not None:
+        item['error_type'] = type(exception).__name__
+    if note:
+        item['reason'] = str(note)[:60]
+    state.pop('_v183_perf_pending', None)
+    _v183_queue_cloud_save()
+
+
+def _v183_fragment_trace(fn):
+    @functools.wraps(fn)
+    def wrapped(*args, **kwargs):
+        scope = fn.__name__
+        ctx = _V183_SCOPE.set(scope)
+        try:
+            result = fn(*args, **kwargs)
+        except BaseException as exc:
+            _v183_finish_action(scope, exception=exc)
+            raise
+        else:
+            _v183_finish_action(scope)
+            return result
+        finally:
+            _V183_SCOPE.reset(ctx)
+    return wrapped
+
+
+@st.fragment(run_every='12s')
+@_v183_fragment_trace
+def _v183_performance_panel():
+    st.subheader('ボタン操作・画面応答ログ')
+    st.caption('操作受付からサーバー側の画面生成終了までをミリ秒で記録します。'
+               '端末のタップから通信が届くまでの時間、ブラウザーの描画時間、バックグラウンド収集の完了時間は含みません。')
+    logs = list(st.session_state.get('_v183_perf_records', []))
+    finished = [r for r in logs if r.get('server_ms') is not None and r.get('status') == '画面生成終了']
+    if finished:
+        durations = [r['server_ms'] for r in finished]
+        a, b, c = st.columns(3)
+        a.metric('計測件数', f'{len(finished)}件')
+        b.metric('平均応答', f'{statistics.mean(durations):.0f} ms')
+        c.metric('最大応答', f'{max(durations):.0f} ms')
+    if logs:
+        display = [{k: r.get(k) for k in ('time_jst','button','status','server_ms','scope','build')}
+                   for r in reversed(logs[-150:])]
+        st.dataframe(display, hide_index=True, use_container_width=True)
+        sio = io.StringIO()
+        writer = csv.DictWriter(sio, fieldnames=['time_jst','button','key','status','server_ms','scope','build','error_type','reason'])
+        writer.writeheader()
+        writer.writerows([{k:r.get(k, '') for k in writer.fieldnames} for r in logs])
+        c1, c2 = st.columns(2)
+        with c1:
+            st.download_button('操作ログCSVをダウンロード', sio.getvalue().encode('utf-8-sig'),
+                               'sumai_ui_performance.csv', 'text/csv',
+                               key='v183_perf_csv', use_container_width=True, on_click='ignore')
+        with c2:
+            st.download_button('操作ログJSONをダウンロード',
+                               json.dumps({'build': BUILD, 'metric': 'server_event_to_render_end_ms',
+                                           'records': logs}, ensure_ascii=False, indent=2).encode('utf-8'),
+                               'sumai_ui_performance.json', 'application/json',
+                               key='v183_perf_json', use_container_width=True, on_click='ignore')
+    else:
+        st.caption('まだ操作記録がありません。ボタンを押すと自動で記録を開始します。')
+    ident = _v183_log_identity()
+    if ident:
+        result, pending = _v183_perf_writer().status(ident)
+        if result.get('error'):
+            st.warning('クラウド保存失敗：' + result['error'])
+        elif pending:
+            st.caption('ログをSupabaseへ保存中（画面操作を妨げず実行）')
+        elif result.get('saved_at'):
+            st.caption('Supabase保存確認済み：' + str(result['count']) + '件｜' +
+                       acquisition_time_jst(result['saved_at']))
+    elif logs:
+        st.caption('通勤設定のブラウザーIDが読み込めていないため、クラウド保存は待機中です。CSV/JSON出力は可能です。')
+    if ident:
+        if st.button('過去の保存ログを読み込む', key='v183_perf_load_cloud'):
+            try:
+                database = Database()
+                prefix = ident.rsplit('.', 1)[0] + '.'
+                stored = database.call('GET', SEARCH_TABLE, {
+                    'namespace': 'eq.' + database.namespace,
+                    'status': 'eq.ui_performance_log',
+                    'and': '(id.gte.' + prefix + ',id.lt.' + prefix + '~)',
+                    'select': 'id,summary,finished_at',
+                    'order': 'finished_at.desc', 'limit': 20,
+                })
+                historical = []
+                for saved_row in (stored or []):
+                    # The active session is already displayed above.
+                    if not isinstance(saved_row, dict) or saved_row.get('id') == ident:
+                        continue
+                    snapshot = saved_row.get('summary') or {}
+                    historical.extend(r for r in snapshot.get('records', [])
+                                      if isinstance(r, dict) and 'button' in r and 'time_jst' in r)
+                historical.sort(key=lambda r: str(r.get('time_jst', '')), reverse=True)
+                st.session_state['_v183_perf_archive'] = historical[:3000]
+                st.session_state['_v183_perf_archive_error'] = ''
+            except (AppError, ValueError, TypeError) as exc:
+                st.session_state['_v183_perf_archive_error'] = str(exc)[:180]
+        if st.session_state.get('_v183_perf_archive_error'):
+            st.warning('過去ログの読込失敗：' + st.session_state['_v183_perf_archive_error'])
+        old = st.session_state.get('_v183_perf_archive') or []
+        if old:
+            with st.expander('過去の動作ログ（' + str(len(old)) + '件）'):
+                st.dataframe([{'時刻':r.get('time_jst'), '操作':r.get('button'),
+                               'サーバー応答ms':r.get('server_ms'), '状態':r.get('status'),
+                               'バージョン':r.get('build')} for r in old[:150]],
+                             hide_index=True, use_container_width=True)
+                st.download_button('過去ログJSONをダウンロード',
+                    json.dumps({'records': old}, ensure_ascii=False, indent=2).encode('utf-8'),
+                    'sumai_ui_performance_history.json', 'application/json',
+                    key='v183_perf_history_json', on_click='ignore')
+    if st.session_state.get('_v183_perf_save_error'):
+        st.warning('ログ保存設定：' + st.session_state['_v183_perf_save_error'])
+    st.divider()
+
 
 
 class SearchCancelled(BaseException):
@@ -8137,6 +8462,7 @@ def apply_saved_load(job):
 
 
 @st.fragment(run_every='8s')
+@_v183_fragment_trace
 def saved_load_progress():
     """Compact progress for the optional listing/CSV view, NOT the map."""
     job=active_saved_load()
@@ -8434,6 +8760,7 @@ def snapshot_count_metrics(snapshot):
 
 
 @st.fragment(run_every='10s')
+@_v183_fragment_trace
 def background_progress():
     """Render live worker progress and buttons inside the fragment-owned container."""
     job=active_job()
@@ -8486,6 +8813,7 @@ def background_progress():
 
 
 @st.fragment(run_every='20s')
+@_v183_fragment_trace
 def background_status():
     """Render current-search diagnostics with download buttons always available."""
     job=active_job()
@@ -8550,6 +8878,7 @@ def mobile_map_content_signature(rows,facilities):
 
 
 @st.fragment
+@_v183_fragment_trace
 def interactive_rental_map(pins,cells,facilities):
     from streamlit_folium import st_folium
     """Reliable map mount: base map and rental data are rendered atomically.
@@ -9883,6 +10212,7 @@ def automatic_collection_ward_filter_ui(ward_codes, filters, busy=False):
 
 
 @st.fragment(run_every='16s')
+@_v183_fragment_trace
 def automatic_collection_panel():
     st.subheader('アプリ内の自動収集（SUUMO）')
     memory=cloud_memory_pressure()
@@ -11243,7 +11573,7 @@ def capture_map_fragment_v117():
 # its folium-html prop and result callbacks can remount the iframe on every
 # viewport update. The browser map lives independently; only bounds are sent
 # to Python, while the layer changes only on explicit map revision changes.
-TOWN_COMPONENT_HTML_V121 = '<!doctype html><html lang="ja"><head><meta charset="utf-8">\n<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">\n<link id="leaflet-css" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.css">\n<style>\nhtml,body{margin:0;padding:0;width:100%;height:480px;overflow:hidden;background:#ecefee;font-family:system-ui,"Hiragino Kaku Gothic ProN",sans-serif}\n#map{height:480px;width:100%;background:#f5f6f4;position:relative}\n#notice{position:absolute;z-index:9999;left:10px;bottom:12px;max-width:80%;background:rgba(255,255,255,.95);border-radius:5px;padding:7px 10px;font-size:12px;color:#173a5e;pointer-events:none;display:none}\n#touchmode{position:absolute;z-index:1200;right:12px;top:12px;border:1px solid #ddd;border-radius:5px;background:#fff;padding:10px;color:#193b45;font-size:13px;box-shadow:0 1px 6px #999;display:none}\n/* v121: station-first labels; transparent text with crisp white halo,\n   no irregular opaque white rectangles competing with the rent polygons. */\n.station-chip{display:inline-flex;position:relative;align-items:center;gap:3px;white-space:nowrap;\n  color:#062d4f;font-weight:900;font-size:14px;line-height:18px;\n  background:none;border:0;border-radius:0;padding:0;box-shadow:none;\n  pointer-events:none;transform:translate(-50%,-50%);\n  text-shadow:-1.5px -1.5px 0 #fff,0 -2px 0 #fff,1.5px -1.5px 0 #fff,\n     2px 0 0 #fff,1.5px 1.5px 0 #fff,0 2px 0 #fff,\n     -1.5px 1.5px 0 #fff,-2px 0 0 #fff,0 0 4px #fff;}\n.station-chip::before{content:"";display:inline-block;flex:none;width:5px;height:5px;\n  border-radius:50%;background:#0064b0;border:1.3px solid #fff;\n  box-shadow:0 0 0 1px #005b9b;}\n.station-chip.minor{font-size:12px;line-height:16px;font-weight:800;color:#143b57;}\n.station-chip.minor::before{width:4px;height:4px;background:#216f9c;}\n/* Compact, overlap-checked labels let additional hubs appear at low zoom. */\n.station-chip.compact{font-size:12px;line-height:16px;}\n.station-chip.minor.compact{font-size:11px;line-height:15px;}\n/* No separate white town/ward cards. The base map has its own muted\n   geographic context; hover/tap any polygon for the exact town name. */\n.town-chip,.ward-chip{display:none}\n.leaflet-tooltip{font-family:inherit}\n</style></head>\n<body>\n<div id="map"></div><button id="touchmode" type="button">ページをスクロール</button><div id="notice" role="status"></div>\n<script src="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.js" onerror="var script=document.createElement(\'script\');script.src=\'https://unpkg.com/leaflet@1.9.4/dist/leaflet.js\';document.head.appendChild(script);"></script>\n<script>\n(function(){\'use strict\';\nvar state={map:null,overlay:null,stationLayer:null,townLabelLayer:null,wardLayer:null,townAnchors:[],groupSignature:null,stations:[],wards:[],lastBounds:null,\n           loading:false,started:false,sentBounds:\'\',revision:-1,touchPan:true,pendingArgs:null,retryCount:0,retryTimer:null};\nfunction hostMessage(type,extra){window.parent.postMessage(Object.assign({isStreamlitMessage:true,type:type},extra||{}),\'*\')}\nfunction setHeight(){hostMessage(\'streamlit:setFrameHeight\',{height:480})}\nfunction note(message){var el=document.getElementById(\'notice\');el.textContent=message||\'\';el.style.display=message?\'block\':\'none\'}\nfunction initMap(args){\n if(state.map)return;\n if(!window.L){note(\'地図を読み込み中…\');return}\n var center=Array.isArray(args.center)&&args.center.length===2?args.center:[35.6812,139.7671];\n var zoom=Number.isFinite(+args.zoom)?+args.zoom:14;\n state.map=L.map(\'map\',{center:center,zoom:zoom,zoomControl:true,preferCanvas:true,zoomSnap:.25,\n   zoomDelta:.5,wheelPxPerZoomLevel:110,scrollWheelZoom:true,gestureHandling:false,touchZoom:true,dragging:true});\n var base=L.tileLayer(\'https://cyberjapandata.gsi.go.jp/xyz/pale/{z}/{x}/{y}.png\',{\n  attribution:\'国土地理院\',maxZoom:18,keepBuffer:1,updateWhenIdle:true});\n state.map.createPane(\'grayBase\');state.map.getPane(\'grayBase\').style.zIndex=\'200\';\n state.map.getPane(\'grayBase\').style.filter=\'grayscale(1) contrast(.68) brightness(1.12)\';\n state.map.getPane(\'grayBase\').style.opacity=\'.42\';\n base.options.pane=\'grayBase\';base.addTo(state.map);\n var errors=0, backup=false;\n base.on(\'tileerror\',function(){errors++;if(errors>=6&&!backup){backup=true;\n   state.map.removeLayer(base);\n   L.tileLayer(\'https://tile.openstreetmap.org/{z}/{x}/{y}.png\',{\n     attribution:\'&copy; OpenStreetMap contributors\',maxZoom:19,keepBuffer:1,pane:\'grayBase\',updateWhenIdle:true}).addTo(state.map);\n }});\n state.map.createPane(\'townNamePane\');state.map.getPane(\'townNamePane\').style.zIndex=\'640\';state.map.getPane(\'townNamePane\').style.pointerEvents=\'none\';\n state.map.createPane(\'stationNamePane\');state.map.getPane(\'stationNamePane\').style.zIndex=\'670\';state.map.getPane(\'stationNamePane\').style.pointerEvents=\'none\';\n state.stationLayer=L.layerGroup().addTo(state.map);\n state.townLabelLayer=L.layerGroup().addTo(state.map);\n state.wardLayer=L.layerGroup().addTo(state.map);\n var touch=window.matchMedia && window.matchMedia(\'(pointer:coarse)\').matches;\n if(touch){\n   var button=document.getElementById(\'touchmode\');button.style.display=\'block\';\n   button.addEventListener(\'click\',function(){state.touchPan=!state.touchPan;\n      if(state.touchPan){state.map.dragging.enable();state.map.touchZoom.enable();button.textContent=\'ページをスクロール\';document.getElementById(\'map\').style.touchAction=\'none\'}\n      else{state.map.dragging.disable();state.map.touchZoom.disable();button.textContent=\'地図を動かす\';document.getElementById(\'map\').style.touchAction=\'pan-y\'}\n   });document.getElementById(\'map\').style.touchAction=\'none\';\n }\n var schedule=null;\n state.map.on(\'moveend zoomend\',function(){\n    if(schedule!==null)clearTimeout(schedule);\n    schedule=setTimeout(function(){schedule=null;redrawStations();emitBounds()},420);\n });\n state.map.on(\'resize\',function(){redrawStations()});\n document.addEventListener(\'visibilitychange\',function(){if(document.visibilityState===\'visible\')setTimeout(function(){state.map.invalidateSize();redrawStations()},100)});\n window.addEventListener(\'pageshow\',function(){setTimeout(function(){if(state.map){state.map.invalidateSize();redrawStations()}},200)});\n state.map.whenReady(function(){setTimeout(function(){state.map.invalidateSize();redrawStations();emitBounds()},350)});\n note(\'\');setHeight();\n}\nfunction emitBounds(){if(!state.map)return;var b=state.map.getBounds();\n var arr=[b.getSouth(),b.getWest(),b.getNorth(),b.getEast()];\n if(arr.some(function(x){return !isFinite(x)}))return;\n var key=arr.map(function(v){return v.toFixed(5)}).join(\',\')+\'|\'+state.map.getZoom();\n if(key===state.sentBounds)return;\n state.sentBounds=key;\n hostMessage(\'streamlit:setComponentValue\',{dataType:\'json\',value:{bounds:{_southWest:{lat:arr[0],lng:arr[1]},_northEast:{lat:arr[2],lng:arr[3]}},zoom:state.map.getZoom()}});\n}\nfunction updateOverlay(geo,signature){\n if(!state.map || signature===state.groupSignature)return;\n try{\n  var fresh=null;\n  if(geo && geo.features && geo.features.length){\n   fresh=L.geoJSON(geo,{smoothFactor:1.7,style:function(feature){return {color:\'#606b72\',weight:.7,fillColor:feature.properties.color||\'#bbb\',fillOpacity:.77}},\n       onEachFeature:function(feature,layer){var props=feature.properties||{},name=String(props.name||\'\'),avg=String(props.price_label||\'\'),count=String(props.count_label||\'\');\n         var el=document.createElement(\'div\');el.textContent=name+\'｜平均 \'+avg+\'｜\'+count;layer.bindPopup(el);}});\n  }\n  // All town labels remain in GeoJSON popups; do not create 700+ browser\n  // markers when stations are the only permanent geographic labels.\n  var anchors=[];\n  if(state.overlay){state.map.removeLayer(state.overlay);state.overlay=null}\n  if(fresh){fresh.addTo(state.map);state.overlay=fresh}\n  state.townAnchors=anchors;\n  state.groupSignature=signature;\n }catch(err){note(\'地図の塗り分けを表示できません: \'+(err&&err.message||\'エラー\'))}\n}\nfunction safeLabel(value){return String(value||\'\').replace(/[&<>"\']/g,function(c){return {\'&\':\'&amp;\',\'<\':\'&lt;\',\'>\':\'&gt;\',\'"\':\'&quot;\',"\'":\'&#39;\'}[c]})}\nfunction reserveLabel(point,width,height,boxes,size){\n var box=[point.x-width/2,point.y-height/2,point.x+width/2,point.y+height/2];\n if(box[0]<3 || box[1]<3 || box[2]>size.x-3 || box[3]>size.y-3)return false;\n for(var i=0;i<boxes.length;i++){\n   var v=boxes[i];if(box[0]<v[2]+4&&box[2]>v[0]-4&&box[1]<v[3]+4&&box[3]>v[1]-4)return false;\n }\n boxes.push(box);return true;\n}\nfunction stationBox(p,width,height){\n return [p.x-width/2,p.y-height/2,p.x+width/2,p.y+height/2];\n}\nfunction redrawStations(){\n if(!state.map || !state.stationLayer)return;\n var m=state.map,zoom=m.getZoom(),bounds=m.getBounds(),size=m.getSize();\n if(size.x<30||size.y<30)return;\n state.stationLayer.clearLayers();\n // Explicitly clear previous town and ward labels from earlier render cycles.\n if(state.townLabelLayer)state.townLabelLayer.clearLayers();\n if(state.wardLayer)state.wardLayer.clearLayers();\n var stations=state.stations||[],boxes=[],visible=[],count=0;\n // v158: show a second tier of widely used hubs on zoomed-out screens.\n // Preserve all local-station labels at detailed zooms.  Collision detection\n // remains the final arbiter, so mobile text cannot obscure other labels.\n var wide=size.x>=520;\n var limit=zoom>=16?150:zoom>=15?120:zoom>=14?100:zoom>=13?75:zoom>=12?55:zoom>=11.5?40:zoom>=11?(wide?42:28):zoom>=10?(wide?32:22):zoom>=9?(wide?24:18):16;\n for(var i=0;i<stations.length;i++){\n   var s=stations[i];\n   if(zoom<9 && s.priority>0)continue;\n   if(zoom>=9 && zoom<11 && s.priority>1)continue;\n   if(zoom>=11 && zoom<11.5 && s.priority>2)continue;\n   if(!bounds.contains([s.lat,s.lng]))continue;\n   visible.push(s);\n }\n // Prioritize major stations, then stations nearest the viewport center.\n // This avoids a broad alphabetic bias when the map is densely populated.\n var cp=size.divideBy(2);\n visible.sort(function(a,b){\n   var pa=Number(zoom>=12?a.detail_priority:a.priority),pb=Number(zoom>=12?b.detail_priority:b.priority);\n   if(pa!==pb)return pa-pb;\n   var ap=m.latLngToContainerPoint([a.lat,a.lng]);\n   var bp=m.latLngToContainerPoint([b.lat,b.lng]);\n   var da=(ap.x-cp.x)*(ap.x-cp.x)+(ap.y-cp.y)*(ap.y-cp.y);\n   var db=(bp.x-cp.x)*(bp.x-cp.x)+(bp.y-cp.y)*(bp.y-cp.y);\n   return da-db;\n });\n for(var j=0;j<visible.length&&count<limit;j++){\n   var s=visible[j],name=String(s.name||\'\');\n   if(!name)continue;\n   var p=m.latLngToContainerPoint([s.lat,s.lng]);\n   var major=s.priority===0;\n   var compact=zoom<12;\n   var fontSize=compact?(major?12:11):(major?14:12);\n   var width=Math.min(195,Array.from(name).length*fontSize+11);\n   var height=compact?17:(major?21:19);\n   // Use a precise pixel collision box matching the compact halo label.\n   if(!reserveLabel(p,width,height,boxes,size))continue;\n   count++;\n   var html=\'<span class="station-chip\'+(major?\'\':\' minor\')+(compact?\' compact\':\'\')+\'">\'+safeLabel(name)+\'</span>\';\n   L.marker([s.lat,s.lng],{icon:L.divIcon({className:\'\',html:html,iconSize:[0,0]}),\n          interactive:false,keyboard:false,pane:\'stationNamePane\'}).addTo(state.stationLayer);\n }\n}\nfunction render(args){\n args=args||{};\n if(!state.map){\n   if(!window.L){\n      state.pendingArgs=args;\n      if(!state.retryTimer && state.retryCount<30){\n        state.retryTimer=setTimeout(function(){state.retryTimer=null;state.retryCount++;render(state.pendingArgs)},500);\n      }\n      if(state.retryCount>=30)note(\'地図ライブラリの読込に失敗しました。通信を確認してください。\');\n      return;\n   }\n   initMap(args);if(!state.map)return;\n }\n state.stations=Array.isArray(args.stations)?args.stations:state.stations;\n state.wards=Array.isArray(args.wards)?args.wards:state.wards;\n updateOverlay(args.geo,args.signature);\n redrawStations();\n setHeight();\n}\nwindow.addEventListener(\'message\',function(e){if(e.data&&e.data.type===\'streamlit:render\')render(e.data.args)});\nhostMessage(\'streamlit:componentReady\',{apiVersion:1});setHeight();\n})();\n</script>\n</body></html>\n'
+TOWN_COMPONENT_HTML_V121 = '<!doctype html><html lang="ja"><head><meta charset="utf-8">\n<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">\n<link id="leaflet-css" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.css">\n<style>\nhtml,body{margin:0;padding:0;width:100%;height:480px;overflow:hidden;background:#ecefee;font-family:system-ui,"Hiragino Kaku Gothic ProN",sans-serif}\n#map{height:480px;width:100%;background:#f5f6f4;position:relative}\n#notice{position:absolute;z-index:9999;left:10px;bottom:12px;max-width:80%;background:rgba(255,255,255,.95);border-radius:5px;padding:7px 10px;font-size:12px;color:#173a5e;pointer-events:none;display:none}\n#touchmode{position:absolute;z-index:1200;right:12px;top:12px;border:1px solid #ddd;border-radius:5px;background:#fff;padding:10px;color:#193b45;font-size:13px;box-shadow:0 1px 6px #999;display:none}\n#touchmode:active,#touchmode:focus,.leaflet-bar a:active,.leaflet-bar a:focus{\n  background:#156f6a!important;color:white!important;border-color:#0b615f!important;\n  outline:2px solid #0b615f!important;outline-offset:1px!important;\n}\n\n/* v121: station-first labels; transparent text with crisp white halo,\n   no irregular opaque white rectangles competing with the rent polygons. */\n.station-chip{display:inline-flex;position:relative;align-items:center;gap:3px;white-space:nowrap;\n  color:#062d4f;font-weight:900;font-size:14px;line-height:18px;\n  background:none;border:0;border-radius:0;padding:0;box-shadow:none;\n  pointer-events:none;transform:translate(-50%,-50%);\n  text-shadow:-1.5px -1.5px 0 #fff,0 -2px 0 #fff,1.5px -1.5px 0 #fff,\n     2px 0 0 #fff,1.5px 1.5px 0 #fff,0 2px 0 #fff,\n     -1.5px 1.5px 0 #fff,-2px 0 0 #fff,0 0 4px #fff;}\n.station-chip::before{content:"";display:inline-block;flex:none;width:5px;height:5px;\n  border-radius:50%;background:#0064b0;border:1.3px solid #fff;\n  box-shadow:0 0 0 1px #005b9b;}\n.station-chip.minor{font-size:12px;line-height:16px;font-weight:800;color:#143b57;}\n.station-chip.minor::before{width:4px;height:4px;background:#216f9c;}\n/* Compact, overlap-checked labels let additional hubs appear at low zoom. */\n.station-chip.compact{font-size:12px;line-height:16px;}\n.station-chip.minor.compact{font-size:11px;line-height:15px;}\n/* No separate white town/ward cards. The base map has its own muted\n   geographic context; hover/tap any polygon for the exact town name. */\n.town-chip,.ward-chip{display:none}\n.leaflet-tooltip{font-family:inherit}\n</style></head>\n<body>\n<div id="map"></div><button id="touchmode" type="button">ページをスクロール</button><div id="notice" role="status"></div>\n<script src="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.js" onerror="var script=document.createElement(\'script\');script.src=\'https://unpkg.com/leaflet@1.9.4/dist/leaflet.js\';document.head.appendChild(script);"></script>\n<script>\n(function(){\'use strict\';\nvar state={map:null,overlay:null,stationLayer:null,townLabelLayer:null,wardLayer:null,townAnchors:[],groupSignature:null,stations:[],wards:[],lastBounds:null,\n           loading:false,started:false,sentBounds:\'\',revision:-1,touchPan:true,pendingArgs:null,retryCount:0,retryTimer:null};\nfunction hostMessage(type,extra){window.parent.postMessage(Object.assign({isStreamlitMessage:true,type:type},extra||{}),\'*\')}\nfunction setHeight(){hostMessage(\'streamlit:setFrameHeight\',{height:480})}\nfunction note(message){var el=document.getElementById(\'notice\');el.textContent=message||\'\';el.style.display=message?\'block\':\'none\'}\nfunction initMap(args){\n if(state.map)return;\n if(!window.L){note(\'地図を読み込み中…\');return}\n var center=Array.isArray(args.center)&&args.center.length===2?args.center:[35.6812,139.7671];\n var zoom=Number.isFinite(+args.zoom)?+args.zoom:14;\n state.map=L.map(\'map\',{center:center,zoom:zoom,zoomControl:true,preferCanvas:true,zoomSnap:.25,\n   zoomDelta:.5,wheelPxPerZoomLevel:110,scrollWheelZoom:true,gestureHandling:false,touchZoom:true,dragging:true});\n var base=L.tileLayer(\'https://cyberjapandata.gsi.go.jp/xyz/pale/{z}/{x}/{y}.png\',{\n  attribution:\'国土地理院\',maxZoom:18,keepBuffer:1,updateWhenIdle:true});\n state.map.createPane(\'grayBase\');state.map.getPane(\'grayBase\').style.zIndex=\'200\';\n state.map.getPane(\'grayBase\').style.filter=\'grayscale(1) contrast(.68) brightness(1.12)\';\n state.map.getPane(\'grayBase\').style.opacity=\'.42\';\n base.options.pane=\'grayBase\';base.addTo(state.map);\n var errors=0, backup=false;\n base.on(\'tileerror\',function(){errors++;if(errors>=6&&!backup){backup=true;\n   state.map.removeLayer(base);\n   L.tileLayer(\'https://tile.openstreetmap.org/{z}/{x}/{y}.png\',{\n     attribution:\'&copy; OpenStreetMap contributors\',maxZoom:19,keepBuffer:1,pane:\'grayBase\',updateWhenIdle:true}).addTo(state.map);\n }});\n state.map.createPane(\'townNamePane\');state.map.getPane(\'townNamePane\').style.zIndex=\'640\';state.map.getPane(\'townNamePane\').style.pointerEvents=\'none\';\n state.map.createPane(\'stationNamePane\');state.map.getPane(\'stationNamePane\').style.zIndex=\'670\';state.map.getPane(\'stationNamePane\').style.pointerEvents=\'none\';\n state.stationLayer=L.layerGroup().addTo(state.map);\n state.townLabelLayer=L.layerGroup().addTo(state.map);\n state.wardLayer=L.layerGroup().addTo(state.map);\n var touch=window.matchMedia && window.matchMedia(\'(pointer:coarse)\').matches;\n if(touch){\n   var button=document.getElementById(\'touchmode\');button.style.display=\'block\';\n   button.addEventListener(\'click\',function(){state.touchPan=!state.touchPan;\n      if(state.touchPan){state.map.dragging.enable();state.map.touchZoom.enable();button.textContent=\'ページをスクロール\';document.getElementById(\'map\').style.touchAction=\'none\'}\n      else{state.map.dragging.disable();state.map.touchZoom.disable();button.textContent=\'地図を動かす\';document.getElementById(\'map\').style.touchAction=\'pan-y\'}\n   });document.getElementById(\'map\').style.touchAction=\'none\';\n }\n var schedule=null;\n state.map.on(\'moveend zoomend\',function(){\n    if(schedule!==null)clearTimeout(schedule);\n    schedule=setTimeout(function(){schedule=null;redrawStations();emitBounds()},420);\n });\n state.map.on(\'resize\',function(){redrawStations()});\n document.addEventListener(\'visibilitychange\',function(){if(document.visibilityState===\'visible\')setTimeout(function(){state.map.invalidateSize();redrawStations()},100)});\n window.addEventListener(\'pageshow\',function(){setTimeout(function(){if(state.map){state.map.invalidateSize();redrawStations()}},200)});\n state.map.whenReady(function(){setTimeout(function(){state.map.invalidateSize();redrawStations();emitBounds()},350)});\n note(\'\');setHeight();\n}\nfunction emitBounds(){if(!state.map)return;var b=state.map.getBounds();\n var arr=[b.getSouth(),b.getWest(),b.getNorth(),b.getEast()];\n if(arr.some(function(x){return !isFinite(x)}))return;\n var key=arr.map(function(v){return v.toFixed(5)}).join(\',\')+\'|\'+state.map.getZoom();\n if(key===state.sentBounds)return;\n state.sentBounds=key;\n hostMessage(\'streamlit:setComponentValue\',{dataType:\'json\',value:{bounds:{_southWest:{lat:arr[0],lng:arr[1]},_northEast:{lat:arr[2],lng:arr[3]}},zoom:state.map.getZoom()}});\n}\nfunction updateOverlay(geo,signature){\n if(!state.map || signature===state.groupSignature)return;\n try{\n  var fresh=null;\n  if(geo && geo.features && geo.features.length){\n   fresh=L.geoJSON(geo,{smoothFactor:1.7,style:function(feature){return {color:\'#606b72\',weight:.7,fillColor:feature.properties.color||\'#bbb\',fillOpacity:.77}},\n       onEachFeature:function(feature,layer){var props=feature.properties||{},name=String(props.name||\'\'),avg=String(props.price_label||\'\'),count=String(props.count_label||\'\');\n         var el=document.createElement(\'div\');el.textContent=name+\'｜平均 \'+avg+\'｜\'+count;layer.bindPopup(el);}});\n  }\n  // All town labels remain in GeoJSON popups; do not create 700+ browser\n  // markers when stations are the only permanent geographic labels.\n  var anchors=[];\n  if(state.overlay){state.map.removeLayer(state.overlay);state.overlay=null}\n  if(fresh){fresh.addTo(state.map);state.overlay=fresh}\n  state.townAnchors=anchors;\n  state.groupSignature=signature;\n }catch(err){note(\'地図の塗り分けを表示できません: \'+(err&&err.message||\'エラー\'))}\n}\nfunction safeLabel(value){return String(value||\'\').replace(/[&<>"\']/g,function(c){return {\'&\':\'&amp;\',\'<\':\'&lt;\',\'>\':\'&gt;\',\'"\':\'&quot;\',"\'":\'&#39;\'}[c]})}\nfunction reserveLabel(point,width,height,boxes,size){\n var box=[point.x-width/2,point.y-height/2,point.x+width/2,point.y+height/2];\n if(box[0]<3 || box[1]<3 || box[2]>size.x-3 || box[3]>size.y-3)return false;\n for(var i=0;i<boxes.length;i++){\n   var v=boxes[i];if(box[0]<v[2]+4&&box[2]>v[0]-4&&box[1]<v[3]+4&&box[3]>v[1]-4)return false;\n }\n boxes.push(box);return true;\n}\nfunction stationBox(p,width,height){\n return [p.x-width/2,p.y-height/2,p.x+width/2,p.y+height/2];\n}\nfunction redrawStations(){\n if(!state.map || !state.stationLayer)return;\n var m=state.map,zoom=m.getZoom(),bounds=m.getBounds(),size=m.getSize();\n if(size.x<30||size.y<30)return;\n state.stationLayer.clearLayers();\n // Explicitly clear previous town and ward labels from earlier render cycles.\n if(state.townLabelLayer)state.townLabelLayer.clearLayers();\n if(state.wardLayer)state.wardLayer.clearLayers();\n var stations=state.stations||[],boxes=[],visible=[],count=0;\n // v158: show a second tier of widely used hubs on zoomed-out screens.\n // Preserve all local-station labels at detailed zooms.  Collision detection\n // remains the final arbiter, so mobile text cannot obscure other labels.\n var wide=size.x>=520;\n var limit=zoom>=16?150:zoom>=15?120:zoom>=14?100:zoom>=13?75:zoom>=12?55:zoom>=11.5?40:zoom>=11?(wide?42:28):zoom>=10?(wide?32:22):zoom>=9?(wide?24:18):16;\n for(var i=0;i<stations.length;i++){\n   var s=stations[i];\n   if(zoom<9 && s.priority>0)continue;\n   if(zoom>=9 && zoom<11 && s.priority>1)continue;\n   if(zoom>=11 && zoom<11.5 && s.priority>2)continue;\n   if(!bounds.contains([s.lat,s.lng]))continue;\n   visible.push(s);\n }\n // Prioritize major stations, then stations nearest the viewport center.\n // This avoids a broad alphabetic bias when the map is densely populated.\n var cp=size.divideBy(2);\n visible.sort(function(a,b){\n   var pa=Number(zoom>=12?a.detail_priority:a.priority),pb=Number(zoom>=12?b.detail_priority:b.priority);\n   if(pa!==pb)return pa-pb;\n   var ap=m.latLngToContainerPoint([a.lat,a.lng]);\n   var bp=m.latLngToContainerPoint([b.lat,b.lng]);\n   var da=(ap.x-cp.x)*(ap.x-cp.x)+(ap.y-cp.y)*(ap.y-cp.y);\n   var db=(bp.x-cp.x)*(bp.x-cp.x)+(bp.y-cp.y)*(bp.y-cp.y);\n   return da-db;\n });\n for(var j=0;j<visible.length&&count<limit;j++){\n   var s=visible[j],name=String(s.name||\'\');\n   if(!name)continue;\n   var p=m.latLngToContainerPoint([s.lat,s.lng]);\n   var major=s.priority===0;\n   var compact=zoom<12;\n   var fontSize=compact?(major?12:11):(major?14:12);\n   var width=Math.min(195,Array.from(name).length*fontSize+11);\n   var height=compact?17:(major?21:19);\n   // Use a precise pixel collision box matching the compact halo label.\n   if(!reserveLabel(p,width,height,boxes,size))continue;\n   count++;\n   var html=\'<span class="station-chip\'+(major?\'\':\' minor\')+(compact?\' compact\':\'\')+\'">\'+safeLabel(name)+\'</span>\';\n   L.marker([s.lat,s.lng],{icon:L.divIcon({className:\'\',html:html,iconSize:[0,0]}),\n          interactive:false,keyboard:false,pane:\'stationNamePane\'}).addTo(state.stationLayer);\n }\n}\nfunction render(args){\n args=args||{};\n if(!state.map){\n   if(!window.L){\n      state.pendingArgs=args;\n      if(!state.retryTimer && state.retryCount<30){\n        state.retryTimer=setTimeout(function(){state.retryTimer=null;state.retryCount++;render(state.pendingArgs)},500);\n      }\n      if(state.retryCount>=30)note(\'地図ライブラリの読込に失敗しました。通信を確認してください。\');\n      return;\n   }\n   initMap(args);if(!state.map)return;\n }\n state.stations=Array.isArray(args.stations)?args.stations:state.stations;\n state.wards=Array.isArray(args.wards)?args.wards:state.wards;\n updateOverlay(args.geo,args.signature);\n redrawStations();\n setHeight();\n}\nwindow.addEventListener(\'message\',function(e){if(e.data&&e.data.type===\'streamlit:render\')render(e.data.args)});\nhostMessage(\'streamlit:componentReady\',{apiVersion:1});setHeight();\n})();\n</script>\n</body></html>\n'
 
 # v153: Same gradient as TOWN_GRADIENT, now placed immediately above
 # the map INSIDE the same component iframe. No intermediate Streamlit
@@ -12054,6 +12384,7 @@ def town_station_refs_v164(destinations):
     return stations,wards
 
 @st.fragment(run_every='15s')
+@_v183_fragment_trace
 def town_choropleth_status():
     """Poll summary/boundary readiness WITHOUT remounting the map iframe."""
     state=st.session_state
@@ -12115,6 +12446,7 @@ def town_choropleth_status():
 
 
 @st.fragment(run_every='8s')
+@_v183_fragment_trace
 def interactive_town_choropleth(group):
     """Leaflet map persists in the browser across Streamlit fragment reruns.
 
@@ -12174,7 +12506,7 @@ def interactive_town_choropleth(group):
         registry.request(_v168_visible_wards(geo)[:8])
     destinations=commute_selected_destinations_v164()
     if len(destinations)==2:
-        st.caption(f'通勤先：1.{destinations[0]}駅／2.{destinations[1]}駅｜乗換回数が少ない経路を優先（同数なら最短時間・概算）')
+        st.caption(f'通勤先：①{destinations[0]}駅／②{destinations[1]}駅｜乗換回数が少ない経路を優先（同数なら最短時間・概算）')
     elif destinations:
         st.caption(f'通勤先：{destinations[0]}駅｜乗換回数が少ない経路を優先（同数なら最短時間・概算）')
     if destinations:
@@ -12352,6 +12684,7 @@ class V147RealUrlReplay:
 
 
 @st.fragment(run_every='10s')
+@_v183_fragment_trace
 def v147_replay_status():
     job=st.session_state.get('v147_live_test_job')
     if job is None:return
@@ -12919,6 +13252,7 @@ def v170_commute_autosave_sync():
 
 
 def main():
+    _v183_install_button_feedback()
     st.set_page_config(page_title='住まいコンパス｜新しい住まいを探す',page_icon='🏡',layout='wide',initial_sidebar_state='collapsed')
     st.markdown(CSS,unsafe_allow_html=True)
     st.markdown(f'<div class="hero"><span class="badge">SUMAI COMPASS · {BUILD}</span><h1>次の住まいを、地図から。</h1><p>掲載物件を確認し、家賃と暮らしやすさを比べます。<br>間取りと家賃帯を、取得できた情報で比較します。</p></div>',unsafe_allow_html=True)
@@ -13192,6 +13526,7 @@ def main():
             st.caption('乗換回数最少を優先（同数なら最短時間）。登録41駅・11路線による概算。時刻表・直通運転・道路の徒歩経路は使用していません。徒歩は直線距離×1.25、列車は距離から推定、乗り換えは5分です。')
         else: st.info('物件を検索するか、保存物件を読み込むと通勤を比較できます。')
     with tabs[3]:
+        _v183_performance_panel()
         st.subheader('実URL・Supabase保存検証（追加課金なし）')
         st.caption('旧版の失敗ログから固定抽出した実URLを再検索し、住所・家賃・間取りを保存してSupabaseで読み戻します。24/30以上で合格。')
         groups={'詳細住所確定失敗 30 URL':'map.address_inference',
@@ -13265,4 +13600,10 @@ analyze public.housing_searches_v1;'''
 
 
 if __name__=='__main__':
-    main()
+    try:
+        main()
+    except BaseException as _v183_error:
+        _v183_finish_action('main', exception=_v183_error)
+        raise
+    else:
+        _v183_finish_action('main')
