@@ -55,7 +55,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v193"
+BUILD = "REBUILD-01-v194"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -12039,16 +12039,16 @@ _V191_MARKUP_NEW = """   var destClass=targetNo===3?'destination-both':(targetNo
 assert TOWN_COMPONENT_HTML_V121.count(_V191_MARKUP_OLD)==1
 TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(_V191_MARKUP_OLD,_V191_MARKUP_NEW,1)
 
-# v193: Keep office destinations the SAME FONT SIZE as ordinary station labels.
-# Retain dark red/purple text and white halo; remove the opaque badge so the
-# rent polygons below office stations remain visible.
+# v194: Office destination labels keep the SAME font size as ordinary stations.
+# Add a very tight solid-white background (1px vertical / 3px horizontal)
+# without the large white boxes of v192. Ordinary labels stay unchanged.
 _V193_DESTINATION_CSS = """
 .station-chip.destination-label{
   display:inline-flex!important;align-items:center!important;justify-content:center!important;
   font-size:14px!important;font-weight:900!important;line-height:18px!important;
   letter-spacing:0!important;white-space:nowrap!important;
-  background:transparent!important;border:0!important;
-  border-radius:0!important;padding:0!important;
+  background:#fff!important;border:0!important;
+  border-radius:3px!important;padding:1px 3px!important;
   color:#87102c!important;
   text-shadow:-1.5px -1.5px 0 #fff,0 -2px 0 #fff,1.5px -1.5px 0 #fff,
      2px 0 0 #fff,1.5px 1.5px 0 #fff,0 2px 0 #fff,
@@ -12066,7 +12066,7 @@ _V193_DESTINATION_CSS = """
 }
 .station-chip.destination-label .station-name{
   color:inherit!important;font-size:inherit!important;line-height:inherit!important;
-  font-weight:900!important;text-shadow:inherit!important;
+  font-weight:900!important;text-shadow:none!important;
 }
 .station-chip.destination-one{color:#87102c!important;}
 .station-chip.destination-two{color:#492094!important;}
@@ -12075,13 +12075,13 @@ _V193_DESTINATION_CSS = """
 assert TOWN_COMPONENT_HTML_V121.count('</style></head>') == 1
 TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(
     '</style></head>',_V193_DESTINATION_CSS+'</style></head>',1)
-# Match target label collision area to the SAME normal-station font size;
-# do not reserve the oversized 42px rectangle from v192.
+# Match collision reservation to normal-sized text + six horizontal / two
+# vertical pixels of padding; do not reserve v192's oversized 42px badge.
 _V193_BOX_OLD = """     width=Math.min(size.x-8,Math.max(36,Array.from(prefix+name).length*14+16));
      height=24;
      var offsets=[[0,0],[0,-30],[0,30],[-60,0],[60,0],[0,-60],[0,60]];"""
-_V193_BOX_NEW = """     width=Math.min(size.x-8,Math.max(30,Array.from(prefix+name).length*fontSize+13));
-     height=compact?(major?17:16):(major?21:19);
+_V193_BOX_NEW = """     width=Math.min(size.x-8,Math.max(34,Array.from(prefix+name).length*fontSize+19));
+     height=compact?(major?19:18):(major?23:21);
      var offsets=[[0,0],[0,-24],[0,24],[-48,0],[48,0],[0,-48],[0,48]];"""
 assert TOWN_COMPONENT_HTML_V121.count(_V193_BOX_OLD) == 1
 TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(_V193_BOX_OLD,_V193_BOX_NEW,1)
@@ -12090,7 +12090,7 @@ TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(_V193_BOX_OLD,_V193_BO
 # map script instead of keeping a previously mounted/cached v178 iframe.
 @st.cache_resource(show_spinner=False)
 def town_component_v121():
-    folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-v193')
+    folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-v194')
     os.makedirs(folder,exist_ok=True)
     path=os.path.join(folder,'index.html')
     # Component HTML is small; create once per worker process. Never include
@@ -12107,7 +12107,7 @@ def town_component_v121():
         with open(temp_path,'w',encoding='utf-8') as output:
             output.write(TOWN_COMPONENT_HTML_V121)
         os.replace(temp_path,path)
-    return st.components.v1.declare_component('sumai_town_map_v193',path=folder)
+    return st.components.v1.declare_component('sumai_town_map_v194',path=folder)
 
 # v159: Station-to-office approximate train travel times, OFFLINE AND READ-ONLY.
 # Tokyo Metro/Toei/JR local edge minutes adapted from MIT-licensed public project:
