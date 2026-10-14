@@ -55,7 +55,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v186"
+BUILD = "REBUILD-01-v187"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -763,10 +763,57 @@ button:disabled{background:#e3e9e3!important;color:#607369!important;opacity:1!i
 # v183: UI responsiveness measurements. Data collection is asynchronous and
 # never blocks a button on Supabase writes. No form values, URLs, or secrets
 # are recorded; only button labels/keys and elapsed server-side times.
-_V183_ORIGINAL_BUTTON = st.button
+def _v187_unwrap_button():
+    """Recover Streamlit's REAL button after any number of hot-reloaded v183 wrappers.
+
+    Streamlit reruns the file in a fresh module namespace, but `st` is a shared
+    module. The old implementation captured the previously patched `st.button`
+    every time, causing one physical click to be recorded dozens of times.
+    """
+    current = st.button
+    visited = set()
+    for _ in range(1024):
+        if id(current) in visited:
+            raise RuntimeError('st.button の重複ラッパーを解除できませんでした')
+        visited.add(id(current))
+        if getattr(current, '__name__', '') != '_v183_button':
+            return current
+        previous = getattr(current, '__globals__', {}).get('_V183_ORIGINAL_BUTTON')
+        if not callable(previous) or previous is current:
+            raise RuntimeError('st.button の元の処理が確認できませんでした')
+        current = previous
+    raise RuntimeError('st.button のラッパーが異常に多く重なっています')
+
+
+_V183_ORIGINAL_BUTTON = _v187_unwrap_button()
 _V183_SCOPE = contextvars.ContextVar('sumai_perf_scope', default='main')
 _V183_LIMIT = 350
-_V183_INSTALLED = False
+
+
+def _v187_clean_legacy_perf_records():
+    """Discard only demonstrably duplicated, obsolete measurement records."""
+    state = st.session_state
+    if state.get('_v187_perf_cleaned'):
+        return
+    records = state.get('_v183_perf_records', [])
+    if isinstance(records, list):
+        state['_v183_perf_records'] = [r for r in records
+            if not (isinstance(r, dict) and r.get('status') == '中断'
+                    and r.get('reason') == '次の操作が開始')][- _V183_LIMIT:]
+    state.pop('_v183_perf_pending', None)
+    state['_v187_perf_cleaned'] = True
+
+
+def _v187_perf_stage(stage, started):
+    """Attach a measurement to the current button, not a separate button event."""
+    state=st.session_state
+    pending=state.get('_v183_perf_pending')
+    if not isinstance(pending, dict):
+        return
+    for row in reversed(state.get('_v183_perf_records', [])):
+        if row.get('seq') == pending.get('seq'):
+            row.setdefault('stages_ms', {})[stage] = round((time.perf_counter()-started)*1000, 1)
+            return
 
 
 def _v183_record_press(label, key=None, scope=None):
@@ -826,10 +873,10 @@ def _v183_button(label, *args, **kwargs):
 
 
 def _v183_install_button_feedback():
-    global _V183_INSTALLED
-    if not _V183_INSTALLED:
+    # Replace the wrapper, NEVER wrap the previous deployment's wrapper.
+    # The unwrapped original above is fixed for this entire script execution.
+    if st.button is not _v183_button:
         st.button = _v183_button
-        _V183_INSTALLED = True
 
 
 class _V183PerfWriter:
@@ -851,7 +898,9 @@ class _V183PerfWriter:
     def _work(self):
         while True:
             # Coalesce rapid button operations; never add an HTTP call to a click.
-            time.sleep(0.35)
+            # Batch DB updates. A snapshot every few seconds is sufficient for
+            # diagnostics; do not cause a POST + GET per button click.
+            time.sleep(6.0)
             with self.lock:
                 if not self.pending:
                     self.running = False
@@ -891,7 +940,8 @@ class _V183PerfWriter:
 
 
 @st.cache_resource(show_spinner=False)
-def _v183_perf_writer():
+def _v187_perf_writer():
+    # New cache identity: never reuse the old per-click DB writer on hot deploy.
     return _V183PerfWriter()
 
 
@@ -900,11 +950,13 @@ def _v183_log_identity():
     token = str(state.get('_v174_commute_token') or '')
     if not re.fullmatch(r'[0-9a-f]{40}', token):
         return None
-    if '_v183_perf_session' not in state:
-        state['_v183_perf_session'] = secrets.token_hex(8)
+    # A new session ID prevents a still-running old-version background writer
+    # from overwriting this build's cleaned performance records after deployment.
+    if '_v187_perf_session' not in state:
+        state['_v187_perf_session'] = secrets.token_hex(8)
     profile = str(state.get('_v170_commute_active') or 'primary')
     owner = hashlib.sha256((token + ':' + profile).encode('utf-8')).hexdigest()[:20]
-    return 'ui_perf.' + owner + '.' + state['_v183_perf_session']
+    return 'ui_perf.' + owner + '.' + state['_v187_perf_session']
 
 
 def _v183_queue_cloud_save():
@@ -913,10 +965,13 @@ def _v183_queue_cloud_save():
     if not ident:
         return
     try:
-        db = Database()
-        config = {'SUPABASE_URL': db.url, 'SUPABASE_SECRET_KEY': db.key,
-                  'SUPABASE_NAMESPACE': db.namespace}
-        _v183_perf_writer().submit(ident, config, state.get('_v183_perf_records', []))
+        config = state.get('_v187_perf_db_config')
+        if not isinstance(config, dict):
+            db = Database()
+            config = {'SUPABASE_URL': db.url, 'SUPABASE_SECRET_KEY': db.key,
+                      'SUPABASE_NAMESPACE': db.namespace}
+            state['_v187_perf_db_config'] = config
+        _v187_perf_writer().submit(ident, config, state.get('_v183_perf_records', []))
     except Exception as exc:
         state['_v183_perf_save_error'] = type(exc).__name__ + ': ' + str(exc)[:120]
 
@@ -965,7 +1020,7 @@ def _v183_fragment_trace(fn):
     return wrapped
 
 
-@st.fragment(run_every='12s')
+@st.fragment(run_every='30s')
 @_v183_fragment_trace
 def _v183_performance_panel():
     st.subheader('ボタン操作・画面応答ログ')
@@ -984,9 +1039,13 @@ def _v183_performance_panel():
                    for r in reversed(logs[-150:])]
         st.dataframe(display, hide_index=True, use_container_width=True)
         sio = io.StringIO()
-        writer = csv.DictWriter(sio, fieldnames=['time_jst','button','key','status','server_ms','scope','build','error_type','reason'])
+        writer = csv.DictWriter(sio, fieldnames=['time_jst','button','key','status','server_ms','scope','build',
+                                                'town_geometry_ms','commute_route_ms','town_map_component_ms',
+                                                'error_type','reason'])
         writer.writeheader()
-        writer.writerows([{k:r.get(k, '') for k in writer.fieldnames} for r in logs])
+        writer.writerows([dict({k:r.get(k, '') for k in writer.fieldnames},
+                         **{k:(r.get('stages_ms') or {}).get(k,'')
+                            for k in ('town_geometry_ms','commute_route_ms','town_map_component_ms')}) for r in logs])
         c1, c2 = st.columns(2)
         with c1:
             st.download_button('操作ログCSVをダウンロード', sio.getvalue().encode('utf-8-sig'),
@@ -1002,7 +1061,7 @@ def _v183_performance_panel():
         st.caption('まだ操作記録がありません。ボタンを押すと自動で記録を開始します。')
     ident = _v183_log_identity()
     if ident:
-        result, pending = _v183_perf_writer().status(ident)
+        result, pending = _v187_perf_writer().status(ident)
         if result.get('error'):
             st.warning('クラウド保存失敗：' + result['error'])
         elif pending:
@@ -12451,8 +12510,27 @@ def town_choropleth_status():
         st.caption('町丁目家賃：集計の開始待ち')
 
 
-@st.fragment(run_every='8s')
-@_v183_fragment_trace
+def _v187_town_geometry_cache(key, build):
+    """Per-user LRU cache: at most five GeoJSON overlays (~four layouts + pan)."""
+    state=st.session_state
+    cache=state.setdefault('_v187_town_geometry', {})
+    if key in cache:
+        entry=cache.pop(key)
+        cache[key]=entry
+        return entry, True
+    entry=build()
+    cache[key]=entry
+    while len(cache)>5:
+        cache.pop(next(iter(cache)))
+    return entry, False
+
+
+@functools.lru_cache(maxsize=16)
+def _v187_town_station_refs(destinations):
+    """Reference route values depend solely on the selected destinations."""
+    return town_station_refs_v164(tuple(destinations))
+
+
 def interactive_town_choropleth(group):
     """Leaflet map persists in the browser across Streamlit fragment reruns.
 
@@ -12498,11 +12576,23 @@ def interactive_town_choropleth(group):
     if needs_update:
         window=_v156_town_render_window(bounds,center)
         groups=(snap['summary'] or {}).get('groups') or {}
-        geo,limited,count=town_colored_shapes(groups,group,shapes if ready else {},window,include_no_data=False,
-                                              suumo_oz_codes=suumo_oz_codes)
+        # Only regenerate polygons when this viewport + layout + summary is new.
+        # Reusing any previous layout in the same view requires NO geometry scan.
+        payload_key=hashlib.sha256(repr((signature,window)).encode('utf-8')).hexdigest()[:20]
+        geo_start=time.perf_counter()
+        (geo,limited,count),geo_cached=_v187_town_geometry_cache(
+            payload_key,
+            lambda: town_colored_shapes(groups,group,shapes if ready else {},window,
+                                        include_no_data=False,suumo_oz_codes=suumo_oz_codes))
+        _v187_perf_stage('town_geometry_ms',geo_start)
+        pending=state.get('_v183_perf_pending')
+        if isinstance(pending,dict):
+            for row in reversed(state.get('_v183_perf_records', [])):
+                if row.get('seq')==pending.get('seq'):
+                    row['town_geometry_cache_hit']=bool(geo_cached)
+                    break
         # The window MUST be part of the Leaflet data revision: keeping the
         # same component key preserves the map position while replacing colors.
-        payload_key=hashlib.sha256(repr((signature,window)).encode('utf-8')).hexdigest()[:20]
         cached={'signature':signature,'layer_signature':payload_key,
                 'window':window,'geo':geo,'limited':limited,
                 'ready':bool(ready and snap['ready']),
@@ -12521,13 +12611,17 @@ def interactive_town_choropleth(group):
         st.caption(f"着色 {cached['colored_count']}町丁目｜保存家賃のない地域は背景地図のまま表示")
     else:
         st.caption('集計中。完了後、地図の色は自動更新されます')
-    stations,wards=town_station_refs_v164(destinations)
+    route_start=time.perf_counter()
+    stations,wards=_v187_town_station_refs(destinations)
+    _v187_perf_stage('commute_route_ms',route_start)
     widget=town_component_v121()
+    widget_start=time.perf_counter()
     data=widget(center=list(cached['center']),zoom=14,geo=cached['geo'],
                 signature=cached['layer_signature'],stations=stations,wards=wards,
                 commute_destination=(destinations[0] if destinations else ''),
                 commute_destination_2=(destinations[1] if len(destinations)==2 else ''),
                 key='town_map_v172_'+str(reset),default=None)
+    _v187_perf_stage('town_map_component_ms',widget_start)
     if isinstance(data,dict):
         current=viewport_bounds(data)
         if current:
@@ -13257,8 +13351,44 @@ def v170_commute_autosave_sync():
     return True
 
 
+def _v187_choose_layout(group):
+    st.session_state['layout_display_group']=group
+
+
+@st.fragment(run_every='8s')
+@_v183_fragment_trace
+def _v187_layout_map_fragment():
+    state=st.session_state
+    selected=state.get('layout_display_group', 'group1')
+    if selected not in ('group0','group1','group2','house'):
+        selected='group1'
+        state['layout_display_group']=selected
+    st.button('ワンルーム・1K・1DK',key='layout_group0_v174',
+              type='primary' if selected=='group0' else 'secondary',
+              use_container_width=True,on_click=_v187_choose_layout,args=('group0',))
+    if selected=='group0':st.caption('マンション・築15年以内')
+    col1,col2,col3=st.columns(3)
+    with col1:
+        st.button('1LDK・2K・2DK',key='layout_group1',
+                  type='primary' if selected=='group1' else 'secondary',
+                  use_container_width=True,on_click=_v187_choose_layout,args=('group1',))
+        if selected=='group1':st.caption('マンション・築15年以内')
+    with col2:
+        st.button('2LDK・3K・3DK',key='layout_group2',
+                  type='primary' if selected=='group2' else 'secondary',
+                  use_container_width=True,on_click=_v187_choose_layout,args=('group2',))
+        if selected=='group2':st.caption('マンション・築15年以内')
+    with col3:
+        st.button('一戸建て',key='layout_group_house',
+                  type='primary' if selected=='house' else 'secondary',
+                  use_container_width=True,on_click=_v187_choose_layout,args=('house',))
+        if selected=='house':st.caption('築40年以内・50㎡以上')
+    interactive_town_choropleth(selected)
+
+
 def main():
     _v183_install_button_feedback()
+    _v187_clean_legacy_perf_records()
     st.set_page_config(page_title='住まいコンパス｜新しい住まいを探す',page_icon='🏡',layout='wide',initial_sidebar_state='collapsed')
     st.markdown(CSS,unsafe_allow_html=True)
     st.markdown(f'<div class="hero"><span class="badge">SUMAI COMPASS · {BUILD}</span><h1>次の住まいを、地図から。</h1><p>掲載物件を確認し、家賃と暮らしやすさを比べます。<br>間取りと家賃帯を、取得できた情報で比較します。</p></div>',unsafe_allow_html=True)
@@ -13281,30 +13411,8 @@ def main():
     tabs=st.tabs(['住まいを探す','保存データ','通勤','設定','初期設定'])
     with tabs[0]:
         st.subheader('地図を動かして、探す地域を表示してください')
-        selected_group=state.get('layout_display_group','group1')
-        if selected_group not in ('group0','group1','group2','house'):selected_group='group1';state.layout_display_group='group1'
-        if st.button('ワンルーム・1K・1DK',key='layout_group0_v174',type='primary' if selected_group=='group0' else 'secondary',use_container_width=True):
-            if state.layout_display_group!='group0':state.layout_display_group='group0';st.rerun()
-        if selected_group=='group0':st.caption('マンション・築15年以内')
-        g1,g2,g3=st.columns(3)
-        with g1:
-            if st.button('1LDK・2K・2DK',key='layout_group1',type='primary' if selected_group=='group1' else 'secondary',use_container_width=True):
-                if state.layout_display_group!='group1':state.layout_display_group='group1';st.rerun()
-            if selected_group=='group1':st.caption('マンション・築15年以内')
-        with g2:
-            if st.button('2LDK・3K・3DK',key='layout_group2',type='primary' if selected_group=='group2' else 'secondary',use_container_width=True):
-                if state.layout_display_group!='group2':state.layout_display_group='group2';st.rerun()
-            if selected_group=='group2':st.caption('マンション・築15年以内')
-        with g3:
-            if st.button('一戸建て',key='layout_group_house',type='primary' if selected_group=='house' else 'secondary',use_container_width=True):
-                if state.layout_display_group!='house':state.layout_display_group='house';st.rerun()
-            if selected_group=='house':st.caption('築40年以内・50㎡以上')
-        selected_group=state.get('layout_display_group','group1')
-        bounds=state.get('new_bounds')
-        center=bounds_center(bounds) if bounds else state.get('new_view_center',DEFAULT_CENTER)
-        radius=bounds_radius(bounds) if bounds else 1500
         town_choropleth_status()
-        interactive_town_choropleth(selected_group)
+        _v187_layout_map_fragment()
         # Fragment owns its widget container directly, including partial reruns.
         background_progress()
         # Initial component defaults are not real viewport bounds. Only the browser callback makes the search ready.
