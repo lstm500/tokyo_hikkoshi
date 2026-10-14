@@ -55,7 +55,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v190"
+BUILD = "REBUILD-01-v191"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -11948,11 +11948,102 @@ TOWN_COMPONENT_HTML_V121 = TOWN_COMPONENT_HTML_V121.replace(
     'var zoom=Number.isFinite(+args.zoom)?+args.zoom:14;',
     'var zoom=Number.isFinite(+args.zoom)?+args.zoom:11;',1)
 
+
+# v191: Highlight each configured office station *only while inside the map*.
+# Reserve label space for them before ordinary stations, and keep the real
+# station coordinates as their marker anchors. This is browser-only: no DB work.
+_V191_CSS = """
+.station-chip.destination-label{font-size:14px;line-height:21px;font-weight:900;letter-spacing:.1px;}
+.station-chip.destination-label .station-name{font-size:inherit;font-weight:900;}
+.station-chip.destination-one,.station-chip.destination-one.minor,
+.station-chip.destination-one .station-name{color:#b01e40!important;}
+.station-chip.destination-two,.station-chip.destination-two.minor,
+.station-chip.destination-two .station-name{color:#7139a5!important;}
+.station-chip.destination-both,.station-chip.destination-both.minor,
+.station-chip.destination-both .station-name{color:#ad245e!important;}
+.station-chip.destination-one::before{background:#b01e40;box-shadow:0 0 0 1px #b01e40;}
+.station-chip.destination-two::before{background:#7139a5;box-shadow:0 0 0 1px #7139a5;}
+.station-chip.destination-both::before{background:#ad245e;box-shadow:0 0 0 1px #ad245e;}
+"""
+assert TOWN_COMPONENT_HTML_V121.count('</style></head>')==1
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(
+    '</style></head>',_V191_CSS+'</style></head>',1)
+_V191_RENDER_TARGET_OLD = ' state.commuteDestination2=String(args.commute_destination_2||"");'
+assert TOWN_COMPONENT_HTML_V121.count(_V191_RENDER_TARGET_OLD)==1
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(
+    _V191_RENDER_TARGET_OLD,
+    _V191_RENDER_TARGET_OLD+'\n state.highlightDestination1=String(args.highlight_destination_1||"");'+
+    '\n state.highlightDestination2=String(args.highlight_destination_2||"");',1)
+_V191_VISIBLE_OLD = """   var s=stations[i];
+   if(zoom<9 && s.priority>0)continue;
+   if(zoom>=9 && zoom<11 && s.priority>1)continue;
+   if(zoom>=11 && zoom<11.5 && s.priority>2)continue;
+"""
+_V191_VISIBLE_NEW = """   var s=stations[i];
+   var selected=(s.name===state.highlightDestination1||s.name===state.highlightDestination2);
+   if(!selected && zoom<9 && s.priority>0)continue;
+   if(!selected && zoom>=9 && zoom<11 && s.priority>1)continue;
+   if(!selected && zoom>=11 && zoom<11.5 && s.priority>2)continue;
+"""
+assert TOWN_COMPONENT_HTML_V121.count(_V191_VISIBLE_OLD)==1
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(_V191_VISIBLE_OLD,_V191_VISIBLE_NEW,1)
+_V191_SORT_OLD = """ visible.sort(function(a,b){
+   var pa=Number(zoom>=12?a.detail_priority:a.priority),pb=Number(zoom>=12?b.detail_priority:b.priority);"""
+_V191_SORT_NEW = """ visible.sort(function(a,b){
+   // Always place visible office destinations before regular station labels.
+   var da=a.name===state.highlightDestination1?1:(a.name===state.highlightDestination2?2:0);
+   var db=b.name===state.highlightDestination1?1:(b.name===state.highlightDestination2?2:0);
+   if(da!==db)return da===0?1:(db===0?-1:da-db);
+   var pa=Number(zoom>=12?a.detail_priority:a.priority),pb=Number(zoom>=12?b.detail_priority:b.priority);"""
+assert TOWN_COMPONENT_HTML_V121.count(_V191_SORT_OLD)==1
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(_V191_SORT_OLD,_V191_SORT_NEW,1)
+_V191_STATION_OLD = """   var s=visible[j],name=String(s.name||'');
+   if(!name)continue;"""
+_V191_STATION_NEW = """   var s=visible[j],name=String(s.name||'');
+   if(!name)continue;
+   var targetNo=(name===state.highlightDestination1?1:0)+(name===state.highlightDestination2?2:0);"""
+assert TOWN_COMPONENT_HTML_V121.count(_V191_STATION_OLD)==1
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(_V191_STATION_OLD,_V191_STATION_NEW,1)
+_V191_COLLISION_OLD = """   // Include the travel-time suffix in the measured collision box.
+   if(!reserveLabel(p,width,height,boxes,size))continue;
+   count++;"""
+_V191_COLLISION_NEW = """   // Office destinations are always drawn if their actual coordinate is in
+   // the viewport; unlike the other labels they cannot be filtered by density.
+   var shiftX=0,shiftY=0;
+   if(targetNo){
+     var prefix=targetNo===3?'\\u2460\\u2461':(targetNo===1?'\\u2460':'\\u2461');
+     width=Math.min(size.x-8,Math.max(36,Array.from(prefix+name).length*14+16));
+     height=24;
+     var offsets=[[0,0],[0,-30],[0,30],[-60,0],[60,0],[0,-60],[0,60]];
+     var placed=false;
+     for(var k=0;k<offsets.length;k++){
+       var px=Math.max(width/2+4,Math.min(size.x-width/2-4,p.x+offsets[k][0]));
+       var py=Math.max(height/2+4,Math.min(size.y-height/2-4,p.y+offsets[k][1]));
+       if(reserveLabel({x:px,y:py},width,height,boxes,size)){
+         shiftX=px-p.x;shiftY=py-p.y;placed=true;break;
+       }
+     }
+     if(!placed)continue;
+   }else if(!reserveLabel(p,width,height,boxes,size))continue;
+   count++;"""
+assert TOWN_COMPONENT_HTML_V121.count(_V191_COLLISION_OLD)==1
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(
+    _V191_COLLISION_OLD,_V191_COLLISION_NEW,1)
+_V191_MARKUP_OLD = """   var html='<span class="'+classes+'">'+content+'</span>';"""
+_V191_MARKUP_NEW = """   var destClass=targetNo===3?'destination-both':(targetNo===1?'destination-one':'destination-two');
+   var destPrefix=targetNo===3?'\\u2460\\u2461':(targetNo===1?'\\u2460':'\\u2461');
+   var html=targetNo?
+     '<span class="station-chip destination-label '+destClass+'" style="left:'+Math.round(shiftX)+'px;top:'+Math.round(shiftY)+'px;">'+
+       '<span class="station-name">'+safeLabel(destPrefix+name)+'</span></span>':
+     '<span class="'+classes+'">'+content+'</span>';"""
+assert TOWN_COMPONENT_HTML_V121.count(_V191_MARKUP_OLD)==1
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(_V191_MARKUP_OLD,_V191_MARKUP_NEW,1)
+
 # v182: unique name and static folder force the browser to fetch the updated
 # map script instead of keeping a previously mounted/cached v178 iframe.
 @st.cache_resource(show_spinner=False)
 def town_component_v121():
-    folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-v190')
+    folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-v191')
     os.makedirs(folder,exist_ok=True)
     path=os.path.join(folder,'index.html')
     # Component HTML is small; create once per worker process. Never include
@@ -11969,7 +12060,7 @@ def town_component_v121():
         with open(temp_path,'w',encoding='utf-8') as output:
             output.write(TOWN_COMPONENT_HTML_V121)
         os.replace(temp_path,path)
-    return st.components.v1.declare_component('sumai_town_map_v190',path=folder)
+    return st.components.v1.declare_component('sumai_town_map_v191',path=folder)
 
 # v159: Station-to-office approximate train travel times, OFFLINE AND READ-ONLY.
 # Tokyo Metro/Toei/JR local edge minutes adapted from MIT-licensed public project:
@@ -12701,6 +12792,8 @@ def interactive_town_choropleth(group):
         state['_v118_choropleth_payload']=cached
         registry.request(_v168_visible_wards(geo)[:8])
     destinations=commute_selected_destinations_v164()
+    chosen_office_1=commute_current_destination_v160()
+    chosen_office_2=commute_current_destination_v164_second()
     if len(destinations)==2:
         st.caption(f'通勤先：①{destinations[0]}駅／②{destinations[1]}駅｜乗換回数が少ない経路を優先（同数なら最短時間・概算）')
     elif destinations:
@@ -12721,7 +12814,9 @@ def interactive_town_choropleth(group):
                 signature=cached['layer_signature'],stations=stations,wards=wards,
                 commute_destination=(destinations[0] if destinations else ''),
                 commute_destination_2=(destinations[1] if len(destinations)==2 else ''),
-                key='town_map_v190_'+str(reset),default=None)
+                highlight_destination_1=(chosen_office_1 if chosen_office_1!='\u8868\u793a\u3057\u306a\u3044' else ''),
+                highlight_destination_2=(chosen_office_2 if chosen_office_2!='\u8868\u793a\u3057\u306a\u3044' else ''),
+                key='town_map_v191_'+str(reset),default=None)
     _v187_perf_stage('town_map_component_ms',widget_start)
     # An old viewport result can arrive just after a layout switch.
     # Accept only bounds reported by the current browser view revision.
