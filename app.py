@@ -55,7 +55,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v192"
+BUILD = "REBUILD-01-v193"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -12033,54 +12033,64 @@ _V191_MARKUP_OLD = """   var html='<span class="'+classes+'">'+content+'</span>'
 _V191_MARKUP_NEW = """   var destClass=targetNo===3?'destination-both':(targetNo===1?'destination-one':'destination-two');
    var destPrefix=targetNo===3?'\\u2460\\u2461':(targetNo===1?'\\u2460':'\\u2461');
    var html=targetNo?
-     '<span class="station-chip destination-label '+destClass+'" style="left:'+Math.round(shiftX)+'px;top:'+Math.round(shiftY)+'px;">'+
+     '<span class="station-chip destination-label '+destClass+(major?'':' minor')+(compact?' compact':'')+'" style="left:'+Math.round(shiftX)+'px;top:'+Math.round(shiftY)+'px;">'+
        '<span class="station-name">'+safeLabel(destPrefix+name)+'</span></span>':
      '<span class="'+classes+'">'+content+'</span>';"""
 assert TOWN_COMPONENT_HTML_V121.count(_V191_MARKUP_OLD)==1
 TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(_V191_MARKUP_OLD,_V191_MARKUP_NEW,1)
 
-# v192: The previous red/purple text over colored rent polygons was too subtle
-# on smartphones. Put ONLY the two configured office stations in solid white
-# outlined labels, keeping all ordinary map labels visually unchanged.
-_V192_DESTINATION_CSS = """
+# v193: Keep office destinations the SAME FONT SIZE as ordinary station labels.
+# Retain dark red/purple text and white halo; remove the opaque badge so the
+# rent polygons below office stations remain visible.
+_V193_DESTINATION_CSS = """
 .station-chip.destination-label{
   display:inline-flex!important;align-items:center!important;justify-content:center!important;
-  font-size:19px!important;font-weight:900!important;line-height:24px!important;
-  letter-spacing:.2px!important;white-space:nowrap!important;
-  background:#fff!important;border:3px solid #b31037!important;
-  border-radius:11px!important;padding:5px 9px!important;
-  color:#87102c!important;text-shadow:none!important;
-  box-shadow:0 0 0 2px rgba(255,255,255,.98),0 3px 10px rgba(0,0,0,.46)!important;
+  font-size:14px!important;font-weight:900!important;line-height:18px!important;
+  letter-spacing:0!important;white-space:nowrap!important;
+  background:transparent!important;border:0!important;
+  border-radius:0!important;padding:0!important;
+  color:#87102c!important;
+  text-shadow:-1.5px -1.5px 0 #fff,0 -2px 0 #fff,1.5px -1.5px 0 #fff,
+     2px 0 0 #fff,1.5px 1.5px 0 #fff,0 2px 0 #fff,
+     -1.5px 1.5px 0 #fff,-2px 0 0 #fff,0 0 4px #fff!important;
+  box-shadow:none!important;
   transform:translate(-50%,-50%)!important;pointer-events:none!important;
 }
-.station-chip.destination-label::before{display:none!important;content:none!important;}
-.station-chip.destination-label .station-name{
-  color:inherit!important;font-size:19px!important;line-height:24px!important;
-  font-weight:900!important;text-shadow:none!important;
+.station-chip.destination-label.compact{font-size:12px!important;line-height:16px!important;}
+.station-chip.destination-label.minor{font-size:12px!important;line-height:16px!important;}
+.station-chip.destination-label.minor.compact{font-size:11px!important;line-height:15px!important;}
+.station-chip.destination-label::before{
+  display:inline-block!important;content:""!important;
+  width:5px!important;height:5px!important;
+  background:currentColor!important;box-shadow:0 0 0 1px currentColor!important;
 }
-.station-chip.destination-one{color:#87102c!important;border-color:#b31037!important;}
-.station-chip.destination-two{color:#492094!important;border-color:#6438c1!important;}
-.station-chip.destination-both{color:#7c1b6a!important;border-color:#a02283!important;}
+.station-chip.destination-label .station-name{
+  color:inherit!important;font-size:inherit!important;line-height:inherit!important;
+  font-weight:900!important;text-shadow:inherit!important;
+}
+.station-chip.destination-one{color:#87102c!important;}
+.station-chip.destination-two{color:#492094!important;}
+.station-chip.destination-both{color:#7c1b6a!important;}
 """
 assert TOWN_COMPONENT_HTML_V121.count('</style></head>') == 1
 TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(
-    '</style></head>',_V192_DESTINATION_CSS+'</style></head>',1)
-# The collision rectangle must match the new 19px type and 40px tall badge;
-# otherwise nearby ordinary labels may overlap the emphasized destinations.
-_V192_BOX_OLD = """     width=Math.min(size.x-8,Math.max(36,Array.from(prefix+name).length*14+16));
+    '</style></head>',_V193_DESTINATION_CSS+'</style></head>',1)
+# Match target label collision area to the SAME normal-station font size;
+# do not reserve the oversized 42px rectangle from v192.
+_V193_BOX_OLD = """     width=Math.min(size.x-8,Math.max(36,Array.from(prefix+name).length*14+16));
      height=24;
      var offsets=[[0,0],[0,-30],[0,30],[-60,0],[60,0],[0,-60],[0,60]];"""
-_V192_BOX_NEW = """     width=Math.min(size.x-8,Math.max(92,Array.from(prefix+name).length*19+40));
-     height=42;
-     var offsets=[[0,0],[0,-46],[0,46],[-110,0],[110,0],[0,-92],[0,92]];"""
-assert TOWN_COMPONENT_HTML_V121.count(_V192_BOX_OLD) == 1
-TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(_V192_BOX_OLD,_V192_BOX_NEW,1)
+_V193_BOX_NEW = """     width=Math.min(size.x-8,Math.max(30,Array.from(prefix+name).length*fontSize+13));
+     height=compact?(major?17:16):(major?21:19);
+     var offsets=[[0,0],[0,-24],[0,24],[-48,0],[48,0],[0,-48],[0,48]];"""
+assert TOWN_COMPONENT_HTML_V121.count(_V193_BOX_OLD) == 1
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(_V193_BOX_OLD,_V193_BOX_NEW,1)
 
 # v182: unique name and static folder force the browser to fetch the updated
 # map script instead of keeping a previously mounted/cached v178 iframe.
 @st.cache_resource(show_spinner=False)
 def town_component_v121():
-    folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-v192')
+    folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-v193')
     os.makedirs(folder,exist_ok=True)
     path=os.path.join(folder,'index.html')
     # Component HTML is small; create once per worker process. Never include
@@ -12097,7 +12107,7 @@ def town_component_v121():
         with open(temp_path,'w',encoding='utf-8') as output:
             output.write(TOWN_COMPONENT_HTML_V121)
         os.replace(temp_path,path)
-    return st.components.v1.declare_component('sumai_town_map_v192',path=folder)
+    return st.components.v1.declare_component('sumai_town_map_v193',path=folder)
 
 # v159: Station-to-office approximate train travel times, OFFLINE AND READ-ONLY.
 # Tokyo Metro/Toei/JR local edge minutes adapted from MIT-licensed public project:
