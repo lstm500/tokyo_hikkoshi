@@ -55,7 +55,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v187"
+BUILD = "REBUILD-01-v188"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -13386,6 +13386,80 @@ def _v187_layout_map_fragment():
     interactive_town_choropleth(selected)
 
 
+
+# v188: On mobile st.selectbox focuses a searchable HTML input and invokes the
+# software keyboard. A popover containing radio buttons provides selection
+# without an editable input. Keep legacy commute state keys unchanged.
+def _v188_select_changed(value_key, radio_key, on_change):
+    selected=st.session_state.get(radio_key)
+    if selected is None or selected==st.session_state.get(value_key):
+        return
+    st.session_state[value_key]=selected
+    if on_change is not None:
+        on_change()
+
+
+def _v188_shift_choice_page(page_key, direction, page_count):
+    current=int(st.session_state.get(page_key,0))
+    st.session_state[page_key]=max(0,min(page_count-1,current+direction))
+
+
+def _v188_select_without_keyboard(label, choices, *, key, on_change=None,
+                                  disabled=False, help=None, format_func=None):
+    """Selection-only widget with no text input, including on smartphones.
+
+    Paginate long lists so thousands of stored properties do not build thousands
+    of radio DOM nodes every rerun. A legacy Streamlit selectbox's state is
+    copied to plain session state before the old widget identity is cleaned up.
+    """
+    options=list(choices)
+    if not options:
+        raise ValueError('選択肢がありません: '+label)
+    state=st.session_state
+    current=state.get(key)
+    if current not in options:
+        current=options[0]
+    state[key]=current  # retain old commute keys and their cloud-save snapshots
+    formatter=format_func if format_func is not None else str
+    radio_key='_v188_radio_'+key
+    page_key='_v188_page_'+key
+    marker_key='_v188_value_'+key
+    page_size=36
+    page_count=(len(options)+page_size-1)//page_size
+    if state.get(marker_key)!=current:
+        state[page_key]=options.index(current)//page_size
+        state[marker_key]=current
+    page=max(0,min(page_count-1,int(state.get(page_key,0))))
+    state[page_key]=page
+    page_options=options[page*page_size:(page+1)*page_size]
+    wanted=current if current in page_options else None
+    if state.get(radio_key)!=wanted:
+        state[radio_key]=wanted
+
+    st.caption(label)
+    with st.popover(str(formatter(current)),use_container_width=True,
+                    disabled=disabled,help=help):
+        if page_count>1:
+            st.caption(f'候補 {len(options)} 件・{page+1}/{page_count} ページ')
+            before,after=st.columns(2)
+            with before:
+                st.button('前へ',key='_v188_prev_'+key,
+                          disabled=(page==0),use_container_width=True,
+                          on_click=_v188_shift_choice_page,
+                          args=(page_key,-1,page_count))
+            with after:
+                st.button('次へ',key='_v188_next_'+key,
+                          disabled=(page+1>=page_count),use_container_width=True,
+                          on_click=_v188_shift_choice_page,
+                          args=(page_key,1,page_count))
+        with st.container(height=min(330,60+len(page_options)*37),border=False):
+            st.radio(label,page_options,index=None,key=radio_key,
+                     format_func=formatter,label_visibility='collapsed',
+                     on_change=_v188_select_changed,
+                     args=(key,radio_key,on_change))
+    return current
+
+
 def main():
     _v183_install_button_feedback()
     _v187_clean_legacy_perf_records()
@@ -13549,7 +13623,7 @@ def main():
         current_profile=state.get('_v170_commute_active','primary')
         if state.get('v170_commute_person_selector') not in profile_ids:
             state['v170_commute_person_selector']=current_profile
-        st.selectbox('通勤設定の利用者（このブラウザー内）',profile_ids,
+        _v188_select_without_keyboard('通勤設定の利用者（このブラウザー内）',profile_ids,
                      format_func=lambda ident:next((p['name'] for p in profiles if p['id']==ident),ident),
                      key='v170_commute_person_selector',on_change=v170_commute_profile_changed,
                      disabled=(not commute_storage_ready or not state.get('_v170_commute_available',True)))
@@ -13581,14 +13655,14 @@ def main():
             st.session_state['commute_line_v160']=_COMMUTE_V160_NO_LINE
             st.session_state['commute_station_v160']=_COMMUTE_V160_NO_STATION
         st.markdown('**通勤先1**')
-        first_line=st.selectbox(
+        first_line=_v188_select_without_keyboard(
             '① 路線（通勤先1）',line_options,
             key='commute_line_v160',on_change=_commute_line_changed_v160,
             help='鉄道会社・路線名から選べます。',disabled=not commute_storage_ready)
         first_station_options=[_COMMUTE_V160_NO_STATION,*available_lines.get(first_line,())]
         if st.session_state.get('commute_station_v160') not in first_station_options:
             st.session_state['commute_station_v160']=_COMMUTE_V160_NO_STATION
-        first_station=st.selectbox(
+        first_station=_v188_select_without_keyboard(
             '② 駅（通勤先1）',first_station_options,
             key='commute_station_v160',on_change=_v180_commit_commute_change,
             disabled=(first_line==_COMMUTE_V160_NO_LINE or not commute_storage_ready))
@@ -13600,14 +13674,14 @@ def main():
         if st.session_state.get('commute_line_2_v164') not in line_options:
             st.session_state['commute_line_2_v164']=_COMMUTE_V160_NO_LINE
             st.session_state['commute_station_2_v164']=_COMMUTE_V160_NO_STATION
-        second_line=st.selectbox(
+        second_line=_v188_select_without_keyboard(
             '① 路線（通勤先2）',line_options,
             key='commute_line_2_v164',on_change=_commute_line_changed_v164_second,
             help='2駅目が不要な場合は「路線を選択してください」のままで構いません。',disabled=not commute_storage_ready)
         second_station_options=[_COMMUTE_V160_NO_STATION,*available_lines.get(second_line,())]
         if st.session_state.get('commute_station_2_v164') not in second_station_options:
             st.session_state['commute_station_2_v164']=_COMMUTE_V160_NO_STATION
-        second_station=st.selectbox(
+        second_station=_v188_select_without_keyboard(
             '② 駅（通勤先2）',second_station_options,
             key='commute_station_2_v164',on_change=_v180_commit_commute_change,
             disabled=(second_line==_COMMUTE_V160_NO_LINE or not commute_storage_ready))
@@ -13622,8 +13696,10 @@ def main():
                    '現行時刻表・待ち時間・改札内移動・職場までの徒歩時間は含みません。')
         options=physical_units([r for r in state.new_units if has_point(r) and r.get('coordinate_precision')!='town'])
         if options:
-            i=st.selectbox('出発する物件',range(len(options)),format_func=lambda i:options[i]['title'])
-            destination=st.selectbox('勤務先の最寄り駅',list(STATIONS),key='new_destination')
+            i=_v188_select_without_keyboard('出発する物件',range(len(options)),
+                  key='_v188_compare_property',format_func=lambda i:options[i]['title'])
+            destination=_v188_select_without_keyboard('勤務先の最寄り駅',list(STATIONS),
+                         key='new_destination')
             walk=st.number_input('勤務先までの徒歩（分）',min_value=0,max_value=60,value=8)
             r=options[i];nearest=min(STATIONS,key=lambda s:meters((r['latitude'],r['longitude']),STATIONS[s]))
             route=commute(nearest,destination)
