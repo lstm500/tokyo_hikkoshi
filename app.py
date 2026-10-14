@@ -55,7 +55,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v191"
+BUILD = "REBUILD-01-v192"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -12039,11 +12039,48 @@ _V191_MARKUP_NEW = """   var destClass=targetNo===3?'destination-both':(targetNo
 assert TOWN_COMPONENT_HTML_V121.count(_V191_MARKUP_OLD)==1
 TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(_V191_MARKUP_OLD,_V191_MARKUP_NEW,1)
 
+# v192: The previous red/purple text over colored rent polygons was too subtle
+# on smartphones. Put ONLY the two configured office stations in solid white
+# outlined labels, keeping all ordinary map labels visually unchanged.
+_V192_DESTINATION_CSS = """
+.station-chip.destination-label{
+  display:inline-flex!important;align-items:center!important;justify-content:center!important;
+  font-size:19px!important;font-weight:900!important;line-height:24px!important;
+  letter-spacing:.2px!important;white-space:nowrap!important;
+  background:#fff!important;border:3px solid #b31037!important;
+  border-radius:11px!important;padding:5px 9px!important;
+  color:#87102c!important;text-shadow:none!important;
+  box-shadow:0 0 0 2px rgba(255,255,255,.98),0 3px 10px rgba(0,0,0,.46)!important;
+  transform:translate(-50%,-50%)!important;pointer-events:none!important;
+}
+.station-chip.destination-label::before{display:none!important;content:none!important;}
+.station-chip.destination-label .station-name{
+  color:inherit!important;font-size:19px!important;line-height:24px!important;
+  font-weight:900!important;text-shadow:none!important;
+}
+.station-chip.destination-one{color:#87102c!important;border-color:#b31037!important;}
+.station-chip.destination-two{color:#492094!important;border-color:#6438c1!important;}
+.station-chip.destination-both{color:#7c1b6a!important;border-color:#a02283!important;}
+"""
+assert TOWN_COMPONENT_HTML_V121.count('</style></head>') == 1
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(
+    '</style></head>',_V192_DESTINATION_CSS+'</style></head>',1)
+# The collision rectangle must match the new 19px type and 40px tall badge;
+# otherwise nearby ordinary labels may overlap the emphasized destinations.
+_V192_BOX_OLD = """     width=Math.min(size.x-8,Math.max(36,Array.from(prefix+name).length*14+16));
+     height=24;
+     var offsets=[[0,0],[0,-30],[0,30],[-60,0],[60,0],[0,-60],[0,60]];"""
+_V192_BOX_NEW = """     width=Math.min(size.x-8,Math.max(92,Array.from(prefix+name).length*19+40));
+     height=42;
+     var offsets=[[0,0],[0,-46],[0,46],[-110,0],[110,0],[0,-92],[0,92]];"""
+assert TOWN_COMPONENT_HTML_V121.count(_V192_BOX_OLD) == 1
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(_V192_BOX_OLD,_V192_BOX_NEW,1)
+
 # v182: unique name and static folder force the browser to fetch the updated
 # map script instead of keeping a previously mounted/cached v178 iframe.
 @st.cache_resource(show_spinner=False)
 def town_component_v121():
-    folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-v191')
+    folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-v192')
     os.makedirs(folder,exist_ok=True)
     path=os.path.join(folder,'index.html')
     # Component HTML is small; create once per worker process. Never include
@@ -12060,7 +12097,7 @@ def town_component_v121():
         with open(temp_path,'w',encoding='utf-8') as output:
             output.write(TOWN_COMPONENT_HTML_V121)
         os.replace(temp_path,path)
-    return st.components.v1.declare_component('sumai_town_map_v191',path=folder)
+    return st.components.v1.declare_component('sumai_town_map_v192',path=folder)
 
 # v159: Station-to-office approximate train travel times, OFFLINE AND READ-ONLY.
 # Tokyo Metro/Toei/JR local edge minutes adapted from MIT-licensed public project:
@@ -12816,7 +12853,7 @@ def interactive_town_choropleth(group):
                 commute_destination_2=(destinations[1] if len(destinations)==2 else ''),
                 highlight_destination_1=(chosen_office_1 if chosen_office_1!='\u8868\u793a\u3057\u306a\u3044' else ''),
                 highlight_destination_2=(chosen_office_2 if chosen_office_2!='\u8868\u793a\u3057\u306a\u3044' else ''),
-                key='town_map_v191_'+str(reset),default=None)
+                key='town_map_v192_'+str(reset),default=None)
     _v187_perf_stage('town_map_component_ms',widget_start)
     # An old viewport result can arrive just after a layout switch.
     # Accept only bounds reported by the current browser view revision.
