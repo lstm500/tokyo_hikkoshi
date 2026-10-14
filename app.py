@@ -55,7 +55,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v188"
+BUILD = "REBUILD-01-v189"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -757,6 +757,70 @@ button:disabled{background:#e3e9e3!important;color:#607369!important;opacity:1!i
  content:" ✓";white-space:nowrap;font-weight:900;margin-left:5px;
 }
 .stApp button:focus-visible,.stApp a:focus-visible{outline:3px solid #156f6a!important;outline-offset:2px!important}
+
+/* v189: v188 non-searchable popover triggers must use the same LIGHT theme
+   as the other commute controls. Before this fix the default Streamlit
+   popover background was dark while the global foreground was dark too. */
+.stApp [data-testid="stPopover"] button,
+.stApp [data-testid="stPopover"] button[kind],
+.stApp [data-testid="stPopover"] button[data-testid^="stBaseButton"]{
+ background:#ffffff!important;
+ background-color:#ffffff!important;
+ color:#173a5e!important;
+ -webkit-text-fill-color:#173a5e!important;
+ border:1px solid #a7b8ac!important;
+ border-radius:12px!important;
+ min-height:48px!important;
+ opacity:1!important;
+ font-weight:600!important;
+}
+.stApp [data-testid="stPopover"] button *,
+.stApp [data-testid="stPopover"] button p,
+.stApp [data-testid="stPopover"] button span,
+.stApp [data-testid="stPopover"] button svg{
+ color:inherit!important;
+ -webkit-text-fill-color:inherit!important;
+}
+.stApp [data-testid="stPopover"] button:not(:disabled):hover{
+ background:#eaf2ed!important;
+ background-color:#eaf2ed!important;
+ color:#173a5e!important;
+ -webkit-text-fill-color:#173a5e!important;
+}
+.stApp [data-testid="stPopover"] button:not(:disabled):is(:active,:focus,:focus-visible),
+.stApp [data-testid="stPopover"] button[aria-expanded="true"]{
+ background:#156f6a!important;
+ background-color:#156f6a!important;
+ color:#ffffff!important;
+ -webkit-text-fill-color:#ffffff!important;
+ border-color:#0b615f!important;
+}
+.stApp [data-testid="stPopover"] button:disabled{
+ background:#e7ece8!important;
+ background-color:#e7ece8!important;
+ color:#455e55!important;
+ -webkit-text-fill-color:#455e55!important;
+ opacity:1!important;
+}
+/* The choice list itself also needs dark text on an opaque light surface,
+   including when the Streamlit popover is placed in a portal. */
+[data-testid="stPopoverBody"],
+[data-testid="stPopoverContent"],
+[data-testid="stPopover"] [role="dialog"]{
+ background:#ffffff!important;
+ background-color:#ffffff!important;
+ color:#173a5e!important;
+ color-scheme:light!important;
+}
+[data-testid="stPopoverBody"] [data-testid="stRadio"] label,
+[data-testid="stPopoverBody"] [data-testid="stRadio"] p,
+[data-testid="stPopoverBody"] [data-testid="stRadio"] span,
+[data-testid="stPopoverContent"] [data-testid="stRadio"] label,
+[data-testid="stPopoverContent"] [data-testid="stRadio"] p,
+[data-testid="stPopoverContent"] [data-testid="stRadio"] span{
+ color:#173a5e!important;
+ -webkit-text-fill-color:#173a5e!important;
+}
 </style>'''
 
 
