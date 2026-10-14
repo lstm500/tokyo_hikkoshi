@@ -55,7 +55,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v189"
+BUILD = "REBUILD-01-v190"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -234,6 +234,10 @@ def homes_preflight_or_fallback(web,regions):
             return False,disable_homes_for_runtime(web,exc,url)
         raise
 DEFAULT_CENTER = (35.7303,139.711)
+# v190: Home view matched to the supplied Tokyo map screenshot.
+_V190_MAP_CENTER = (35.669, 139.757)
+_V190_MAP_ZOOM = 11
+_V190_MAP_INITIAL_WINDOW = (35.50, 139.57, 35.84, 139.94)
 UNIT_TABLE = "housing_units_v1"
 SEARCH_TABLE = "housing_searches_v1"
 PLACE_TABLE = "housing_places_v1"
@@ -11912,11 +11916,43 @@ _V178_WIDTH_NEW='   var width=Math.min(460,nameWidth+timeWidth+19);'
 assert TOWN_COMPONENT_HTML_V121.count(_V178_WIDTH_OLD)==1
 TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(_V178_WIDTH_OLD,_V178_WIDTH_NEW,1)
 
+# v190: Reset map view only when the selected layout changes.  Re-rendering
+# the same layout after a pan/zoom keeps the user's current map position.
+assert TOWN_COMPONENT_HTML_V121.count('lastBounds:null,') == 1
+TOWN_COMPONENT_HTML_V121 = TOWN_COMPONENT_HTML_V121.replace(
+    'lastBounds:null,', 'lastBounds:null,viewEpoch:null,', 1)
+_V190_EPOCH_JS = """ var requestedEpoch=Number.isFinite(+args.view_epoch)?+args.view_epoch:0;
+ if(state.viewEpoch===null){
+   state.viewEpoch=requestedEpoch;
+ }else if(state.viewEpoch!==requestedEpoch){
+   state.viewEpoch=requestedEpoch;
+   state.sentBounds='';
+   var center=Array.isArray(args.center)&&args.center.length===2?args.center:[35.669,139.757];
+   var zoom=Number.isFinite(+args.zoom)?+args.zoom:11;
+   state.map.setView(center,zoom,{animate:false});
+ }
+"""
+assert TOWN_COMPONENT_HTML_V121.count(' state.stations=Array.isArray(args.stations)?args.stations:state.stations;') == 1
+TOWN_COMPONENT_HTML_V121 = TOWN_COMPONENT_HTML_V121.replace(
+    ' state.stations=Array.isArray(args.stations)?args.stations:state.stations;',
+    _V190_EPOCH_JS+' state.stations=Array.isArray(args.stations)?args.stations:state.stations;', 1)
+assert TOWN_COMPONENT_HTML_V121.count('zoom:state.map.getZoom()}});') == 1
+TOWN_COMPONENT_HTML_V121 = TOWN_COMPONENT_HTML_V121.replace(
+    'zoom:state.map.getZoom()}});',
+    'zoom:state.map.getZoom(),view_epoch:state.viewEpoch}});',1)
+assert TOWN_COMPONENT_HTML_V121.count('[35.6812,139.7671]') == 1
+TOWN_COMPONENT_HTML_V121 = TOWN_COMPONENT_HTML_V121.replace(
+    '[35.6812,139.7671]', '[35.669,139.757]',1)
+assert TOWN_COMPONENT_HTML_V121.count('var zoom=Number.isFinite(+args.zoom)?+args.zoom:14;') == 1
+TOWN_COMPONENT_HTML_V121 = TOWN_COMPONENT_HTML_V121.replace(
+    'var zoom=Number.isFinite(+args.zoom)?+args.zoom:14;',
+    'var zoom=Number.isFinite(+args.zoom)?+args.zoom:11;',1)
+
 # v182: unique name and static folder force the browser to fetch the updated
 # map script instead of keeping a previously mounted/cached v178 iframe.
 @st.cache_resource(show_spinner=False)
 def town_component_v121():
-    folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-v182')
+    folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-v190')
     os.makedirs(folder,exist_ok=True)
     path=os.path.join(folder,'index.html')
     # Component HTML is small; create once per worker process. Never include
@@ -11933,7 +11969,7 @@ def town_component_v121():
         with open(temp_path,'w',encoding='utf-8') as output:
             output.write(TOWN_COMPONENT_HTML_V121)
         os.replace(temp_path,path)
-    return st.components.v1.declare_component('sumai_town_map_v182',path=folder)
+    return st.components.v1.declare_component('sumai_town_map_v190',path=folder)
 
 # v159: Station-to-office approximate train travel times, OFFLINE AND READ-ONLY.
 # Tokyo Metro/Toei/JR local edge minutes adapted from MIT-licensed public project:
@@ -12633,12 +12669,12 @@ def interactive_town_choropleth(group):
     signature=(BUILD,group,revision,reset,snap['revision'],summary_version,bool(ready),oz_signature)
     cached=state.get('_v118_choropleth_payload')
     bounds=state.get('new_bounds')
-    center=bounds_center(bounds) if bounds else state.get('new_view_center',DEFAULT_CENTER)
+    center=bounds_center(bounds) if bounds else _V190_MAP_CENTER
     needs_update=(not isinstance(cached,dict)
                   or cached.get('signature')!=signature
                   or not _v156_view_is_covered(bounds,cached.get('window')))
     if needs_update:
-        window=_v156_town_render_window(bounds,center)
+        window=_v156_town_render_window(bounds,center) if bounds else _V190_MAP_INITIAL_WINDOW
         groups=(snap['summary'] or {}).get('groups') or {}
         # Only regenerate polygons when this viewport + layout + summary is new.
         # Reusing any previous layout in the same view requires NO geometry scan.
@@ -12680,13 +12716,16 @@ def interactive_town_choropleth(group):
     _v187_perf_stage('commute_route_ms',route_start)
     widget=town_component_v121()
     widget_start=time.perf_counter()
-    data=widget(center=list(cached['center']),zoom=14,geo=cached['geo'],
+    view_epoch=int(state.get('_v190_map_view_epoch',0))
+    data=widget(center=list(_V190_MAP_CENTER),zoom=_V190_MAP_ZOOM,view_epoch=view_epoch,geo=cached['geo'],
                 signature=cached['layer_signature'],stations=stations,wards=wards,
                 commute_destination=(destinations[0] if destinations else ''),
                 commute_destination_2=(destinations[1] if len(destinations)==2 else ''),
-                key='town_map_v172_'+str(reset),default=None)
+                key='town_map_v190_'+str(reset),default=None)
     _v187_perf_stage('town_map_component_ms',widget_start)
-    if isinstance(data,dict):
+    # An old viewport result can arrive just after a layout switch.
+    # Accept only bounds reported by the current browser view revision.
+    if isinstance(data,dict) and data.get('view_epoch')==view_epoch:
         current=viewport_bounds(data)
         if current:
             state['new_bounds']=current;state['new_view_center']=bounds_center(current)
@@ -13416,7 +13455,15 @@ def v170_commute_autosave_sync():
 
 
 def _v187_choose_layout(group):
-    st.session_state['layout_display_group']=group
+    state=st.session_state
+    if state.get('layout_display_group')==group:
+        return
+    state['layout_display_group']=group
+    state['_v190_map_view_epoch']=int(state.get('_v190_map_view_epoch',0))+1
+    state['new_bounds']=None
+    state['new_view_center']=_V190_MAP_CENTER
+    state.pop('new_map',None)
+    state.pop('_v118_choropleth_payload',None)
 
 
 @st.fragment(run_every='8s')
@@ -13534,6 +13581,12 @@ def main():
     state.setdefault('new_units',[]);state.setdefault('new_search',None);state.setdefault('new_saved_keys',[])
     state.setdefault('new_map_loaded',False);state.setdefault('address_point_cache',{})
     state.setdefault('layout_display_group','group1')
+    if not state.get('_v190_map_view_initialized'):
+        state['_v190_map_view_initialized']=True
+        state['_v190_map_view_epoch']=0
+        state['new_bounds']=None
+        state['new_view_center']=_V190_MAP_CENTER
+        state.pop('_v118_choropleth_payload',None)
     commute_storage_ready=v170_commute_autosave_sync()
     restore_manual_search()
     restore_automatic_collection()
