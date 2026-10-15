@@ -55,7 +55,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v199"
+BUILD = "REBUILD-01-v200"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -12119,11 +12119,12 @@ function updateTownSearch(area, jumpToken){
  if(token>0 && token!==state.townSearchJumpToken && area && Array.isArray(area.bounds) && area.bounds.length===4){
    var b=area.bounds.map(Number);
    if(b.every(Number.isFinite) && b[0]<=b[2] && b[1]<=b[3]){
-     // One search click -> one fit; subsequent rent/status updates never recenter.
+     // At most zoom 13 (about the reference screenshot); fit out farther only
+     // if a town's actual outline cannot fit. Do not recenter on later redraws.
      state.townSearchJumpToken=token;
      state.sentBounds='';
      state.map.fitBounds([[b[0],b[1]],[b[2],b[3]]],
-       {padding:[38,38],maxZoom:15,animate:false});
+       {padding:[38,38],maxZoom:13,animate:false});
    }
  }
 }
@@ -12149,7 +12150,7 @@ TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(
 # map script instead of keeping a previously mounted/cached v178 iframe.
 @st.cache_resource(show_spinner=False)
 def town_component_v121():
-    folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-v199')
+    folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-v200')
     os.makedirs(folder,exist_ok=True)
     path=os.path.join(folder,'index.html')
     # Component HTML is small; create once per worker process. Never include
@@ -12166,7 +12167,7 @@ def town_component_v121():
         with open(temp_path,'w',encoding='utf-8') as output:
             output.write(TOWN_COMPONENT_HTML_V121)
         os.replace(temp_path,path)
-    return st.components.v1.declare_component('sumai_town_map_v199',path=folder)
+    return st.components.v1.declare_component('sumai_town_map_v200',path=folder)
 
 # v159: Station-to-office approximate train travel times, OFFLINE AND READ-ONLY.
 # Tokyo Metro/Toei/JR local edge minutes adapted from MIT-licensed public project:
@@ -12904,10 +12905,12 @@ def _v199_use_town_candidate(candidate,boundary_store):
     state['_v199_town_search_name']=candidate['label']
     state['_v199_town_jump_token']=int(state.get('_v199_town_jump_token',0))+1
     state['_v199_town_candidates']=[]
-    # The old polygon viewport is no longer adequate after fitBounds.
+    # The reference zoom 13 shows much more of the surrounding area than
+    # the selected town alone. Prefetch the visible 480px-high map and a
+    # desktop-width view so rent colors do not abruptly disappear on jump.
     south,west,north,east=data['bounds']
-    lat_pad=max(.016,(north-south)*1.3)
-    lon_pad=max(.019,(east-west)*1.3)
+    lat_pad=max(.039,(north-south)*1.3)
+    lon_pad=max(.095,(east-west)*1.3)
     state['new_bounds']=(south-lat_pad,west-lon_pad,north+lat_pad,east+lon_pad)
     state['new_view_center']=((south+north)/2,(west+east)/2)
     state.pop('_v118_choropleth_payload',None)
