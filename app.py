@@ -55,7 +55,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v198"
+BUILD = "REBUILD-01-v199"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -12086,11 +12086,70 @@ _V193_BOX_NEW = """     width=Math.min(size.x-8,Math.max(34,Array.from(prefix+na
 assert TOWN_COMPONENT_HTML_V121.count(_V193_BOX_OLD) == 1
 TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(_V193_BOX_OLD,_V193_BOX_NEW,1)
 
+# v199 - jump to a searched Tokyo town and outline its exact official
+# census polygons; never color missing-rent polygons or guess a street address.
+_V199_AREA_CSS = """
+/* Highlight follows the real polygon boundaries, with no covering fill. */
+.leaflet-pane.town-search-pane{pointer-events:none!important}
+"""
+assert TOWN_COMPONENT_HTML_V121.count('</style></head>')==1
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(
+    '</style></head>', _V199_AREA_CSS+'</style></head>', 1)
+_V199_SEARCH_JS = r"""
+function updateTownSearch(area, jumpToken){
+ if(!state.map)return;
+ var id=area && typeof area.id==='string'?area.id:'';
+ if(id!==state.townSearchId){
+   if(state.townSearchLayer){state.map.removeLayer(state.townSearchLayer);state.townSearchLayer=null;}
+   state.townSearchId=id;
+   if(id && area && area.geo && Array.isArray(area.geo.features) && area.geo.features.length){
+     if(!state.map.getPane('townSearchPane')){
+       state.map.createPane('townSearchPane');
+       state.map.getPane('townSearchPane').style.zIndex='625';
+       state.map.getPane('townSearchPane').style.pointerEvents='none';
+     }
+     var under=L.geoJSON(area.geo,{interactive:false,pane:'townSearchPane',
+        smoothFactor:0,style:function(){return {color:'#ffffff',weight:6.5,opacity:1,fill:false}}});
+     var over=L.geoJSON(area.geo,{interactive:false,pane:'townSearchPane',
+        smoothFactor:0,style:function(){return {color:'#a52c40',weight:3,opacity:1,fill:false}}});
+     state.townSearchLayer=L.layerGroup([under,over]).addTo(state.map);
+   }
+ }
+ var token=Number(jumpToken)||0;
+ if(token>0 && token!==state.townSearchJumpToken && area && Array.isArray(area.bounds) && area.bounds.length===4){
+   var b=area.bounds.map(Number);
+   if(b.every(Number.isFinite) && b[0]<=b[2] && b[1]<=b[3]){
+     // One search click -> one fit; subsequent rent/status updates never recenter.
+     state.townSearchJumpToken=token;
+     state.sentBounds='';
+     state.map.fitBounds([[b[0],b[1]],[b[2],b[3]]],
+       {padding:[38,38],maxZoom:15,animate:false});
+   }
+ }
+}
+"""
+assert TOWN_COMPONENT_HTML_V121.count('function render(args){')==1
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('function render(args){',_V199_SEARCH_JS+'\nfunction render(args){',1)
+assert TOWN_COMPONENT_HTML_V121.count(' updateOverlay(args.geo,args.signature);')==1
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(
+    ' updateOverlay(args.geo,args.signature);',
+    ' updateOverlay(args.geo,args.signature);\n updateTownSearch(args.town_search_area||null,args.town_search_jump_token||0);',1)
+# Tag viewport callbacks with the last applied search. Stale callbacks from the
+# old viewport must not overwrite the new search target while the map jumps.
+assert TOWN_COMPONENT_HTML_V121.count('zoom:state.map.getZoom(),view_epoch:state.viewEpoch}});')==1
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(
+    'zoom:state.map.getZoom(),view_epoch:state.viewEpoch}});',
+    'zoom:state.map.getZoom(),view_epoch:state.viewEpoch,town_search_jump_token:state.townSearchJumpToken}});',1)
+assert TOWN_COMPONENT_HTML_V121.count('lastBounds:null,viewEpoch:null,')==1
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(
+    'lastBounds:null,viewEpoch:null,',
+    'lastBounds:null,viewEpoch:null,townSearchId:null,townSearchLayer:null,townSearchJumpToken:0,',1)
+
 # v182: unique name and static folder force the browser to fetch the updated
 # map script instead of keeping a previously mounted/cached v178 iframe.
 @st.cache_resource(show_spinner=False)
 def town_component_v121():
-    folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-v198')
+    folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-v199')
     os.makedirs(folder,exist_ok=True)
     path=os.path.join(folder,'index.html')
     # Component HTML is small; create once per worker process. Never include
@@ -12107,7 +12166,7 @@ def town_component_v121():
         with open(temp_path,'w',encoding='utf-8') as output:
             output.write(TOWN_COMPONENT_HTML_V121)
         os.replace(temp_path,path)
-    return st.components.v1.declare_component('sumai_town_map_v198',path=folder)
+    return st.components.v1.declare_component('sumai_town_map_v199',path=folder)
 
 # v159: Station-to-office approximate train travel times, OFFLINE AND READ-ONLY.
 # Tokyo Metro/Toei/JR local edge minutes adapted from MIT-licensed public project:
@@ -12769,6 +12828,138 @@ def _v187_town_station_refs(destinations):
     return town_station_refs_v164(tuple(destinations))
 
 
+# v199: Search the already downloaded 23-ward census polygons locally.
+# A base town (e.g. 南長崎) selects every real chome; a numbered town
+# (e.g. 南長崎3丁目) selects only that exact chome. No geocoding or network calls.
+def _v199_find_town_candidates(query, boundary_store, max_candidates=10):
+    import difflib
+    user_text=address_key(str(query or '')).replace('東京都','').replace(' ', '').replace('　','')
+    if len(user_text)<2 or len(user_text)>65:
+        return []
+    wards=sorted(TOKYO_WARDS.values(),key=len,reverse=True)
+    ward=next((w for w in wards if user_text.startswith(w)),None)
+    term=user_text[len(ward):] if ward else user_text
+    if not term:
+        return []
+    # Shorthand '南長崎3' means '南長崎3丁目'; named non-chome towns are untouched.
+    if re.search(r'[^0-9]\d{1,2}$',term):
+        term+='丁目'
+    has_chome=bool(re.search(r'\d+丁目$',term))
+    index={}
+    for key in boundary_store.coverage_keys():
+        if not isinstance(key,str) or '|' not in key:continue
+        w,name=key.split('|',1)
+        if ward and ward!=w:continue
+        label=address_key(name)
+        target=label if has_chome else town_base_name(label)
+        grouping=(w,target)
+        index.setdefault(grouping,[]).append(key)
+    results=[]
+    for (w,target),keys in index.items():
+        if target==term:score=0
+        elif target.startswith(term):score=1
+        elif term in target:score=2
+        else:
+            if len(term)<3:continue
+            ratio=difflib.SequenceMatcher(None,term,target).ratio()
+            if ratio<.67:continue
+            score=3+(1.-ratio)
+        n=len(keys)
+        label=w+' '+target+(f'（{n}丁目をまとめて表示）' if n>1 else '')
+        results.append({'label':label,'keys':sorted(keys),'score':score,
+                        'exact':score==0})
+    results.sort(key=lambda r:(r['score'],len(r['label']),r['label']))
+    return results[:max_candidates]
+
+
+def _v199_read_town_outline(boundary_store, keys):
+    # Fetch only the chosen polygons. Do not stream every town to the browser.
+    keys=sorted(set(keys))
+    if not keys or len(keys)>30:raise ValueError('対象町丁目が多すぎます。検索地名を絞ってください。')
+    marks=','.join('?' for _ in keys)
+    features=[]
+    extent=None
+    with sqlite3.connect('file:'+quote(boundary_store.path,safe='/')+'?mode=ro',uri=True,timeout=8) as conn:
+        rows=conn.execute('SELECT town,south,west,north,east,poly FROM areas WHERE town IN ('+marks+')',keys)
+        for name,south,west,north,east,raw in rows:
+            polygons=json.loads(raw)
+            if not polygons:continue
+            features.append({'type':'Feature','geometry':{'type':'MultiPolygon','coordinates':polygons},
+                             'properties':{'name':name}})
+            if extent is None:extent=[south,west,north,east]
+            else:
+                extent=[min(extent[0],south),min(extent[1],west),
+                        max(extent[2],north),max(extent[3],east)]
+    if not features or extent is None:raise ValueError('該当する町丁目境界を読み取れませんでした。')
+    # A stable identity avoids remounting the Leaflet highlight every 8 seconds.
+    digest=hashlib.sha256('|'.join(keys).encode('utf-8')).hexdigest()[:16]
+    return {'id':digest,'geo':{'type':'FeatureCollection','features':features},
+            'bounds':extent}
+
+
+def _v199_use_town_candidate(candidate,boundary_store):
+    data=_v199_read_town_outline(boundary_store,candidate['keys'])
+    state=st.session_state
+    state['_v199_town_search_area']=data
+    state['_v199_town_search_name']=candidate['label']
+    state['_v199_town_jump_token']=int(state.get('_v199_town_jump_token',0))+1
+    state['_v199_town_candidates']=[]
+    # The old polygon viewport is no longer adequate after fitBounds.
+    south,west,north,east=data['bounds']
+    lat_pad=max(.016,(north-south)*1.3)
+    lon_pad=max(.019,(east-west)*1.3)
+    state['new_bounds']=(south-lat_pad,west-lon_pad,north+lat_pad,east+lon_pad)
+    state['new_view_center']=((south+north)/2,(west+east)/2)
+    state.pop('_v118_choropleth_payload',None)
+    state['_v118_map_revision']=int(state.get('_v118_map_revision',0))+1
+
+
+def _v199_choose_town_safely(candidate,boundary_store):
+    try:
+        _v199_use_town_candidate(candidate,boundary_store)
+    except (sqlite3.Error,ValueError,OSError,TypeError) as exc:
+        st.warning('地名の境界を表示できません：'+str(exc)[:160])
+        return False
+    return True
+
+
+def _v199_town_search_controls(boundary_store,ready):
+    state=st.session_state
+    term=st.text_input('地名を検索（区名・町名・丁目）',key='_v199_town_text',
+                       placeholder='例：南長崎 / 豊島区南長崎3丁目')
+    if st.button('地名を検索して移動',key='v199_town_search_button',type='secondary'):
+        if not term.strip():
+            st.warning('区名・町名・丁目を入力してください。')
+        elif not ready or boundary_store is None:
+            st.warning('地図の町丁目境界を読み込み中です。完了後に再度検索してください。')
+        else:
+            try:
+                hits=_v199_find_town_candidates(term,boundary_store)
+            except (sqlite3.Error,OSError) as exc:
+                st.warning('地名検索DBを読み取れません：'+str(exc)[:160])
+                return
+            if not hits:
+                state['_v199_town_candidates']=[]
+                st.warning('一致する町丁目がありません。区名・町名を確認してください。')
+            else:
+                exact=[h for h in hits if h['exact']]
+                if len(exact)==1:
+                    if _v199_choose_town_safely(exact[0],boundary_store):
+                        st.rerun(scope='fragment')
+                else:
+                    state['_v199_town_candidates']=hits
+    options=state.get('_v199_town_candidates') or []
+    if options:
+        st.caption('候補を選択してください（候補が複数のときだけ表示）')
+        for i,option in enumerate(options):
+            if st.button(option['label'],key='v199_town_option_'+str(i),
+                         use_container_width=True):
+                if _v199_choose_town_safely(option,boundary_store):
+                    st.rerun(scope='fragment')
+    if state.get('_v199_town_search_name'):
+        st.caption('表示中：'+state['_v199_town_search_name']+'（境界線を強調表示）')
+
+
 def interactive_town_choropleth(group):
     """Leaflet map persists in the browser across Streamlit fragment reruns.
 
@@ -12858,6 +13049,8 @@ def interactive_town_choropleth(group):
     widget_start=time.perf_counter()
     view_epoch=int(state.get('_v190_map_view_epoch',0))
     data=widget(center=list(_V190_MAP_CENTER),zoom=_V190_MAP_ZOOM,view_epoch=view_epoch,geo=cached['geo'],
+                town_search_area=state.get('_v199_town_search_area'),
+                town_search_jump_token=int(state.get('_v199_town_jump_token',0)),
                 signature=cached['layer_signature'],stations=stations,wards=wards,
                 commute_destination=(destinations[0] if destinations else ''),
                 commute_destination_2=(destinations[1] if len(destinations)==2 else ''),
@@ -12867,15 +13060,13 @@ def interactive_town_choropleth(group):
     _v187_perf_stage('town_map_component_ms',widget_start)
     # An old viewport result can arrive just after a layout switch.
     # Accept only bounds reported by the current browser view revision.
-    if isinstance(data,dict) and data.get('view_epoch')==view_epoch:
+    if (isinstance(data,dict) and data.get('view_epoch')==view_epoch
+            and data.get('town_search_jump_token',0)==int(state.get('_v199_town_jump_token',0))):
         current=viewport_bounds(data)
         if current:
             state['new_bounds']=current;state['new_view_center']=bounds_center(current)
             state['new_map']=data
-    if st.button('地図を再初期化',key='reset_v118_map'):
-        state.pop('_v118_choropleth_payload',None)
-        state['_v118_map_reset_count']=reset+1
-        st.rerun(scope='fragment')
+    _v199_town_search_controls(shapes if ready else None,ready)
 
 
 # V147: REAL-URL REPLAY.  This mode uses the SAME fetch/parse/map-address/
@@ -13601,6 +13792,9 @@ def _v187_choose_layout(group):
     if state.get('layout_display_group')==group:
         return
     state['layout_display_group']=group
+    state.pop('_v199_town_search_area',None)
+    state.pop('_v199_town_search_name',None)
+    state.pop('_v199_town_candidates',None)
     state['_v190_map_view_epoch']=int(state.get('_v190_map_view_epoch',0))+1
     state['new_bounds']=None
     state['new_view_center']=_V190_MAP_CENTER
