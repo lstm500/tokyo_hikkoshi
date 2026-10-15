@@ -55,7 +55,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v200"
+BUILD = "REBUILD-01-v201"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -12930,6 +12930,9 @@ def _v199_town_search_controls(boundary_store,ready):
     state=st.session_state
     term=st.text_input('地名を検索（区名・町名・丁目）',key='_v199_town_text',
                        placeholder='例：南長崎 / 豊島区南長崎3丁目')
+    # Reserve this position before the search button. Streamlit renders the
+    # candidates in this slot after the search resolves, without an extra rerun.
+    candidate_slot=st.empty()
     if st.button('地名を検索して移動',key='v199_town_search_button',type='secondary'):
         if not term.strip():
             st.warning('区名・町名・丁目を入力してください。')
@@ -12953,12 +12956,15 @@ def _v199_town_search_controls(boundary_store,ready):
                     state['_v199_town_candidates']=hits
     options=state.get('_v199_town_candidates') or []
     if options:
-        st.caption('候補を選択してください（候補が複数のときだけ表示）')
-        for i,option in enumerate(options):
-            if st.button(option['label'],key='v199_town_option_'+str(i),
-                         use_container_width=True):
-                if _v199_choose_town_safely(option,boundary_store):
-                    st.rerun(scope='fragment')
+        # Candidate buttons appear ABOVE '地名を検索して移動' (including on the
+        # same run that finds them). This is intentionally visible on mobile.
+        with candidate_slot.container():
+            st.markdown(f'**地名の候補（{len(options)}件）を選択して移動**')
+            for i,option in enumerate(options):
+                if st.button(option['label'],key='v199_town_option_'+str(i),
+                             use_container_width=True):
+                    if _v199_choose_town_safely(option,boundary_store):
+                        st.rerun(scope='fragment')
     if state.get('_v199_town_search_name'):
         st.caption('表示中：'+state['_v199_town_search_name']+'（境界線を強調表示）')
 
