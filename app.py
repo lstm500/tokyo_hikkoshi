@@ -52,7 +52,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v189"
+BUILD = "REBUILD-01-v190"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -11990,9 +11990,57 @@ def _v189_resolve_suumo_selection(state,data,group):
     return reply
 
 
+# v190: a component remount must restore the actual viewport, not zoom 14.
+_V190_VIEWPORT_JS = r"""
+function v190ValidView(value){
+ if(!value||!Array.isArray(value.center)||value.center.length!==2)return null;
+ var lat=Number(value.center[0]),lng=Number(value.center[1]),zoom=Number(value.zoom);
+ if(!Number.isFinite(lat)||!Number.isFinite(lng)||!Number.isFinite(zoom)||lat<34||lat>37||lng<138||lng>141||zoom<1||zoom>20)return null;
+ return {center:[lat,lng],zoom:zoom,jump:String(value.jump||''),local:!!value.local};
+}
+function v190InitialView(args){
+ state._v190Epoch=String(args.viewport_epoch||'0');
+ try{
+   var saved=JSON.parse(sessionStorage.getItem('sumai.viewport.v190')||'null');
+   var view=saved&&String(saved.epoch)===state._v190Epoch?v190ValidView(saved):null;
+   if(view){state.lastJumpToken=view.jump;state._v185FocusActive=view.local;return view;}
+ }catch(e){}
+ return v190ValidView({center:args.center,zoom:args.zoom})||{center:[35.7303,139.711],zoom:14};
+}
+function v190SaveViewport(){
+ if(!state.map)return;
+ try{
+   var center=state.map.getCenter();
+   var view=v190ValidView({center:[center.lat,center.lng],zoom:state.map.getZoom(),jump:state.lastJumpToken,local:state._v185FocusActive});
+   if(view){view.epoch=state._v190Epoch||'0';sessionStorage.setItem('sumai.viewport.v190',JSON.stringify(view));}
+ }catch(e){}
+}
+"""
+assert TOWN_COMPONENT_HTML_V121.count('function initMap(args){')==1
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('function initMap(args){',_V190_VIEWPORT_JS+'\nfunction initMap(args){',1)
+_v190_initial="var center=Array.isArray(args.center)&&args.center.length===2?args.center:[35.6812,139.7671];\n var zoom=Number.isFinite(+args.zoom)?+args.zoom:14;"
+assert TOWN_COMPONENT_HTML_V121.count(_v190_initial)==1
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(_v190_initial,
+    'var initial=v190InitialView(args);\n var center=initial.center;\n var zoom=initial.zoom;',1)
+_v190_move="state.map.on('moveend zoomend',function(){"
+assert TOWN_COMPONENT_HTML_V121.count(_v190_move)==1
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(_v190_move,_v190_move+'\n    v190SaveViewport();',1)
+_v190_emit='function emitBounds(){if(!state.map||state.searchPendingTicket||state._v189Pending)return;'
+assert TOWN_COMPONENT_HTML_V121.count(_v190_emit)==1
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(_v190_emit,
+    'function emitBounds(){v190SaveViewport();if(!state.map||state.searchPendingTicket||state._v189Pending)return;',1)
+
+
+def _v190_view_zoom(value,default=14):
+    try:
+        zoom=float(value)
+        return zoom if math.isfinite(zoom) and 1<=zoom<=20 else default
+    except (ValueError,TypeError,OverflowError):return default
+
+
 @st.cache_resource(show_spinner=False)
 def town_component_v121():
-    _asset_revision='v189-search-suumo-button'
+    _asset_revision='v190-preserve-current-viewport'
     folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-v184')
     os.makedirs(folder,exist_ok=True)
     path=os.path.join(folder,'index.html')
@@ -12872,7 +12920,8 @@ def interactive_town_choropleth(group):
             pass
     stations,wards=town_station_refs_v164(destinations)
     widget=town_component_v121()
-    data=widget(center=list(cached['center']),zoom=14,geo=cached['geo'],
+    data=widget(center=list(center),zoom=_v190_view_zoom(state.get('new_view_zoom')),geo=cached['geo'],
+                viewport_epoch=str(reset),
                 signature=cached['layer_signature'],stations=stations,wards=wards,
                 search_catalog=search_catalog,search_district_names=list(TOKYO_WARDS.values()),
                 search_ward_bounds=search_ward_bounds,
@@ -12914,14 +12963,17 @@ def interactive_town_choropleth(group):
                     state['_v184_search_error']={'ticket':ticket,'message':'検索した町域の境界を取得できませんでした。'}
                 if current:
                     state['new_bounds']=current;state['new_view_center']=bounds_center(current)
+                    state['new_view_zoom']=_v190_view_zoom(data.get('zoom'),state.get('new_view_zoom',14))
                 st.rerun(scope='fragment')
         command=state.get('_v182_map_jump')
         confirmed=not command or data.get('jump_applied')==command.get('id')
         if command and confirmed:
             state['_v182_map_jump_confirmed']=command['id']
+            state.pop('_v182_map_jump',None)  # Consume once, including after iframe remounts.
         if current and confirmed:
             state['new_bounds']=current;state['new_view_center']=bounds_center(current)
             state['new_map']=data
+            state['new_view_zoom']=_v190_view_zoom(data.get('zoom'),state.get('new_view_zoom',14))
 
 
 def town_location_search_panel_v184():
