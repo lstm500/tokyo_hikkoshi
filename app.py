@@ -52,7 +52,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v190"
+BUILD = "REBUILD-01-v202"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -231,6 +231,10 @@ def homes_preflight_or_fallback(web,regions):
             return False,disable_homes_for_runtime(web,exc,url)
         raise
 DEFAULT_CENTER = (35.7303,139.711)
+# Restore the specified home view from app.py_ver.201.
+_V202_HOME_CENTER = (35.669,139.757)
+_V202_HOME_ZOOM = 11
+_V202_HOME_WINDOW = (35.50,139.57,35.84,139.94)
 UNIT_TABLE = "housing_units_v1"
 SEARCH_TABLE = "housing_searches_v1"
 PLACE_TABLE = "housing_places_v1"
@@ -11990,48 +11994,58 @@ def _v189_resolve_suumo_selection(state,data,group):
     return reply
 
 
-# v190: a component remount must restore the actual viewport, not zoom 14.
-_V190_VIEWPORT_JS = r"""
-function v190ValidView(value){
- if(!value||!Array.isArray(value.center)||value.center.length!==2)return null;
- var lat=Number(value.center[0]),lng=Number(value.center[1]),zoom=Number(value.zoom);
- if(!Number.isFinite(lat)||!Number.isFinite(lng)||!Number.isFinite(zoom)||lat<34||lat>37||lng<138||lng>141||zoom<1||zoom>20)return null;
- return {center:[lat,lng],zoom:zoom,jump:String(value.jump||''),local:!!value.local};
-}
-function v190InitialView(args){
- state._v190Epoch=String(args.viewport_epoch||'0');
- try{
-   var saved=JSON.parse(sessionStorage.getItem('sumai.viewport.v190')||'null');
-   var view=saved&&String(saved.epoch)===state._v190Epoch?v190ValidView(saved):null;
-   if(view){state.lastJumpToken=view.jump;state._v185FocusActive=view.local;return view;}
- }catch(e){}
- return v190ValidView({center:args.center,zoom:args.zoom})||{center:[35.7303,139.711],zoom:14};
-}
-function v190SaveViewport(){
- if(!state.map)return;
- try{
-   var center=state.map.getCenter();
-   var view=v190ValidView({center:[center.lat,center.lng],zoom:state.map.getZoom(),jump:state.lastJumpToken,local:state._v185FocusActive});
-   if(view){view.epoch=state._v190Epoch||'0';sessionStorage.setItem('sumai.viewport.v190',JSON.stringify(view));}
- }catch(e){}
+# v202: home/layout view and town-search view have different specified scales.
+assert TOWN_COMPONENT_HTML_V121.count('maxZoom:14,animate:false')==3
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('maxZoom:14,animate:false','maxZoom:13,animate:false')
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('padding:[24,24],maxZoom:13','padding:[38,38],maxZoom:13').replace('padding:[25,25],maxZoom:13','padding:[38,38],maxZoom:13')
+_V202_HOME_VIEW_JS = r"""
+function v202HomeView(args){
+ var epoch=Number(args.home_view_epoch)||0;
+ if(state._v202HomeEpoch===undefined){state._v202HomeEpoch=epoch;return;}
+ if(epoch===state._v202HomeEpoch)return;
+ state._v202HomeEpoch=epoch;
+ state._v189Place=null;state._v189Pending=false;state._v189Reply=null;
+ state._v185FocusActive=false;state.lastJumpToken=null;state.searchPendingTicket=null;
+ if(state.focusLayer){state.map.removeLayer(state.focusLayer);state.focusLayer=null;}
+ if(state.provisionalFocus){state.map.removeLayer(state.provisionalFocus);state.provisionalFocus=null;}
+ state.sentBounds='';setTownStatus('');
+ var center=Array.isArray(args.home_center)?args.home_center:[35.669,139.757];
+ state.map.setView(center,11,{animate:false});
+ v189UpdateSuumo();
+ setTimeout(emitBounds,80);
 }
 """
-assert TOWN_COMPONENT_HTML_V121.count('function initMap(args){')==1
-TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('function initMap(args){',_V190_VIEWPORT_JS+'\nfunction initMap(args){',1)
-_v190_initial="var center=Array.isArray(args.center)&&args.center.length===2?args.center:[35.6812,139.7671];\n var zoom=Number.isFinite(+args.zoom)?+args.zoom:14;"
-assert TOWN_COMPONENT_HTML_V121.count(_v190_initial)==1
-TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(_v190_initial,
-    'var initial=v190InitialView(args);\n var center=initial.center;\n var zoom=initial.zoom;',1)
-_v190_move="state.map.on('moveend zoomend',function(){"
-assert TOWN_COMPONENT_HTML_V121.count(_v190_move)==1
-TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(_v190_move,_v190_move+'\n    v190SaveViewport();',1)
-_v190_emit='function emitBounds(){if(!state.map||state.searchPendingTicket||state._v189Pending)return;'
-assert TOWN_COMPONENT_HTML_V121.count(_v190_emit)==1
-TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(_v190_emit,
-    'function emitBounds(){v190SaveViewport();if(!state.map||state.searchPendingTicket||state._v189Pending)return;',1)
+assert TOWN_COMPONENT_HTML_V121.count('function render(args){')==1
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('function render(args){',_V202_HOME_VIEW_JS+'\nfunction render(args){',1)
+assert TOWN_COMPONENT_HTML_V121.count(' state._v189WardUrls=args.suumo_ward_urls||{};')==1
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(' state._v189WardUrls=args.suumo_ward_urls||{};',
+    ' v202HomeView(args);\n state._v189WardUrls=args.suumo_ward_urls||{};',1)
+_v202_message='zoom:state.map.getZoom(),jump_applied:state.lastJumpToken||null'
+assert TOWN_COMPONENT_HTML_V121.count(_v202_message)==2
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(_v202_message,
+    _v202_message+',home_view_epoch:state._v202HomeEpoch')
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('kind:place.kind}});', 'kind:place.kind,home_view_epoch:state._v202HomeEpoch}});',1)
 
 
-def _v190_view_zoom(value,default=14):
+def _v202_reset_home(state):
+    state['_v202_home_epoch']=int(state.get('_v202_home_epoch',0))+1
+    state['new_bounds']=None
+    state['new_view_center']=_V202_HOME_CENTER
+    state['new_view_zoom']=_V202_HOME_ZOOM
+    for key in ('new_map','_v182_map_jump','_v182_map_jump_confirmed','_v184_search_error',
+                '_v189_suumo_reply','_v118_choropleth_payload'):
+        state.pop(key,None)
+
+
+def _v202_choose_layout(state,group):
+    if group not in ('group0','group1','group2','house'):return False
+    if state.get('layout_display_group')==group:return False
+    state['layout_display_group']=group
+    _v202_reset_home(state)
+    return True
+
+
+def _v202_view_zoom(value,default=11):
     try:
         zoom=float(value)
         return zoom if math.isfinite(zoom) and 1<=zoom<=20 else default
@@ -12040,7 +12054,7 @@ def _v190_view_zoom(value,default=14):
 
 @st.cache_resource(show_spinner=False)
 def town_component_v121():
-    _asset_revision='v190-preserve-current-viewport'
+    _asset_revision='v202-restore-specified-home-and-search-scales'
     folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-v184')
     os.makedirs(folder,exist_ok=True)
     path=os.path.join(folder,'index.html')
@@ -12849,20 +12863,20 @@ def interactive_town_choropleth(group):
     # Layout controls live next to the map instead of above map diagnostics.
     if group not in ('group0','group1','group2','house'):group='group1';state.layout_display_group='group1'
     if st.button('ワンルーム・1K・1DK',key='layout_group0_v174',type='primary' if group=='group0' else 'secondary',use_container_width=True):
-        if state.layout_display_group!='group0':state.layout_display_group='group0';st.rerun(scope='fragment')
+        if _v202_choose_layout(state,'group0'):st.rerun(scope='fragment')
     if group=='group0':st.caption('マンション・築15年以内')
     g1,g2,g3=st.columns(3)
     with g1:
         if st.button('1LDK・2K・2DK',key='layout_group1',type='primary' if group=='group1' else 'secondary',use_container_width=True):
-            if state.layout_display_group!='group1':state.layout_display_group='group1';st.rerun(scope='fragment')
+            if _v202_choose_layout(state,'group1'):st.rerun(scope='fragment')
         if group=='group1':st.caption('マンション・築15年以内')
     with g2:
         if st.button('2LDK・3K・3DK',key='layout_group2',type='primary' if group=='group2' else 'secondary',use_container_width=True):
-            if state.layout_display_group!='group2':state.layout_display_group='group2';st.rerun(scope='fragment')
+            if _v202_choose_layout(state,'group2'):st.rerun(scope='fragment')
         if group=='group2':st.caption('マンション・築15年以内')
     with g3:
         if st.button('一戸建て',key='layout_group_house',type='primary' if group=='house' else 'secondary',use_container_width=True):
-            if state.layout_display_group!='house':state.layout_display_group='house';st.rerun(scope='fragment')
+            if _v202_choose_layout(state,'house'):st.rerun(scope='fragment')
         if group=='house':st.caption('築40年以内・50㎡以上')
     reset=int(state.get('_v118_map_reset_count',0))
     revision=int(state.get('_v118_map_revision',0))
@@ -12882,12 +12896,12 @@ def interactive_town_choropleth(group):
     signature=(BUILD,group,revision,reset,snap['revision'],summary_version,bool(ready),oz_signature)
     cached=state.get('_v118_choropleth_payload')
     bounds=state.get('new_bounds')
-    center=bounds_center(bounds) if bounds else state.get('new_view_center',DEFAULT_CENTER)
+    center=bounds_center(bounds) if bounds else state.get('new_view_center',_V202_HOME_CENTER)
     needs_update=(not isinstance(cached,dict)
                   or cached.get('signature')!=signature
                   or not _v156_view_is_covered(bounds,cached.get('window')))
     if needs_update:
-        window=_v156_town_render_window(bounds,center)
+        window=_v156_town_render_window(bounds,center) if bounds else _V202_HOME_WINDOW
         groups=(snap['summary'] or {}).get('groups') or {}
         geo,limited,count=town_colored_shapes(groups,group,shapes if ready else {},window,include_no_data=False,
                                               suumo_oz_codes=suumo_oz_codes)
@@ -12920,8 +12934,8 @@ def interactive_town_choropleth(group):
             pass
     stations,wards=town_station_refs_v164(destinations)
     widget=town_component_v121()
-    data=widget(center=list(center),zoom=_v190_view_zoom(state.get('new_view_zoom')),geo=cached['geo'],
-                viewport_epoch=str(reset),
+    data=widget(center=list(center),zoom=_v202_view_zoom(state.get('new_view_zoom')),geo=cached['geo'],
+                home_view_epoch=int(state.get('_v202_home_epoch',0)),home_center=list(_V202_HOME_CENTER),
                 signature=cached['layer_signature'],stations=stations,wards=wards,
                 search_catalog=search_catalog,search_district_names=list(TOKYO_WARDS.values()),
                 search_ward_bounds=search_ward_bounds,
@@ -12934,7 +12948,7 @@ def interactive_town_choropleth(group):
                 commute_destination_2=(destinations[1] if len(destinations)==2 else ''),
                 jump=state.get('_v182_map_jump'),
                 key='town_map_v184_'+str(reset),default=None)
-    if isinstance(data,dict):
+    if isinstance(data,dict) and data.get('home_view_epoch')==int(state.get('_v202_home_epoch',0)):
         current=viewport_bounds(data)
         if data.get('event')=='town_suumo_v189':
             ticket=str(data.get('ticket') or '')[:100]
@@ -12963,23 +12977,24 @@ def interactive_town_choropleth(group):
                     state['_v184_search_error']={'ticket':ticket,'message':'検索した町域の境界を取得できませんでした。'}
                 if current:
                     state['new_bounds']=current;state['new_view_center']=bounds_center(current)
-                    state['new_view_zoom']=_v190_view_zoom(data.get('zoom'),state.get('new_view_zoom',14))
+                    state['new_view_zoom']=_v202_view_zoom(data.get('zoom'),state.get('new_view_zoom',11))
                 st.rerun(scope='fragment')
         command=state.get('_v182_map_jump')
         confirmed=not command or data.get('jump_applied')==command.get('id')
         if command and confirmed:
             state['_v182_map_jump_confirmed']=command['id']
-            state.pop('_v182_map_jump',None)  # Consume once, including after iframe remounts.
+            state.pop('_v182_map_jump',None)
         if current and confirmed:
             state['new_bounds']=current;state['new_view_center']=bounds_center(current)
             state['new_map']=data
-            state['new_view_zoom']=_v190_view_zoom(data.get('zoom'),state.get('new_view_zoom',14))
+            state['new_view_zoom']=_v202_view_zoom(data.get('zoom'),state.get('new_view_zoom',11))
 
 
 def town_location_search_panel_v184():
     """Map reset remains external; searching is now inside the Leaflet iframe."""
     state=st.session_state
     if st.button('地図を再初期化',key='reset_v118_map'):
+        _v202_reset_home(state)
         state.pop('_v182_map_jump',None)
         state.pop('_v182_map_jump_confirmed',None)
         state.pop('_v181_map_jump',None)
@@ -13714,6 +13729,9 @@ def main():
     state.setdefault('new_units',[]);state.setdefault('new_search',None);state.setdefault('new_saved_keys',[])
     state.setdefault('new_map_loaded',False);state.setdefault('address_point_cache',{})
     state.setdefault('layout_display_group','group1')
+    if not state.get('_v202_home_initialized'):
+        state['_v202_home_initialized']=True
+        _v202_reset_home(state)
     commute_storage_ready=v170_commute_autosave_sync()
     restore_manual_search()
     restore_automatic_collection()
