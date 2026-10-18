@@ -52,7 +52,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v202"
+BUILD = "REBUILD-01-v203"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -12213,8 +12213,12 @@ def commute_network_v159():
 # https://github.com/select766/tokyo-train-time-map/blob/master/data/stations.csv
 # Tokyo Metropolitan Government route names/stations (Nippori-Toneri Liner):
 # https://www.kotsu.metro.tokyo.jp/nippori_toneri/map/
+# v203: Nippori-Toneri minutes follow Toei Transportation Guide 2025 p25.
+# https://www.kotsu.metro.tokyo.jp/toei-guide/guide2025.pdf
+# Cumulative minutes from Nippori: 0,1,3,5,6,8,10,11,13,14,16,18,20.
+# The values are published travel-time guidelines, not departure-specific schedules.
 _COMMUTE_V162_TIMED_LINES = r"""
-日暮里・舎人ライナー|日暮里 西日暮里:2 赤土小学校前:2 熊野前:2 足立小台:2 扇大橋:1 高野:2 江北:2 西新井大師西:2 谷在家:2 舎人公園:2 舎人:2 見沼代親水公園:2
+日暮里・舎人ライナー|日暮里 西日暮里:1 赤土小学校前:2 熊野前:2 足立小台:1 扇大橋:2 高野:2 江北:1 西新井大師西:2 谷在家:1 舎人公園:2 舎人:2 見沼代親水公園:2
 ゆりかもめ|新橋 汐留:1 竹芝:3 日の出:2 芝浦ふ頭:1 お台場海浜公園:6 台場:2 東京国際クルーズターミナル:2 テレコムセンター:2 青海:2 東京ビッグサイト:2 有明(ゆりかもめ):2 有明テニスの森:2 市場前:2 新豊洲:1 豊洲:2
 都電荒川線|面影橋 学習院下:2 鬼子母神前:1 都電雑司ヶ谷:2 東池袋四丁目:2 向原:2 大塚駅前:5 巣鴨新田:1 庚申塚:1 新庚申塚:1 西ヶ原四丁目:3 滝野川一丁目:1 飛鳥山:1 王子駅前:3 栄町:1 梶原:1 荒川車庫前:4 荒川遊園地前:1 小台:2 宮ノ前:1 熊野前:5 東尾久三丁目:1 町屋二丁目:1 町屋駅前:4 荒川七丁目:1 荒川二丁目:1 荒川区役所前:1 荒川一中前:1 三ノ輪橋:1
 埼京線|浮間舟渡 北赤羽:2 赤羽:2 十条:2 板橋:2 池袋:3 新宿:5 渋谷:6 恵比寿:2 大崎:4
@@ -12477,6 +12481,8 @@ def commute_current_destination_v160():
 # 注意: 各駅間の実測値ではない。代表区間値を経路上の乗車時間で加重した
 # 「参考混雑率」を表示する。データ欠落区間があれば数値を示さない。
 _COMMUTE_CROWD_2025_V178 = {
+    # MLIT 2025, table 3-4: busiest hour 7:30-8:30, not each segment's actual crowding.
+    '日暮里・舎人ライナー':(176,'赤土小学校前→西日暮里'),
     '山手線':(136,'新大久保→新宿（内回り）'),
     '京浜東北線':(158,'川口→赤羽'),
     '埼京線':(167,'板橋→池袋'),
@@ -12486,6 +12492,7 @@ _COMMUTE_CROWD_2025_V178 = {
     '横須賀線':(138,'武蔵小杉→西大井'),
     '総武線快速':(160,'新小岩→錦糸町'),
     '常磐線快速':(142,'三河島→日暮里'),
+    '常磐快速線':(142,'三河島→日暮里'),  # Same line name used by the v162 transfer graph.
     '南武線':(156,'武蔵中原→武蔵小杉'),
     '南武線（各停概算）':(156,'武蔵中原→武蔵小杉'),
     '京葉線（概算）':(123,'葛西臨海公園→新木場'),
