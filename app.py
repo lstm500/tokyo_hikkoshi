@@ -52,7 +52,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v209"
+BUILD = "REBUILD-01-v211"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -726,6 +726,20 @@ button:disabled{background:#e3e9e3!important;color:#607369!important;opacity:1!i
 .unit{background:#fff;border-radius:16px;padding:18px;margin-bottom:12px;border:1px solid #e0e4da}
 .unit h3{font-size:18px;margin:0 0 8px}.unit a{color:#286b5d}
 @media(max-width:600px){.hero{padding:18px}.hero h1{font-size:26px}.block-container{padding-top:1rem}}
+
+/* v210: immediate pointer/touch feedback and retained keyboard/click focus. */
+.stApp button:not(:disabled),.stApp a[data-testid="stBaseLinkButton"]{
+ transition:background-color .08s ease,color .08s ease,border-color .08s ease}
+.stApp button:not(:disabled):is(:active,:focus),
+.stApp [data-testid="stLinkButton"] a:is(:active,:focus),
+.stApp a[data-testid="stBaseLinkButton"]:is(:active,:focus){
+ background:#174a6a!important;color:#fff!important;border-color:#174a6a!important;
+ box-shadow:0 0 0 3px rgba(23,74,106,.23)!important}
+.stApp button:not(:disabled):is(:active,:focus) *,
+.stApp [data-testid="stLinkButton"] a:is(:active,:focus) *{color:inherit!important}
+.stApp button:not(:disabled):focus-visible,.stApp [data-testid="stLinkButton"] a:focus-visible{
+ outline:3px solid #b35636!important;outline-offset:3px}
+@media(prefers-reduced-motion:reduce){.stApp button,.stApp a{transition:none!important}}
 </style>'''
 
 
@@ -2103,7 +2117,8 @@ class PublicWeb:
             if route:options['proxies']={'http':route,'https':route}
             referer=getattr(self.session_primed,'references',{}).get((root,index+1))
             if referer:options['headers']={**options.get('headers',{}),'Referer':referer}
-            for attempt in range(3):
+            attempts=1 if getattr(self.local,'landmark_lookup',False) and host in ('overpass-api.de','overpass.private.coffee') else 3
+            for attempt in range(attempts):
                 try:
                     response=self.route_request(session,method,url,options);status=response.status_code;info=self.response_info(response)
                     trace(self,'transport_attempt',{'url':url,'method':method,'route':'proxy' if route else 'direct','route_number':index+1 if route else None,'attempt':attempt+1,'status':status,'bytes':len(response.content),**info},stage='transport')
@@ -2133,7 +2148,7 @@ class PublicWeb:
                         return response
                     # OSM's public endpoint has fair-use limits. A 429 is a
                     # refusal, not a signal to retry under another identity.
-                    if host=='overpass-api.de' and status==429:
+                    if host in ('overpass-api.de','overpass.private.coffee') and status==429:
                         trace(self,'osm_rate_limited',{'host':host,'status':429,
                             'next_stage':'stop_independent_lookup'},'WARNING','address.stage2')
                         break
@@ -2149,7 +2164,7 @@ class PublicWeb:
                         if delay>30:
                             with self.route_lock:self.route_cooldowns[(host,index)]=time.monotonic()+delay
                             trace(self,'route_cooldown',{'host':host,'route_number':index+1,'remaining_seconds':round(delay),'reason':'Retry-After'},stage='transport');break
-                        if attempt<2:
+                        if attempt<attempts-1:
                             trace(self,'http_retry',{'url':url,'status':status,'wait_seconds':delay,'route_number':index+1 if route else None},'WARNING','transport');self.pause(delay);continue
                     if blocked:
                         with self.route_lock:self.route_cooldowns[(host,index,u.path)]=time.monotonic()+60
@@ -2162,7 +2177,7 @@ class PublicWeb:
                 except (requests.Timeout,requests.ConnectionError) as exc:
                     trace(self,'proxy_error' if route else 'network',{'url':url,'route_number':index+1 if route else None,'attempt':attempt+1,'exception_type':type(exc).__name__},'WARNING','transport')
                     last=exc
-                    if attempt<2:self.pause(2**attempt);continue
+                    if attempt<attempts-1:self.pause(2**attempt);continue
                     break
             if len(ordered)>1:trace(self,'proxy_switch',{'url':url,'failed_route_number':index+1,'remaining_routes':len(ordered)-ordered.index(index)-1},'WARNING','transport')
         if isinstance(last,Exception):raise last
@@ -2170,7 +2185,7 @@ class PublicWeb:
             error=AppError(host+'：取得経路の待機中です（直前の403・429等）。設定した全経路の待機が終わってから再検索してください。');error.diagnostic={'skipped_routes':skipped};raise error
         return last
     def _fetch_uncached(self,url,method='GET',**kwargs):
-        allowed=tuple(RENTAL_HOSTS)+('mreversegeocoder.gsi.go.jp','msearch.gsi.go.jp','maps.gsi.go.jp','cyberjapandata.gsi.go.jp','japanese-addresses-v2.geoloniamaps.com','overpass-api.de','geolonia.github.io','img01.suumo.com','img02.suumo.com','maps.googleapis.com','maps.google.com','html.duckduckgo.com','www.google.com','search.yahoo.co.jp','myhome.nifty.com','www.mansion-review.jp','www.e-room.co','www.housecom.jp','vidax-gotanda.jp','www.goodrooms.jp','www.able.co.jp','www.mec-h.com','www.start-line.co.jp','www.m-standard.co.jp','www.property-bank.co.jp','lifullhomes-index.jp')+tuple(_EXTERNAL_IDENTITY_HOSTS)
+        allowed=tuple(RENTAL_HOSTS)+('mreversegeocoder.gsi.go.jp','msearch.gsi.go.jp','maps.gsi.go.jp','cyberjapandata.gsi.go.jp','japanese-addresses-v2.geoloniamaps.com','overpass-api.de','overpass.private.coffee','geolonia.github.io','img01.suumo.com','img02.suumo.com','maps.googleapis.com','maps.google.com','html.duckduckgo.com','www.google.com','search.yahoo.co.jp','myhome.nifty.com','www.mansion-review.jp','www.e-room.co','www.housecom.jp','vidax-gotanda.jp','www.goodrooms.jp','www.able.co.jp','www.mec-h.com','www.start-line.co.jp','www.m-standard.co.jp','www.property-bank.co.jp','lifullhomes-index.jp')+tuple(_EXTERNAL_IDENTITY_HOSTS)
         u=urlparse(url)
         if u.scheme!='https' or u.hostname not in allowed or u.username or u.password: raise AppError('取得先が不正です。')
         # After one genuine HOME'S 403, use one persistent real Chromium session for
@@ -12084,7 +12099,7 @@ TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('</style></head>',_V20
 
 
 # v205: personal named landmarks, independent of rental observations.
-_V205_PIN_DOM = """<details id="v205-pins-panel"><summary>目印ピンを追加・表示</summary><label for="v205-pin-address">施設名・目印の名前で検索</label><input id="v205-pin-address" maxlength="180" placeholder="例：立教小学校（住所の入力は不要）"/><label for="v205-pin-name">ピンの名前（検索結果から自動入力・変更可）</label><input id="v205-pin-name" maxlength="60" placeholder="検索後に施設名が入ります"/><div class="v205-actions"><button type="button" id="v205-pin-search">名前で検索</button><button type="button" id="v205-pin-pick">地図をタップして指定</button><button type="button" id="v205-pin-cancel" hidden>指定をやめる</button></div><div id="v205-pin-candidates" hidden><label id="v206-result-label" for="v205-pin-candidate">検索結果</label><select id="v205-pin-candidate"></select><div id="v206-result-detail" role="status"></div><button type="button" id="v205-pin-add">この場所にピンを追加</button></div><div id="v205-pin-status" role="status" aria-live="polite"></div><div id="v205-pin-saved" hidden><label for="v205-pin-list">保存した目印</label><select id="v205-pin-list"></select><button type="button" id="v205-pin-jump">選んだピンへ移動</button></div><p class="v205-help">東京23区周辺の施設を名前で検索し、住所と位置を表示します。選択すると仮の印で位置を確認でき、追加ボタンで保存します。情報：国土地理院・<a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener noreferrer">© OpenStreetMap contributors</a>。保存先はこのブラウザーです。</p></details>"""
+_V205_PIN_DOM = """<details id="v205-pins-panel"><summary>目印ピンを追加・表示</summary><label for="v205-pin-address">施設名・目印の名前で検索</label><input id="v205-pin-address" maxlength="180" placeholder="例：立教小学校（住所の入力は不要）"/><label for="v205-pin-name">ピンの名前（検索結果から自動入力・変更可）</label><input id="v205-pin-name" maxlength="60" placeholder="検索後に施設名が入ります"/><div class="v205-actions"><button type="button" id="v205-pin-search">名前で検索</button><button type="button" id="v205-pin-pick">地図をタップして指定</button><button type="button" id="v205-pin-cancel" hidden>仮ピンを取り消す</button></div><div id="v205-pin-candidates" hidden><label id="v206-result-label" for="v205-pin-candidate">検索結果</label><select id="v205-pin-candidate"></select><div id="v206-result-detail" role="status"></div><button type="button" id="v205-pin-add">確認して確定</button></div><div id="v205-pin-status" role="status" aria-live="polite"></div><div id="v205-pin-saved" hidden><label for="v205-pin-list">保存した目印</label><select id="v205-pin-list"></select><button type="button" id="v205-pin-jump">選んだピンへ移動</button></div><p class="v205-help">東京23区周辺の施設を名前で検索し、住所と位置を表示します。選択すると仮の印で位置を確認でき、「確認して確定」で保存します。確定したピンの長押しで削除確認を開きます。情報：国土地理院・<a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener noreferrer">© OpenStreetMap contributors</a>。保存先はこのブラウザーです。</p></details>"""
 _V205_PIN_CSS = """
 #v205-pins-panel{padding:12px 13px;background:#fff;border-top:1px solid #d5dfdc;color:#173a5e;font:14px system-ui}
 #v205-pins-panel summary{font-weight:750;cursor:pointer;padding:5px 0}
@@ -12153,15 +12168,14 @@ function v205DrawPins(){
   address.className='v205-pin-popup-address';address.textContent=pin.address||'地図で指定した場所';popup.appendChild(heading);popup.appendChild(address);
   var actions=document.createElement('div');actions.className='v204-popup-actions';
   var route=document.createElement('a');route.className='v167-suumo-link';route.textContent='経路案内 ↗';route.href=v204DirectionsUrl(pin);route.target='_blank';route.rel='noopener noreferrer';actions.appendChild(route);
-  var remove=document.createElement('button');remove.type='button';remove.className='v205-pin-delete';remove.textContent='ピンを削除';
-  remove.addEventListener('click',function(){if(v205SavePins((state._v205Pins||[]).filter(function(p){return p.id!==pin.id})))v205Status('「'+pin.name+'」を削除しました。');});
-  actions.appendChild(remove);popup.appendChild(actions);marker.bindPopup(popup);
+  var hint=document.createElement('div');hint.textContent='長押し・右クリックで削除確認';hint.className='v205-pin-popup-address';
+  popup.appendChild(actions);popup.appendChild(hint);marker.bindPopup(popup);
   marker.on('dragend',function(){var point=marker.getLatLng();
    if(!v205Point(point.lat,point.lng)){marker.setLatLng([pin.lat,pin.lng]);v205Status('対応範囲外です。位置を元に戻しました。');return;}
    var next=(state._v205Pins||[]).map(function(p){return p.id===pin.id?Object.assign({},p,{lat:point.lat,lng:point.lng}):p});
    if(v205SavePins(next))v205Status('ピンの位置を保存しました。');else marker.setLatLng([pin.lat,pin.lng]);
   });
-  marker.addTo(state._v205Layer);state._v205Markers[pin.id]=marker;
+  marker.addTo(state._v205Layer);state._v205Markers[pin.id]=marker;v211BindLongPress(marker,pin);
  });
 }
 function v205FocusPin(pin){
@@ -12181,22 +12195,75 @@ function v205AddPin(name,address,lat,lng){
 }
 function v206ClearPreview(){
  if(state._v206Preview&&state.map){state.map.removeLayer(state._v206Preview);state._v206Preview=null;}
+ state._v211Draft=null;state._v211DraftAddress=null;state._v211DraftConfirm=null;
+}
+function v211CancelDraft(){
+ state._v205Pick=null;state._v207DetailPending=null;v206ClearPreview();state._v211Draft=null;
+ document.getElementById('v205-pin-cancel').hidden=true;document.getElementById('v205-pin-candidates').hidden=true;
+ v205Status('仮ピンを取り消しました。');
+}
+function v211DraftDetails(){
+ var item=state._v211Draft;if(!item)return;
+ var address=String(item.address||'住所を確認しています…');
+ document.getElementById('v206-result-detail').textContent='仮ピン（未確定）\n施設名：'+item.name+'\n住所：'+address+'\n緯度 '+item.lat.toFixed(6)+' / 経度 '+item.lng.toFixed(6);
+ var pending=!!state._v207DetailPending||!item.address||!!item.address_error;
+ document.getElementById('v205-pin-add').disabled=pending;
+ if(state._v211DraftAddress)state._v211DraftAddress.textContent='住所：'+address;
+ if(state._v211DraftConfirm)state._v211DraftConfirm.disabled=pending;
+}
+function v211ConfirmDraft(){
+ var item=state._v211Draft;
+ if(!item||state._v205SearchPending||state._v207DetailPending||!item.address||item.address_error){v205Status('住所を確認できてから確定してください。');return;}
+ var name=document.getElementById('v205-pin-name').value.trim()||item.name;
+ if(v205AddPin(name,item.address,item.lat,item.lng)){
+  v206ClearPreview();state._v211Draft=null;document.getElementById('v205-pin-cancel').hidden=true;
+  v205Status('「'+name+'」のピンを確定しました。長押しで削除確認を開けます。');
+ }
 }
 function v206SelectCandidate(){
  var item=(state._v205Candidates||[])[Number(document.getElementById('v205-pin-candidate').value)];
  if(!item)return;
- v207ResolveCandidateAddress(item);
- document.getElementById('v206-result-detail').textContent=String(item.address||'住所を確認しています…')+'\n緯度 '+item.lat.toFixed(6)+' / 経度 '+item.lng.toFixed(6);
- if(state._v206Stage!=='places'){v206ClearPreview();return;}
+ v206ClearPreview();state._v211Draft=item;v207ResolveCandidateAddress(item);
  document.getElementById('v205-pin-name').value=String(item.name||item.title||'').slice(0,60);
- v206ClearPreview();
+ document.getElementById('v205-pin-cancel').hidden=false;
  if(state.map&&window.L){
-  var text=document.createElement('span');text.textContent=String(item.name||item.title||'')+'（確認中）';
-  state._v206Preview=L.marker([item.lat,item.lng],{title:String(item.name||item.title||''),
-    icon:L.divIcon({className:'v205-pin-icon v206-preview',html:'<span class="v205-pin-dot"></span>',iconSize:[22,28],iconAnchor:[11,26]})}).bindTooltip(text,{permanent:true,direction:'right',className:'v205-pin-label'}).addTo(state.map);
-  state.map.setView([item.lat,item.lng],Math.max(13,state.map.getZoom()),{animate:false});
+  var text=document.createElement('span');text.textContent=String(item.name)+'（仮ピン・未確定）';
+  var popup=document.createElement('div'),title=document.createElement('div'),address=document.createElement('div');
+  title.className='v205-pin-popup-title';title.textContent='仮ピン：'+item.name;popup.appendChild(title);
+  address.className='v205-pin-popup-address';popup.appendChild(address);state._v211DraftAddress=address;
+  var confirm=document.createElement('button');confirm.type='button';confirm.textContent='確認して確定';confirm.addEventListener('click',v211ConfirmDraft);popup.appendChild(confirm);state._v211DraftConfirm=confirm;
+  var cancel=document.createElement('button');cancel.type='button';cancel.textContent='取り消す';cancel.addEventListener('click',v211CancelDraft);popup.appendChild(cancel);
+  state._v206Preview=L.marker([item.lat,item.lng],{title:String(item.name),
+    icon:L.divIcon({className:'v205-pin-icon v206-preview',html:'<span class="v205-pin-dot"></span>',iconSize:[22,28],iconAnchor:[11,26]})}).bindTooltip(text,{permanent:true,direction:'right',className:'v205-pin-label'}).bindPopup(popup).addTo(state.map);
+  state.map.setView([item.lat,item.lng],Math.max(13,state.map.getZoom()),{animate:false});state._v206Preview.openPopup();
  }
- setHeight();
+ v211DraftDetails();setHeight();
+}
+function v211DeletePopup(marker,pin,event){
+ if(event&&event.originalEvent){event.originalEvent.preventDefault();event.originalEvent.stopPropagation();}
+ var popup=document.createElement('div'),title=document.createElement('div'),address=document.createElement('div');
+ title.className='v205-pin-popup-title';title.textContent='「'+pin.name+'」を削除しますか？';popup.appendChild(title);
+ address.className='v205-pin-popup-address';address.textContent=pin.address||'住所未登録';popup.appendChild(address);
+ var remove=document.createElement('button');remove.type='button';remove.className='v205-pin-delete';remove.textContent='削除する';
+ remove.addEventListener('click',function(){if(v205SavePins((state._v205Pins||[]).filter(function(p){return p.id!==pin.id}))){state.map.closePopup();v205Status('「'+pin.name+'」を削除しました。');}});popup.appendChild(remove);
+ var cancel=document.createElement('button');cancel.type='button';cancel.textContent='キャンセル';cancel.addEventListener('click',function(){state.map.closePopup()});popup.appendChild(cancel);
+ L.popup().setLatLng(marker.getLatLng()).setContent(popup).openOn(state.map);
+}
+function v211BindLongPress(marker,pin){
+ marker.on('contextmenu',function(event){v211DeletePopup(marker,pin,event)});
+ var element=marker.getElement&&marker.getElement();if(!element)return;
+ var timer=null,start=null,blockedUntil=0;
+ function clear(){if(timer!==null)clearTimeout(timer);timer=null;start=null;}
+ element.addEventListener('pointerdown',function(event){
+  clear();if(event.button!==undefined&&event.button!==0)return;
+  start={x:event.clientX,y:event.clientY};
+  timer=setTimeout(function(){timer=null;start=null;blockedUntil=Date.now()+900;v211DeletePopup(marker,pin)},650);
+ });
+ element.addEventListener('pointermove',function(event){if(start&&Math.hypot(event.clientX-start.x,event.clientY-start.y)>10)clear();});
+ ['pointerup','pointercancel','pointerleave','lostpointercapture'].forEach(function(type){element.addEventListener(type,clear)});
+ element.addEventListener('click',function(event){if(Date.now()<blockedUntil){event.preventDefault();event.stopImmediatePropagation();}},true);
+ element.addEventListener('keydown',function(event){if(event.key==='Delete'||(event.shiftKey&&event.key==='F10')){event.preventDefault();v211DeletePopup(marker,pin)}});
+ marker.on('dragstart',clear);marker.on('remove',clear);
 }
 function v207ResolveCandidateAddress(item){
  state._v207DetailPending=null;
@@ -12227,7 +12294,7 @@ function v205PinReply(reply){
   var chosen=(state._v205Candidates||[])[Number(document.getElementById('v205-pin-candidate').value)];
   if(!chosen)return;
   chosen.address=String(reply.address||'住所情報なし（地図上の位置で確認してください）');chosen.address_checked=true;
-  document.getElementById('v206-result-detail').textContent=chosen.address+'\n緯度 '+chosen.lat.toFixed(6)+' / 経度 '+chosen.lng.toFixed(6);
+  chosen.address_error=!!reply.error;v211DraftDetails();
   v205Status(reply.error||'施設名・住所・地図上の仮の印を確認してから保存してください。');return;
  }
  if(reply.ticket!==state._v205SearchPending)return;
@@ -12237,7 +12304,7 @@ function v205PinReply(reply){
  var box=document.getElementById('v205-pin-candidates'),select=document.getElementById('v205-pin-candidate'),add=document.getElementById('v205-pin-add');select.replaceChildren();
  box.hidden=!state._v205Candidates.length;
  document.getElementById('v206-result-label').textContent='検索結果（施設名・所在地）';
- add.textContent='確認してこの施設にピンを立てる';
+ add.textContent='確認して確定';
  state._v205Candidates.forEach(function(p,i){var opt=document.createElement('option');opt.value=String(i);opt.textContent=String(p.name)+(p.address?' — '+p.address:'');select.appendChild(opt)});
  if(state._v205Candidates.length){
   v205Status('施設名・住所・地図上の仮の印を確認してから保存してください。');v206SelectCandidate();
@@ -12254,21 +12321,21 @@ function v205InitPins(args){
    var name=document.getElementById('v205-pin-name').value.trim();
    if(!name){v205Status('ピンの名前を入力してください。');return;}
    if(state._v205SearchPending){v205Status('施設名の検索が終わってから指定してください。');return;}
-   state._v207DetailPending=null;v206ClearPreview();
+   state._v207DetailPending=null;v206ClearPreview();document.getElementById('v205-pin-candidates').hidden=true;
    state._v205Pick={name:name,address:''};
    document.getElementById('v205-pin-cancel').hidden=false;v205Status('追加する場所を地図上でタップしてください。');
   });
-  document.getElementById('v205-pin-cancel').addEventListener('click',function(){state._v205Pick=null;this.hidden=true;v205Status('地図での指定をやめました。');});
-  document.getElementById('v205-pin-add').addEventListener('click',function(){
-   var item=(state._v205Candidates||[])[Number(document.getElementById('v205-pin-candidate').value)];
-   if(!item||state._v205SearchPending||state._v207DetailPending)return;
-   var name=document.getElementById('v205-pin-name').value.trim()||item.name||item.title;
-   if(v205AddPin(name,item.address||'住所未登録',item.lat,item.lng))v206ClearPreview();
-  });
+  document.getElementById('v205-pin-cancel').addEventListener('click',v211CancelDraft);
+  document.getElementById('v205-pin-add').addEventListener('click',v211ConfirmDraft);
   document.getElementById('v205-pin-jump').addEventListener('click',function(){var id=document.getElementById('v205-pin-list').value;v205FocusPin((state._v205Pins||[]).find(function(p){return p.id===id}));});
   state.map.on('click',function(event){
    var pick=state._v205Pick,point=event&&event.latlng;if(!pick||!point)return;
-   if(v205AddPin(pick.name,pick.address,point.lat,point.lng)){state._v205Pick=null;document.getElementById('v205-pin-cancel').hidden=true;}
+   if(!v205Point(point.lat,point.lng)){v205Status('対応範囲外です。');return;}
+   state._v205Pick=null;state._v206Stage='places';state._v205Candidates=[{name:pick.name,title:pick.name,address:'',lat:point.lat,lng:point.lng}];
+   var select=document.getElementById('v205-pin-candidate');select.replaceChildren();
+   var option=document.createElement('option');option.value='0';option.textContent=pick.name;select.appendChild(option);
+   document.getElementById('v205-pin-candidates').hidden=false;document.getElementById('v205-pin-add').textContent='確認して確定';
+   v206SelectCandidate();v205Status('地図に仮ピンを置きました。住所と位置を確認してから確定してください。');
   });
   v205PinList();
  }
@@ -12417,6 +12484,46 @@ def _v208_landmark_log_panel(state):
                 'sumai_landmark_errors.csv','text/csv',key='landmark_errors_v208',on_click='ignore')
 
 
+def _v211_name_document(web,query,pattern):
+    """Indexed exact lookup first; partial lookup only after a successful empty result.
+
+    Try the independent public instance only for network/5xx failures, never
+    for access refusal/rate limits. Each endpoint is attempted once per query.
+    """
+    if not hasattr(web,'local'):web.local=threading.local()
+    web.local.landmark_lookup=True
+    bbox='(35.45,139.4,35.95,140.05)'
+    endpoints=('https://overpass-api.de/api/interpreter','https://overpass.private.coffee/api/interpreter')
+    for mode in ('exact','partial'):
+        literal=json.dumps(query if mode=='exact' else pattern,ensure_ascii=False)
+        operator='=' if mode=='exact' else '~'
+        suffix='' if mode=='exact' else ',i'
+        keys=('name','name:ja','alt_name','short_name')
+        q='[out:json][timeout:8];('+''.join('nwr["'+key+'"'+operator+literal+suffix+']'+bbox+';' for key in keys)+');out center tags;'
+        for index,url in enumerate(endpoints):
+            info={'url':url,'parameters':{'data':q},'match_mode':mode,'failed_stage':'name_search.request'}
+            try:
+                doc,info=_v208_landmark_json(web,url,{'data':q},'name_search')
+                info.update(match_mode=mode,failed_stage='name_search.validation')
+                if not isinstance(doc,dict):raise ValueError('facility response must be an object')
+                if doc.get('remark'):
+                    error=ValueError('Overpass remark: '+str(doc['remark'])[:1500]);error.landmark_diagnostic=info
+                    raise error
+                if not isinstance(doc.get('elements'),list):raise ValueError('facility response is missing elements array')
+                break
+            except Exception as exc:
+                exc.landmark_diagnostic={**info,**(getattr(exc,'landmark_diagnostic',{}) or {})}
+                detail={**(getattr(exc,'diagnostic',{}) or {}),**exc.landmark_diagnostic}
+                status=detail.get('status')
+                try:status=int(status) if status is not None else None
+                except (TypeError,ValueError):status=None
+                transient=(status is not None and 500<=status<=599) or any(word in (type(exc).__name__+' '+str(exc)+' '+str(detail)).lower() for word in ('timeout','timed out','タイムアウト','connection','接続できません','通信失敗'))
+                if status in (401,403,429) or not transient or index==len(endpoints)-1:raise
+                trace(web,'landmark_endpoint_fallback',{**detail,'url':url,'next_url':endpoints[index+1],
+                      'match_mode':mode,'reason':str(exc),'exception_type':type(exc).__name__},'WARNING','landmark.name_search')
+        if doc['elements'] or mode=='partial':return doc,info
+
+
 def _v207_search_landmarks(data,audit=None):
     """User-triggered name lookup; address typing is never required."""
     ticket=str(data.get('ticket') or '')[:100]
@@ -12454,15 +12561,8 @@ def _v207_search_landmarks(data,audit=None):
     # Whitespace is omitted between search tokens so "立教 小学校" matches too.
     compact=re.sub(r'\s+','',query)
     pattern=re.sub(r'([.\[\]{}()*+?^$|\\])',r'\\\1',compact)
-    literal=json.dumps(pattern,ensure_ascii=False)
-    bbox='(35.45,139.4,35.95,140.05)'
-    q='[out:json][timeout:12];('+''.join('nwr["'+key+'"~'+literal+',i]'+bbox+';' for key in ('name','name:ja','alt_name','short_name'))+');out center tags;'
     try:
-        doc,info=_v208_landmark_json(web,'https://overpass-api.de/api/interpreter',{'data':q},'name_search')
-        info['failed_stage']='name_search.validation'
-        if not isinstance(doc,dict):raise ValueError('facility response must be an object')
-        if doc.get('remark'):raise ValueError('Overpass remark: '+str(doc['remark'])[:1500])
-        if not isinstance(doc.get('elements'),list):raise ValueError('facility response is missing elements array')
+        doc,info=_v211_name_document(web,compact,pattern)
         seen=set()
         for element in doc['elements']:
             try:
@@ -12489,9 +12589,13 @@ def _v207_search_landmarks(data,audit=None):
     return reply
 
 
+# v210: append last so the common feedback wins over individual component styles.
+_V210_BUTTON_CSS = '\n/* v210: buttons created later (popups, zoom, candidate actions) inherit feedback. */\nbutton:not(:disabled):is(:active,:focus),a[role="button"]:is(:active,:focus),\na.leaflet-control-zoom-in:is(:active,:focus),a.leaflet-control-zoom-out:is(:active,:focus),\na.v167-suumo-link:not([aria-disabled="true"]):is(:active,:focus){\n background:#174a6a!important;color:#fff!important;border-color:#174a6a!important;\n box-shadow:0 0 0 3px rgba(23,74,106,.25)!important}\nbutton:not(:disabled):is(:active,:focus) *,a.v167-suumo-link:is(:active,:focus) *{color:inherit!important}\nbutton:not(:disabled):focus-visible,a[role="button"]:focus-visible{\n outline:3px solid #b35636;outline-offset:3px}\n#v205-pin-search:disabled,#town-submit:disabled,#town-confirm:disabled{\n background:#174a6a!important;color:#fff!important;border-color:#174a6a!important;cursor:wait}\n'
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('</style></head>',_V210_BUTTON_CSS+'</style></head>',1)
+
 @st.cache_resource(show_spinner=False)
 def town_component_v121():
-    _asset_revision='v209-settings-log-tools'
+    _asset_revision='v211-draft-confirm-longpress'
     folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-v184')
     os.makedirs(folder,exist_ok=True)
     path=os.path.join(folder,'index.html')
