@@ -52,7 +52,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v208"
+BUILD = "REBUILD-01-v209"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -1236,7 +1236,7 @@ class Database:
                   and not u.username and not u.password and u.port in (None,443)
                   and u.path in ('','/') and not u.query and not u.fragment)
         except ValueError: okay=False
-        if not okay or not self.key: raise AppError('「初期設定」の接続情報をStreamlit Secretsに設定してください。')
+        if not okay or not self.key: raise AppError('「設定」→「初期設定」の接続情報をStreamlit Secretsに設定してください。')
         if not re.fullmatch(r'[\w-]{1,80}',self.namespace,flags=re.ASCII): raise AppError('保存領域名の形式を確認してください。')
         self.headers={'apikey':self.key,'Content-Type':'application/json','Accept':'application/json'}
         if not self.key.startswith('sb_secret_'):
@@ -1292,7 +1292,7 @@ class Database:
             if status in (401,403) or code=='42501':
                 msg='Supabaseの認証・テーブル権限を確認してください。'
             elif status==404 or code in ('42P01','PGRST205'):
-                msg='Supabaseの保存テーブルがありません。「初期設定」のSQLを確認してください。'
+                msg='Supabaseの保存テーブルがありません。「設定」→「初期設定」のSQLを確認してください。'
             elif code=='57014':
                 msg='SupabaseのDB処理が時間制限を超えました。保存済み履歴の検索負荷とインデックスを確認してください。'
             elif status in (500,502,503,504):
@@ -10026,31 +10026,6 @@ def automatic_collection_panel():
         if snap['error']:st.error(snap['error'])
     if st.session_state.get('automatic_settings_error'):st.error(st.session_state.automatic_settings_error)
 
-    if st.toggle('ログ・エラーの詳細を表示（不具合の調査用）',
-                 key='show_diagnostic_tools_v122',value=False):
-        st.markdown('##### ログ・エラーCSV')
-        automatic_log_download_panel(controller,busy,summary if snap else st.session_state.get('automatic_saved_summary',{}))
-
-        try:
-            # Full historical errors are queried only when explicitly requested.
-            # This avoids competing 25k+ JSON rows with the primary collection job.
-            error_job=get_automatic_failure_export(max_age=900,refresh=False);failure=error_job.snapshot()
-            if st.button('エラー履歴を取得する（時間がかかります）',key='automatic_refresh_error_csv',disabled=busy or error_job.running):
-                error_job.refresh(max_age=0)
-                st.rerun()
-            if failure['loaded']:
-                st.download_button(f"エラー履歴CSV（{failure['row_count']}行）",
-                                   failure['csv'],'sumai_all_acquisition_errors.csv','text/csv',
-                                   key='automatic_all_errors_csv',on_click='ignore',use_container_width=True)
-                status='過去ログの統合が未完了' if failure.get('phase')=='partial' else '過去ログも裏で統合中' if failure['running'] and failure.get('phase')=='historical_backfill' else '裏で最新化中' if failure['running'] else '最新'
-                st.caption(f"エラーCSV：{status}｜最終同期 {acquisition_time_jst(failure.get('updated_at'))}｜同じ物件で複数エラーがあれば複数行です。")
-            else:
-                st.download_button('全取得エラーCSV',b'','sumai_all_acquisition_errors.csv','text/csv',
-                                   key='automatic_all_errors_csv_wait',disabled=True,use_container_width=True)
-                st.caption('大量の履歴照会は自動実行しません。収集停止後に「エラーCSVを手動更新（過去全件）」を押してください。')
-            if failure['error']:st.error('エラーCSVの自動更新に失敗しました：'+failure['error'])
-        except Exception as exc:
-            st.error('エラーCSVを出力できませんでした：'+(str(exc) if isinstance(exc,AppError) else type(exc).__name__))
     st.caption('保存物件の読み込みやCSV出力は、この下の『保存した物件』で操作できます。')
 
 
@@ -12379,12 +12354,23 @@ def _v208_landmark_failure(web,data,exc,operation,info=None):
           details,'ERROR','landmark.'+operation)
 
 
+def _v209_log_secrets():
+    values=[]
+    for name in ('SUPABASE_SECRET_KEY','SUPABASE_SERVICE_ROLE_KEY'):
+        value=os.environ.get(name)
+        if value is None:
+            try:value=st.secrets.get(name,'')
+            except Exception:value=''
+        if value:values.append(str(value).strip())
+    return tuple(values)
+
+
 def _v208_run_landmark_lookup(state,data):
     """Reuse AuditLog, its redaction, and the existing diagnostic_log storage."""
     audit=state.get('_v208_landmark_audit')
     if audit is None:
         audit=AuditLog({'mode':'landmark','providers':['OpenStreetMap','国土地理院']},
-                       (setting('SUPABASE_SECRET_KEY'),setting('SUPABASE_SERVICE_ROLE_KEY')))
+                       _v209_log_secrets())
         state['_v208_landmark_audit']=audit
     reply=_v207_search_landmarks(data,audit=audit)
     audit.add('search','finish','INFO',{'operation':'landmark','ticket':reply['ticket'],
@@ -12408,14 +12394,17 @@ def _v208_run_landmark_lookup(state,data):
             state['_v208_landmark_storage_error']=audit.clean(str(exc))
             state['_v208_landmark_saved']=False
     if reply.get('error'):
-        reply['error']+=' 詳細は地図の下の「施設名検索のログ」からダウンロードできます。'
+        reply['error']+=' 詳細は「設定」→「ログ出力」で「ログ表示を更新」を押すとダウンロードできます。'
     return reply
 
 
 def _v208_landmark_log_panel(state):
     audit=state.get('_v208_landmark_audit')
-    if audit is None:return
-    with st.expander('施設名検索のログ'):
+    with st.expander('施設名検索のログ',expanded=True):
+        if audit is None:
+            st.caption('施設名を検索後、「ログ表示を更新」を押してください。')
+            st.download_button('詳細ログ JSON',b'','sumai_landmark_log.json','application/json',key='landmark_json_pending_v209',disabled=True)
+            return
         if state.get('_v208_landmark_storage_error'):
             st.caption('保存先への記録を確認できません。下のボタンから現在のログを保存してください。')
         elif state.get('_v208_landmark_saved'):
@@ -12502,7 +12491,7 @@ def _v207_search_landmarks(data,audit=None):
 
 @st.cache_resource(show_spinner=False)
 def town_component_v121():
-    _asset_revision='v208-landmark-diagnostic-logs'
+    _asset_revision='v209-settings-log-tools'
     folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-v184')
     os.makedirs(folder,exist_ok=True)
     path=os.path.join(folder,'index.html')
@@ -13404,7 +13393,6 @@ def interactive_town_choropleth(group):
                 commute_destination_2=(destinations[1] if len(destinations)==2 else ''),
                 jump=state.get('_v182_map_jump'),
                 key='town_map_v184_'+str(reset),default=None)
-    _v208_landmark_log_panel(state)
     if isinstance(data,dict) and data.get('home_view_epoch')==int(state.get('_v202_home_epoch',0)):
         current=viewport_bounds(data)
         if data.get('event')=='custom_pin_search_v205':
@@ -14184,6 +14172,157 @@ def v170_commute_autosave_sync():
     return True
 
 
+def _v209_automatic_log_tools():
+    controller=get_automatic_collection();snap=controller.snapshot() if controller else None
+    busy=bool(snap and snap['running']);summary=(snap.get('summary') or {}) if snap else {}
+    st.markdown('##### ログ・エラーCSV')
+    automatic_log_download_panel(controller,busy,summary if snap else st.session_state.get('automatic_saved_summary',{}))
+
+    try:
+        # Full historical errors are queried only when explicitly requested.
+        # This avoids competing 25k+ JSON rows with the primary collection job.
+        error_job=get_automatic_failure_export(max_age=900,refresh=False);failure=error_job.snapshot()
+        if st.button('エラー履歴を取得する（時間がかかります）',key='automatic_refresh_error_csv',disabled=busy or error_job.running):
+            error_job.refresh(max_age=0)
+            st.rerun()
+        if failure['loaded']:
+            st.download_button(f"エラー履歴CSV（{failure['row_count']}行）",
+                               failure['csv'],'sumai_all_acquisition_errors.csv','text/csv',
+                               key='automatic_all_errors_csv',on_click='ignore',use_container_width=True)
+            status='過去ログの統合が未完了' if failure.get('phase')=='partial' else '過去ログも裏で統合中' if failure['running'] and failure.get('phase')=='historical_backfill' else '裏で最新化中' if failure['running'] else '最新'
+            st.caption(f"エラーCSV：{status}｜最終同期 {acquisition_time_jst(failure.get('updated_at'))}｜同じ物件で複数エラーがあれば複数行です。")
+        else:
+            st.download_button('全取得エラーCSV',b'','sumai_all_acquisition_errors.csv','text/csv',
+                               key='automatic_all_errors_csv_wait',disabled=True,use_container_width=True)
+            st.caption('大量の履歴照会は自動実行しません。収集停止後に「エラーCSVを手動更新（過去全件）」を押してください。')
+        if failure['error']:st.error('エラーCSVの自動更新に失敗しました：'+failure['error'])
+    except Exception as exc:
+        st.error('エラーCSVを出力できませんでした：'+(str(exc) if isinstance(exc,AppError) else type(exc).__name__))
+
+
+def _v209_saved_log_tools(state):
+    if st.button('検索履歴を読み込む',key='new_history_load'):
+        try: state.new_history=Database().history()
+        except AppError as exc: st.error(str(exc))
+    if state.get('new_history'):
+        st.dataframe([{'開始（UTC）':r['started_at'],'結果':r['status'],'表示範囲':str(r['conditions'].get('bounds','')),
+                       '保存確認':r['summary'].get('saved',0)} for r in state.new_history],hide_index=True)
+    if state.get('new_history'):
+        chosen=st.selectbox('作業ログを取り出す検索',state.new_history,format_func=lambda r:r['started_at']+'｜'+r['status'],key='diagnostic_history')
+        if st.button('選んだ検索の詳細作業ログを読み込む',key='diagnostic_load'):
+            try:
+                state.saved_diagnostics=Database().load_diagnostics(chosen['id'])
+                if not state.saved_diagnostics:st.info('この検索には保存された詳細ログがありません。v30以降で再検索してください。')
+            except AppError as exc:st.error(str(exc))
+    if state.get('saved_diagnostics'):diagnostic_downloads(state.saved_diagnostics,'saved')
+    with st.expander('前回のログと比較して改善を確認'):
+        baseline=st.file_uploader('前回の解析用JSONログを選択',type=['json'],key='diagnostic_baseline')
+        if baseline:
+            try:
+                old=json.loads(baseline.getvalue().decode('utf-8-sig')).get('events')
+                if not isinstance(old,list) or not all(isinstance(e,dict) for e in old):raise ValueError()
+                compare_target=st.radio('比較する今回のログ',['現在の検索','読み込んだ保存ログ'],key='diagnostic_compare_target')
+                current=(active_job().audit.records() if active_job() else []) if compare_target=='現在の検索' else state.get('saved_diagnostics',[])
+                if current:
+                    st.dataframe(compare_logs(old,current),hide_index=True)
+                    old_start=next((e.get('details',{}) for e in old if e.get('code')=='start'),{})
+                    new_start=next((e.get('details',{}) for e in current if e.get('code')=='start'),{})
+                    if old_start.get('bounds')!=new_start.get('bounds') or old_start.get('providers')!=new_start.get('providers'):st.info('表示範囲・取得元が異なります。差分だけで改善効果を判断できません。')
+                    st.caption('差分はログの観測件数です。精度は同じ物件の正解データとの照合で確認してください。')
+                else:st.info('比較対象として現在の検索ログまたは保存ログを読み込んでください。')
+            except (ValueError,UnicodeError,AttributeError):st.error('このアプリからダウンロードした解析用JSONログを選択してください。')
+
+
+def _v209_initial_settings(state):
+            st.subheader('実URL・Supabase保存検証（追加課金なし）')
+            st.caption('旧版の失敗ログから固定抽出した実URLを再検索し、住所・家賃・間取りを保存してSupabaseで読み戻します。24/30以上で合格。')
+            groups={'詳細住所確定失敗 30 URL':'map.address_inference',
+                    'GSI住所候補なし 30 URL':'address.residential_candidates',
+                    '地図マーカー欠落 30 URL（過去ログから抽出）':'map.room_marker'}
+            option=st.selectbox('検証する主要エラー',list(groups),key='v147_replay_group')
+            existing=state.get('v147_live_test_job')
+            running=bool(existing and not existing.snapshot()['finished'])
+            if st.button('実URLで再取得し、Supabase保存・再読込を検証する',key='v147_real_url_replay',
+                         disabled=running or automatic_busy() or bool(active_job() and not active_job().snapshot()['finished'])):
+                try:
+                    db=Database();db.web_config=rental_network_settings()
+                    job=V147RealUrlReplay(db,PublicWeb(),groups[option]);state.v147_live_test_job=job
+                    job.thread.start()
+                except AppError as exc:st.error(str(exc))
+            if state.get('v147_live_test_job'):st.caption('検証結果・CSVは「設定」→「ログ出力」で確認できます。')
+            st.divider()
+            st.subheader('新しいアプリの初期設定')
+            with st.expander('既存DBの整理（過去エラーのみ削除・物件は保持）',expanded=False):
+                st.warning('自動収集を停止したうえで、保存領域名をSecretsと照合してください。実行すると過去のエラーログと診断ログが削除され、復元できません。募集情報・取得済みID・町の進捗は削除しません。')
+                st.caption('以下は既定値 SUPABASE_NAMESPACE = sumai-compass 用です。別の値なら SQL 内の namespace を置換してください。')
+                st.code(DB_MAINTENANCE_SQL,language='sql')
+                st.download_button('既存エラーログ整理SQL',DB_MAINTENANCE_SQL,
+                                   'supabase_cleanup_ver105.sql','text/plain')
+            st.write('1．SupabaseのSQL Editorに、以下のSQLを貼り付けてRunを押してください。')
+            st.code(SQL,language='sql')
+            st.download_button('セットアップSQLをダウンロード',SQL,'supabase_rebuild_01.sql','text/plain')
+            st.write('2．StreamlitのSettings → Secretsに、接続先とサーバー用のSecret keyを設定してください。')
+            st.code('SUPABASE_URL = "https://プロジェクトID.supabase.co"\nSUPABASE_SECRET_KEY = "sb_secret_から始まるキー"\nSUPABASE_NAMESPACE = "sumai-compass"',language='toml')
+            st.write('物件取得にプロキシを使用する場合は、同じSecretsへ追加してください。Supabase・地名取得には適用しません。')
+            st.code('RENTAL_HTTP_PROXIES = ["http://ユーザー:パスワード@ホスト:ポート", "http://別のユーザー:パスワード@別のホスト:ポート"]',language='toml')
+            try:st.caption('設定済みプロキシ：'+str(len(rental_network_settings()['proxies']))+'経路')
+            except AppError as exc:st.error(str(exc))
+            st.caption('第1段階：Google・Yahoo!検索ページを通常のHTTPナビゲーションとして取得します。旧版のアプリ内robots判定で事前遮断せず、取得できた場合は元の物件掲載ページで建物と住所を照合します。公開先が実際に403/429を返す場合は停止します。')
+            st.caption('第1段階専用のHTTP(S)プロキシを使う場合は下記Secretsに設定できます。設定しなければ直接通信です。OS・他アプリ・共有環境のVPN/プロキシ設定を変更しません。')
+            st.code('STAGE1_SEARCH_DIRECT = "YES"\nSTAGE1_SEARCH_HTTP_PROXIES = ["http://ユーザー:パスワード@ホスト:ポート"]',language='toml')
+            st.caption('サイトのrobots.txt上の方針や利用規約が変更されることがあります。HTTPヘッダーやプロキシによる取得成功を保証しません。Google・Yahoo!の実際のアクセス制限・CAPTCHAを突破する処理はありません。検索APIは任意で追加できます。')
+            st.caption('検索APIは課金される場合があります。既定では無効です。利用者が契約・キー取得後に明示的に有効化した場合のみ要求します。上限はアプリ実行プロセスごとであり、請求上限ではありません。')
+            st.code('STAGE1_SEARCH_API_PROVIDER = "brave"\nSTAGE1_SEARCH_API_KEY = "契約したサービスのAPIキー"\nSTAGE1_SEARCH_API_APPROVED = "YES"\nSTAGE1_SEARCH_API_MAX_REQUESTS = 25',language='toml')
+            st.caption('Googleの既存Custom Search API契約がある場合は PROVIDER = "google_legacy" とし、STAGE1_GOOGLE_CSE_ID = "既存の検索エンジンID" を追加してください。Yahoo! JAPANのウェブ検索APIは提供を終了しています。')
+            st.caption('追加対策：同じ経路で公開トップページを確認してCookieを引き継ぎ、物件サイトごとに同時通信2件・通信開始は最低1秒間隔で取得します。403の経路とURLは60秒休止し、別の公開条件ページも確認します。')
+            st.caption('利用するプロキシサービスの接続URLを設定してください。設定済みの経路で403・空応答・通信失敗が出た場合は別の経路へ切り替えます。認証情報は作業ログへ出力しません。')
+            st.write('3．接続確認が成功したら、「住まいを探す」の地図を動かして検索してください。')
+            if st.button('Supabase接続・テーブル構造を診断',key='new_check'):
+                try:
+                    db=Database();db.check()
+                    st.success('3テーブルへの少量データ照会に成功。接続先・認証・基本構造は正常です。大量の取得履歴照会でのHTTP 500は別途発生する可能性があります。')
+                except AppError as exc:
+                    st.error(str(exc))
+                    diagnostic=getattr(exc,'diagnostic',{})
+                    if diagnostic:st.json(diagnostic)
+            st.caption('HTTP 500が繰り返される場合：下記の補助インデックスSQLをSupabase SQL Editorで1回実行してください。既存レコードは削除しません。')
+            performance_sql='''create index if not exists housing_searches_v1_status_id on public.housing_searches_v1(namespace,status,id);
+    create index if not exists housing_searches_v1_acquisition_recent on public.housing_searches_v1(namespace,status,finished_at,id);
+    analyze public.housing_searches_v1;'''
+            st.code(performance_sql,language='sql')
+            st.download_button('DB検索高速化SQLをダウンロード',performance_sql,'supabase_indexes.sql','text/plain',key='database_index_sql')
+            st.caption('旧アプリの物件や検索状態を使用しません。旧テーブルのデータは削除しません。')
+            st.caption(f'実行中の版：{BUILD}')
+            with st.expander('取得・集計の範囲'):
+                st.write('SUUMOのみで検索します。マンションは築15年以内、ワンルーム/1K/1DK・1LDK/2K/2DK・2LDK/3K/3DK。一戸建て・その他は築40年以内・50㎡以上。地図の色分けに必要な町丁目はSUUMO掲載所在地を優先し、不足時のみ物件固有地図から照合します。')
+                st.caption('住所照合：SUUMOの所在地を市区・町丁目に正規化。町丁目を特定できない場合だけ物件固有のマーカーから国土地理院の逆ジオコーディングを利用します。番地を作りません。')
+                st.write('データベースへ保存する募集項目は家賃・間取り・種別・町丁目（既存の詳細住所は保持）・取得日時です。UTCで保存し画面はJST表示します。管理費・面積・築年数・画像・緯度経度は募集データに保存しません。')
+                st.write('募集情報は既存SupabaseのJSON領域を利用し、追加SQLは不要です。過去のschema 3〜7は書き換えず、集計時に町丁目へ正規化。新規schema 8のデータと同じ区域で表示します。')
+                st.write('SUUMOの詳細ページ「所在地」から町丁目を確認します。所在地が不十分な場合だけ、物件固有地図から町丁目を照合します。番地や建物座標を推測して保存しません。')
+                st.write('地図範囲内の居住地名タイルと100m間隔の地点・範囲の端から地名・丁目を判定します。候補数・物件数・ページ数による打ち切りは行いません。通信失敗やページ送りの異常は未完了として表示します。掲載サイト側の非公開情報・取得制限や、地名データの欠落は取得できません。')
+                st.write('地図は町丁目別の平均家賃を着色します。町丁目のみ判明した物件に仮の建物座標は付けません。過去の保存内容は維持し、地図用の集計だけを更新します。')
+                st.write('検索と保存はサーバーのバックグラウンドで実行し、画面は定期的に進捗を更新します。サーバーの休止・再起動を越えて実行することはできません。募集終了物件の自動削除は行いません。')
+                st.caption('地名取得の代替経路：Geolonia Japanese Addresses v2（デジタル庁アドレス・ベース・レジストリ由来、CC BY 4.0）。町代表点を使って近隣自治体の全町丁目を検索します。地名データの欠落や境界の完全な網羅は保証できません。')
+                st.link_button('町丁目データの出典・ライセンス','https://github.com/geolonia/japanese-addresses-v2')
+
+
+def _v209_log_tools(state):
+    st.subheader('ログ出力')
+    st.button('ログ表示を更新',key='settings_refresh_logs_v209')
+    _v208_landmark_log_panel(state)
+    with st.expander('手動検索の作業ログ'):
+        if active_job() is None:st.caption('手動検索の作業ログはまだありません。')
+        else:background_status()
+    with st.expander('自動収集のログ・エラーCSV'):
+        _v209_automatic_log_tools()
+    with st.expander('保存済みのログ・検索履歴'):
+        _v209_saved_log_tools(state)
+    render_memory_diagnostic_v124()
+    if state.get('v147_live_test_job'):
+        with st.expander('実URL検証の結果・CSV'):
+            v147_replay_status()
+
+
 def main():
     st.set_page_config(page_title='住まいコンパス｜新しい住まいを探す',page_icon='🏡',layout='wide',initial_sidebar_state='collapsed')
     st.markdown(CSS,unsafe_allow_html=True)
@@ -14207,7 +14346,7 @@ def main():
     except Exception:state.current_storage_key=None
     # Choropleth display does not auto-restore thousands of old per-listing points.
     # The Saved Data tab can still load them explicitly for detailed export.
-    tabs=st.tabs(['住まいを探す','保存データ','通勤','初期設定'])
+    tabs=st.tabs(['住まいを探す','保存データ','通勤','設定'])
     with tabs[0]:
         st.subheader('地図を動かして、探す地域を表示してください')
         selected_group=state.get('layout_display_group','group1')
@@ -14243,7 +14382,6 @@ def main():
             ward_town_selector(ward_code,'manual',disabled=searching)
         st.button('表示中の地名から全件検索・保存' if scope=='地図の表示範囲' else '選択した区・町名を検索・保存',type='primary',use_container_width=True,
                   on_click=remember_search,key='new_start',disabled=searching or (scope=='地図の表示範囲' and (not bounds or not providers)))
-        background_status()
         result=state.new_search
         if result:
             summary=result['summary'];saved=summary.get('saved',0);confirmed=summary.get('confirmed',0)
@@ -14283,9 +14421,9 @@ def main():
             if ready and ready.get('key')==(id(state.new_units),len(state.new_units)):
                 st.download_button('CSVをダウンロード',ready['bytes'],'sumai_rebuild_units.csv',
                                    'text/csv',use_container_width=True,on_click='ignore')
-        if st.toggle('その他の操作を表示（CSV取込・再読込・履歴）',
+        if st.toggle('その他の操作を表示（CSV取込・再読込）',
                      key='show_saved_advanced_v122',value=False):
-            st.caption('通常は操作不要です。保存データの修復・CSV取込・過去ログを扱う場合に使用します。')
+            st.caption('通常は操作不要です。保存データの修復・CSV取込に使用します。ログは「設定」→「ログ出力」で確認できます。')
             if st.button('保存物件を全件読み直す',key='new_load_full',use_container_width=False,
                          disabled=bool(active_saved_load() and not active_saved_load().snapshot()['finished'])):
                 try:start_saved_load(bounds,state.get('address_point_cache'),force_full=True)
@@ -14303,37 +14441,6 @@ def main():
                     saved=Database().save_units(state.new_units);state.new_saved_keys=list(set(state.new_saved_keys)|saved)
                     state.new_notice=f'{len(saved)}件の保存を確認しました。';st.rerun()
                 except AppError as exc: st.error(str(exc))
-            if st.button('検索履歴を読み込む',key='new_history_load'):
-                try: state.new_history=Database().history()
-                except AppError as exc: st.error(str(exc))
-            if state.get('new_history'):
-                st.dataframe([{'開始（UTC）':r['started_at'],'結果':r['status'],'表示範囲':str(r['conditions'].get('bounds','')),
-                               '保存確認':r['summary'].get('saved',0)} for r in state.new_history],hide_index=True)
-            if state.get('new_history'):
-                chosen=st.selectbox('作業ログを取り出す検索',state.new_history,format_func=lambda r:r['started_at']+'｜'+r['status'],key='diagnostic_history')
-                if st.button('選んだ検索の詳細作業ログを読み込む',key='diagnostic_load'):
-                    try:
-                        state.saved_diagnostics=Database().load_diagnostics(chosen['id'])
-                        if not state.saved_diagnostics:st.info('この検索には保存された詳細ログがありません。v30以降で再検索してください。')
-                    except AppError as exc:st.error(str(exc))
-            if state.get('saved_diagnostics'):diagnostic_downloads(state.saved_diagnostics,'saved')
-            with st.expander('前回のログと比較して改善を確認'):
-                baseline=st.file_uploader('前回の解析用JSONログを選択',type=['json'],key='diagnostic_baseline')
-                if baseline:
-                    try:
-                        old=json.loads(baseline.getvalue().decode('utf-8-sig')).get('events')
-                        if not isinstance(old,list) or not all(isinstance(e,dict) for e in old):raise ValueError()
-                        compare_target=st.radio('比較する今回のログ',['現在の検索','読み込んだ保存ログ'],key='diagnostic_compare_target')
-                        current=(active_job().audit.records() if active_job() else []) if compare_target=='現在の検索' else state.get('saved_diagnostics',[])
-                        if current:
-                            st.dataframe(compare_logs(old,current),hide_index=True)
-                            old_start=next((e.get('details',{}) for e in old if e.get('code')=='start'),{})
-                            new_start=next((e.get('details',{}) for e in current if e.get('code')=='start'),{})
-                            if old_start.get('bounds')!=new_start.get('bounds') or old_start.get('providers')!=new_start.get('providers'):st.info('表示範囲・取得元が異なります。差分だけで改善効果を判断できません。')
-                            st.caption('差分はログの観測件数です。精度は同じ物件の正解データとの照合で確認してください。')
-                        else:st.info('比較対象として現在の検索ログまたは保存ログを読み込んでください。')
-                    except (ValueError,UnicodeError,AttributeError):st.error('このアプリからダウンロードした解析用JSONログを選択してください。')
-        render_memory_diagnostic_v124()
     with tabs[2]:
         st.subheader('通勤の目安')
         if not commute_storage_ready:
@@ -14442,76 +14549,19 @@ def main():
             st.caption('乗換回数最少を優先（同数なら最短時間）。登録41駅・11路線による概算。時刻表・直通運転・道路の徒歩経路は使用していません。徒歩は直線距離×1.25、列車は距離から推定、乗り換えは5分です。')
         else: st.info('物件を検索するか、保存物件を読み込むと通勤を比較できます。')
     with tabs[3]:
-        st.subheader('実URL・Supabase保存検証（追加課金なし）')
-        st.caption('旧版の失敗ログから固定抽出した実URLを再検索し、住所・家賃・間取りを保存してSupabaseで読み戻します。24/30以上で合格。')
-        groups={'詳細住所確定失敗 30 URL':'map.address_inference',
-                'GSI住所候補なし 30 URL':'address.residential_candidates',
-                '地図マーカー欠落 30 URL（過去ログから抽出）':'map.room_marker'}
-        option=st.selectbox('検証する主要エラー',list(groups),key='v147_replay_group')
-        existing=state.get('v147_live_test_job')
-        running=bool(existing and not existing.snapshot()['finished'])
-        if st.button('実URLで再取得し、Supabase保存・再読込を検証する',key='v147_real_url_replay',
-                     disabled=running or automatic_busy() or bool(active_job() and not active_job().snapshot()['finished'])):
-            try:
-                db=Database();db.web_config=rental_network_settings()
-                job=V147RealUrlReplay(db,PublicWeb(),groups[option]);state.v147_live_test_job=job
-                job.thread.start()
-            except AppError as exc:st.error(str(exc))
-        if state.get('v147_live_test_job'):v147_replay_status()
-        st.divider()
-        st.subheader('新しいアプリの初期設定')
-        with st.expander('既存DBの整理（過去エラーのみ削除・物件は保持）',expanded=False):
-            st.warning('自動収集を停止したうえで、保存領域名をSecretsと照合してください。実行すると過去のエラーログと診断ログが削除され、復元できません。募集情報・取得済みID・町の進捗は削除しません。')
-            st.caption('以下は既定値 SUPABASE_NAMESPACE = sumai-compass 用です。別の値なら SQL 内の namespace を置換してください。')
-            st.code(DB_MAINTENANCE_SQL,language='sql')
-            st.download_button('既存エラーログ整理SQL',DB_MAINTENANCE_SQL,
-                               'supabase_cleanup_ver105.sql','text/plain')
-        st.write('1．SupabaseのSQL Editorに、以下のSQLを貼り付けてRunを押してください。')
-        st.code(SQL,language='sql')
-        st.download_button('セットアップSQLをダウンロード',SQL,'supabase_rebuild_01.sql','text/plain')
-        st.write('2．StreamlitのSettings → Secretsに、接続先とサーバー用のSecret keyを設定してください。')
-        st.code('SUPABASE_URL = "https://プロジェクトID.supabase.co"\nSUPABASE_SECRET_KEY = "sb_secret_から始まるキー"\nSUPABASE_NAMESPACE = "sumai-compass"',language='toml')
-        st.write('物件取得にプロキシを使用する場合は、同じSecretsへ追加してください。Supabase・地名取得には適用しません。')
-        st.code('RENTAL_HTTP_PROXIES = ["http://ユーザー:パスワード@ホスト:ポート", "http://別のユーザー:パスワード@別のホスト:ポート"]',language='toml')
-        try:st.caption('設定済みプロキシ：'+str(len(rental_network_settings()['proxies']))+'経路')
-        except AppError as exc:st.error(str(exc))
-        st.caption('第1段階：Google・Yahoo!検索ページを通常のHTTPナビゲーションとして取得します。旧版のアプリ内robots判定で事前遮断せず、取得できた場合は元の物件掲載ページで建物と住所を照合します。公開先が実際に403/429を返す場合は停止します。')
-        st.caption('第1段階専用のHTTP(S)プロキシを使う場合は下記Secretsに設定できます。設定しなければ直接通信です。OS・他アプリ・共有環境のVPN/プロキシ設定を変更しません。')
-        st.code('STAGE1_SEARCH_DIRECT = "YES"\nSTAGE1_SEARCH_HTTP_PROXIES = ["http://ユーザー:パスワード@ホスト:ポート"]',language='toml')
-        st.caption('サイトのrobots.txt上の方針や利用規約が変更されることがあります。HTTPヘッダーやプロキシによる取得成功を保証しません。Google・Yahoo!の実際のアクセス制限・CAPTCHAを突破する処理はありません。検索APIは任意で追加できます。')
-        st.caption('検索APIは課金される場合があります。既定では無効です。利用者が契約・キー取得後に明示的に有効化した場合のみ要求します。上限はアプリ実行プロセスごとであり、請求上限ではありません。')
-        st.code('STAGE1_SEARCH_API_PROVIDER = "brave"\nSTAGE1_SEARCH_API_KEY = "契約したサービスのAPIキー"\nSTAGE1_SEARCH_API_APPROVED = "YES"\nSTAGE1_SEARCH_API_MAX_REQUESTS = 25',language='toml')
-        st.caption('Googleの既存Custom Search API契約がある場合は PROVIDER = "google_legacy" とし、STAGE1_GOOGLE_CSE_ID = "既存の検索エンジンID" を追加してください。Yahoo! JAPANのウェブ検索APIは提供を終了しています。')
-        st.caption('追加対策：同じ経路で公開トップページを確認してCookieを引き継ぎ、物件サイトごとに同時通信2件・通信開始は最低1秒間隔で取得します。403の経路とURLは60秒休止し、別の公開条件ページも確認します。')
-        st.caption('利用するプロキシサービスの接続URLを設定してください。設定済みの経路で403・空応答・通信失敗が出た場合は別の経路へ切り替えます。認証情報は作業ログへ出力しません。')
-        st.write('3．接続確認が成功したら、「住まいを探す」の地図を動かして検索してください。')
-        if st.button('Supabase接続・テーブル構造を診断',key='new_check'):
-            try:
-                db=Database();db.check()
-                st.success('3テーブルへの少量データ照会に成功。接続先・認証・基本構造は正常です。大量の取得履歴照会でのHTTP 500は別途発生する可能性があります。')
-            except AppError as exc:
-                st.error(str(exc))
-                diagnostic=getattr(exc,'diagnostic',{})
-                if diagnostic:st.json(diagnostic)
-        st.caption('HTTP 500が繰り返される場合：下記の補助インデックスSQLをSupabase SQL Editorで1回実行してください。既存レコードは削除しません。')
-        performance_sql='''create index if not exists housing_searches_v1_status_id on public.housing_searches_v1(namespace,status,id);
-create index if not exists housing_searches_v1_acquisition_recent on public.housing_searches_v1(namespace,status,finished_at,id);
-analyze public.housing_searches_v1;'''
-        st.code(performance_sql,language='sql')
-        st.download_button('DB検索高速化SQLをダウンロード',performance_sql,'supabase_indexes.sql','text/plain',key='database_index_sql')
-        st.caption('旧アプリの物件や検索状態を使用しません。旧テーブルのデータは削除しません。')
-        st.caption(f'実行中の版：{BUILD}')
-        with st.expander('取得・集計の範囲'):
-            st.write('SUUMOのみで検索します。マンションは築15年以内、ワンルーム/1K/1DK・1LDK/2K/2DK・2LDK/3K/3DK。一戸建て・その他は築40年以内・50㎡以上。地図の色分けに必要な町丁目はSUUMO掲載所在地を優先し、不足時のみ物件固有地図から照合します。')
-            st.caption('住所照合：SUUMOの所在地を市区・町丁目に正規化。町丁目を特定できない場合だけ物件固有のマーカーから国土地理院の逆ジオコーディングを利用します。番地を作りません。')
-            st.write('データベースへ保存する募集項目は家賃・間取り・種別・町丁目（既存の詳細住所は保持）・取得日時です。UTCで保存し画面はJST表示します。管理費・面積・築年数・画像・緯度経度は募集データに保存しません。')
-            st.write('募集情報は既存SupabaseのJSON領域を利用し、追加SQLは不要です。過去のschema 3〜7は書き換えず、集計時に町丁目へ正規化。新規schema 8のデータと同じ区域で表示します。')
-            st.write('SUUMOの詳細ページ「所在地」から町丁目を確認します。所在地が不十分な場合だけ、物件固有地図から町丁目を照合します。番地や建物座標を推測して保存しません。')
-            st.write('地図範囲内の居住地名タイルと100m間隔の地点・範囲の端から地名・丁目を判定します。候補数・物件数・ページ数による打ち切りは行いません。通信失敗やページ送りの異常は未完了として表示します。掲載サイト側の非公開情報・取得制限や、地名データの欠落は取得できません。')
-            st.write('地図は町丁目別の平均家賃を着色します。町丁目のみ判明した物件に仮の建物座標は付けません。過去の保存内容は維持し、地図用の集計だけを更新します。')
-            st.write('検索と保存はサーバーのバックグラウンドで実行し、画面は定期的に進捗を更新します。サーバーの休止・再起動を越えて実行することはできません。募集終了物件の自動削除は行いません。')
-            st.caption('地名取得の代替経路：Geolonia Japanese Addresses v2（デジタル庁アドレス・ベース・レジストリ由来、CC BY 4.0）。町代表点を使って近隣自治体の全町丁目を検索します。地名データの欠落や境界の完全な網羅は保証できません。')
-            st.link_button('町丁目データの出典・ライセンス','https://github.com/geolonia/japanese-addresses-v2')
+        st.subheader('設定')
+        state.setdefault('_v209_settings_page','logs')
+        logs_button,initial_button=st.columns(2)
+        with logs_button:
+            if st.button('ログ出力',key='settings_logs_v209',use_container_width=True,
+                         type='primary' if state['_v209_settings_page']=='logs' else 'secondary'):
+                state['_v209_settings_page']='logs'
+        with initial_button:
+            if st.button('初期設定',key='settings_initial_v209',use_container_width=True,
+                         type='primary' if state['_v209_settings_page']=='initial' else 'secondary'):
+                state['_v209_settings_page']='initial'
+        if state['_v209_settings_page']=='initial':_v209_initial_settings(state)
+        else:_v209_log_tools(state)
 
 
 if __name__=='__main__':
