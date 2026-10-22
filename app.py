@@ -52,7 +52,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v203"
+BUILD = "REBUILD-01-v204"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -12052,9 +12052,61 @@ def _v202_view_zoom(value,default=11):
     except (ValueError,TypeError,OverflowError):return default
 
 
+# v204: directions use the exact tapped point, never a town's geometric center.
+_V204_NAV_JS = r"""
+function v204DirectionsUrl(point){
+ if(!point||typeof point.lat!=='number'||typeof point.lng!=='number'||
+    !Number.isFinite(point.lat)||!Number.isFinite(point.lng)||
+    point.lat < -90||point.lat > 90||point.lng < -180||point.lng > 180)return '';
+ var url=new URL('https://www.google.com/maps/dir/');
+ url.searchParams.set('api','1');
+ url.searchParams.set('destination',point.lat.toFixed(6)+','+point.lng.toFixed(6));
+ // Omitting origin lets Google Maps use the device's current location.
+ // Leave travel mode to Google Maps and the user's preferences.
+ url.searchParams.set('dir_action','navigate');
+ return url.href;
+}
+"""
+_V204_POPUP_NEW=_V167_POPUP_NEW.replace(
+    "var suumo=String(props.suumo_url||'');",
+    "var actions=document.createElement('div');actions.className='v204-popup-actions';el.appendChild(actions);\nvar suumo=String(props.suumo_url||'');",1).replace(
+    "  el.appendChild(document.createElement('div'));\n  el.appendChild(link);",
+    "  actions.appendChild(link);",1)
+_V204_ROUTE_LINK = r"""
+var route=document.createElement('a');
+route.className='v167-suumo-link v204-route-link';
+route.textContent='経路案内 ↗';route.target='_blank';route.rel='noopener noreferrer';
+route.title='現在地からタップした場所までGoogleマップで案内';
+route.setAttribute('aria-label','現在地からタップした場所までGoogleマップで経路案内');
+route.setAttribute('aria-disabled','true');
+actions.appendChild(route);
+route.addEventListener('click',function(event){if(!route.hasAttribute('href'))event.preventDefault();});
+// Register before bindPopup: update the URL before Leaflet opens the popup.
+layer.on('click',function(event){
+ var url=v204DirectionsUrl(event&&event.latlng);
+ if(url){route.href=url;route.removeAttribute('aria-disabled');}
+ else{route.removeAttribute('href');route.setAttribute('aria-disabled','true');}
+});
+layer.bindPopup(el);
+"""
+assert _V204_POPUP_NEW!=_V167_POPUP_NEW
+assert _V204_POPUP_NEW.count('actions.appendChild(link);')==1
+_V204_POPUP_NEW=_V204_POPUP_NEW.replace('layer.bindPopup(el);',_V204_ROUTE_LINK,1)
+assert TOWN_COMPONENT_HTML_V121.count(_V167_POPUP_NEW)==1
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(_V167_POPUP_NEW,_V204_POPUP_NEW,1)
+assert TOWN_COMPONENT_HTML_V121.count('function render(args){')==1
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('function render(args){',_V204_NAV_JS+'\nfunction render(args){',1)
+_V204_NAV_CSS="""
+.v204-popup-actions{display:flex;flex-wrap:wrap;align-items:stretch;gap:7px;margin-top:8px}
+.v204-popup-actions .v167-suumo-link{display:inline-flex;align-items:center;justify-content:center;box-sizing:border-box;margin:0;min-height:40px;padding:8px 10px;white-space:nowrap}
+.v204-route-link[aria-disabled="true"]{opacity:.55;cursor:default}
+"""
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('</style></head>',_V204_NAV_CSS+'</style></head>',1)
+
+
 @st.cache_resource(show_spinner=False)
 def town_component_v121():
-    _asset_revision='v202-restore-specified-home-and-search-scales'
+    _asset_revision='v204-popup-google-directions'
     folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-v184')
     os.makedirs(folder,exist_ok=True)
     path=os.path.join(folder,'index.html')
