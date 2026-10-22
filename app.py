@@ -52,7 +52,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v204"
+BUILD = "REBUILD-01-v205"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -12104,9 +12104,195 @@ _V204_NAV_CSS="""
 TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('</style></head>',_V204_NAV_CSS+'</style></head>',1)
 
 
+# v205: personal named landmarks, independent of rental observations.
+_V205_PIN_DOM = """<details id="v205-pins-panel"><summary>目印ピンを追加・表示</summary><label for="v205-pin-name">ピンの名前</label><input id="v205-pin-name" maxlength="60" placeholder="例：立教小学校"/><label for="v205-pin-address">住所</label><input id="v205-pin-address" maxlength="180" placeholder="住所を入力（地図で指定する場合は空欄で可）"/><div class="v205-actions"><button type="button" id="v205-pin-search">住所から場所を探す</button><button type="button" id="v205-pin-pick">地図をタップして指定</button><button type="button" id="v205-pin-cancel" hidden>指定をやめる</button></div><div id="v205-pin-candidates" hidden><label for="v205-pin-candidate">追加する場所を確認</label><select id="v205-pin-candidate"></select><button type="button" id="v205-pin-add">この場所にピンを追加</button></div><div id="v205-pin-status" role="status" aria-live="polite"></div><div id="v205-pin-saved" hidden><label for="v205-pin-list">保存した目印</label><select id="v205-pin-list"></select><button type="button" id="v205-pin-jump">選んだピンへ移動</button></div><p class="v205-help">このブラウザーに保存します。住所検索の位置は目安です。追加したピンはドラッグで調整でき、タップすると経路案内・削除ができます。</p></details>"""
+_V205_PIN_CSS = """
+#v205-pins-panel{padding:12px 13px;background:#fff;border-top:1px solid #d5dfdc;color:#173a5e;font:14px system-ui}
+#v205-pins-panel summary{font-weight:750;cursor:pointer;padding:5px 0}
+#v205-pins-panel label{display:block;font-size:13px;font-weight:650;margin:10px 0 5px}
+#v205-pins-panel input,#v205-pins-panel select{box-sizing:border-box;width:100%;min-height:40px;border:1px solid #b9c7c3;border-radius:7px;background:#fff;color:#173a5e;padding:7px 9px;font-size:16px}
+#v205-pins-panel button{min-height:40px;padding:7px 10px;margin-top:8px;border:1px solid #a5b8b0;border-radius:7px;background:#eef5f1;color:#173a5e;font-size:13px;cursor:pointer;touch-action:manipulation}
+#v205-pins-panel [hidden]{display:none!important}
+.v205-actions{display:flex;flex-wrap:wrap;gap:7px}
+#v205-pin-status,.v205-help{font-size:12px;line-height:1.45;margin:7px 0 0;color:#49616b}
+.v205-pin-icon{background:none;border:0}
+.v205-pin-dot{display:block;width:18px;height:18px;background:#a52c40;border:2px solid #fff;border-radius:50% 50% 50% 0;transform:rotate(-45deg);box-shadow:0 1px 4px #555}
+.leaflet-tooltip.v205-pin-label{color:#173a5e;background:#fff;border:1px solid #a52c40;border-radius:4px;font-weight:750;font-size:13px;padding:3px 6px;white-space:normal;max-width:170px}
+.v205-pin-popup-title{font-weight:750;color:#173a5e;margin-bottom:5px}
+.v205-pin-popup-address{font-size:12px;color:#49616b;overflow-wrap:anywhere}
+.v205-pin-delete{min-height:40px;padding:7px 10px;color:#a52c40;background:#fff;border:1px solid #a52c40;border-radius:6px;cursor:pointer;font-size:13px}
+"""
+_V205_PIN_JS = r"""
+var v205StorageKey='sumai.personal-landmarks.v205';
+function v205Status(text){var el=document.getElementById('v205-pin-status');if(el)el.textContent=text||'';setHeight()}
+function v205Point(lat,lng){return typeof lat==='number'&&typeof lng==='number'&&Number.isFinite(lat)&&Number.isFinite(lng)&&lat>=34&&lat<=37&&lng>=138&&lng<=141}
+function v205CleanPin(pin){
+ if(!pin||typeof pin.id!=='string'||!pin.id||pin.id.length>100||typeof pin.name!=='string'||!pin.name.trim()||pin.name.length>60||!v205Point(pin.lat,pin.lng))return null;
+ return {id:pin.id,name:pin.name.trim(),address:String(pin.address||'').slice(0,180),lat:pin.lat,lng:pin.lng};
+}
+function v205LoadPins(){
+ try{
+  var raw=localStorage.getItem(v205StorageKey);
+  if(!raw)return [];
+  var data=JSON.parse(raw);
+  if(!data||data.schema!==1||!Array.isArray(data.pins))throw new Error('invalid pin data');
+  var used=new Set();return data.pins.map(v205CleanPin).filter(function(pin){if(!pin||used.has(pin.id))return false;used.add(pin.id);return true});
+ }catch(e){v205Status('保存したピンを読み込めません。このブラウザーの保存設定を確認してください。');return []}
+}
+function v205SavePins(pins){
+ var clean=pins.map(v205CleanPin);
+ if(clean.some(function(pin){return !pin}))return false;
+ try{localStorage.setItem(v205StorageKey,JSON.stringify({schema:1,pins:clean}));}
+ catch(e){v205Status('ピンを保存できません。ブラウザーの保存設定・空き容量を確認してください。');return false;}
+ state._v205Pins=clean;v205DrawPins();v205PinList();return true;
+}
+function v205PinList(){
+ var box=document.getElementById('v205-pin-saved'),select=document.getElementById('v205-pin-list');
+ if(!box||!select)return;
+ var old=select.value;select.replaceChildren();
+ (state._v205Pins||[]).forEach(function(pin){var opt=document.createElement('option');opt.value=pin.id;opt.textContent=pin.name;select.appendChild(opt)});
+ box.hidden=!(state._v205Pins||[]).length;
+ if((state._v205Pins||[]).some(function(p){return p.id===old}))select.value=old;
+ setHeight();
+}
+function v205DrawPins(){
+ if(!state.map||!window.L)return;
+ var pins=state._v205Pins||[],signature=JSON.stringify(pins);
+ if(state._v205Layer&&state._v205PinSignature===signature)return;
+ if(!state.map.getPane('personalPinPane')){state.map.createPane('personalPinPane');state.map.getPane('personalPinPane').style.zIndex='690';}
+ if(!state._v205Layer)state._v205Layer=L.layerGroup().addTo(state.map);
+ state._v205Layer.clearLayers();state._v205Markers={};state._v205PinSignature=signature;
+ pins.forEach(function(pin){
+  var marker=L.marker([pin.lat,pin.lng],{pane:'personalPinPane',draggable:true,keyboard:true,title:pin.name,
+   icon:L.divIcon({className:'v205-pin-icon',html:'<span class="v205-pin-dot"></span>',iconSize:[22,28],iconAnchor:[11,26],popupAnchor:[0,-25]})});
+  var title=document.createElement('span');title.textContent=pin.name;
+  marker.bindTooltip(title,{permanent:true,direction:'right',offset:[9,-17],className:'v205-pin-label'});
+  var popup=document.createElement('div'),heading=document.createElement('div'),address=document.createElement('div');
+  heading.className='v205-pin-popup-title';heading.textContent=pin.name;
+  address.className='v205-pin-popup-address';address.textContent=pin.address||'地図で指定した場所';popup.appendChild(heading);popup.appendChild(address);
+  var actions=document.createElement('div');actions.className='v204-popup-actions';
+  var route=document.createElement('a');route.className='v167-suumo-link';route.textContent='経路案内 ↗';route.href=v204DirectionsUrl(pin);route.target='_blank';route.rel='noopener noreferrer';actions.appendChild(route);
+  var remove=document.createElement('button');remove.type='button';remove.className='v205-pin-delete';remove.textContent='ピンを削除';
+  remove.addEventListener('click',function(){if(v205SavePins((state._v205Pins||[]).filter(function(p){return p.id!==pin.id})))v205Status('「'+pin.name+'」を削除しました。');});
+  actions.appendChild(remove);popup.appendChild(actions);marker.bindPopup(popup);
+  marker.on('dragend',function(){var point=marker.getLatLng();
+   if(!v205Point(point.lat,point.lng)){marker.setLatLng([pin.lat,pin.lng]);v205Status('対応範囲外です。位置を元に戻しました。');return;}
+   var next=(state._v205Pins||[]).map(function(p){return p.id===pin.id?Object.assign({},p,{lat:point.lat,lng:point.lng}):p});
+   if(v205SavePins(next))v205Status('ピンの位置を保存しました。');else marker.setLatLng([pin.lat,pin.lng]);
+  });
+  marker.addTo(state._v205Layer);state._v205Markers[pin.id]=marker;
+ });
+}
+function v205FocusPin(pin){
+ if(!state.map||!pin)return;
+ state.map.setView([pin.lat,pin.lng],Math.max(13,state.map.getZoom()),{animate:false});
+ var marker=(state._v205Markers||{})[pin.id];if(marker)marker.openPopup();
+}
+function v205AddPin(name,address,lat,lng){
+ name=String(name||'').trim().slice(0,60);
+ if(!name||!v205Point(lat,lng)){v205Status('名前と位置を確認してください。');return false;}
+ if((state._v205Pins||[]).some(function(p){return p.name===name&&Math.abs(p.lat-lat)<.000001&&Math.abs(p.lng-lng)<.000001})){v205Status('同じ目印ピンは登録済みです。');return false;}
+ var id='pin_'+Date.now().toString(36)+'_'+Math.random().toString(36).slice(2,14);
+ var pin={id:id,name:name,address:String(address||'').slice(0,180),lat:lat,lng:lng};
+ if(!v205SavePins((state._v205Pins||[]).concat([pin])))return false;
+ document.getElementById('v205-pin-candidates').hidden=true;
+ v205FocusPin(pin);v205Status('「'+name+'」を保存しました。ピンはドラッグで位置を調整できます。');return true;
+}
+function v205SearchPin(){
+ if(state._v205SearchPending)return;
+ var name=document.getElementById('v205-pin-name').value.trim(),address=document.getElementById('v205-pin-address').value.trim();
+ if(!name){v205Status('ピンの名前を入力してください。');return;}
+ if(!address){v205Status('住所を入力するか、「地図をタップして指定」を使ってください。');return;}
+ state._v205Pick=null;document.getElementById('v205-pin-cancel').hidden=true;
+ state._v205SearchPending=String(Date.now())+'_'+Math.random().toString(36).slice(2,12);
+ state._v205SearchName=name;state._v205SearchAddress=address;state._v205SearchEpoch=state._v202HomeEpoch;
+ document.getElementById('v205-pin-search').disabled=true;document.getElementById('v205-pin-candidates').hidden=true;
+ v205Status('住所の位置を確認しています…');
+ hostMessage('streamlit:setComponentValue',{dataType:'json',value:{event:'custom_pin_search_v205',ticket:state._v205SearchPending,name:name,address:address,home_view_epoch:state._v202HomeEpoch}});
+}
+function v205PinReply(reply){
+ if(!reply||reply.ticket!==state._v205SearchPending)return;
+ state._v205SearchPending=null;document.getElementById('v205-pin-search').disabled=false;
+ state._v205Candidates=Array.isArray(reply.candidates)?reply.candidates.filter(function(p){return p&&v205Point(p.lat,p.lng)}):[];
+ var box=document.getElementById('v205-pin-candidates'),select=document.getElementById('v205-pin-candidate');select.replaceChildren();
+ box.hidden=!state._v205Candidates.length;
+ state._v205Candidates.forEach(function(p,i){var opt=document.createElement('option');opt.value=String(i);opt.textContent=String(p.title||'住所の候補');select.appendChild(opt)});
+ if(state._v205Candidates.length)v205Status('住所の候補を選び、「この場所にピンを追加」を押してください。');
+ else v205Status(reply.error||'住所が見つかりませんでした。住所を詳しくするか、地図で指定してください。');
+}
+function v205InitPins(args){
+ if(!state.map)return;
+ if(!state._v205Initialized){
+  state._v205Initialized=true;state._v205Pins=v205LoadPins();
+  document.getElementById('v205-pins-panel').addEventListener('toggle',setHeight);
+  document.getElementById('v205-pin-search').addEventListener('click',v205SearchPin);
+  document.getElementById('v205-pin-pick').addEventListener('click',function(){
+   var name=document.getElementById('v205-pin-name').value.trim();
+   if(!name){v205Status('ピンの名前を入力してください。');return;}
+   if(state._v205SearchPending){v205Status('住所の確認が終わってから指定してください。');return;}
+   state._v205Pick={name:name,address:document.getElementById('v205-pin-address').value.trim()};
+   document.getElementById('v205-pin-cancel').hidden=false;v205Status('追加する場所を地図上でタップしてください。');
+  });
+  document.getElementById('v205-pin-cancel').addEventListener('click',function(){state._v205Pick=null;this.hidden=true;v205Status('地図での指定をやめました。');});
+  document.getElementById('v205-pin-add').addEventListener('click',function(){
+   var item=(state._v205Candidates||[])[Number(document.getElementById('v205-pin-candidate').value)];
+   if(item)v205AddPin(state._v205SearchName,state._v205SearchAddress,item.lat,item.lng);
+  });
+  document.getElementById('v205-pin-jump').addEventListener('click',function(){var id=document.getElementById('v205-pin-list').value;v205FocusPin((state._v205Pins||[]).find(function(p){return p.id===id}));});
+  state.map.on('click',function(event){
+   var pick=state._v205Pick,point=event&&event.latlng;if(!pick||!point)return;
+   if(v205AddPin(pick.name,pick.address,point.lat,point.lng)){state._v205Pick=null;document.getElementById('v205-pin-cancel').hidden=true;}
+  });
+  v205PinList();
+ }
+ if(state._v205SearchPending&&state._v205SearchEpoch!==state._v202HomeEpoch){state._v205SearchPending=null;document.getElementById('v205-pin-search').disabled=false;v205Status('表示を切り替えたため住所検索を中断しました。再度検索してください。');}
+ v205DrawPins();v205PinReply(args.custom_pin_reply||null);
+}
+"""
+assert TOWN_COMPONENT_HTML_V121.count('<div id="town-search-status" role="status" aria-live="polite"></div></div>')==1
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('<div id="town-search-status" role="status" aria-live="polite"></div></div>',
+    '<div id="town-search-status" role="status" aria-live="polite"></div></div>'+_V205_PIN_DOM,1)
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('</style></head>',_V205_PIN_CSS+'</style></head>',1)
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('function render(args){',_V205_PIN_JS+'\nfunction render(args){',1)
+assert TOWN_COMPONENT_HTML_V121.count(' v202HomeView(args);')==1
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(' v202HomeView(args);',' v202HomeView(args);\n v205InitPins(args);',1)
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('state.searchPendingTicket||state._v189Pending)return;',
+    'state.searchPendingTicket||state._v189Pending||state._v205SearchPending)return;',1)
+
+
+def _v205_geocode_pin(data):
+    """Read-only address lookup for personal landmarks; candidates require confirmation."""
+    reply={'ticket':str(data.get('ticket') or '')[:100],'candidates':[],'error':''}
+    name=data.get('name');address=data.get('address')
+    if (not isinstance(name,str) or not name.strip() or len(name)>60 or
+        not isinstance(address,str) or not address.strip() or len(address)>180):
+        reply['error']='ピンの名前と住所を確認してください。'
+        return reply
+    try:
+        web=PublicWeb()
+        doc=web.fetch('https://msearch.gsi.go.jp/address-search/AddressSearch',params={'q':address.strip()}).json()
+        if not isinstance(doc,list):raise ValueError('invalid address response')
+        seen=set()
+        for item in doc:
+            try:
+                geometry=item['geometry']
+                if geometry.get('type')!='Point':continue
+                lng,lat=map(float,geometry['coordinates'][:2])
+                if not (math.isfinite(lat) and math.isfinite(lng) and 34<=lat<=37 and 138<=lng<=141):continue
+                title=normal((item.get('properties') or {}).get('title') or address.strip())[:220]
+                key=(round(lat,7),round(lng,7),title)
+                if key in seen:continue
+                seen.add(key);reply['candidates'].append({'title':title,'lat':lat,'lng':lng})
+            except (KeyError,ValueError,TypeError,AttributeError):continue
+        if not reply['candidates']:reply['error']='住所が見つかりません。住所を詳しくするか、地図をタップして指定してください。'
+    except Exception:
+        reply['error']='住所の確認に失敗しました。再試行するか、地図をタップして指定してください。'
+    return reply
+
+
 @st.cache_resource(show_spinner=False)
 def town_component_v121():
-    _asset_revision='v204-popup-google-directions'
+    _asset_revision='v205-personal-named-pins'
     folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-v184')
     os.makedirs(folder,exist_ok=True)
     path=os.path.join(folder,'index.html')
@@ -13002,6 +13188,7 @@ def interactive_town_choropleth(group):
                 suumo_ward_codes=_V167_WARD_TO_CODE,
                 suumo_town_codes=suumo_oz_codes,
                 suumo_search_reply=state.get('_v189_suumo_reply'),
+                custom_pin_reply=state.get('_v205_pin_reply'),
                 search_error=state.get('_v184_search_error'),
                 commute_destination=(destinations[0] if destinations else ''),
                 commute_destination_2=(destinations[1] if len(destinations)==2 else ''),
@@ -13009,6 +13196,12 @@ def interactive_town_choropleth(group):
                 key='town_map_v184_'+str(reset),default=None)
     if isinstance(data,dict) and data.get('home_view_epoch')==int(state.get('_v202_home_epoch',0)):
         current=viewport_bounds(data)
+        if data.get('event')=='custom_pin_search_v205':
+            ticket=str(data.get('ticket') or '')[:100]
+            if ticket and ticket!=state.get('_v205_last_pin_ticket'):
+                state['_v205_last_pin_ticket']=ticket
+                state['_v205_pin_reply']=_v205_geocode_pin(data)
+                st.rerun(scope='fragment')
         if data.get('event')=='town_suumo_v189':
             ticket=str(data.get('ticket') or '')[:100]
             if ticket and ticket!=state.get('_v189_last_suumo_ticket'):
