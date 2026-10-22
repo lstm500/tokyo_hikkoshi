@@ -52,7 +52,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v212"
+BUILD = "REBUILD-01-v214"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -12101,7 +12101,7 @@ TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('</style></head>',_V20
 
 
 # v205: personal named landmarks, independent of rental observations.
-_V205_PIN_DOM = """<details id="v205-pins-panel"><summary>目印ピンを追加・表示</summary><label for="v205-pin-address">施設名・目印の名前で検索</label><input id="v205-pin-address" maxlength="180" placeholder="例：立教小学校（住所の入力は不要）"/><label for="v205-pin-name">ピンの名前（検索結果から自動入力・変更可）</label><input id="v205-pin-name" maxlength="60" placeholder="検索後に施設名が入ります"/><div class="v205-actions"><button type="button" id="v205-pin-search">名前で検索</button><button type="button" id="v205-pin-pick">地図をタップして指定</button><button type="button" id="v205-pin-cancel" hidden>仮ピンを取り消す</button></div><div id="v205-pin-candidates" hidden><label id="v206-result-label" for="v205-pin-candidate">検索結果</label><select id="v205-pin-candidate"></select><div id="v206-result-detail" role="status"></div><button type="button" id="v205-pin-add">確認して確定</button></div><div id="v205-pin-status" role="status" aria-live="polite"></div><div id="v205-pin-saved" hidden><label for="v205-pin-list">保存した目印</label><select id="v205-pin-list"></select><button type="button" id="v205-pin-jump">選んだピンへ移動</button></div><p class="v205-help">東京23区周辺の施設を名前で検索し、住所と位置を表示します。選択すると仮の印で位置を確認でき、「確認して確定」で保存します。確定したピンの長押しで削除確認を開きます。情報：国土地理院・<a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener noreferrer">© OpenStreetMap contributors</a>。保存先はこのブラウザーです。</p></details>"""
+_V205_PIN_DOM = """<details id="v205-pins-panel"><summary>目印ピンを追加・表示</summary><label for="v205-pin-address">施設名・目印の名前で検索</label><input id="v205-pin-address" maxlength="180" placeholder="例：立教小学校（住所の入力は不要）"/><label for="v205-pin-name">ピンの名前（検索結果から自動入力・変更可）</label><input id="v205-pin-name" maxlength="60" placeholder="検索後に施設名が入ります"/><div class="v205-actions"><button type="button" id="v205-pin-search">名前で検索</button><button type="button" id="v205-pin-pick">地図をタップして指定</button><button type="button" id="v205-pin-cancel" hidden>仮ピンを取り消す</button></div><div id="v205-pin-candidates" hidden><label id="v206-result-label" for="v205-pin-candidate">検索結果</label><select id="v205-pin-candidate"></select><div id="v206-result-detail" role="status"></div><button type="button" id="v205-pin-add">確認して確定</button></div><div id="v205-pin-status" role="status" aria-live="polite"></div><div id="v205-pin-saved" hidden><label for="v205-pin-list">保存した目印</label><select id="v205-pin-list"></select><button type="button" id="v205-pin-jump">選んだピンへ移動</button></div><p class="v205-help">東京23区周辺の施設を名前で検索し、住所と位置を表示します。選択すると仮の印で位置を確認でき、「確認して確定」で保存します。確定したピンの長押しで徒歩の目安の円・削除メニューを開きます。情報：国土地理院・<a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener noreferrer">© OpenStreetMap contributors</a>。保存先はこのブラウザーです。</p></details>"""
 _V205_PIN_CSS = """
 #v205-pins-panel{padding:12px 13px;background:#fff;border-top:1px solid #d5dfdc;color:#173a5e;font:14px system-ui}
 #v205-pins-panel summary{font-weight:750;cursor:pointer;padding:5px 0}
@@ -12115,7 +12115,8 @@ _V205_PIN_CSS = """
 .v206-preview .v205-pin-dot{background:#277c91;border-style:dashed}
 .v205-pin-icon{background:none;border:0}
 .v205-pin-dot{display:block;width:18px;height:18px;background:#a52c40;border:2px solid #fff;border-radius:50% 50% 50% 0;transform:rotate(-45deg);box-shadow:0 1px 4px #555}
-.leaflet-tooltip.v205-pin-label{color:#173a5e;background:#fff;border:1px solid #a52c40;border-radius:4px;font-weight:750;font-size:13px;padding:3px 6px;white-space:normal;max-width:170px}
+.leaflet-tooltip.v205-pin-label{color:#173a5e;background:rgba(255,255,255,.94);border:1px solid #b8c2c8;border-radius:3px;font-weight:600;font-size:10px;line-height:1.2;padding:2px 4px;white-space:nowrap!important;writing-mode:horizontal-tb!important;width:max-content!important;min-width:0!important;max-width:none!important;pointer-events:none}
+@media(max-width:480px){.leaflet-tooltip.v205-pin-label{display:none!important}}
 .v205-pin-popup-title{font-weight:750;color:#173a5e;margin-bottom:5px}
 .v205-pin-popup-address{font-size:12px;color:#49616b;overflow-wrap:anywhere}
 .v205-pin-delete{min-height:40px;padding:7px 10px;color:#a52c40;background:#fff;border:1px solid #a52c40;border-radius:6px;cursor:pointer;font-size:13px}
@@ -12155,7 +12156,7 @@ function v205PinList(){
 }
 function v205DrawPins(){
  if(!state.map||!window.L)return;
- var pins=state._v205Pins||[],signature=JSON.stringify(pins);
+ var pins=state._v205Pins||[],signature=JSON.stringify(pins);v214SyncRings(pins);
  if(state._v205Layer&&state._v205PinSignature===signature)return;
  if(!state.map.getPane('personalPinPane')){state.map.createPane('personalPinPane');state.map.getPane('personalPinPane').style.zIndex='690';}
  if(!state._v205Layer)state._v205Layer=L.layerGroup().addTo(state.map);
@@ -12170,7 +12171,7 @@ function v205DrawPins(){
   address.className='v205-pin-popup-address';address.textContent=pin.address||'地図で指定した場所';popup.appendChild(heading);popup.appendChild(address);
   var actions=document.createElement('div');actions.className='v204-popup-actions';
   var route=document.createElement('a');route.className='v167-suumo-link';route.textContent='経路案内 ↗';route.href=v204DirectionsUrl(pin);route.target='_blank';route.rel='noopener noreferrer';actions.appendChild(route);
-  var hint=document.createElement('div');hint.textContent='長押し・右クリックで削除確認';hint.className='v205-pin-popup-address';
+  var hint=document.createElement('div');hint.textContent='長押し・右クリックで徒歩の円・削除';hint.className='v205-pin-popup-address';
   popup.appendChild(actions);popup.appendChild(hint);marker.bindPopup(popup);
   marker.on('dragend',function(){var point=marker.getLatLng();
    if(!v205Point(point.lat,point.lng)){marker.setLatLng([pin.lat,pin.lng]);v205Status('対応範囲外です。位置を元に戻しました。');return;}
@@ -12219,7 +12220,7 @@ function v211ConfirmDraft(){
  var name=document.getElementById('v205-pin-name').value.trim()||item.name;
  if(v205AddPin(name,item.address,item.lat,item.lng)){
   v206ClearPreview();state._v211Draft=null;document.getElementById('v205-pin-cancel').hidden=true;
-  v205Status('「'+name+'」のピンを確定しました。長押しで削除確認を開けます。');
+  v205Status('「'+name+'」のピンを確定しました。長押しで徒歩の円・削除メニューを開けます。');
  }
 }
 function v206SelectCandidate(){
@@ -12241,13 +12242,59 @@ function v206SelectCandidate(){
  }
  v211DraftDetails();setHeight();
 }
+function v214RemoveRing(id){
+ var rings=state._v214Rings;if(!rings||!rings[id])return;
+ state.map.removeLayer(rings[id].layer);delete rings[id];
+}
+function v214ShowRing(pin,minutes){
+ minutes=Number(minutes);var radius=minutes*80;
+ if(!Number.isFinite(minutes)||minutes<1||!Number.isFinite(radius)){v205Status('分数は1以上の数値で入力してください。');return false;}
+ if(!state.map||!window.L||!v205Point(pin.lat,pin.lng))return false;
+ if(!state._v214Rings)state._v214Rings=Object.create(null);
+ var existing=state._v214Rings[pin.id];
+ if(existing){existing.layer.setLatLng([pin.lat,pin.lng]);existing.layer.setRadius(radius);existing.minutes=minutes;}
+ else{
+  var circle=L.circle([pin.lat,pin.lng],{radius:radius,color:'#174a6a',weight:2,opacity:.9,fill:false,interactive:false}).addTo(state.map);
+  state._v214Rings[pin.id]={layer:circle,minutes:minutes};
+ }
+ v205Status('「'+pin.name+'」から徒歩'+minutes+'分の目安（直線半径'+Math.round(radius)+'m）を表示しました。');
+ return true;
+}
+function v214SyncRings(pins){
+ var rings=state._v214Rings;if(!rings)return;
+ Object.keys(rings).forEach(function(id){
+  var pin=pins.find(function(p){return p.id===id});
+  if(!pin){v214RemoveRing(id);return;}
+  rings[id].layer.setLatLng([pin.lat,pin.lng]);
+ });
+}
 function v211DeletePopup(marker,pin,event){
+ if(event&&event.originalEvent){event.originalEvent.preventDefault();event.originalEvent.stopPropagation();}
+ var popup=document.createElement('div'),title=document.createElement('div'),hint=document.createElement('p');
+ title.className='v205-pin-popup-title';title.textContent=pin.name;popup.appendChild(title);
+ hint.textContent='徒歩1分＝80mの直線距離の目安です。道路・坂道・信号は反映しません。円は再読み込み・終了で消えます。';hint.style.fontSize='11px';popup.appendChild(hint);
+ var label=document.createElement('label');label.textContent='徒歩の分数：';
+ var input=document.createElement('input');input.type='number';input.min='1';input.step='1';
+ input.value=String((state._v214Rings&&state._v214Rings[pin.id])?state._v214Rings[pin.id].minutes:10);
+ input.setAttribute('aria-label','徒歩の分数');input.style.width='80px';input.style.fontSize='16px';label.appendChild(input);popup.appendChild(label);
+ var show=document.createElement('button');show.type='button';show.textContent='N分の円を表示';
+ show.addEventListener('click',function(){if(v214ShowRing(pin,input.value))state.map.closePopup();});popup.appendChild(show);
+ if(state._v214Rings&&state._v214Rings[pin.id]){
+  var hide=document.createElement('button');hide.type='button';hide.textContent='この円を消す';
+  hide.addEventListener('click',function(){v214RemoveRing(pin.id);state.map.closePopup();v205Status('円を非表示にしました。');});popup.appendChild(hide);
+ }
+ var remove=document.createElement('button');remove.type='button';remove.className='v205-pin-delete';remove.textContent='ピンを削除…';
+ remove.addEventListener('click',function(){v214ConfirmDelete(marker,pin)});popup.appendChild(remove);
+ var cancel=document.createElement('button');cancel.type='button';cancel.textContent='閉じる';cancel.addEventListener('click',function(){state.map.closePopup()});popup.appendChild(cancel);
+ L.popup().setLatLng(marker.getLatLng()).setContent(popup).openOn(state.map);
+}
+function v214ConfirmDelete(marker,pin,event){
  if(event&&event.originalEvent){event.originalEvent.preventDefault();event.originalEvent.stopPropagation();}
  var popup=document.createElement('div'),title=document.createElement('div'),address=document.createElement('div');
  title.className='v205-pin-popup-title';title.textContent='「'+pin.name+'」を削除しますか？';popup.appendChild(title);
  address.className='v205-pin-popup-address';address.textContent=pin.address||'住所未登録';popup.appendChild(address);
  var remove=document.createElement('button');remove.type='button';remove.className='v205-pin-delete';remove.textContent='削除する';
- remove.addEventListener('click',function(){if(v205SavePins((state._v205Pins||[]).filter(function(p){return p.id!==pin.id}))){state.map.closePopup();v205Status('「'+pin.name+'」を削除しました。');}});popup.appendChild(remove);
+ remove.addEventListener('click',function(){if(v205SavePins((state._v205Pins||[]).filter(function(p){return p.id!==pin.id}))){v214RemoveRing(pin.id);state.map.closePopup();v205Status('「'+pin.name+'」を削除しました。');}});popup.appendChild(remove);
  var cancel=document.createElement('button');cancel.type='button';cancel.textContent='キャンセル';cancel.addEventListener('click',function(){state.map.closePopup()});popup.appendChild(cancel);
  L.popup().setLatLng(marker.getLatLng()).setContent(popup).openOn(state.map);
 }
@@ -12677,7 +12724,7 @@ TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('</style></head>',_V21
 
 @st.cache_resource(show_spinner=False)
 def town_component_v121():
-    _asset_revision='v212-geocoder-search-diagnostics'
+    _asset_revision='v214-temporary-walking-rings'
     folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-v184')
     os.makedirs(folder,exist_ok=True)
     path=os.path.join(folder,'index.html')
