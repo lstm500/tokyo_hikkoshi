@@ -52,7 +52,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v206"
+BUILD = "REBUILD-01-v207"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -12105,7 +12105,7 @@ TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('</style></head>',_V20
 
 
 # v205: personal named landmarks, independent of rental observations.
-_V205_PIN_DOM = """<details id="v205-pins-panel"><summary>目印ピンを追加・表示</summary><label for="v205-pin-address">住所から目印を検索</label><input id="v205-pin-address" maxlength="180" placeholder="目印を探す住所を入力"/><label for="v205-pin-name">ピンの名前（検索結果から自動入力・変更可）</label><input id="v205-pin-name" maxlength="60" placeholder="検索後に施設名が入ります"/><div class="v205-actions"><button type="button" id="v205-pin-search">この住所の目印を検索</button><button type="button" id="v205-pin-pick">地図をタップして指定</button><button type="button" id="v205-pin-cancel" hidden>指定をやめる</button></div><div id="v205-pin-candidates" hidden><label id="v206-result-label" for="v205-pin-candidate">検索結果</label><select id="v205-pin-candidate"></select><div id="v206-result-detail" role="status"></div><button type="button" id="v205-pin-add">この場所にピンを追加</button></div><div id="v205-pin-status" role="status" aria-live="polite"></div><div id="v205-pin-saved" hidden><label for="v205-pin-list">保存した目印</label><select id="v205-pin-list"></select><button type="button" id="v205-pin-jump">選んだピンへ移動</button></div><p class="v205-help">住所付近300mの施設名を検索します。選択すると仮の印で位置を確認でき、追加ボタンで保存します。情報：国土地理院・<a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener noreferrer">© OpenStreetMap contributors</a>。保存先はこのブラウザーです。</p></details>"""
+_V205_PIN_DOM = """<details id="v205-pins-panel"><summary>目印ピンを追加・表示</summary><label for="v205-pin-address">施設名・目印の名前で検索</label><input id="v205-pin-address" maxlength="180" placeholder="例：立教小学校（住所の入力は不要）"/><label for="v205-pin-name">ピンの名前（検索結果から自動入力・変更可）</label><input id="v205-pin-name" maxlength="60" placeholder="検索後に施設名が入ります"/><div class="v205-actions"><button type="button" id="v205-pin-search">名前で検索</button><button type="button" id="v205-pin-pick">地図をタップして指定</button><button type="button" id="v205-pin-cancel" hidden>指定をやめる</button></div><div id="v205-pin-candidates" hidden><label id="v206-result-label" for="v205-pin-candidate">検索結果</label><select id="v205-pin-candidate"></select><div id="v206-result-detail" role="status"></div><button type="button" id="v205-pin-add">この場所にピンを追加</button></div><div id="v205-pin-status" role="status" aria-live="polite"></div><div id="v205-pin-saved" hidden><label for="v205-pin-list">保存した目印</label><select id="v205-pin-list"></select><button type="button" id="v205-pin-jump">選んだピンへ移動</button></div><p class="v205-help">東京23区周辺の施設を名前で検索し、住所と位置を表示します。選択すると仮の印で位置を確認でき、追加ボタンで保存します。情報：国土地理院・<a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener noreferrer">© OpenStreetMap contributors</a>。保存先はこのブラウザーです。</p></details>"""
 _V205_PIN_CSS = """
 #v205-pins-panel{padding:12px 13px;background:#fff;border-top:1px solid #d5dfdc;color:#173a5e;font:14px system-ui}
 #v205-pins-panel summary{font-weight:750;cursor:pointer;padding:5px 0}
@@ -12206,7 +12206,8 @@ function v206ClearPreview(){
 function v206SelectCandidate(){
  var item=(state._v205Candidates||[])[Number(document.getElementById('v205-pin-candidate').value)];
  if(!item)return;
- document.getElementById('v206-result-detail').textContent=String(item.address||item.title||'')+(typeof item.distance_m==='number'?'\n検索住所の位置から約'+item.distance_m+'m':'');
+ v207ResolveCandidateAddress(item);
+ document.getElementById('v206-result-detail').textContent=String(item.address||'住所を確認しています…')+'\n緯度 '+item.lat.toFixed(6)+' / 経度 '+item.lng.toFixed(6);
  if(state._v206Stage!=='places'){v206ClearPreview();return;}
  document.getElementById('v205-pin-name').value=String(item.name||item.title||'').slice(0,60);
  v206ClearPreview();
@@ -12218,33 +12219,50 @@ function v206SelectCandidate(){
  }
  setHeight();
 }
-function v206Request(stage,item){
- if(state._v205SearchPending)return;
- var address=document.getElementById('v205-pin-address').value.trim();
- if(!address){v205Status('住所を入力してください。');return;}
- state._v205Pick=null;document.getElementById('v205-pin-cancel').hidden=true;v206ClearPreview();
- state._v205SearchPending=String(Date.now())+'_'+Math.random().toString(36).slice(2,12);
- state._v205SearchAddress=address;state._v205SearchEpoch=state._v202HomeEpoch;
- document.getElementById('v205-pin-search').disabled=true;document.getElementById('v205-pin-add').disabled=true;document.getElementById('v205-pin-candidates').hidden=true;
- v205Status(stage==='places'?'この住所の周辺で目印になる施設名を探しています…':'住所と周辺の施設名を確認しています…');
- hostMessage('streamlit:setComponentValue',{dataType:'json',value:{event:'custom_pin_search_v205',ticket:state._v205SearchPending,address:address,stage:stage,
-  lat:item?item.lat:null,lng:item?item.lng:null,address_title:item?item.title:'',home_view_epoch:state._v202HomeEpoch}});
+function v207ResolveCandidateAddress(item){
+ state._v207DetailPending=null;
+ document.getElementById('v205-pin-add').disabled=false;
+ if(item.address_checked||item.address)return;
+ var ticket='detail_'+Date.now()+'_'+Math.random().toString(36).slice(2,12);
+ state._v207DetailPending=ticket;
+ document.getElementById('v205-pin-add').disabled=true;
+ hostMessage('streamlit:setComponentValue',{dataType:'json',value:{event:'custom_pin_search_v205',ticket:ticket,stage:'detail',
+  name:item.name,lat:item.lat,lng:item.lng,home_view_epoch:state._v202HomeEpoch}});
 }
-function v205SearchPin(){v206Request('address',null)}
+function v205SearchPin(){
+ if(state._v205SearchPending)return;
+ var query=document.getElementById('v205-pin-address').value.trim();
+ if(query.length<2){v205Status('施設名・目印の名前を2文字以上で入力してください。');return;}
+ state._v205Pick=null;state._v207DetailPending=null;document.getElementById('v205-pin-cancel').hidden=true;v206ClearPreview();
+ state._v205SearchPending=String(Date.now())+'_'+Math.random().toString(36).slice(2,12);
+ state._v205SearchEpoch=state._v202HomeEpoch;
+ document.getElementById('v205-pin-search').disabled=true;document.getElementById('v205-pin-add').disabled=true;document.getElementById('v205-pin-candidates').hidden=true;
+ v205Status('施設名から住所と位置を検索しています…');
+ hostMessage('streamlit:setComponentValue',{dataType:'json',value:{event:'custom_pin_search_v205',ticket:state._v205SearchPending,query:query,home_view_epoch:state._v202HomeEpoch}});
+}
 function v205PinReply(reply){
- if(!reply||reply.ticket!==state._v205SearchPending)return;
+ if(!reply)return;
+ if(reply.stage==='detail'){
+  if(reply.ticket!==state._v207DetailPending)return;
+  state._v207DetailPending=null;document.getElementById('v205-pin-add').disabled=false;
+  var chosen=(state._v205Candidates||[])[Number(document.getElementById('v205-pin-candidate').value)];
+  if(!chosen)return;
+  chosen.address=String(reply.address||'住所情報なし（地図上の位置で確認してください）');chosen.address_checked=true;
+  document.getElementById('v206-result-detail').textContent=chosen.address+'\n緯度 '+chosen.lat.toFixed(6)+' / 経度 '+chosen.lng.toFixed(6);
+  v205Status(reply.error||'施設名・住所・地図上の仮の印を確認してから保存してください。');return;
+ }
+ if(reply.ticket!==state._v205SearchPending)return;
  state._v205SearchPending=null;document.getElementById('v205-pin-search').disabled=false;document.getElementById('v205-pin-add').disabled=false;
- state._v206Stage=reply.stage==='address'?'address':'places';
- state._v205Candidates=Array.isArray(reply.candidates)?reply.candidates.filter(function(p){return p&&v205Point(p.lat,p.lng)}):[];
+ state._v206Stage='places';
+ state._v205Candidates=Array.isArray(reply.candidates)?reply.candidates.filter(function(p){return p&&v205Point(p.lat,p.lng)&&p.name}):[];
  var box=document.getElementById('v205-pin-candidates'),select=document.getElementById('v205-pin-candidate'),add=document.getElementById('v205-pin-add');select.replaceChildren();
  box.hidden=!state._v205Candidates.length;
- document.getElementById('v206-result-label').textContent=state._v206Stage==='address'?'住所が複数あります。対象を選択':'検索結果（住所付近300mの施設）';
- add.textContent=state._v206Stage==='address'?'この住所の目印を探す':'確認してこの施設にピンを立てる';
- state._v205Candidates.forEach(function(p,i){var opt=document.createElement('option');opt.value=String(i);opt.textContent=String(p.name||p.title||'住所の候補')+(typeof p.distance_m==='number'?'（約'+p.distance_m+'m）':'');select.appendChild(opt)});
+ document.getElementById('v206-result-label').textContent='検索結果（施設名・所在地）';
+ add.textContent='確認してこの施設にピンを立てる';
+ state._v205Candidates.forEach(function(p,i){var opt=document.createElement('option');opt.value=String(i);opt.textContent=String(p.name)+(p.address?' — '+p.address:'');select.appendChild(opt)});
  if(state._v205Candidates.length){
-  v206SelectCandidate();
-  v205Status(state._v206Stage==='address'?'住所を選択して施設名を検索してください。':'施設名・住所・地図上の仮の印を確認し、問題なければ追加してください。');
- }else{v206ClearPreview();v205Status(reply.error||'目印になる施設名が見つかりません。別の住所で検索するか、名前を入力して地図で指定してください。');}
+  v205Status('施設名・住所・地図上の仮の印を確認してから保存してください。');v206SelectCandidate();
+ }else{v206ClearPreview();v205Status(reply.error||'施設名が見つかりません。正式名称や名前の一部で再検索してください。');}
 }
 function v205InitPins(args){
  if(!state.map)return;
@@ -12256,15 +12274,15 @@ function v205InitPins(args){
   document.getElementById('v205-pin-pick').addEventListener('click',function(){
    var name=document.getElementById('v205-pin-name').value.trim();
    if(!name){v205Status('ピンの名前を入力してください。');return;}
-   if(state._v205SearchPending){v205Status('住所の確認が終わってから指定してください。');return;}
-   state._v205Pick={name:name,address:document.getElementById('v205-pin-address').value.trim()};
+   if(state._v205SearchPending){v205Status('施設名の検索が終わってから指定してください。');return;}
+   state._v207DetailPending=null;v206ClearPreview();
+   state._v205Pick={name:name,address:''};
    document.getElementById('v205-pin-cancel').hidden=false;v205Status('追加する場所を地図上でタップしてください。');
   });
   document.getElementById('v205-pin-cancel').addEventListener('click',function(){state._v205Pick=null;this.hidden=true;v205Status('地図での指定をやめました。');});
   document.getElementById('v205-pin-add').addEventListener('click',function(){
    var item=(state._v205Candidates||[])[Number(document.getElementById('v205-pin-candidate').value)];
-   if(!item||state._v205SearchPending)return;
-   if(state._v206Stage==='address'){v206Request('places',item);return;}
+   if(!item||state._v205SearchPending||state._v207DetailPending)return;
    var name=document.getElementById('v205-pin-name').value.trim()||item.name||item.title;
    if(v205AddPin(name,item.address||'住所未登録',item.lat,item.lng))v206ClearPreview();
   });
@@ -12275,8 +12293,8 @@ function v205InitPins(args){
   });
   v205PinList();
  }
- if(state._v205SearchPending&&state._v205SearchEpoch!==state._v202HomeEpoch){state._v205SearchPending=null;document.getElementById('v205-pin-search').disabled=false;document.getElementById('v205-pin-add').disabled=false;v205Status('表示を切り替えたため住所検索を中断しました。再度検索してください。');}
- if(state._v206PreviewEpoch!==state._v202HomeEpoch){v206ClearPreview();state._v206PreviewEpoch=state._v202HomeEpoch;}
+ if(state._v205SearchPending&&state._v205SearchEpoch!==state._v202HomeEpoch){state._v205SearchPending=null;document.getElementById('v205-pin-search').disabled=false;document.getElementById('v205-pin-add').disabled=false;v205Status('表示を切り替えたため施設検索を中断しました。再度検索してください。');}
+ if(state._v206PreviewEpoch!==state._v202HomeEpoch){state._v207DetailPending=null;document.getElementById('v205-pin-add').disabled=false;v206ClearPreview();state._v206PreviewEpoch=state._v202HomeEpoch;}
  v205DrawPins();v205PinReply(args.custom_pin_reply||null);
 }
 """
@@ -12288,7 +12306,7 @@ TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('function render(args)
 assert TOWN_COMPONENT_HTML_V121.count(' v202HomeView(args);')==1
 TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(' v202HomeView(args);',' v202HomeView(args);\n v205InitPins(args);',1)
 TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('state.searchPendingTicket||state._v189Pending)return;',
-    'state.searchPendingTicket||state._v189Pending||state._v205SearchPending)return;',1)
+    'state.searchPendingTicket||state._v189Pending||state._v205SearchPending||state._v207DetailPending)return;',1)
 
 
 def _v205_geocode_pin(data):
@@ -12321,72 +12339,69 @@ def _v205_geocode_pin(data):
     return reply
 
 
-def _v206_landmarks_near_address(web,point,address_label,ticket):
-    """Named OSM facilities near a geocoded address, never an asserted exact address match."""
-    lat,lng=point
-    query=(f'[out:json][timeout:8];nwr(around:300,{lat:.7f},{lng:.7f})'
-           '["name"][~"^(amenity|shop|tourism|leisure|office|building|historic|railway)$"~"."];out center tags;')
-    reply={'ticket':ticket,'stage':'places','candidates':[],'error':''}
-    try:
-        data=web.fetch('https://overpass-api.de/api/interpreter',params={'data':query}).json()
-        if not isinstance(data,dict) or not isinstance(data.get('elements'),list) or data.get('remark'):
-            raise ValueError('incomplete facility response')
-        found={}
-        for element in data['elements']:
-            try:
-                tags=element.get('tags') or {};center=element.get('center') or element
-                name=normal(tags.get('name:ja') or tags.get('name'))[:60]
-                y,x=float(center['lat']),float(center['lon'])
-                if not name or not (math.isfinite(x) and math.isfinite(y) and 34<=y<=37 and 138<=x<=141):continue
-                distance=meters(point,(y,x))
-                # OSM's around filter can match a building whose footprint is
-                # nearby while its representative center is farther away.
-                # Preserve the returned center and display its actual distance.
-                full=normal(tags.get('addr:full'))
-                if not full:
-                    full=''.join(normal(tags.get(k)) for k in ('addr:province','addr:city','addr:suburb','addr:quarter','addr:neighbourhood','addr:street','addr:block_number','addr:housenumber'))
-                key=(name,round(y,5),round(x,5))
-                candidate={'name':name,'title':name,'address':full[:180] or '住所未登録',
-                           'lat':y,'lng':x,'distance_m':int(round(distance)),
-                           'source':'OpenStreetMap','search_address':address_label[:180]}
-                if key not in found or distance<found[key]['distance_m']:found[key]=candidate
-            except (KeyError,ValueError,TypeError,AttributeError):continue
-        reply['candidates']=sorted(found.values(),key=lambda item:(item['distance_m'],item['name']))
-        if not reply['candidates']:reply['error']='この住所付近の施設名が見つかりません。別の住所で検索するか、名前を入力して地図で指定してください。'
-    except Exception:
-        reply['error']='周辺の施設名を取得できません。時間を置いて再検索するか、名前を入力して地図で指定してください。'
-    return reply
-
-
-def _v206_search_landmarks(data):
+def _v207_search_landmarks(data):
+    """User-triggered name lookup; address typing is never required."""
     ticket=str(data.get('ticket') or '')[:100]
-    reply={'ticket':ticket,'stage':'address','candidates':[],'error':''}
-    address=data.get('address')
-    if not isinstance(address,str) or not address.strip() or len(address)>180:
-        reply['error']='検索する住所を入力してください。';return reply
-    if data.get('stage')=='places':
+    reply={'ticket':ticket,'stage':'places','candidates':[],'error':''}
+    if data.get('stage')=='detail':
+        reply={'ticket':ticket,'stage':'detail','address':'','error':''}
         try:
-            # Coordinates are carried over only after the user picks an address.
             if isinstance(data.get('lat'),bool) or isinstance(data.get('lng'),bool):raise ValueError()
             lat,lng=float(data['lat']),float(data['lng'])
-            if not (math.isfinite(lat) and math.isfinite(lng) and 34<=lat<=37 and 138<=lng<=141):raise ValueError()
-        except (KeyError,ValueError,TypeError):
-            reply['error']='住所の位置を確認できません。住所から検索し直してください。';return reply
-        return _v206_landmarks_near_address(PublicWeb(),(lat,lng),str(data.get('address_title') or address),ticket)
-    located=_v205_geocode_pin({'ticket':ticket,'name':'住所の位置確認','address':address})
-    candidates=located['candidates']
-    if located['error'] or not candidates:
-        reply['error']=located['error'];return reply
-    # An ambiguous address is never resolved by silently choosing the first hit.
-    if len(candidates)>1:
-        reply['candidates']=candidates;return reply
-    chosen=candidates[0]
-    return _v206_landmarks_near_address(PublicWeb(),(chosen['lat'],chosen['lng']),chosen['title'],ticket)
+            if not (math.isfinite(lat) and math.isfinite(lng) and 35.45<=lat<=35.95 and 139.4<=lng<=140.05):raise ValueError()
+            web=PublicWeb()
+            doc=web.fetch('https://mreversegeocoder.gsi.go.jp/reverse-geocoder/LonLatToAddress',params={'lat':lat,'lon':lng}).json()
+            result=doc.get('results') or {};code=str(result.get('muniCd') or '')
+            town=normal(result.get('lv01Nm'))
+            # GSI supplies town/chome only. Do not invent a street number.
+            ward=TOKYO_WARDS.get(code)
+            if ward and town:reply['address']='東京都'+ward+town+'（周辺住所・番地は未確認）'
+            else:
+                munis=municipalities(web);municipality=munis.get(code)
+                if municipality and town:reply['address']=municipality[1]+municipality[2]+town+'（周辺住所・番地は未確認）'
+            if not reply['address']:raise ValueError()
+        except Exception:
+            reply['error']='住所情報を取得できません。施設名と地図上の位置を確認してください。'
+        return reply
+    query=data.get('query')
+    if not isinstance(query,str) or not 2<=len(query.strip())<=180:
+        reply['error']='施設名・目印の名前を2文字以上で入力してください。';return reply
+    query=normal(query)
+    # POSIX regex metacharacters are escaped, then encoded as an Overpass string.
+    # Whitespace is omitted between search tokens so "立教 小学校" matches too.
+    compact=re.sub(r'\s+','',query)
+    pattern=re.sub(r'([.\[\]{}()*+?^$|\\])',r'\\\1',compact)
+    literal=json.dumps(pattern,ensure_ascii=False)
+    bbox='(35.45,139.4,35.95,140.05)'
+    q='[out:json][timeout:12];('+''.join('nwr["'+key+'"~'+literal+',i]'+bbox+';' for key in ('name','name:ja','alt_name','short_name'))+');out center tags;'
+    try:
+        web=PublicWeb();doc=web.fetch('https://overpass-api.de/api/interpreter',params={'data':q}).json()
+        if not isinstance(doc,dict) or not isinstance(doc.get('elements'),list) or doc.get('remark'):raise ValueError()
+        seen=set()
+        for element in doc['elements']:
+            try:
+                tags=element.get('tags') or {};point=element.get('center') or element
+                name=normal(tags.get('name:ja') or tags.get('name'))[:60]
+                lat,lng=float(point['lat']),float(point['lon'])
+                if not name or not (math.isfinite(lat) and math.isfinite(lng) and 35.45<=lat<=35.95 and 139.4<=lng<=140.05):continue
+                address=normal(tags.get('addr:full'))
+                if not address:
+                    address=''.join(normal(tags.get(k)) for k in ('addr:province','addr:city','addr:suburb','addr:quarter','addr:neighbourhood','addr:street','addr:block_number','addr:housenumber'))
+                key=(name,round(lat,5),round(lng,5))
+                if key in seen:continue
+                seen.add(key);reply['candidates'].append({'name':name,'title':name,'address':address[:180],
+                    'lat':lat,'lng':lng,'source':'OpenStreetMap','address_checked':bool(address)})
+            except (KeyError,TypeError,ValueError,AttributeError):continue
+        reply['candidates'].sort(key=lambda p:(re.sub(r'\s+','',p['name']).casefold()!=compact.casefold(),p['name'],p['lat'],p['lng']))
+        if not reply['candidates']:reply['error']='施設名が見つかりません。正式名称や名前の一部で再検索してください。'
+    except Exception:
+        reply['error']='施設名の検索に失敗しました。時間を置いて再検索してください。'
+    return reply
 
 
 @st.cache_resource(show_spinner=False)
 def town_component_v121():
-    _asset_revision='v206-address-to-landmark-confirmation'
+    _asset_revision='v207-name-to-landmark-confirmation'
     folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-v184')
     os.makedirs(folder,exist_ok=True)
     path=os.path.join(folder,'index.html')
@@ -13294,7 +13309,7 @@ def interactive_town_choropleth(group):
             ticket=str(data.get('ticket') or '')[:100]
             if ticket and ticket!=state.get('_v205_last_pin_ticket'):
                 state['_v205_last_pin_ticket']=ticket
-                state['_v205_pin_reply']=_v206_search_landmarks(data)
+                state['_v205_pin_reply']=_v207_search_landmarks(data)
                 st.rerun(scope='fragment')
         if data.get('event')=='town_suumo_v189':
             ticket=str(data.get('ticket') or '')[:100]
