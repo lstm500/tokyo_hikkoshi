@@ -52,7 +52,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v207"
+BUILD = "REBUILD-01-v208"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -6770,6 +6770,10 @@ def search_all(db,conditions,screen,state=None):
 DIAG_CONTEXT=threading.local()
 
 DIAG_ADVICE={
+ 'landmark_search_failed':('施設名検索の通信・応答解析に失敗','検索語・失敗工程・HTTP状態・応答抜粋・例外を確認して原因を切り分ける。'),
+ 'landmark_address_failed':('施設の住所照合に失敗','座標と国土地理院の応答形式・地域コードを確認する。'),
+ 'landmark_no_candidates':('施設名に一致する候補がない','通信成功時の0件と、不正な施設データの全件除外を確認する。'),
+ 'landmark_log_save_failed':('施設名検索ログの保存に失敗','ダウンロードでログを確保し、保存先への接続・権限を確認する。'),
  'timeout':('接続または応答の時間超過','同じURLをブラウザで確認し、サービス障害とStreamlitからの通信制限を切り分ける。正常時の応答時間を測ってからタイムアウトと同時接続数を調整する。'),
  'http_403':('公開先がアクセスを拒否','通信試行ログの経路番号を確認する。プロキシ設定・認証・HTTPS接続と経路切替後のHTTP状態を比較する。403の解消は成功応答で確認する。'),
  'http_429':('取得先の要求回数制限','同じ自治体・ページの重複要求を減らし、キャッシュと取得間隔を導入する。Retry-Afterがあればその値に従う。'),
@@ -12339,18 +12343,105 @@ def _v205_geocode_pin(data):
     return reply
 
 
-def _v207_search_landmarks(data):
+def _v208_landmark_json(web,url,params,operation):
+    """Keep HTTP/decoding evidence even when the public transport wraps errors."""
+    started=time.monotonic();response=None
+    info={'url':url,'parameters':params,'operation':operation,'failed_stage':operation+'.request'}
+    trace(web,'landmark_request',info,stage='landmark.'+operation)
+    try:
+        response=web.fetch(url,params=params)
+        headers=getattr(response,'headers',{}) or {}
+        info.update(status=getattr(response,'status_code',None),
+                    content_type=headers.get('Content-Type',''),retry_after=headers.get('Retry-After',''),
+                    response_bytes=len(getattr(response,'content',b'')),failed_stage=operation+'.json')
+        doc=response.json()
+        info['elapsed_ms']=round((time.monotonic()-started)*1000)
+        trace(web,'landmark_response',info,stage='landmark.'+operation)
+        return doc,info
+    except Exception as exc:
+        details=dict(getattr(exc,'diagnostic',{}) or {})
+        details={**info,**details,'elapsed_ms':round((time.monotonic()-started)*1000)}
+        if response is not None:details['response_excerpt']=str(getattr(response,'text',''))[:1500]
+        # Preserve the original exception class/message and the transport diagnostics.
+        exc.landmark_diagnostic=details
+        raise
+
+
+def _v208_landmark_failure(web,data,exc,operation,info=None):
+    details={**(info or {}),**(getattr(exc,'landmark_diagnostic',{}) or {}),
+             'query':str(data.get('query') or data.get('name') or '')[:180],
+             'ticket':str(data.get('ticket') or '')[:100],
+             'reason':str(exc),'exception_type':type(exc).__name__,
+             'technical_exception':getattr(exc,'diagnostic',{}) or {},
+             'traceback':traceback.format_exc()}
+    details.setdefault('failed_stage',operation+'.validation')
+    trace(web,'landmark_search_failed' if operation=='name_search' else 'landmark_address_failed',
+          details,'ERROR','landmark.'+operation)
+
+
+def _v208_run_landmark_lookup(state,data):
+    """Reuse AuditLog, its redaction, and the existing diagnostic_log storage."""
+    audit=state.get('_v208_landmark_audit')
+    if audit is None:
+        audit=AuditLog({'mode':'landmark','providers':['OpenStreetMap','国土地理院']},
+                       (setting('SUPABASE_SECRET_KEY'),setting('SUPABASE_SERVICE_ROLE_KEY')))
+        state['_v208_landmark_audit']=audit
+    reply=_v207_search_landmarks(data,audit=audit)
+    audit.add('search','finish','INFO',{'operation':'landmark','ticket':reply['ticket'],
+              'error':reply.get('error') or '', 'candidates':len(reply.get('candidates') or [])})
+    if reply.get('error'):
+        try:
+            db=Database();audit.persist(db,force=True)
+            if audit.storage_error:raise AppError(audit.storage_error)
+            records=audit.records()
+            db.save_search({'id':audit.search_id,'status':'failed',
+                'started_at':records[0]['time'],'finished_at':utc_now(),
+                'conditions':{'mode':'landmark','providers':['OpenStreetMap','国土地理院']},
+                'summary':{'issues':[reply['error']],'saved':0,'operation':'施設名検索'}})
+            state['_v208_landmark_storage_error']=''
+            state['_v208_landmark_saved']=True
+        except Exception as exc:
+            # A storage error must not erase the original search error or the local log.
+            audit.add('landmark.log','landmark_log_save_failed','ERROR',
+                      {'reason':str(exc),'exception_type':type(exc).__name__,
+                       'technical_exception':getattr(exc,'diagnostic',{}) or {}})
+            state['_v208_landmark_storage_error']=audit.clean(str(exc))
+            state['_v208_landmark_saved']=False
+    if reply.get('error'):
+        reply['error']+=' 詳細は地図の下の「施設名検索のログ」からダウンロードできます。'
+    return reply
+
+
+def _v208_landmark_log_panel(state):
+    audit=state.get('_v208_landmark_audit')
+    if audit is None:return
+    with st.expander('施設名検索のログ'):
+        if state.get('_v208_landmark_storage_error'):
+            st.caption('保存先への記録を確認できません。下のボタンから現在のログを保存してください。')
+        elif state.get('_v208_landmark_saved'):
+            st.caption('失敗ログは保存済みです。検索履歴からも読み込めます。')
+        events=audit.records()
+        diagnostic_downloads(events,'landmark_v208')
+        failures=acquisition_failure_rows(events)
+        if failures:
+            st.download_button('施設名検索のエラーCSV',csv_bytes_from_rows(failures),
+                'sumai_landmark_errors.csv','text/csv',key='landmark_errors_v208',on_click='ignore')
+
+
+def _v207_search_landmarks(data,audit=None):
     """User-triggered name lookup; address typing is never required."""
     ticket=str(data.get('ticket') or '')[:100]
     reply={'ticket':ticket,'stage':'places','candidates':[],'error':''}
+    web=PublicWeb();web.audit=audit;info={}
     if data.get('stage')=='detail':
         reply={'ticket':ticket,'stage':'detail','address':'','error':''}
         try:
-            if isinstance(data.get('lat'),bool) or isinstance(data.get('lng'),bool):raise ValueError()
+            if isinstance(data.get('lat'),bool) or isinstance(data.get('lng'),bool):raise ValueError('boolean coordinate is invalid')
             lat,lng=float(data['lat']),float(data['lng'])
-            if not (math.isfinite(lat) and math.isfinite(lng) and 35.45<=lat<=35.95 and 139.4<=lng<=140.05):raise ValueError()
-            web=PublicWeb()
-            doc=web.fetch('https://mreversegeocoder.gsi.go.jp/reverse-geocoder/LonLatToAddress',params={'lat':lat,'lon':lng}).json()
+            if not (math.isfinite(lat) and math.isfinite(lng) and 35.45<=lat<=35.95 and 139.4<=lng<=140.05):raise ValueError('coordinate outside supported area')
+            doc,info=_v208_landmark_json(web,'https://mreversegeocoder.gsi.go.jp/reverse-geocoder/LonLatToAddress',{'lat':lat,'lon':lng},'address_lookup')
+            info['failed_stage']='address_lookup.validation'
+            if not isinstance(doc,dict):raise ValueError('address response must be an object')
             result=doc.get('results') or {};code=str(result.get('muniCd') or '')
             town=normal(result.get('lv01Nm'))
             # GSI supplies town/chome only. Do not invent a street number.
@@ -12359,13 +12450,16 @@ def _v207_search_landmarks(data):
             else:
                 munis=municipalities(web);municipality=munis.get(code)
                 if municipality and town:reply['address']=municipality[1]+municipality[2]+town+'（周辺住所・番地は未確認）'
-            if not reply['address']:raise ValueError()
-        except Exception:
+            if not reply['address']:raise ValueError('address response has no usable municipality/town')
+        except Exception as exc:
+            _v208_landmark_failure(web,data,exc,'address_lookup',info)
             reply['error']='住所情報を取得できません。施設名と地図上の位置を確認してください。'
         return reply
     query=data.get('query')
     if not isinstance(query,str) or not 2<=len(query.strip())<=180:
-        reply['error']='施設名・目印の名前を2文字以上で入力してください。';return reply
+        reply['error']='施設名・目印の名前を2文字以上で入力してください。'
+        trace(web,'landmark_invalid_query',{'reason':reply['error'],'ticket':ticket},'WARNING','landmark.validation')
+        return reply
     query=normal(query)
     # POSIX regex metacharacters are escaped, then encoded as an Overpass string.
     # Whitespace is omitted between search tokens so "立教 小学校" matches too.
@@ -12375,8 +12469,11 @@ def _v207_search_landmarks(data):
     bbox='(35.45,139.4,35.95,140.05)'
     q='[out:json][timeout:12];('+''.join('nwr["'+key+'"~'+literal+',i]'+bbox+';' for key in ('name','name:ja','alt_name','short_name'))+');out center tags;'
     try:
-        web=PublicWeb();doc=web.fetch('https://overpass-api.de/api/interpreter',params={'data':q}).json()
-        if not isinstance(doc,dict) or not isinstance(doc.get('elements'),list) or doc.get('remark'):raise ValueError()
+        doc,info=_v208_landmark_json(web,'https://overpass-api.de/api/interpreter',{'data':q},'name_search')
+        info['failed_stage']='name_search.validation'
+        if not isinstance(doc,dict):raise ValueError('facility response must be an object')
+        if doc.get('remark'):raise ValueError('Overpass remark: '+str(doc['remark'])[:1500])
+        if not isinstance(doc.get('elements'),list):raise ValueError('facility response is missing elements array')
         seen=set()
         for element in doc['elements']:
             try:
@@ -12393,15 +12490,19 @@ def _v207_search_landmarks(data):
                     'lat':lat,'lng':lng,'source':'OpenStreetMap','address_checked':bool(address)})
             except (KeyError,TypeError,ValueError,AttributeError):continue
         reply['candidates'].sort(key=lambda p:(re.sub(r'\s+','',p['name']).casefold()!=compact.casefold(),p['name'],p['lat'],p['lng']))
-        if not reply['candidates']:reply['error']='施設名が見つかりません。正式名称や名前の一部で再検索してください。'
-    except Exception:
+        trace(web,'landmark_result',{'query':query,'ticket':ticket,'elements':len(doc['elements']),'candidates':len(reply['candidates'])},stage='landmark.result')
+        if not reply['candidates']:
+            reply['error']='施設名が見つかりません。正式名称や名前の一部で再検索してください。'
+            trace(web,'landmark_no_candidates',{**info,'query':query,'reason':reply['error'],'elements':len(doc['elements'])},'WARNING','landmark.result')
+    except Exception as exc:
+        _v208_landmark_failure(web,data,exc,'name_search',info)
         reply['error']='施設名の検索に失敗しました。時間を置いて再検索してください。'
     return reply
 
 
 @st.cache_resource(show_spinner=False)
 def town_component_v121():
-    _asset_revision='v207-name-to-landmark-confirmation'
+    _asset_revision='v208-landmark-diagnostic-logs'
     folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-v184')
     os.makedirs(folder,exist_ok=True)
     path=os.path.join(folder,'index.html')
@@ -13303,13 +13404,14 @@ def interactive_town_choropleth(group):
                 commute_destination_2=(destinations[1] if len(destinations)==2 else ''),
                 jump=state.get('_v182_map_jump'),
                 key='town_map_v184_'+str(reset),default=None)
+    _v208_landmark_log_panel(state)
     if isinstance(data,dict) and data.get('home_view_epoch')==int(state.get('_v202_home_epoch',0)):
         current=viewport_bounds(data)
         if data.get('event')=='custom_pin_search_v205':
             ticket=str(data.get('ticket') or '')[:100]
             if ticket and ticket!=state.get('_v205_last_pin_ticket'):
                 state['_v205_last_pin_ticket']=ticket
-                state['_v205_pin_reply']=_v207_search_landmarks(data)
+                state['_v205_pin_reply']=_v208_run_landmark_lookup(state,data)
                 st.rerun(scope='fragment')
         if data.get('event')=='town_suumo_v189':
             ticket=str(data.get('ticket') or '')[:100]
