@@ -52,7 +52,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v211"
+BUILD = "REBUILD-01-v212"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -2117,7 +2117,7 @@ class PublicWeb:
             if route:options['proxies']={'http':route,'https':route}
             referer=getattr(self.session_primed,'references',{}).get((root,index+1))
             if referer:options['headers']={**options.get('headers',{}),'Referer':referer}
-            attempts=1 if getattr(self.local,'landmark_lookup',False) and host in ('overpass-api.de','overpass.private.coffee') else 3
+            attempts=1 if getattr(self.local,'landmark_lookup',False) and host in ('overpass-api.de','overpass.private.coffee','photon.komoot.io') else 3
             for attempt in range(attempts):
                 try:
                     response=self.route_request(session,method,url,options);status=response.status_code;info=self.response_info(response)
@@ -2185,7 +2185,7 @@ class PublicWeb:
             error=AppError(host+'：取得経路の待機中です（直前の403・429等）。設定した全経路の待機が終わってから再検索してください。');error.diagnostic={'skipped_routes':skipped};raise error
         return last
     def _fetch_uncached(self,url,method='GET',**kwargs):
-        allowed=tuple(RENTAL_HOSTS)+('mreversegeocoder.gsi.go.jp','msearch.gsi.go.jp','maps.gsi.go.jp','cyberjapandata.gsi.go.jp','japanese-addresses-v2.geoloniamaps.com','overpass-api.de','overpass.private.coffee','geolonia.github.io','img01.suumo.com','img02.suumo.com','maps.googleapis.com','maps.google.com','html.duckduckgo.com','www.google.com','search.yahoo.co.jp','myhome.nifty.com','www.mansion-review.jp','www.e-room.co','www.housecom.jp','vidax-gotanda.jp','www.goodrooms.jp','www.able.co.jp','www.mec-h.com','www.start-line.co.jp','www.m-standard.co.jp','www.property-bank.co.jp','lifullhomes-index.jp')+tuple(_EXTERNAL_IDENTITY_HOSTS)
+        allowed=tuple(RENTAL_HOSTS)+('mreversegeocoder.gsi.go.jp','msearch.gsi.go.jp','maps.gsi.go.jp','cyberjapandata.gsi.go.jp','japanese-addresses-v2.geoloniamaps.com','overpass-api.de','overpass.private.coffee','photon.komoot.io','geolonia.github.io','img01.suumo.com','img02.suumo.com','maps.googleapis.com','maps.google.com','html.duckduckgo.com','www.google.com','search.yahoo.co.jp','myhome.nifty.com','www.mansion-review.jp','www.e-room.co','www.housecom.jp','vidax-gotanda.jp','www.goodrooms.jp','www.able.co.jp','www.mec-h.com','www.start-line.co.jp','www.m-standard.co.jp','www.property-bank.co.jp','lifullhomes-index.jp')+tuple(_EXTERNAL_IDENTITY_HOSTS)
         u=urlparse(url)
         if u.scheme!='https' or u.hostname not in allowed or u.username or u.password: raise AppError('取得先が不正です。')
         # After one genuine HOME'S 403, use one persistent real Chromium session for
@@ -6785,6 +6785,8 @@ def search_all(db,conditions,screen,state=None):
 DIAG_CONTEXT=threading.local()
 
 DIAG_ADVICE={
+ 'landmark_geocoder_failed':('施設名ジオコーダーの通信・解析失敗','failure_phase・exception_chain・HTTP状態を確認し、元の通信例外まで追跡する。'),
+ 'landmark_endpoint_fallback':('施設検索先の障害による切替','接続先別の実測時間と応答有無を比較する。サーバー待ちと要求回数制限を区別する。'),
  'landmark_search_failed':('施設名検索の通信・応答解析に失敗','検索語・失敗工程・HTTP状態・応答抜粋・例外を確認して原因を切り分ける。'),
  'landmark_address_failed':('施設の住所照合に失敗','座標と国土地理院の応答形式・地域コードを確認する。'),
  'landmark_no_candidates':('施設名に一致する候補がない','通信成功時の0件と、不正な施設データの全件除外を確認する。'),
@@ -12385,15 +12387,31 @@ def _v205_geocode_pin(data):
     return reply
 
 
+def _v212_exception_details(exc):
+    """Do not lose requests/urllib3 causes hidden by `raise AppError from None`."""
+    chain=[];seen=set();current=exc
+    while current is not None and id(current) not in seen and len(chain)<8:
+        seen.add(id(current));chain.append({'type':type(current).__name__,
+            'message':str(current),'errno':getattr(current,'errno',None)})
+        current=current.__cause__ or current.__context__
+    signature=' '.join(item['type']+' '+item['message'] for item in chain).lower()
+    phase=('response_wait' if 'readtimeout' in signature else 'connect' if 'connecttimeout' in signature
+           else 'tls' if 'sslerror' in signature else 'dns' if any(word in signature for word in ('nameresolution','gaierror','getaddrinfo'))
+           else 'timeout_unspecified' if any(word in signature for word in ('timeout','timed out','タイムアウト')) else 'request_or_decode')
+    return {'exception_chain':chain,'failure_phase':phase,'diagnostic_schema':2}
+
+
 def _v208_landmark_json(web,url,params,operation):
     """Keep HTTP/decoding evidence even when the public transport wraps errors."""
     started=time.monotonic();response=None
-    info={'url':url,'parameters':params,'operation':operation,'failed_stage':operation+'.request'}
+    info={'url':url,'parameters':params,'operation':operation,'failed_stage':operation+'.request',
+          'host':urlparse(url).hostname,'method':'GET','connect_timeout_seconds':4,'read_timeout_seconds':12,
+          'response_received':False,'diagnostic_schema':2,'build':BUILD}
     trace(web,'landmark_request',info,stage='landmark.'+operation)
     try:
         response=web.fetch(url,params=params)
         headers=getattr(response,'headers',{}) or {}
-        info.update(status=getattr(response,'status_code',None),
+        info.update(response_received=True,status=getattr(response,'status_code',None),
                     content_type=headers.get('Content-Type',''),retry_after=headers.get('Retry-After',''),
                     response_bytes=len(getattr(response,'content',b'')),failed_stage=operation+'.json')
         doc=response.json()
@@ -12402,7 +12420,7 @@ def _v208_landmark_json(web,url,params,operation):
         return doc,info
     except Exception as exc:
         details=dict(getattr(exc,'diagnostic',{}) or {})
-        details={**info,**details,'elapsed_ms':round((time.monotonic()-started)*1000)}
+        details={**info,**details,**_v212_exception_details(exc),'elapsed_ms':round((time.monotonic()-started)*1000)}
         if response is not None:details['response_excerpt']=str(getattr(response,'text',''))[:1500]
         # Preserve the original exception class/message and the transport diagnostics.
         exc.landmark_diagnostic=details
@@ -12415,7 +12433,7 @@ def _v208_landmark_failure(web,data,exc,operation,info=None):
              'ticket':str(data.get('ticket') or '')[:100],
              'reason':str(exc),'exception_type':type(exc).__name__,
              'technical_exception':getattr(exc,'diagnostic',{}) or {},
-             'traceback':traceback.format_exc()}
+             'traceback':traceback.format_exc(),**_v212_exception_details(exc)}
     details.setdefault('failed_stage',operation+'.validation')
     trace(web,'landmark_search_failed' if operation=='name_search' else 'landmark_address_failed',
           details,'ERROR','landmark.'+operation)
@@ -12436,21 +12454,24 @@ def _v208_run_landmark_lookup(state,data):
     """Reuse AuditLog, its redaction, and the existing diagnostic_log storage."""
     audit=state.get('_v208_landmark_audit')
     if audit is None:
-        audit=AuditLog({'mode':'landmark','providers':['OpenStreetMap','国土地理院']},
+        audit=AuditLog({'mode':'landmark','providers':['Photon / OpenStreetMap','Overpass','国土地理院']},
                        _v209_log_secrets())
         state['_v208_landmark_audit']=audit
+    before_seq=audit.count
     reply=_v207_search_landmarks(data,audit=audit)
     audit.add('search','finish','INFO',{'operation':'landmark','ticket':reply['ticket'],
               'error':reply.get('error') or '', 'candidates':len(reply.get('candidates') or [])})
-    if reply.get('error'):
+    request_failures=any(diagnostic_failure_event(event) for event in audit.records() if event.get('seq',0)>before_seq)
+    if reply.get('error') or request_failures:
         try:
             db=Database();audit.persist(db,force=True)
             if audit.storage_error:raise AppError(audit.storage_error)
             records=audit.records()
-            db.save_search({'id':audit.search_id,'status':'failed',
+            db.save_search({'id':audit.search_id,'status':'failed' if reply.get('error') else 'completed',
                 'started_at':records[0]['time'],'finished_at':utc_now(),
-                'conditions':{'mode':'landmark','providers':['OpenStreetMap','国土地理院']},
-                'summary':{'issues':[reply['error']],'saved':0,'operation':'施設名検索'}})
+                'conditions':{'mode':'landmark','providers':['Photon / OpenStreetMap','Overpass','国土地理院']},
+                'summary':{'issues':[reply['error']] if reply.get('error') else ['施設名検索は成功・通信障害から復旧'],
+                           'saved':0,'candidates':len(reply.get('candidates') or []),'operation':'施設名検索'}})
             state['_v208_landmark_storage_error']=''
             state['_v208_landmark_saved']=True
         except Exception as exc:
@@ -12482,6 +12503,67 @@ def _v208_landmark_log_panel(state):
         if failures:
             st.download_button('施設名検索のエラーCSV',csv_bytes_from_rows(failures),
                 'sumai_landmark_errors.csv','text/csv',key='landmark_errors_v208',on_click='ignore')
+
+
+_V212_NAME_CACHE={}
+
+
+def _v212_photon_document(web,query):
+    cached=_V212_NAME_CACHE.get(query)
+    if cached and time.monotonic()-cached['time']<3600:
+        trace(web,'landmark_cache_hit',{'query':query,'provider':'Photon','age_seconds':round(time.monotonic()-cached['time'])},stage='landmark.name_search')
+        return cached['doc'],cached['info']
+    if not hasattr(web,'local'):web.local=threading.local()
+    web.local.landmark_lookup=True
+    params={'q':query,'bbox':'139.4,35.45,140.05,35.95'}
+    doc,info=_v208_landmark_json(web,'https://photon.komoot.io/api/',params,'name_search')
+    info.update(provider='Photon',failed_stage='name_search.validation')
+    try:
+        if not isinstance(doc,dict) or doc.get('type')!='FeatureCollection' or not isinstance(doc.get('features'),list):
+            raise ValueError('Photon response is not a GeoJSON FeatureCollection')
+        elements=[];decisions=[]
+        for feature in doc['features']:
+            try:
+                props=feature['properties'];geometry=feature['geometry']
+                if geometry.get('type')!='Point':raise ValueError('geometry is not a Point')
+                lng,lat=map(float,geometry['coordinates'][:2]);name=normal(props.get('name'))
+                if not name:raise ValueError('facility name missing')
+                if not (math.isfinite(lat) and math.isfinite(lng) and 35.45<=lat<=35.95 and 139.4<=lng<=140.05):raise ValueError('outside supported region')
+                if props.get('countrycode') and str(props['countrycode']).upper()!='JP':raise ValueError('country is not Japan')
+                parts=[]
+                for key in ('state','city','district','locality','street','housenumber'):
+                    value=normal(props.get(key))
+                    if value and value not in parts:parts.append(value)
+                address=''.join(parts)
+                if address and not props.get('housenumber'):address+='（番地未確認）'
+                tags={'name':name,'addr:full':address}
+                elements.append({'type':props.get('osm_type'),'id':props.get('osm_id'),'lat':lat,'lon':lng,'tags':tags})
+                decisions.append({'name':name,'address':address,'lat':lat,'lng':lng,'osm_id':props.get('osm_id'),'decision':'candidate'})
+            except (KeyError,TypeError,ValueError,AttributeError,IndexError) as exc:
+                decisions.append({'decision':'rejected','reason':str(exc)})
+        trace(web,'landmark_geocoder_results',{'query':query,'provider':'Photon','features':len(doc['features']),
+              'accepted':len(elements),'decisions':decisions},stage='landmark.result')
+        result={'elements':elements}
+        if elements:
+            if len(_V212_NAME_CACHE)>=128:_V212_NAME_CACHE.clear()
+            _V212_NAME_CACHE[query]={'time':time.monotonic(),'doc':result,'info':dict(info)}
+        return result,info
+    except Exception as exc:
+        exc.landmark_diagnostic=info
+        raise
+
+
+def _v212_name_document(web,query,pattern):
+    try:
+        doc,info=_v212_photon_document(web,query)
+        if doc['elements']:return doc,info
+        trace(web,'landmark_geocoder_empty',{'query':query,'provider':'Photon','next_provider':'Overpass'},stage='landmark.name_search')
+    except Exception as exc:
+        detail={**(getattr(exc,'diagnostic',{}) or {}),**(getattr(exc,'landmark_diagnostic',{}) or {}),**_v212_exception_details(exc)}
+        trace(web,'landmark_geocoder_failed',{**detail,'query':query,'provider':'Photon','reason':str(exc),'exception_type':type(exc).__name__},'ERROR','landmark.name_search')
+        status=detail.get('status')
+        if str(status) in ('401','403','429'):raise
+    return _v211_name_document(web,query,pattern)
 
 
 def _v211_name_document(web,query,pattern):
@@ -12562,7 +12644,7 @@ def _v207_search_landmarks(data,audit=None):
     compact=re.sub(r'\s+','',query)
     pattern=re.sub(r'([.\[\]{}()*+?^$|\\])',r'\\\1',compact)
     try:
-        doc,info=_v211_name_document(web,compact,pattern)
+        doc,info=_v212_name_document(web,compact,pattern)
         seen=set()
         for element in doc['elements']:
             try:
@@ -12576,7 +12658,7 @@ def _v207_search_landmarks(data,audit=None):
                 key=(name,round(lat,5),round(lng,5))
                 if key in seen:continue
                 seen.add(key);reply['candidates'].append({'name':name,'title':name,'address':address[:180],
-                    'lat':lat,'lng':lng,'source':'OpenStreetMap','address_checked':bool(address)})
+                    'lat':lat,'lng':lng,'source':info.get('provider','Overpass')+' / OpenStreetMap','address_checked':bool(address)})
             except (KeyError,TypeError,ValueError,AttributeError):continue
         reply['candidates'].sort(key=lambda p:(re.sub(r'\s+','',p['name']).casefold()!=compact.casefold(),p['name'],p['lat'],p['lng']))
         trace(web,'landmark_result',{'query':query,'ticket':ticket,'elements':len(doc['elements']),'candidates':len(reply['candidates'])},stage='landmark.result')
@@ -12595,7 +12677,7 @@ TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('</style></head>',_V21
 
 @st.cache_resource(show_spinner=False)
 def town_component_v121():
-    _asset_revision='v211-draft-confirm-longpress'
+    _asset_revision='v212-geocoder-search-diagnostics'
     folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-v184')
     os.makedirs(folder,exist_ok=True)
     path=os.path.join(folder,'index.html')
