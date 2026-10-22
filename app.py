@@ -52,7 +52,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v214"
+BUILD = "REBUILD-01-v215"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -12101,7 +12101,7 @@ TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('</style></head>',_V20
 
 
 # v205: personal named landmarks, independent of rental observations.
-_V205_PIN_DOM = """<details id="v205-pins-panel"><summary>目印ピンを追加・表示</summary><label for="v205-pin-address">施設名・目印の名前で検索</label><input id="v205-pin-address" maxlength="180" placeholder="例：立教小学校（住所の入力は不要）"/><label for="v205-pin-name">ピンの名前（検索結果から自動入力・変更可）</label><input id="v205-pin-name" maxlength="60" placeholder="検索後に施設名が入ります"/><div class="v205-actions"><button type="button" id="v205-pin-search">名前で検索</button><button type="button" id="v205-pin-pick">地図をタップして指定</button><button type="button" id="v205-pin-cancel" hidden>仮ピンを取り消す</button></div><div id="v205-pin-candidates" hidden><label id="v206-result-label" for="v205-pin-candidate">検索結果</label><select id="v205-pin-candidate"></select><div id="v206-result-detail" role="status"></div><button type="button" id="v205-pin-add">確認して確定</button></div><div id="v205-pin-status" role="status" aria-live="polite"></div><div id="v205-pin-saved" hidden><label for="v205-pin-list">保存した目印</label><select id="v205-pin-list"></select><button type="button" id="v205-pin-jump">選んだピンへ移動</button></div><p class="v205-help">東京23区周辺の施設を名前で検索し、住所と位置を表示します。選択すると仮の印で位置を確認でき、「確認して確定」で保存します。確定したピンの長押しで徒歩の目安の円・削除メニューを開きます。情報：国土地理院・<a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener noreferrer">© OpenStreetMap contributors</a>。保存先はこのブラウザーです。</p></details>"""
+_V205_PIN_DOM = """<details id="v205-pins-panel"><summary>目印ピンを追加・表示</summary><label for="v205-pin-address">施設名・目印の名前で検索</label><input id="v205-pin-address" maxlength="180" placeholder="例：ヨドバシAKIBA（住所の入力は不要）"/><label for="v205-pin-name">ピンの名前（検索結果から自動入力・変更可）</label><input id="v205-pin-name" maxlength="60" placeholder="検索後に施設名が入ります"/><div class="v205-actions"><button type="button" id="v205-pin-search">名前で検索</button><button type="button" id="v205-pin-pick">地図をタップして指定</button><button type="button" id="v205-pin-cancel" hidden>仮ピンを取り消す</button></div><div id="v205-pin-candidates" hidden><label id="v206-result-label" for="v205-pin-candidate">検索結果</label><select id="v205-pin-candidate"></select><div id="v206-result-detail" role="status"></div><button type="button" id="v205-pin-add">確認して確定</button></div><div id="v205-pin-status" role="status" aria-live="polite"></div><div id="v205-pin-saved" hidden><label for="v205-pin-list">保存した目印</label><select id="v205-pin-list"></select><button type="button" id="v205-pin-jump">選んだピンへ移動</button></div><p class="v205-help">東京23区周辺の施設を名前で検索し、住所と位置を表示します。選択すると仮の印で位置を確認でき、「確認して確定」で保存します。確定したピンの長押しで徒歩の目安の円・削除メニューを開きます。情報：国土地理院・<a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener noreferrer">© OpenStreetMap contributors</a>。保存先はこのブラウザーです。</p></details>"""
 _V205_PIN_CSS = """
 #v205-pins-panel{padding:12px 13px;background:#fff;border-top:1px solid #d5dfdc;color:#173a5e;font:14px system-ui}
 #v205-pins-panel summary{font-weight:750;cursor:pointer;padding:5px 0}
@@ -12119,6 +12119,18 @@ _V205_PIN_CSS = """
 @media(max-width:480px){.leaflet-tooltip.v205-pin-label{display:none!important}}
 .v205-pin-popup-title{font-weight:750;color:#173a5e;margin-bottom:5px}
 .v205-pin-popup-address{font-size:12px;color:#49616b;overflow-wrap:anywhere}
+
+.v215-pin-popup .leaflet-popup-content{margin:12px!important;min-width:0!important}
+.v215-pin-menu{box-sizing:border-box;width:100%;min-width:0;display:flex;flex-direction:column;gap:8px;color:#173a5e;font:13px/1.45 system-ui;white-space:normal;overflow-wrap:anywhere}
+.v215-pin-menu p{margin:0;white-space:normal}
+.v215-pin-menu .v205-pin-popup-title{font-size:13px;line-height:1.4;margin:0;white-space:normal}
+.v215-pin-menu button{box-sizing:border-box;display:block;flex:none;width:100%;min-height:40px;padding:8px 10px;margin:0;border:1px solid #9eb4bd;border-radius:6px;background:#edf4f7;color:#173a5e;font-size:13px;line-height:1.3;white-space:normal;cursor:pointer;touch-action:manipulation}
+.v215-pin-menu button.v205-pin-delete{color:#a52c40;border-color:#ba7180;background:#fff}
+.v215-pin-menu .v204-popup-actions{display:flex;flex-wrap:wrap;gap:6px}
+.v215-pin-menu .v215-minute-row{display:flex;align-items:center;justify-content:space-between;gap:10px;margin:0;font-size:13px;white-space:nowrap}
+.v215-pin-menu input[type=number]{box-sizing:border-box;flex:0 0 84px;width:84px;min-width:0;min-height:40px;padding:6px;border:1px solid #9eb4bd;border-radius:6px;background:#fff;color:#173a5e;font-size:16px}
+.leaflet-tooltip.v205-pin-label,.leaflet-tooltip.v205-pin-label span{white-space:nowrap!important;writing-mode:horizontal-tb!important;word-break:keep-all!important}
+
 .v205-pin-delete{min-height:40px;padding:7px 10px;color:#a52c40;background:#fff;border:1px solid #a52c40;border-radius:6px;cursor:pointer;font-size:13px}
 """
 _V205_PIN_JS = r"""
@@ -12154,6 +12166,11 @@ function v205PinList(){
  if((state._v205Pins||[]).some(function(p){return p.id===old}))select.value=old;
  setHeight();
 }
+function v215PopupOptions(){
+ var element=state.map&&state.map.getContainer&&state.map.getContainer();
+ var width=Math.max(120,Math.min(292,((element&&element.clientWidth)||360)-60));
+ return {minWidth:width,maxWidth:width,className:'v215-pin-popup',autoPanPadding:[14,14]};
+}
 function v205DrawPins(){
  if(!state.map||!window.L)return;
  var pins=state._v205Pins||[],signature=JSON.stringify(pins);v214SyncRings(pins);
@@ -12168,11 +12185,11 @@ function v205DrawPins(){
   marker.bindTooltip(title,{permanent:true,direction:'right',offset:[9,-17],className:'v205-pin-label'});
   var popup=document.createElement('div'),heading=document.createElement('div'),address=document.createElement('div');
   heading.className='v205-pin-popup-title';heading.textContent=pin.name;
-  address.className='v205-pin-popup-address';address.textContent=pin.address||'地図で指定した場所';popup.appendChild(heading);popup.appendChild(address);
+  address.className='v205-pin-popup-address';address.textContent=pin.address||'地図で指定した場所';popup.className='v215-pin-menu';popup.appendChild(heading);popup.appendChild(address);
   var actions=document.createElement('div');actions.className='v204-popup-actions';
   var route=document.createElement('a');route.className='v167-suumo-link';route.textContent='経路案内 ↗';route.href=v204DirectionsUrl(pin);route.target='_blank';route.rel='noopener noreferrer';actions.appendChild(route);
   var hint=document.createElement('div');hint.textContent='長押し・右クリックで徒歩の円・削除';hint.className='v205-pin-popup-address';
-  popup.appendChild(actions);popup.appendChild(hint);marker.bindPopup(popup);
+  popup.appendChild(actions);popup.appendChild(hint);marker.bindPopup(popup,v215PopupOptions());
   marker.on('dragend',function(){var point=marker.getLatLng();
    if(!v205Point(point.lat,point.lng)){marker.setLatLng([pin.lat,pin.lng]);v205Status('対応範囲外です。位置を元に戻しました。');return;}
    var next=(state._v205Pins||[]).map(function(p){return p.id===pin.id?Object.assign({},p,{lat:point.lat,lng:point.lng}):p});
@@ -12232,12 +12249,12 @@ function v206SelectCandidate(){
  if(state.map&&window.L){
   var text=document.createElement('span');text.textContent=String(item.name)+'（仮ピン・未確定）';
   var popup=document.createElement('div'),title=document.createElement('div'),address=document.createElement('div');
-  title.className='v205-pin-popup-title';title.textContent='仮ピン：'+item.name;popup.appendChild(title);
+  popup.className='v215-pin-menu';title.className='v205-pin-popup-title';title.textContent='仮ピン：'+item.name;popup.appendChild(title);
   address.className='v205-pin-popup-address';popup.appendChild(address);state._v211DraftAddress=address;
   var confirm=document.createElement('button');confirm.type='button';confirm.textContent='確認して確定';confirm.addEventListener('click',v211ConfirmDraft);popup.appendChild(confirm);state._v211DraftConfirm=confirm;
   var cancel=document.createElement('button');cancel.type='button';cancel.textContent='取り消す';cancel.addEventListener('click',v211CancelDraft);popup.appendChild(cancel);
   state._v206Preview=L.marker([item.lat,item.lng],{title:String(item.name),
-    icon:L.divIcon({className:'v205-pin-icon v206-preview',html:'<span class="v205-pin-dot"></span>',iconSize:[22,28],iconAnchor:[11,26]})}).bindTooltip(text,{permanent:true,direction:'right',className:'v205-pin-label'}).bindPopup(popup).addTo(state.map);
+    icon:L.divIcon({className:'v205-pin-icon v206-preview',html:'<span class="v205-pin-dot"></span>',iconSize:[22,28],iconAnchor:[11,26]})}).bindTooltip(text,{permanent:true,direction:'right',className:'v205-pin-label'}).bindPopup(popup,v215PopupOptions()).addTo(state.map);
   state.map.setView([item.lat,item.lng],Math.max(13,state.map.getZoom()),{animate:false});state._v206Preview.openPopup();
  }
  v211DraftDetails();setHeight();
@@ -12271,12 +12288,12 @@ function v214SyncRings(pins){
 function v211DeletePopup(marker,pin,event){
  if(event&&event.originalEvent){event.originalEvent.preventDefault();event.originalEvent.stopPropagation();}
  var popup=document.createElement('div'),title=document.createElement('div'),hint=document.createElement('p');
- title.className='v205-pin-popup-title';title.textContent=pin.name;popup.appendChild(title);
+ popup.className='v215-pin-menu';title.className='v205-pin-popup-title';title.textContent=pin.name;popup.appendChild(title);
  hint.textContent='徒歩1分＝80mの直線距離の目安です。道路・坂道・信号は反映しません。円は再読み込み・終了で消えます。';hint.style.fontSize='11px';popup.appendChild(hint);
- var label=document.createElement('label');label.textContent='徒歩の分数：';
+ var label=document.createElement('label');label.className='v215-minute-row';label.textContent='徒歩の分数：';
  var input=document.createElement('input');input.type='number';input.min='1';input.step='1';
  input.value=String((state._v214Rings&&state._v214Rings[pin.id])?state._v214Rings[pin.id].minutes:10);
- input.setAttribute('aria-label','徒歩の分数');input.style.width='80px';input.style.fontSize='16px';label.appendChild(input);popup.appendChild(label);
+ input.setAttribute('aria-label','徒歩の分数');label.appendChild(input);popup.appendChild(label);
  var show=document.createElement('button');show.type='button';show.textContent='N分の円を表示';
  show.addEventListener('click',function(){if(v214ShowRing(pin,input.value))state.map.closePopup();});popup.appendChild(show);
  if(state._v214Rings&&state._v214Rings[pin.id]){
@@ -12286,23 +12303,27 @@ function v211DeletePopup(marker,pin,event){
  var remove=document.createElement('button');remove.type='button';remove.className='v205-pin-delete';remove.textContent='ピンを削除…';
  remove.addEventListener('click',function(){v214ConfirmDelete(marker,pin)});popup.appendChild(remove);
  var cancel=document.createElement('button');cancel.type='button';cancel.textContent='閉じる';cancel.addEventListener('click',function(){state.map.closePopup()});popup.appendChild(cancel);
- L.popup().setLatLng(marker.getLatLng()).setContent(popup).openOn(state.map);
+ L.popup(v215PopupOptions()).setLatLng(marker.getLatLng()).setContent(popup).openOn(state.map);
 }
 function v214ConfirmDelete(marker,pin,event){
  if(event&&event.originalEvent){event.originalEvent.preventDefault();event.originalEvent.stopPropagation();}
  var popup=document.createElement('div'),title=document.createElement('div'),address=document.createElement('div');
- title.className='v205-pin-popup-title';title.textContent='「'+pin.name+'」を削除しますか？';popup.appendChild(title);
+ popup.className='v215-pin-menu';title.className='v205-pin-popup-title';title.textContent='「'+pin.name+'」を削除しますか？';popup.appendChild(title);
  address.className='v205-pin-popup-address';address.textContent=pin.address||'住所未登録';popup.appendChild(address);
  var remove=document.createElement('button');remove.type='button';remove.className='v205-pin-delete';remove.textContent='削除する';
  remove.addEventListener('click',function(){if(v205SavePins((state._v205Pins||[]).filter(function(p){return p.id!==pin.id}))){v214RemoveRing(pin.id);state.map.closePopup();v205Status('「'+pin.name+'」を削除しました。');}});popup.appendChild(remove);
  var cancel=document.createElement('button');cancel.type='button';cancel.textContent='キャンセル';cancel.addEventListener('click',function(){state.map.closePopup()});popup.appendChild(cancel);
- L.popup().setLatLng(marker.getLatLng()).setContent(popup).openOn(state.map);
+ L.popup(v215PopupOptions()).setLatLng(marker.getLatLng()).setContent(popup).openOn(state.map);
 }
 function v211BindLongPress(marker,pin){
  marker.on('contextmenu',function(event){v211DeletePopup(marker,pin,event)});
  var element=marker.getElement&&marker.getElement();if(!element)return;
  var timer=null,start=null,blockedUntil=0;
  function clear(){if(timer!==null)clearTimeout(timer);timer=null;start=null;}
+ element.addEventListener('contextmenu',function(event){
+  event.preventDefault();event.stopPropagation();if(event.stopImmediatePropagation)event.stopImmediatePropagation();
+  clear();blockedUntil=Date.now()+900;v211DeletePopup(marker,pin);
+ },true);
  element.addEventListener('pointerdown',function(event){
   clear();if(event.button!==undefined&&event.button!==0)return;
   start={x:event.clientX,y:event.clientY};
@@ -12724,8 +12745,8 @@ TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('</style></head>',_V21
 
 @st.cache_resource(show_spinner=False)
 def town_component_v121():
-    _asset_revision='v214-temporary-walking-rings'
-    folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-v184')
+    _asset_revision='v215-pin-layout-contextmenu'
+    folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-'+_asset_revision)
     os.makedirs(folder,exist_ok=True)
     path=os.path.join(folder,'index.html')
     # Component HTML is small; create once per worker process. Never include
@@ -12742,7 +12763,7 @@ def town_component_v121():
         with open(temp_path,'w',encoding='utf-8') as output:
             output.write(TOWN_COMPONENT_HTML_V121)
         os.replace(temp_path,path)
-    return st.components.v1.declare_component('sumai_town_map_v184',path=folder)
+    return st.components.v1.declare_component('sumai_town_map_v215',path=folder)
 
 # v159: Station-to-office approximate train travel times, OFFLINE AND READ-ONLY.
 # Tokyo Metro/Toei/JR local edge minutes adapted from MIT-licensed public project:
