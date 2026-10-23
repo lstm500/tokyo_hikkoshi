@@ -52,7 +52,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v215"
+BUILD = "REBUILD-01-v217"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -720,7 +720,18 @@ button:disabled{background:#e3e9e3!important;color:#607369!important;opacity:1!i
 [data-testid="stForm"]{border:1px solid #d1dccf;border-radius:18px;background:#fff;padding:18px}
 [data-testid="stSidebar"]{background:#e8ece3!important}
 [data-baseweb="tab-list"],[data-baseweb="tab"]{background:#f5f3ed!important;color:#203f39!important}
-[data-testid="stExpander"] details{background:#fff!important;color:#203f39!important}
+/* Keep Streamlit theme defaults from painting dark summary/portal surfaces. */
+[data-testid="stExpander"] details,[data-testid="stExpander"] summary,
+[data-testid="stExpander"] summary:hover,[data-testid="stExpander"] summary:focus,
+[data-testid="stExpander"] [data-testid="stExpanderDetails"]{
+ background:#fff!important;color:#203f39!important;color-scheme:light}
+[data-testid="stExpander"] summary *{color:#203f39!important}
+[data-testid="stExpander"] summary svg{fill:currentColor!important;color:#203f39!important}
+[data-testid="stExpander"] summary:focus-visible{outline:3px solid #174a6a;outline-offset:-3px}
+[data-baseweb="popover"],[data-baseweb="menu"],[role="dialog"],[role="tooltip"]{
+ background:#fff!important;color:#203f39!important;color-scheme:light}
+[data-testid="stTextArea"] textarea{background:#fff!important;color:#203f39!important}
+[data-testid="stCaptionContainer"]{color:#52655f!important}
 [data-baseweb="select"] svg{fill:#203f39!important}
 [data-testid="stFileUploader"] section{background:#fff!important;color:#203f39!important}
 .unit{background:#fff;border-radius:16px;padding:18px;margin-bottom:12px;border:1px solid #e0e4da}
@@ -3651,7 +3662,7 @@ def recent_acquisition(value,now=None):
         return acquisition_cutoff(now)<=dt<=now
     except (ValueError,TypeError):return False
 
-def suumo_ward_regions(web,code):
+def suumo_ward_regions(web,code,include_municipalities=True):
     if code not in TOKYO_WARDS:raise AppError('東京23区から対象区を選択してください。')
     url='https://suumo.jp/jj/chintai/ichiran/FR301FC001/'
     params={'ar':'030','bs':'040','ta':'13','sc':code,'pc':'50','srch_navi':'1'}
@@ -3680,7 +3691,7 @@ def suumo_ward_regions(web,code):
                          'label':'東京都'+TOKYO_WARDS[code]+name,'suumo_prepared':prepared}
     if not regions:raise AppError('選択した区のSUUMO町名リストを取得できません。')
     trace(web,'suumo_ward_towns',{'ward':TOKYO_WARDS[code],'municipality_code':code,'town_count':len(regions)},stage='search_conditions')
-    return list(regions.values()),municipalities(web),0
+    return list(regions.values()),municipalities(web) if include_municipalities else {},0
 
 
 def select_ward_towns(regions,town_codes):
@@ -10878,9 +10889,9 @@ _V167_SUUMO_CONDITION_LABELS = {
     'group2':'2LDK・3K・3DK｜マンション・築15年以内',
     'house':'一戸建て・その他｜50㎡以上（築40年以内は掲載先で確認）',
 }
-# This single verified SEO code comes from SUUMO's actual public town page.
-# All other oz codes must come from the real SUUMO town selector, not a guess.
-_V167_VERIFIED_OZ = {'中野区|沼袋':'13114010', '豊島区|南長崎':'13116019'}
+# Verified against SUUMO public town-selection links on 2026-10-23.
+# Embed 23 wards so saved rent polygons do not depend on a separate warmup.
+_V167_VERIFIED_OZ = {'世田谷区|三宿': '13112058', '世田谷区|三軒茶屋': '13112031', '世田谷区|上北沢': '13112013', '世田谷区|上用賀': '13112016', '世田谷区|上祖師谷': '13112014', '世田谷区|上野毛': '13112015', '世田谷区|上馬': '13112012', '世田谷区|下馬': '13112032', '世田谷区|世田谷': '13112036', '世田谷区|中町': '13112048', '世田谷区|代沢': '13112043', '世田谷区|代田': '13112044', '世田谷区|八幡山': '13112051', '世田谷区|北沢': '13112018', '世田谷区|北烏山': '13112017', '世田谷区|千歳台': '13112045', '世田谷区|南烏山': '13112059', '世田谷区|喜多見': '13112019', '世田谷区|大原': '13112006', '世田谷区|大蔵': '13112005', '世田谷区|太子堂': '13112038', '世田谷区|奥沢': '13112008', '世田谷区|宇奈根': '13112003', '世田谷区|宮坂': '13112060', '世田谷区|尾山台': '13112009', '世田谷区|岡本': '13112007', '世田谷区|弦巻': '13112046', '世田谷区|成城': '13112034', '世田谷区|新町': '13112033', '世田谷区|東玉川': '13112054', '世田谷区|松原': '13112057', '世田谷区|桜': '13112027', '世田谷区|桜上水': '13112030', '世田谷区|桜丘': '13112028', '世田谷区|桜新町': '13112029', '世田谷区|梅丘': '13112004', '世田谷区|池尻': '13112002', '世田谷区|深沢': '13112055', '世田谷区|瀬田': '13112035', '世田谷区|玉堤': '13112042', '世田谷区|玉川': '13112039', '世田谷区|玉川台': '13112040', '世田谷区|玉川田園調布': '13112041', '世田谷区|用賀': '13112061', '世田谷区|砧': '13112020', '世田谷区|祖師谷': '13112037', '世田谷区|等々力': '13112047', '世田谷区|粕谷': '13112010', '世田谷区|経堂': '13112023', '世田谷区|給田': '13112022', '世田谷区|羽根木': '13112053', '世田谷区|船橋': '13112056', '世田谷区|若林': '13112062', '世田谷区|豪徳寺': '13112026', '世田谷区|赤堤': '13112001', '世田谷区|野毛': '13112049', '世田谷区|野沢': '13112050', '世田谷区|鎌田': '13112011', '世田谷区|駒沢': '13112024', '中央区|京橋': '13102004', '中央区|佃': '13102010', '中央区|入船': '13102002', '中央区|八丁堀': '13102032', '中央区|八重洲': '13102037', '中央区|勝どき': '13102003', '中央区|新富': '13102007', '中央区|新川': '13102006', '中央区|日本橋': '13102012', '中央区|日本橋中洲': '13102021', '中央区|日本橋久松町': '13102026', '中央区|日本橋人形町': '13102022', '中央区|日本橋兜町': '13102015', '中央区|日本橋堀留町': '13102027', '中央区|日本橋大伝馬町': '13102013', '中央区|日本橋室町': '13102030', '中央区|日本橋富沢町': '13102020', '中央区|日本橋小伝馬町': '13102018', '中央区|日本橋小網町': '13102017', '中央区|日本橋小舟町': '13102019', '中央区|日本橋本町': '13102029', '中央区|日本橋本石町': '13102028', '中央区|日本橋横山町': '13102031', '中央区|日本橋浜町': '13102024', '中央区|日本橋箱崎町': '13102023', '中央区|日本橋茅場町': '13102016', '中央区|日本橋蛎殻町': '13102014', '中央区|日本橋馬喰町': '13102025', '中央区|明石町': '13102001', '中央区|晴海': '13102034', '中央区|月島': '13102008', '中央区|東日本橋': '13102035', '中央区|湊': '13102036', '中央区|築地': '13102009', '中央区|銀座': '13102005', '中野区|上高田': '13114005', '中野区|上鷺宮': '13114004', '中野区|中央': '13114008', '中野区|中野': '13114009', '中野区|丸山': '13114015', '中野区|南台': '13114016', '中野区|大和町': '13114017', '中野区|弥生町': '13114018', '中野区|新井': '13114001', '中野区|本町': '13114013', '中野区|東中野': '13114012', '中野区|松が丘': '13114014', '中野区|江原町': '13114003', '中野区|江古田': '13114002', '中野区|沼袋': '13114010', '中野区|白鷺': '13114007', '中野区|若宮': '13114019', '中野区|野方': '13114011', '中野区|鷺宮': '13114006', '北区|上中里': '13117011', '北区|上十条': '13117010', '北区|中十条': '13117025', '北区|中里': '13117024', '北区|十条仲原': '13117019', '北区|堀船': '13117030', '北区|岩淵町': '13117006', '北区|岸町': '13117013', '北区|志茂': '13117016', '北区|昭和町': '13117017', '北区|東十条': '13117028', '北区|東田端': '13117029', '北区|栄町': '13117015', '北区|桐ケ丘': '13117014', '北区|浮間': '13117007', '北区|滝野川': '13117020', '北区|王子': '13117008', '北区|王子本町': '13117009', '北区|田端': '13117021', '北区|田端新町': '13117022', '北区|神谷': '13117012', '北区|西が丘': '13117026', '北区|西ケ原': '13117027', '北区|豊島': '13117023', '北区|赤羽': '13117001', '北区|赤羽北': '13117002', '北区|赤羽南': '13117005', '北区|赤羽台': '13117003', '北区|赤羽西': '13117004', '千代田区|一ツ橋': '13101051', '千代田区|一番町': '13101002', '千代田区|三番町': '13101043', '千代田区|九段北': '13101037', '千代田区|九段南': '13101038', '千代田区|二番町': '13101048', '千代田区|五番町': '13101041', '千代田区|六番町': '13101059', '千代田区|内神田': '13101004', '千代田区|四番町': '13101058', '千代田区|外神田': '13101044', '千代田区|富士見': '13101054', '千代田区|岩本町': '13101003', '千代田区|平河町': '13101053', '千代田区|東神田': '13101050', '千代田区|永田町': '13101046', '千代田区|神田三崎町': '13101056', '千代田区|神田佐久間河岸': '13101017', '千代田区|神田佐久間町': '13101018', '千代田区|神田北乗物町': '13101015', '千代田区|神田司町': '13101023', '千代田区|神田和泉町': '13101011', '千代田区|神田多町': '13101022', '千代田区|神田富山町': '13101024', '千代田区|神田小川町': '13101013', '千代田区|神田岩本町': '13101012', '千代田区|神田東松下町': '13101030', '千代田区|神田淡路町': '13101010', '千代田区|神田猿楽町': '13101042', '千代田区|神田神保町': '13101019', '千代田区|神田紺屋町': '13101016', '千代田区|神田練塀町': '13101027', '千代田区|神田美倉町': '13101033', '千代田区|神田西福田町': '13101026', '千代田区|神田錦町': '13101025', '千代田区|神田鍛冶町': '13101014', '千代田区|神田須田町': '13101020', '千代田区|神田駿河台': '13101021', '千代田区|紀尾井町': '13101035', '千代田区|西神田': '13101047', '千代田区|鍛冶町': '13101007', '千代田区|隼町': '13101049', '千代田区|飯田橋': '13101001', '千代田区|麹町': '13101040', '台東区|三ノ輪': '13106030', '台東区|三筋': '13106029', '台東区|上野': '13106007', '台東区|上野桜木': '13106009', '台東区|下谷': '13106017', '台東区|今戸': '13106005', '台東区|元浅草': '13106031', '台東区|入谷': '13106006', '台東区|北上野': '13106011', '台東区|千束': '13106018', '台東区|台東': '13106019', '台東区|寿': '13106015', '台東区|小島': '13106014', '台東区|日本堤': '13106022', '台東区|東上野': '13106027', '台東区|東浅草': '13106026', '台東区|松が谷': '13106028', '台東区|柳橋': '13106033', '台東区|根岸': '13106023', '台東区|橋場': '13106024', '台東区|池之端': '13106004', '台東区|浅草': '13106002', '台東区|浅草橋': '13106003', '台東区|清川': '13106012', '台東区|竜泉': '13106034', '台東区|花川戸': '13106025', '台東区|蔵前': '13106013', '台東区|西浅草': '13106021', '台東区|谷中': '13106032', '台東区|雷門': '13106010', '台東区|駒形': '13106016', '台東区|鳥越': '13106020', '品川区|上大崎': '13109005', '品川区|中延': '13109010', '品川区|二葉': '13109022', '品川区|八潮': '13109025', '品川区|勝島': '13109004', '品川区|北品川': '13109006', '品川区|南品川': '13109024', '品川区|南大井': '13109023', '品川区|大井': '13109002', '品川区|大崎': '13109003', '品川区|小山': '13109007', '品川区|小山台': '13109008', '品川区|平塚': '13109020', '品川区|広町': '13109021', '品川区|戸越': '13109009', '品川区|旗の台': '13109015', '品川区|東中延': '13109019', '品川区|東五反田': '13109017', '品川区|東品川': '13109018', '品川区|東大井': '13109016', '品川区|荏原': '13109001', '品川区|西中延': '13109014', '品川区|西五反田': '13109012', '品川区|西品川': '13109013', '品川区|西大井': '13109011', '品川区|豊町': '13109026', '墨田区|両国': '13107026', '墨田区|亀沢': '13107004', '墨田区|京島': '13107006', '墨田区|八広': '13107023', '墨田区|千歳': '13107013', '墨田区|向島': '13107022', '墨田区|吾妻橋': '13107001', '墨田区|堤通': '13107014', '墨田区|墨田': '13107009', '墨田区|太平': '13107010', '墨田区|押上': '13107003', '墨田区|文花': '13107019', '墨田区|本所': '13107020', '墨田区|東向島': '13107018', '墨田区|東墨田': '13107017', '墨田区|東駒形': '13107016', '墨田区|業平': '13107015', '墨田区|横川': '13107025', '墨田区|横網': '13107024', '墨田区|江東橋': '13107008', '墨田区|石原': '13107002', '墨田区|立川': '13107012', '墨田区|立花': '13107011', '墨田区|緑': '13107021', '墨田区|菊川': '13107005', '墨田区|錦糸': '13107007', '大田区|上池台': '13111012', '大田区|下丸子': '13111020', '大田区|中央': '13111026', '大田区|中馬込': '13111032', '大田区|久が原': '13111017', '大田区|仲六郷': '13111033', '大田区|仲池上': '13111031', '大田区|北千束': '13111014', '大田区|北嶺町': '13111016', '大田区|北糀谷': '13111013', '大田区|北馬込': '13111015', '大田区|千鳥': '13111025', '大田区|南久が原': '13111054', '大田区|南六郷': '13111058', '大田区|南千束': '13111055', '大田区|南蒲田': '13111053', '大田区|南雪谷': '13111057', '大田区|南馬込': '13111056', '大田区|多摩川': '13111024', '大田区|大森中': '13111005', '大田区|大森北': '13111004', '大田区|大森南': '13111009', '大田区|大森本町': '13111008', '大田区|大森東': '13111007', '大田区|大森西': '13111006', '大田区|山王': '13111019', '大田区|新蒲田': '13111022', '大田区|本羽田': '13111052', '大田区|東六郷': '13111049', '大田区|東嶺町': '13111046', '大田区|東矢口': '13111047', '大田区|東糀谷': '13111044', '大田区|東蒲田': '13111043', '大田区|東雪谷': '13111048', '大田区|東馬込': '13111045', '大田区|池上': '13111001', '大田区|田園調布': '13111027', '大田区|田園調布南': '13111029', '大田区|田園調布本町': '13111028', '大田区|矢口': '13111059', '大田区|石川町': '13111002', '大田区|羽田': '13111040', '大田区|萩中': '13111039', '大田区|蒲田': '13111010', '大田区|蒲田本町': '13111011', '大田区|西六郷': '13111038', '大田区|西嶺町': '13111037', '大田区|西糀谷': '13111035', '大田区|西蒲田': '13111034', '大田区|西馬込': '13111036', '大田区|雪谷大塚町': '13111060', '大田区|鵜の木': '13111003', '文京区|千石': '13105009', '文京区|千駄木': '13105010', '文京区|向丘': '13105016', '文京区|大塚': '13105001', '文京区|小日向': '13105006', '文京区|小石川': '13105004', '文京区|弥生': '13105018', '文京区|後楽': '13105005', '文京区|春日': '13105003', '文京区|本郷': '13105015', '文京区|本駒込': '13105014', '文京区|根津': '13105012', '文京区|水道': '13105007', '文京区|湯島': '13105019', '文京区|白山': '13105013', '文京区|目白台': '13105017', '文京区|西片': '13105011', '文京区|関口': '13105008', '文京区|音羽': '13105002', '新宿区|三栄町': '13104040', '新宿区|上落合': '13104032', '新宿区|下宮比町': '13104043', '新宿区|下落合': '13104042', '新宿区|中井': '13104063', '新宿区|中町': '13104066', '新宿区|中落合': '13104064', '新宿区|中里町': '13104065', '新宿区|二十騎町': '13104072', '新宿区|住吉町': '13104049', '新宿区|余丁町': '13104091', '新宿区|信濃町': '13104041', '新宿区|内藤町': '13104062', '新宿区|北山伏町': '13104036', '新宿区|北新宿': '13104034', '新宿区|北町': '13104035', '新宿区|南元町': '13104086', '新宿区|南山伏町': '13104087', '新宿区|南榎町': '13104084', '新宿区|南町': '13104085', '新宿区|原町': '13104074', '新宿区|喜久井町': '13104033', '新宿区|四谷': '13104092', '新宿区|四谷三栄町': '13104129', '新宿区|四谷坂町': '13104127', '新宿区|四谷本塩町': '13104128', '新宿区|大久保': '13104025', '新宿区|大京町': '13104052', '新宿区|天神町': '13104056', '新宿区|富久町': '13104100', '新宿区|山吹町': '13104088', '新宿区|岩戸町': '13104023', '新宿区|左門町': '13104039', '新宿区|市谷仲之町': '13104016', '新宿区|市谷八幡町': '13104017', '新宿区|市谷加賀町': '13104006', '新宿区|市谷台町': '13104013', '新宿区|市谷山伏町': '13104022', '新宿区|市谷左内町': '13104010', '新宿区|市谷本村町': '13104019', '新宿区|市谷柳町': '13104021', '新宿区|市谷田町': '13104012', '新宿区|市谷甲良町': '13104008', '新宿区|市谷砂土原町': '13104009', '新宿区|市谷船河原町': '13104018', '新宿区|市谷薬王寺町': '13104020', '新宿区|弁天町': '13104082', '新宿区|愛住町': '13104001', '新宿区|戸塚町': '13104057', '新宿区|戸山': '13104099', '新宿区|払方町': '13104073', '新宿区|改代町': '13104026', '新宿区|新宿': '13104046', '新宿区|新小川町': '13104045', '新宿区|早稲田南町': '13104097', '新宿区|早稲田町': '13104098', '新宿区|早稲田鶴巻町': '13104096', '新宿区|東五軒町': '13104078', '新宿区|東榎町': '13104076', '新宿区|榎町': '13104024', '新宿区|横寺町': '13104090', '新宿区|歌舞伎町': '13104031', '新宿区|水道町': '13104047', '新宿区|河田町': '13104111', '新宿区|片町': '13104030', '新宿区|白銀町': '13104044', '新宿区|百人町': '13104079', '新宿区|矢来町': '13104089', '新宿区|神楽坂': '13104028', '新宿区|筑土八幡町': '13104054', '新宿区|箪笥町': '13104051', '新宿区|築地町': '13104053', '新宿区|納戸町': '13104067', '新宿区|細工町': '13104037', '新宿区|舟町': '13104081', '新宿区|若宮町': '13104095', '新宿区|若松町': '13104094', '新宿区|若葉': '13104093', '新宿区|荒木町': '13104005', '新宿区|袋町': '13104080', '新宿区|西五軒町': '13104069', '新宿区|西新宿': '13104070', '新宿区|西早稲田': '13104071', '新宿区|西落合': '13104068', '新宿区|赤城下町': '13104002', '新宿区|赤城元町': '13104003', '新宿区|須賀町': '13104048', '新宿区|馬場下町': '13104075', '新宿区|高田馬場': '13104050', '杉並区|上井草': '13115011', '杉並区|上荻': '13115012', '杉並区|上高井戸': '13115013', '杉並区|下井草': '13115018', '杉並区|下高井戸': '13115019', '杉並区|久我山': '13115014', '杉並区|井草': '13115004', '杉並区|今川': '13115006', '杉並区|南荻窪': '13115033', '杉並区|和泉': '13115005', '杉並区|和田': '13115036', '杉並区|善福寺': '13115021', '杉並区|堀ノ内': '13115030', '杉並区|大宮': '13115009', '杉並区|天沼': '13115003', '杉並区|宮前': '13115034', '杉並区|成田東': '13115025', '杉並区|成田西': '13115024', '杉並区|方南': '13115029', '杉並区|本天沼': '13115031', '杉並区|松ノ木': '13115032', '杉並区|松庵': '13115020', '杉並区|桃井': '13115035', '杉並区|梅里': '13115007', '杉並区|永福': '13115008', '杉並区|浜田山': '13115028', '杉並区|清水': '13115017', '杉並区|荻窪': '13115010', '杉並区|西荻北': '13115026', '杉並区|西荻南': '13115027', '杉並区|阿佐谷北': '13115001', '杉並区|阿佐谷南': '13115002', '杉並区|高井戸東': '13115023', '杉並区|高井戸西': '13115022', '杉並区|高円寺北': '13115015', '杉並区|高円寺南': '13115016', '板橋区|三園': '13119049', '板橋区|上板橋': '13119017', '板橋区|中丸町': '13119036', '板橋区|中台': '13119034', '板橋区|中板橋': '13119032', '板橋区|仲宿': '13119033', '板橋区|仲町': '13119035', '板橋区|前野町': '13119048', '板橋区|加賀': '13119016', '板橋区|南常盤台': '13119051', '板橋区|南町': '13119050', '板橋区|双葉町': '13119045', '板橋区|向原': '13119053', '板橋区|四葉': '13119056', '板橋区|坂下': '13119022', '板橋区|大原町': '13119008', '板橋区|大和町': '13119054', '板橋区|大山東町': '13119014', '板橋区|大山町': '13119015', '板橋区|大山西町': '13119013', '板橋区|大山金井町': '13119012', '板橋区|大谷口': '13119009', '板橋区|大谷口上町': '13119010', '板橋区|大谷口北町': '13119011', '板橋区|大門': '13119028', '板橋区|宮本町': '13119052', '板橋区|富士見町': '13119044', '板橋区|小茂根': '13119019', '板橋区|小豆沢': '13119004', '板橋区|常盤台': '13119030', '板橋区|幸町': '13119020', '板橋区|弥生町': '13119055', '板橋区|徳丸': '13119031', '板橋区|志村': '13119025', '板橋区|成増': '13119037', '板橋区|新河岸': '13119026', '板橋区|本町': '13119047', '板橋区|東坂下': '13119042', '板橋区|東山町': '13119043', '板橋区|東新町': '13119029', '板橋区|板橋': '13119006', '板橋区|栄町': '13119021', '板橋区|桜川': '13119023', '板橋区|氷川町': '13119041', '板橋区|泉町': '13119005', '板橋区|清水町': '13119024', '板橋区|熊野町': '13119018', '板橋区|相生町': '13119001', '板橋区|稲荷台': '13119007', '板橋区|舟渡': '13119046', '板橋区|若木': '13119057', '板橋区|蓮根': '13119040', '板橋区|蓮沼町': '13119039', '板橋区|西台': '13119038', '板橋区|赤塚': '13119002', '板橋区|赤塚新町': '13119003', '板橋区|高島平': '13119027', '江戸川区|一之江': '13123001', '江戸川区|一之江町': '13123002', '江戸川区|上一色': '13123051', '江戸川区|上篠崎': '13123056', '江戸川区|下篠崎町': '13123017', '江戸川区|中央': '13123018', '江戸川区|中葛西': '13123019', '江戸川区|二之江町': '13123027', '江戸川区|北小岩': '13123009', '江戸川区|北篠崎': '13123057', '江戸川区|北葛西': '13123008', '江戸川区|南小岩': '13123043', '江戸川区|南篠崎町': '13123044', '江戸川区|南葛西': '13123042', '江戸川区|大杉': '13123050', '江戸川区|宇喜田町': '13123003', '江戸川区|小松川': '13123011', '江戸川区|平井': '13123034', '江戸川区|新堀': '13123020', '江戸川区|春江町': '13123028', '江戸川区|本一色': '13123052', '江戸川区|東小岩': '13123030', '江戸川区|東小松川': '13123031', '江戸川区|東松本': '13123059', '江戸川区|東瑞江': '13123033', '江戸川区|東葛西': '13123029', '江戸川区|松島': '13123040', '江戸川区|松本': '13123053', '江戸川区|松江': '13123039', '江戸川区|江戸川': '13123004', '江戸川区|清新町': '13123046', '江戸川区|瑞江': '13123055', '江戸川区|篠崎町': '13123015', '江戸川区|臨海町': '13123049', '江戸川区|興宮町': '13123005', '江戸川区|船堀': '13123035', '江戸川区|西一之江': '13123021', '江戸川区|西小岩': '13123023', '江戸川区|西小松川町': '13123024', '江戸川区|西瑞江': '13123026', '江戸川区|西篠崎': '13123060', '江戸川区|西葛西': '13123022', '江戸川区|谷河内': '13123058', '江戸川区|鹿骨': '13123013', '江戸川区|鹿骨町': '13123014', '江東区|三好': '13108039', '江東区|亀戸': '13108009', '江東区|住吉': '13108022', '江東区|佐賀': '13108013', '江東区|冬木': '13108035', '江東区|北砂': '13108010', '江東区|千田': '13108024', '江東区|千石': '13108023', '江東区|南砂': '13108038', '江東区|古石場': '13108036', '江東区|塩浜': '13108015', '江東区|大島': '13108008', '江東区|富岡': '13108029', '江東区|常盤': '13108028', '江東区|平野': '13108032', '江東区|扇橋': '13108007', '江東区|新大橋': '13108019', '江東区|新砂': '13108021', '江東区|有明': '13108001', '江東区|木場': '13108011', '江東区|東砂': '13108031', '江東区|東陽': '13108027', '江東区|東雲': '13108017', '江東区|枝川': '13108005', '江東区|森下': '13108041', '江東区|毛利': '13108040', '江東区|永代': '13108004', '江東区|海辺': '13108003', '江東区|深川': '13108033', '江東区|清澄': '13108012', '江東区|潮見': '13108016', '江東区|牡丹': '13108037', '江東区|猿江': '13108014', '江東区|白河': '13108018', '江東区|石島': '13108002', '江東区|福住': '13108034', '江東区|豊洲': '13108030', '江東区|越中島': '13108006', '江東区|辰巳': '13108026', '江東区|門前仲町': '13108042', '江東区|青海': '13108045', '江東区|高橋': '13108025', '渋谷区|上原': '13113001', '渋谷区|代々木': '13113031', '渋谷区|代官山町': '13113018', '渋谷区|元代々木町': '13113030', '渋谷区|円山町': '13113029', '渋谷区|初台': '13113025', '渋谷区|千駄ヶ谷': '13113017', '渋谷区|南平台町': '13113021', '渋谷区|大山町': '13113007', '渋谷区|宇田川町': '13113003', '渋谷区|富ヶ谷': '13113019', '渋谷区|幡ヶ谷': '13113023', '渋谷区|広尾': '13113027', '渋谷区|恵比寿': '13113004', '渋谷区|恵比寿南': '13113006', '渋谷区|恵比寿西': '13113005', '渋谷区|本町': '13113028', '渋谷区|東': '13113026', '渋谷区|松濤': '13113013', '渋谷区|桜丘町': '13113009', '渋谷区|渋谷': '13113012', '渋谷区|猿楽町': '13113011', '渋谷区|神南': '13113016', '渋谷区|神宮前': '13113015', '渋谷区|神山町': '13113008', '渋谷区|神泉町': '13113014', '渋谷区|笹塚': '13113010', '渋谷区|西原': '13113022', '渋谷区|道玄坂': '13113020', '渋谷区|鉢山町': '13113024', '渋谷区|鶯谷町': '13113002', '港区|三田': '13103024', '港区|元赤坂': '13103027', '港区|元麻布': '13103028', '港区|六本木': '13103029', '港区|北青山': '13103008', '港区|南青山': '13103025', '港区|南麻布': '13103026', '港区|台場': '13103030', '港区|愛宕': '13103006', '港区|新橋': '13103016', '港区|東新橋': '13103023', '港区|東麻布': '13103022', '港区|浜松町': '13103021', '港区|海岸': '13103007', '港区|港南': '13103009', '港区|白金': '13103014', '港区|白金台': '13103015', '港区|芝': '13103010', '港区|芝公園': '13103012', '港区|芝大門': '13103013', '港区|芝浦': '13103011', '港区|虎ノ門': '13103018', '港区|西新橋': '13103020', '港区|西麻布': '13103019', '港区|赤坂': '13103001', '港区|高輪': '13103017', '港区|麻布十番': '13103002', '港区|麻布台': '13103003', '港区|麻布狸穴町': '13103005', '目黒区|三田': '13110021', '目黒区|上目黒': '13110005', '目黒区|下目黒': '13110008', '目黒区|中央町': '13110013', '目黒区|中根': '13110015', '目黒区|中町': '13110014', '目黒区|中目黒': '13110016', '目黒区|五本木': '13110007', '目黒区|八雲': '13110026', '目黒区|南': '13110023', '目黒区|原町': '13110017', '目黒区|大岡山': '13110002', '目黒区|大橋': '13110003', '目黒区|平町': '13110011', '目黒区|東が丘': '13110018', '目黒区|東山': '13110019', '目黒区|柿の木坂': '13110004', '目黒区|洗足': '13110010', '目黒区|目黒': '13110024', '目黒区|目黒本町': '13110025', '目黒区|碑文谷': '13110020', '目黒区|祐天寺': '13110027', '目黒区|緑が丘': '13110022', '目黒区|自由が丘': '13110009', '目黒区|青葉台': '13110001', '目黒区|駒場': '13110006', '目黒区|鷹番': '13110012', '練馬区|三原台': '13120046', '練馬区|上石神井': '13120006', '練馬区|上石神井南町': '13120048', '練馬区|下石神井': '13120013', '練馬区|中村': '13120027', '練馬区|中村北': '13120028', '練馬区|中村南': '13120029', '練馬区|光が丘': '13120037', '練馬区|北町': '13120008', '練馬区|南大泉': '13120043', '練馬区|南田中': '13120045', '練馬区|向山': '13120009', '練馬区|土支田': '13120026', '練馬区|大泉学園町': '13120003', '練馬区|大泉町': '13120004', '練馬区|富士見台': '13120041', '練馬区|小竹町': '13120010', '練馬区|平和台': '13120042', '練馬区|早宮': '13120036', '練馬区|旭丘': '13120001', '練馬区|旭町': '13120002', '練馬区|春日町': '13120005', '練馬区|東大泉': '13120039', '練馬区|栄町': '13120011', '練馬区|桜台': '13120012', '練馬区|氷川台': '13120038', '練馬区|田柄': '13120020', '練馬区|石神井台': '13120014', '練馬区|石神井町': '13120015', '練馬区|立野町': '13120021', '練馬区|練馬': '13120034', '練馬区|羽沢': '13120035', '練馬区|西大泉': '13120030', '練馬区|谷原': '13120047', '練馬区|豊玉上': '13120022', '練馬区|豊玉中': '13120024', '練馬区|豊玉北': '13120023', '練馬区|豊玉南': '13120025', '練馬区|貫井': '13120033', '練馬区|錦': '13120032', '練馬区|関町北': '13120017', '練馬区|関町南': '13120049', '練馬区|関町東': '13120050', '練馬区|高松': '13120019', '練馬区|高野台': '13120018', '荒川区|南千住': '13118007', '荒川区|東尾久': '13118004', '荒川区|東日暮里': '13118005', '荒川区|町屋': '13118006', '荒川区|荒川': '13118001', '荒川区|西尾久': '13118002', '荒川区|西日暮里': '13118003', '葛飾区|お花茶屋': '13122003', '葛飾区|亀有': '13122007', '葛飾区|南水元': '13122029', '葛飾区|四つ木': '13122030', '葛飾区|堀切': '13122026', '葛飾区|奥戸': '13122002', '葛飾区|宝町': '13122013', '葛飾区|小菅': '13122008', '葛飾区|新宿': '13122015', '葛飾区|新小岩': '13122011', '葛飾区|東四つ木': '13122024', '葛飾区|東堀切': '13122022', '葛飾区|東新小岩': '13122020', '葛飾区|東水元': '13122023', '葛飾区|東立石': '13122021', '葛飾区|東金町': '13122019', '葛飾区|柴又': '13122009', '葛飾区|水元': '13122027', '葛飾区|白鳥': '13122010', '葛飾区|立石': '13122014', '葛飾区|細田': '13122025', '葛飾区|西亀有': '13122016', '葛飾区|西新小岩': '13122017', '葛飾区|西水元': '13122018', '葛飾区|金町': '13122004', '葛飾区|鎌倉': '13122006', '葛飾区|青戸': '13122001', '葛飾区|高砂': '13122012', '豊島区|上池袋': '13116004', '豊島区|北大塚': '13116005', '豊島区|千川': '13116021', '豊島区|千早': '13116022', '豊島区|南大塚': '13116018', '豊島区|南池袋': '13116017', '豊島区|南長崎': '13116019', '豊島区|巣鴨': '13116007', '豊島区|東池袋': '13116016', '豊島区|池袋': '13116001', '豊島区|池袋本町': '13116002', '豊島区|目白': '13116020', '豊島区|西巣鴨': '13116015', '豊島区|西池袋': '13116014', '豊島区|要町': '13116003', '豊島区|長崎': '13116013', '豊島区|雑司が谷': '13116009', '豊島区|駒込': '13116006', '豊島区|高松': '13116011', '豊島区|高田': '13116010', '足立区|一ツ家': '13121078', '足立区|中央本町': '13121060', '足立区|中川': '13121065', '足立区|伊興': '13121106', '足立区|伊興本町': '13121117', '足立区|佐野': '13121032', '足立区|保塚町': '13121082', '足立区|保木間': '13121081', '足立区|入谷': '13121104', '足立区|入谷町': '13121013', '足立区|六月': '13121098', '足立区|六木': '13121087', '足立区|六町': '13121099', '足立区|加平': '13121023', '足立区|加賀': '13121021', '足立区|北加平町': '13121024', '足立区|千住': '13121040', '足立区|千住中居町': '13121048', '足立区|千住仲町': '13121049', '足立区|千住元町': '13121052', '足立区|千住大川町': '13121043', '足立区|千住宮元町': '13121051', '足立区|千住寿町': '13121045', '足立区|千住旭町': '13121042', '足立区|千住曙町': '13121041', '足立区|千住東': '13121054', '足立区|千住柳町': '13121053', '足立区|千住桜木': '13121055', '足立区|千住橋戸町': '13121050', '足立区|千住河原町': '13121044', '足立区|千住緑町': '13121056', '足立区|千住関屋町': '13121046', '足立区|千住龍田町': '13121047', '足立区|南花畑': '13121084', '足立区|古千谷本町': '13121115', '足立区|堀之内': '13121083', '足立区|大谷田': '13121017', '足立区|宮城': '13121085', '足立区|小台': '13121019', '足立区|島根': '13121035', '足立区|平野': '13121080', '足立区|弘道': '13121028', '足立区|扇': '13121016', '足立区|新田': '13121036', '足立区|日ノ出町': '13121079', '足立区|本木': '13121088', '足立区|本木北町': '13121089', '足立区|本木南町': '13121092', '足立区|本木東町': '13121091', '足立区|本木西町': '13121090', '足立区|東伊興': '13121109', '足立区|東保木間': '13121076', '足立区|東六月町': '13121077', '足立区|東和': '13121062', '足立区|東綾瀬': '13121074', '足立区|柳原': '13121097', '足立区|栗原': '13121027', '足立区|梅島': '13121014', '足立区|梅田': '13121015', '足立区|椿': '13121061', '足立区|江北': '13121029', '足立区|皿沼': '13121033', '足立区|神明': '13121037', '足立区|神明南': '13121038', '足立区|竹の塚': '13121057', '足立区|綾瀬': '13121003', '足立区|興野': '13121018', '足立区|舎人': '13121063', '足立区|花畑': '13121073', '足立区|西伊興': '13121107', '足立区|西保木間': '13121072', '足立区|西加平': '13121071', '足立区|西新井': '13121067', '足立区|西新井本町': '13121069', '足立区|西新井栄町': '13121068', '足立区|西竹の塚': '13121108', '足立区|西綾瀬': '13121066', '足立区|谷中': '13121096', '足立区|谷在家': '13121094', '足立区|足立': '13121002', '足立区|辰沼': '13121059', '足立区|関原': '13121039', '足立区|青井': '13121001', '足立区|鹿浜': '13121034'}
 
 
 def _v167_public_oz_codes(cache=None):
@@ -10976,7 +10987,7 @@ class _V168TownOzRegistry:
         while True:
             code=self.tasks.get()
             try:
-                regions,_,_=suumo_ward_regions(web,code)
+                regions,_,_=suumo_ward_regions(web,code,include_municipalities=False)
                 found={}
                 for entry in regions:
                     town=town_base_name(entry.get('suumo_town') or entry.get('town') or '')
@@ -11091,6 +11102,7 @@ def town_colored_shapes(groups,group,features,bounds,max_features=None,include_n
             'properties':{'name':key.replace('|',' '),'has_data':False,
                           'color':'#d0d7da','count_label':'0',
                           'price_label':'n/a',
+                          'suumo_ward':key.split('|',1)[0], 'suumo_name':key.split('|',1)[1],
                           'suumo_url':_v167_suumo_town_search(key,group,suumo_oz_codes),
                           'suumo_conditions':_V167_SUUMO_CONDITION_LABELS.get(group,''), 'suumo_town':town_base_name(key.split('|',1)[1])}})
     for key in selected:
@@ -11102,6 +11114,7 @@ def town_colored_shapes(groups,group,features,bounds,max_features=None,include_n
                           'avg':round(avg), 'price_label':f'{avg/10000:.1f}\u4e07\u5186',
                           'count_label':f'{count}\u4ef6',
                           'color':town_rent_gradient(avg),
+                          'suumo_ward':key.split('|',1)[0], 'suumo_name':key.split('|',1)[1],
                           'suumo_url':_v167_suumo_town_search(key,group,suumo_oz_codes),
                           'suumo_conditions':_V167_SUUMO_CONDITION_LABELS.get(group,''), 'suumo_town':town_base_name(key.split('|',1)[1])}})
     return result,limited,len(rented)
@@ -11965,27 +11978,38 @@ def _v189_resolve_suumo_selection(state,data,group):
     name=str(data.get('name') or '')[:90]
     kind=str(data.get('kind') or '')
     key=ward+'|'+name+'|'+kind
-    reply={'key':key,'error':''}
+    reply={'key':key,'error':'','ticket':str(data.get('ticket') or '')[:100],'url':''}
     city=_V167_WARD_TO_CODE.get(ward)
     if not city or kind not in ('ward','town','chome'):
         reply['error']='SUUMOの検索地域を確認できません。地名を検索し直してください。'
         return reply
-    if kind=='ward':return reply
+    if kind=='ward':
+        reply['url']=_v189_suumo_search_url(city,group);return reply
     town=town_base_name(name)
     if not town or not re.fullmatch(r'[\w\u3040-\u30ff\u3400-\u9fff\u3005\u30fc\-]+',town):
         reply['error']='SUUMOの町名を確認できません。'
         return reply
     codes=_v167_public_oz_codes(state.get('ward_town_cache'))
     codes.update(_v168_town_oz_registry().snapshot())
-    if _v167_suumo_town_search(ward+'|'+name,group,codes):return reply
+    reply['url']=_v167_suumo_town_search(ward+'|'+name,group,codes)
+    if reply['url']:return reply
     try:
         web=PublicWeb();web.configure(rental_network_settings())
-        regions,munis,_=suumo_ward_regions(web,city)
+        audit=state.get('_v217_suumo_audit')
+        if audit is None:
+            audit=AuditLog({'mode':'suumo_town'},_v209_log_secrets());state['_v217_suumo_audit']=audit
+        web.audit=audit
+        trace(web,'suumo_popup_lookup_start',{'ward':ward,'town':town,'ticket':reply['ticket']},stage='suumo.town_lookup')
+        regions,munis,_=suumo_ward_regions(web,city,include_municipalities=False)
         state.setdefault('ward_town_cache',{})[city]={'regions':regions,'munis':munis}
         codes=_v167_public_oz_codes(state.get('ward_town_cache'))
-        if not _v167_suumo_town_search(ward+'|'+name,group,codes):
+        reply['url']=_v167_suumo_town_search(ward+'|'+name,group,codes)
+        trace(web,'suumo_popup_lookup_result',{'ward':ward,'town':town,'url':reply['url'],'towns':len(codes)},stage='suumo.town_lookup')
+        if not reply['url']:
             reply['error']='SUUMOで同じ町名を確認できませんでした。別の地域には変更しません。'
     except Exception as exc:
+        if state.get('_v217_suumo_audit'):
+            state['_v217_suumo_audit'].add('suumo.town_lookup','suumo_popup_lookup_failed','ERROR',{'ward':ward,'town':town,'exception_type':type(exc).__name__,'reason':str(exc),'traceback':traceback.format_exc(),'diagnostic':getattr(exc,'diagnostic',{})})
         reply['error']='SUUMOの町名確認に失敗しました。SUUMOボタンで再試行できます。'
     return reply
 
@@ -12001,6 +12025,7 @@ function v202HomeView(args){
  if(epoch===state._v202HomeEpoch)return;
  state._v202HomeEpoch=epoch;
  state._v189Place=null;state._v189Pending=false;state._v189Reply=null;
+ state._v217Active=null;state._v217Pending=null;state._v217Reply=null;
  state._v185FocusActive=false;state.lastJumpToken=null;state.searchPendingTicket=null;
  if(state.focusLayer){state.map.removeLayer(state.focusLayer);state.focusLayer=null;}
  if(state.provisionalFocus){state.map.removeLayer(state.provisionalFocus);state.provisionalFocus=null;}
@@ -12225,7 +12250,7 @@ function v211CancelDraft(){
 function v211DraftDetails(){
  var item=state._v211Draft;if(!item)return;
  var address=String(item.address||'住所を確認しています…');
- document.getElementById('v206-result-detail').textContent='仮ピン（未確定）\n施設名：'+item.name+'\n住所：'+address+'\n緯度 '+item.lat.toFixed(6)+' / 経度 '+item.lng.toFixed(6);
+ document.getElementById('v206-result-detail').textContent='仮ピン（未確定）\n施設名：'+item.name+'\n住所：'+address+'\n情報：'+String(item.source||'地図で指定')+(item.source_url?'\n出典：'+item.source_url:'')+'\n緯度 '+item.lat.toFixed(6)+' / 経度 '+item.lng.toFixed(6);
  var pending=!!state._v207DetailPending||!item.address||!!item.address_error;
  document.getElementById('v205-pin-add').disabled=pending;
  if(state._v211DraftAddress)state._v211DraftAddress.textContent='住所：'+address;
@@ -12509,7 +12534,7 @@ def _v208_landmark_failure(web,data,exc,operation,info=None):
 
 def _v209_log_secrets():
     values=[]
-    for name in ('SUPABASE_SECRET_KEY','SUPABASE_SERVICE_ROLE_KEY'):
+    for name in ('SUPABASE_SECRET_KEY','SUPABASE_SERVICE_ROLE_KEY','LANDMARK_BRAVE_API_KEY'):
         value=os.environ.get(name)
         if value is None:
             try:value=st.secrets.get(name,'')
@@ -12596,6 +12621,11 @@ def _v212_photon_document(web,query):
                 if geometry.get('type')!='Point':raise ValueError('geometry is not a Point')
                 lng,lat=map(float,geometry['coordinates'][:2]);name=normal(props.get('name'))
                 if not name:raise ValueError('facility name missing')
+                def name_key(value):
+                    return re.sub(r'[\W_]+','',unicodedata.normalize('NFKC',str(value)).casefold()).replace('株式会社','').replace('有限会社','')
+                requested=name_key(query);named=name_key(name)
+                if len(requested)>=3 and not (requested in named or (len(named)>=3 and named in requested)):
+                    raise ValueError('facility name does not match query')
                 if not (math.isfinite(lat) and math.isfinite(lng) and 35.45<=lat<=35.95 and 139.4<=lng<=140.05):raise ValueError('outside supported region')
                 if props.get('countrycode') and str(props['countrycode']).upper()!='JP':raise ValueError('country is not Japan')
                 parts=[]
@@ -12621,17 +12651,116 @@ def _v212_photon_document(web,query):
         raise
 
 
-def _v212_name_document(web,query,pattern):
+# Independent opt-in: rental search API consent is never reused for landmarks.
+
+
+def _v216_setting(name,default=''):
+    value=os.environ.get(name)
+    if value is None:
+        try:value=st.secrets.get(name,default)
+        except Exception:value=default
+    return value
+
+
+def _v216_web_document(web,query):
+    key=str(_v216_setting('LANDMARK_BRAVE_API_KEY')).strip()
+    if not key or str(_v216_setting('LANDMARK_BRAVE_API_APPROVED')).upper()!='YES':
+        trace(web,'landmark_web_api_disabled',{'reason':'API key and separate opt-in required'},stage='landmark.name_search')
+        return None
+    try:limit=max(0,int(_v216_setting('LANDMARK_BRAVE_API_MAX_REQUESTS','25')))
+    except (ValueError,TypeError):limit=0
+    bucket=hashlib.sha256(key.encode()).hexdigest()
+    budget=_v216_api_budget()
+    with budget['lock']:
+        used=budget['uses'].get(bucket,0)
+        if used>=limit:
+            trace(web,'landmark_api_budget_exhausted',{'requests':used,'limit':limit},'WARNING','landmark.name_search')
+            return None
+        budget['uses'][bucket]=used+1
+    started=time.monotonic();status=None
     try:
-        doc,info=_v212_photon_document(web,query)
-        if doc['elements']:return doc,info
-        trace(web,'landmark_geocoder_empty',{'query':query,'provider':'Photon','next_provider':'Overpass'},stage='landmark.name_search')
+        # Never pass the key/headers/exception body through the HTTP URL logger.
+        response=requests.get('https://api.search.brave.com/res/v1/web/search',
+            params={'q':query+' 所在地 住所 東京','country':'JP','search_lang':'ja','count':10},
+            headers={'X-Subscription-Token':key,'Accept':'application/json'},
+            timeout=(4,12),allow_redirects=False)
+        status=int(response.status_code)
+        trace(web,'landmark_web_api_response',{'provider':'Brave Search','status':status,
+            'query':query,'request_number':used+1,'elapsed_ms':round((time.monotonic()-started)*1000)},stage='landmark.name_search')
+        if status!=200:raise ValueError('Search API HTTP '+str(status))
+        if len(response.content)>1_000_000:raise ValueError('Search API response too large')
+        doc=response.json();rows=(doc.get('web') or {}).get('results')
+        if not isinstance(rows,list):raise ValueError('Search API results array missing')
+        elements=[];seen=set()
+        def token(text):return re.sub(r'[\W_]+','',unicodedata.normalize('NFKC',text).casefold())
+        wanted=token(query)
+        for row in rows:
+            if not isinstance(row,dict):continue
+            title=normal(html.unescape(re.sub('<[^>]*>','',str(row.get('title') or ''))))
+            url=str(row.get('url') or '');parsed=urlparse(url)
+            if parsed.scheme!='https' or not parsed.hostname or parsed.username or parsed.password:continue
+            # A page mentioning another facility must not inherit the user's name.
+            if wanted not in token(title):
+                trace(web,'landmark_web_candidate_rejected',{'url':url,'reason':'query_name_not_in_title'},stage='landmark.result');continue
+            text=html.unescape(re.sub('<[^>]*>','',str(row.get('description') or '')))
+            addresses=_extract_detailed_addresses(text)
+            addresses+=re.findall(r'東京都[^\s,、。|<>]{1,12}区[^\s,、。|<>]{1,20}?\d+-\d+(?:-\d+)?',unicodedata.normalize('NFKC',text))
+            for address in dict.fromkeys(addresses):
+                if address in seen:continue
+                seen.add(address)
+                try:
+                    points,info=_v208_landmark_json(web,'https://msearch.gsi.go.jp/address-search/AddressSearch',{'q':address},'web_address_lookup')
+                    if not isinstance(points,list):raise ValueError('GSI address response is not an array')
+                    accepted=0
+                    for point in points:
+                        lng,lat=map(float,point['geometry']['coordinates'][:2]);matched=normal(point.get('properties',{}).get('title'))
+                        def address_token(value):
+                            value=address_key(value).replace('丁目','-').replace('番地','-').replace('番','-').replace('号','')
+                            return re.sub(r'\s+','',value).rstrip('-')
+                        a=address_token(address);b=address_token(matched)
+                        approximate=bool(re.search(r'\d$',b)) and a.startswith(b+'-')
+                        if not b or not (a==b or approximate) or not (35.45<=lat<=35.95 and 139.4<=lng<=140.05):continue
+                        label=address+'（Web検索の住所候補・要確認）'
+                        if a!=b:label+='／地図位置は'+matched+'の概略'
+                        elements.append({'lat':lat,'lon':lng,'tags':{'name':query,'addr:full':label,'source':url}});accepted+=1
+                    trace(web,'landmark_web_address_candidates',{'url':url,'page_title':title,'address':address,'accepted':accepted,'verification':'snippet_candidate_requires_user_confirmation'},stage='landmark.result')
+                except Exception as exc:
+                    _v208_landmark_failure(web,{'query':query},exc,'web_address_lookup')
+        return {'elements':elements},{'provider':'Brave Search + 国土地理院','source':'Web検索の住所候補 / 国土地理院（要確認）'}
     except Exception as exc:
-        detail={**(getattr(exc,'diagnostic',{}) or {}),**(getattr(exc,'landmark_diagnostic',{}) or {}),**_v212_exception_details(exc)}
-        trace(web,'landmark_geocoder_failed',{**detail,'query':query,'provider':'Photon','reason':str(exc),'exception_type':type(exc).__name__},'ERROR','landmark.name_search')
-        status=detail.get('status')
-        if str(status) in ('401','403','429'):raise
-    return _v211_name_document(web,query,pattern)
+        # Tokens may occur in transport exception text. Record safe diagnostics only.
+        trace(web,'landmark_web_api_failed',{'provider':'Brave Search','status':status,
+            'exception_type':type(exc).__name__,'reason':str(exc).replace(key,'[REDACTED]')[:1500],
+            'exception_chain':json.loads(json.dumps(_v212_exception_details(exc),ensure_ascii=False).replace(key,'[REDACTED]')),
+            'elapsed_ms':round((time.monotonic()-started)*1000),
+            'failure_phase':'response_validation' if status else 'connection_or_response_wait'},'ERROR','landmark.name_search')
+        return None
+
+
+def _v212_name_document(web,query,pattern):
+    # Preserve spaces in the first query; normalize punctuation/case only for retries.
+    variants=list(dict.fromkeys([query,re.sub(r'\s+','',query),
+        re.sub(r'\s+','',query).upper().replace('＆','&')]))
+    empty=None
+    for variant in variants:
+        try:
+            doc,info=_v212_photon_document(web,variant)
+            if doc['elements']:return doc,info
+            empty=(doc,info)
+            trace(web,'landmark_geocoder_empty',{'query':variant,'provider':'Photon','reason':'coverage_no_match'},stage='landmark.name_search')
+        except Exception as exc:
+            detail={**(getattr(exc,'diagnostic',{}) or {}),**(getattr(exc,'landmark_diagnostic',{}) or {}),**_v212_exception_details(exc)}
+            trace(web,'landmark_geocoder_failed',{**detail,'query':variant,'provider':'Photon','reason':str(exc),'exception_type':type(exc).__name__},'ERROR','landmark.name_search')
+            if str(detail.get('status')) in ('401','403','429'):raise
+            break
+    extra=_v216_web_document(web,query)
+    if extra and extra[0]['elements']:return extra
+    try:return _v211_name_document(web,query,pattern)
+    except Exception as exc:
+        if empty is None:raise
+        trace(web,'landmark_supplement_failed',{'query':query,'reason':str(exc),**_v212_exception_details(exc)},'WARNING','landmark.name_search')
+        # A valid primary response with zero results is not a total search outage.
+        return empty
 
 
 def _v211_name_document(web,query,pattern):
@@ -12712,7 +12841,7 @@ def _v207_search_landmarks(data,audit=None):
     compact=re.sub(r'\s+','',query)
     pattern=re.sub(r'([.\[\]{}()*+?^$|\\])',r'\\\1',compact)
     try:
-        doc,info=_v212_name_document(web,compact,pattern)
+        doc,info=_v212_name_document(web,query,pattern)
         seen=set()
         for element in doc['elements']:
             try:
@@ -12726,12 +12855,12 @@ def _v207_search_landmarks(data,audit=None):
                 key=(name,round(lat,5),round(lng,5))
                 if key in seen:continue
                 seen.add(key);reply['candidates'].append({'name':name,'title':name,'address':address[:180],
-                    'lat':lat,'lng':lng,'source':info.get('provider','Overpass')+' / OpenStreetMap','address_checked':bool(address)})
+                    'lat':lat,'lng':lng,'source':info.get('source') or info.get('provider','Overpass')+' / OpenStreetMap','source_url':str(tags.get('source') or ''),'address_checked':bool(address)})
             except (KeyError,TypeError,ValueError,AttributeError):continue
         reply['candidates'].sort(key=lambda p:(re.sub(r'\s+','',p['name']).casefold()!=compact.casefold(),p['name'],p['lat'],p['lng']))
         trace(web,'landmark_result',{'query':query,'ticket':ticket,'elements':len(doc['elements']),'candidates':len(reply['candidates'])},stage='landmark.result')
         if not reply['candidates']:
-            reply['error']='施設名が見つかりません。正式名称や名前の一部で再検索してください。'
+            reply['error']='施設名データに一致する候補がありません。正式名称・表記を変えて検索するか、「設定」→「初期設定」の施設名検索APIを設定してください。'
             trace(web,'landmark_no_candidates',{**info,'query':query,'reason':reply['error'],'elements':len(doc['elements'])},'WARNING','landmark.result')
     except Exception as exc:
         _v208_landmark_failure(web,data,exc,'name_search',info)
@@ -12743,9 +12872,73 @@ def _v207_search_landmarks(data,audit=None):
 _V210_BUTTON_CSS = '\n/* v210: buttons created later (popups, zoom, candidate actions) inherit feedback. */\nbutton:not(:disabled):is(:active,:focus),a[role="button"]:is(:active,:focus),\na.leaflet-control-zoom-in:is(:active,:focus),a.leaflet-control-zoom-out:is(:active,:focus),\na.v167-suumo-link:not([aria-disabled="true"]):is(:active,:focus){\n background:#174a6a!important;color:#fff!important;border-color:#174a6a!important;\n box-shadow:0 0 0 3px rgba(23,74,106,.25)!important}\nbutton:not(:disabled):is(:active,:focus) *,a.v167-suumo-link:is(:active,:focus) *{color:inherit!important}\nbutton:not(:disabled):focus-visible,a[role="button"]:focus-visible{\n outline:3px solid #b35636;outline-offset:3px}\n#v205-pin-search:disabled,#town-submit:disabled,#town-confirm:disabled{\n background:#174a6a!important;color:#fff!important;border-color:#174a6a!important;cursor:wait}\n'
 TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('</style></head>',_V210_BUTTON_CSS+'</style></head>',1)
 
+# v217: polygon SUUMO actions resolve their own clicked town, independently of
+# the text search box and of rent aggregate availability.
+_V217_POPUP_JS = r"""
+function v217Place(props){
+ var ward=String(props.suumo_ward||''),name=String(props.suumo_name||props.suumo_town||'');
+ if(!ward){var parts=String(props.name||'').match(/^(.+?区)\s+(.+)$/);if(parts){ward=parts[1];name=parts[2];}}
+ return {ward:ward,name:name,kind:/丁目$/.test(name)?'chome':'town'};
+}
+function v217Url(place,preferred){
+ var city=(state._v189WardCodes||{})[place.ward];
+ function valid(value){try{var u=new URL(value);return u.origin==='https://suumo.jp'&&u.pathname==='/jj/chintai/ichiran/FR301FC001/'&&u.searchParams.get('sc')===city&&new RegExp('^'+city+'[0-9]{3}$').test(u.searchParams.get('oz')||'')?u.href:''}catch(e){return ''}}
+ if(!city)return '';
+ var base=normalizeTownQuery(place.name).replace(/[0-9一二三四五六七八九十]+丁目.*$/,'');
+ var code=(state._v189Oz||{})[place.ward+'|'+base],wardUrl=(state._v189WardUrls||{})[place.ward];
+ if(code&&wardUrl){var target=new URL(wardUrl);target.searchParams.set('oz',code);var current=valid(target.href);if(current)return current;}
+ return valid(preferred||'');
+}
+function v217UpdatePopup(entry){
+ if(!entry)return;
+ var request=state._v217Pending,reply=state._v217Reply;
+ var key=v189SelectionKey(entry.place),url=v217Url(entry.place,entry.props.suumo_url),error='';
+ if(reply&&reply.key===key){if(!url)url=v217Url(entry.place,reply.url);error=reply.error||'';}
+ if(url){entry.link.href=url;entry.link.removeAttribute('aria-disabled');entry.link.textContent='SUUMOで検索 ↗';
+  entry.help.textContent='SUUMO町名：'+String(entry.props.suumo_town||entry.place.name)+'｜'+String(entry.props.suumo_conditions||'')+'｜駅徒歩15分以内・住所順・50件（丁目を含む町全体）';
+ }else{entry.link.removeAttribute('href');entry.link.setAttribute('aria-disabled','true');
+  entry.link.textContent=request&&request.key===key?'SUUMO 確認中…':(error?'SUUMO 再試行':'SUUMOで検索');
+  entry.help.textContent=error||(request&&request.key===key?'SUUMOの町名を確認しています。':'SUUMOボタンでこの町名を確認します。');}
+ if(entry.layer.getPopup){var popup=entry.layer.getPopup();if(popup&&popup.isOpen&&popup.isOpen()&&popup.update)popup.update();}
+}
+function v217RequestPopup(entry){
+ if(!entry||!entry.place.ward||!entry.place.name)return;
+ var key=v189SelectionKey(entry.place);
+ if(state._v217Pending&&state._v217Pending.key===key)return;
+ var ticket='polygon_'+Date.now()+'_'+Math.random().toString(36).slice(2,10);
+ state._v217Reply=null;state._v217Pending={ticket:ticket,key:key};
+ v217UpdatePopup(entry);
+ hostMessage('streamlit:setComponentValue',{dataType:'json',value:{event:'polygon_suumo_v217',ticket:ticket,
+  ward:entry.place.ward,name:entry.place.name,kind:entry.place.kind,home_view_epoch:state._v202HomeEpoch}});
+}
+function v217AttachSuumo(layer,actions,el,props){
+ var link=document.createElement('a');link.className='v167-suumo-link';link.target='_blank';link.rel='noopener noreferrer';
+ link.setAttribute('role','button');link.setAttribute('tabindex','0');actions.appendChild(link);
+ var help=document.createElement('div');help.className='v167-suumo-note';el.appendChild(help);
+ var entry={link:link,help:help,props:props,place:v217Place(props),layer:layer};
+ v217UpdatePopup(entry);
+ function activate(e){if(!link.hasAttribute('href')){e.preventDefault();v217RequestPopup(entry);}}
+ link.addEventListener('click',activate);
+ link.addEventListener('keydown',function(e){if(e.key==='Enter'||e.key===' '){e.preventDefault();link.click();}});
+ layer.on('click',function(){state._v217Active=entry;v217UpdatePopup(entry);if(!link.hasAttribute('href'))v217RequestPopup(entry);});
+}
+function v217PopupReply(args){
+ var reply=args.polygon_suumo_reply,pending=state._v217Pending;
+ if(reply&&pending&&reply.ticket===pending.ticket&&reply.key===pending.key){state._v217Reply=reply;state._v217Pending=null;}
+ v217UpdatePopup(state._v217Active);
+}
+"""
+_v217_start=TOWN_COMPONENT_HTML_V121.index("var suumo=String(props.suumo_url||'');")
+_v217_end=TOWN_COMPONENT_HTML_V121.index("var route=document.createElement('a');",_v217_start)
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121[:_v217_start]+'v217AttachSuumo(layer,actions,el,props);\n'+TOWN_COMPONENT_HTML_V121[_v217_end:]
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('function render(args){',_V217_POPUP_JS+'\nfunction render(args){',1)
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(' v189UpdateSuumo();\n initTownSearch();',' v189UpdateSuumo();\n v217PopupReply(args);\n initTownSearch();',1)
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('state._v205SearchPending||state._v207DetailPending)return;',
+ 'state._v205SearchPending||state._v207DetailPending||state._v217Pending)return;',1)
+
 @st.cache_resource(show_spinner=False)
 def town_component_v121():
-    _asset_revision='v215-pin-layout-contextmenu'
+    _asset_revision='v217-polygon-suumo'
     folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-'+_asset_revision)
     os.makedirs(folder,exist_ok=True)
     path=os.path.join(folder,'index.html')
@@ -12763,7 +12956,13 @@ def town_component_v121():
         with open(temp_path,'w',encoding='utf-8') as output:
             output.write(TOWN_COMPONENT_HTML_V121)
         os.replace(temp_path,path)
-    return st.components.v1.declare_component('sumai_town_map_v215',path=folder)
+    return st.components.v1.declare_component('sumai_town_map_v217',path=folder)
+
+@st.cache_resource(show_spinner=False)
+def _v216_api_budget():
+    # Survives ordinary Streamlit reruns; process restarts reset usage.
+    return {'lock':threading.Lock(),'uses':{}}
+
 
 # v159: Station-to-office approximate train travel times, OFFLINE AND READ-ONLY.
 # Tokyo Metro/Toei/JR local edge minutes adapted from MIT-licensed public project:
@@ -13591,7 +13790,8 @@ def interactive_town_choropleth(group):
     suumo_oz_codes=_v167_public_oz_codes(state.get('ward_town_cache'))
     suumo_oz_codes.update(registry.snapshot())
     oz_signature=hashlib.sha256(repr(sorted(suumo_oz_codes.items())).encode('utf-8')).hexdigest()[:12]
-    signature=(BUILD,group,revision,reset,snap['revision'],summary_version,bool(ready),oz_signature)
+    # Code arrivals update popup links independently; do not close an open popup.
+    signature=(BUILD,group,revision,reset,snap['revision'],summary_version,bool(ready))
     cached=state.get('_v118_choropleth_payload')
     bounds=state.get('new_bounds')
     center=bounds_center(bounds) if bounds else state.get('new_view_center',_V202_HOME_CENTER)
@@ -13641,6 +13841,7 @@ def interactive_town_choropleth(group):
                 suumo_ward_codes=_V167_WARD_TO_CODE,
                 suumo_town_codes=suumo_oz_codes,
                 suumo_search_reply=state.get('_v189_suumo_reply'),
+                polygon_suumo_reply=state.get('_v217_suumo_reply'),
                 custom_pin_reply=state.get('_v205_pin_reply'),
                 search_error=state.get('_v184_search_error'),
                 commute_destination=(destinations[0] if destinations else ''),
@@ -13654,6 +13855,12 @@ def interactive_town_choropleth(group):
             if ticket and ticket!=state.get('_v205_last_pin_ticket'):
                 state['_v205_last_pin_ticket']=ticket
                 state['_v205_pin_reply']=_v208_run_landmark_lookup(state,data)
+                st.rerun(scope='fragment')
+        if data.get('event')=='polygon_suumo_v217':
+            ticket=str(data.get('ticket') or '')[:100]
+            if ticket and ticket!=state.get('_v217_last_suumo_ticket'):
+                state['_v217_last_suumo_ticket']=ticket
+                state['_v217_suumo_reply']=_v189_resolve_suumo_selection(state,data,group)
                 st.rerun(scope='fragment')
         if data.get('event')=='town_suumo_v189':
             ticket=str(data.get('ticket') or '')[:100]
@@ -14488,6 +14695,13 @@ def _v209_saved_log_tools(state):
 
 
 def _v209_initial_settings(state):
+            st.subheader('施設名検索API（任意）')
+            st.write('通常はPhoton / OpenStreetMapを使います。会社名などが見つからない場合は、Brave Search APIで住所候補を探し、国土地理院で位置を検索します。住所候補は検索ページの記載で、正確性は未確認です。仮ピンの住所と位置を必ず確認してください。')
+            st.caption('利用する場合はBrave Search APIのキーを取得し、StreamlitのSecretsに次の3項目を設定してください。APIの利用料は契約によります。未設定では呼び出しません。上限は実行プロセスごとのリクエスト数で、再起動するとリセットされます。請求上限はAPI提供元で管理してください。')
+            st.code('LANDMARK_BRAVE_API_KEY = "取得したAPIキー"\nLANDMARK_BRAVE_API_APPROVED = "YES"\nLANDMARK_BRAVE_API_MAX_REQUESTS = 25',language='toml')
+            enabled=bool(_v216_setting('LANDMARK_BRAVE_API_KEY')) and str(_v216_setting('LANDMARK_BRAVE_API_APPROVED')).upper()=='YES'
+            st.caption('施設名Web検索API：'+('有効' if enabled else '未設定（通常の施設名検索のみ）'))
+            st.markdown('[APIキーの取得・料金確認](https://brave.com/search/api/)')
             st.subheader('実URL・Supabase保存検証（追加課金なし）')
             st.caption('旧版の失敗ログから固定抽出した実URLを再検索し、住所・家賃・間取りを保存してSupabaseで読み戻します。24/30以上で合格。')
             groups={'詳細住所確定失敗 30 URL':'map.address_inference',
@@ -14564,6 +14778,9 @@ def _v209_log_tools(state):
     st.subheader('ログ出力')
     st.button('ログ表示を更新',key='settings_refresh_logs_v209')
     _v208_landmark_log_panel(state)
+    if state.get('_v217_suumo_audit'):
+        with st.expander('SUUMO町名検索のログ'):
+            diagnostic_downloads(state['_v217_suumo_audit'].records(),'suumo_town_v217')
     with st.expander('手動検索の作業ログ'):
         if active_job() is None:st.caption('手動検索の作業ログはまだありません。')
         else:background_status()
