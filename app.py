@@ -52,7 +52,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v218"
+BUILD = "REBUILD-01-v219"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -12293,6 +12293,7 @@ function v206SelectCandidate(){
 }
 function v214RemoveRing(id){
  var rings=state._v214Rings;if(!rings||!rings[id])return;
+ if(rings[id].halo)state.map.removeLayer(rings[id].halo);
  state.map.removeLayer(rings[id].layer);delete rings[id];
 }
 function v214ShowRing(pin,minutes){
@@ -12301,10 +12302,14 @@ function v214ShowRing(pin,minutes){
  if(!state.map||!window.L||!v205Point(pin.lat,pin.lng))return false;
  if(!state._v214Rings)state._v214Rings=Object.create(null);
  var existing=state._v214Rings[pin.id];
- if(existing){existing.layer.setLatLng([pin.lat,pin.lng]);existing.layer.setRadius(radius);existing.minutes=minutes;}
+ if(existing){existing.layer.setLatLng([pin.lat,pin.lng]);existing.layer.setRadius(radius);
+  if(existing.halo){existing.halo.setLatLng([pin.lat,pin.lng]);existing.halo.setRadius(radius);}
+  existing.minutes=minutes;}
  else{
-  var circle=L.circle([pin.lat,pin.lng],{radius:radius,color:'#174a6a',weight:2,opacity:.9,fill:false,interactive:false}).addTo(state.map);
-  state._v214Rings[pin.id]={layer:circle,minutes:minutes};
+  // White casing separates the purple outline from every rent color.
+  var halo=L.circle([pin.lat,pin.lng],{radius:radius,color:'#ffffff',weight:8,opacity:1,fill:false,interactive:false}).addTo(state.map);
+  var circle=L.circle([pin.lat,pin.lng],{radius:radius,color:'#7c3aed',weight:4,opacity:1,fill:false,interactive:false}).addTo(state.map);
+  state._v214Rings[pin.id]={layer:circle,halo:halo,minutes:minutes};
  }
  v205Status('「'+pin.name+'」から徒歩'+minutes+'分の目安（直線半径'+Math.round(radius)+'m）を表示しました。');
  return true;
@@ -12315,6 +12320,7 @@ function v214SyncRings(pins){
   var pin=pins.find(function(p){return p.id===id});
   if(!pin){v214RemoveRing(id);return;}
   rings[id].layer.setLatLng([pin.lat,pin.lng]);
+  if(rings[id].halo)rings[id].halo.setLatLng([pin.lat,pin.lng]);
  });
 }
 function v211DeletePopup(marker,pin,event,walkingOnly){
@@ -12947,7 +12953,7 @@ TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('state._v205SearchPend
 
 @st.cache_resource(show_spinner=False)
 def town_component_v121():
-    _asset_revision='v218-pin-walking-button'
+    _asset_revision='v219-visible-walking-ring'
     folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-'+_asset_revision)
     os.makedirs(folder,exist_ok=True)
     path=os.path.join(folder,'index.html')
@@ -12965,7 +12971,7 @@ def town_component_v121():
         with open(temp_path,'w',encoding='utf-8') as output:
             output.write(TOWN_COMPONENT_HTML_V121)
         os.replace(temp_path,path)
-    return st.components.v1.declare_component('sumai_town_map_v218',path=folder)
+    return st.components.v1.declare_component('sumai_town_map_v219',path=folder)
 
 @st.cache_resource(show_spinner=False)
 def _v216_api_budget():
