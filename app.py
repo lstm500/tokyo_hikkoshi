@@ -52,7 +52,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v219"
+BUILD = "REBUILD-01-v220"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -12168,7 +12168,9 @@ function v205Status(text){var el=document.getElementById('v205-pin-status');if(e
 function v205Point(lat,lng){return typeof lat==='number'&&typeof lng==='number'&&Number.isFinite(lat)&&Number.isFinite(lng)&&lat>=34&&lat<=37&&lng>=138&&lng<=141}
 function v205CleanPin(pin){
  if(!pin||typeof pin.id!=='string'||!pin.id||pin.id.length>100||typeof pin.name!=='string'||!pin.name.trim()||pin.name.length>60||!v205Point(pin.lat,pin.lng))return null;
- return {id:pin.id,name:pin.name.trim(),address:String(pin.address||'').slice(0,180),lat:pin.lat,lng:pin.lng};
+ var clean={id:pin.id,name:pin.name.trim(),address:String(pin.address||'').slice(0,180),lat:pin.lat,lng:pin.lng};
+ if(typeof pin.walk_minutes==='number'&&Number.isFinite(pin.walk_minutes)&&pin.walk_minutes>=1&&Number.isFinite(pin.walk_minutes*80))clean.walk_minutes=pin.walk_minutes;
+ return clean;
 }
 function v205LoadPins(){
  try{
@@ -12221,7 +12223,13 @@ function v205DrawPins(){
   walking.setAttribute('aria-label',pin.name+'から徒歩圏の分数を指定して表示');
   walking.addEventListener('click',function(){v211DeletePopup(marker,pin,null,true);});actions.appendChild(walking);
   var hint=document.createElement('div');hint.textContent='長押し・右クリックでその他の操作';hint.className='v205-pin-popup-address';
-  popup.appendChild(actions);popup.appendChild(hint);marker.bindPopup(popup,v215PopupOptions());
+  popup.appendChild(actions);
+  if(pin.walk_minutes!==undefined){
+   var removeRing=document.createElement('button');removeRing.type='button';removeRing.className='v220-remove-ring';removeRing.textContent='徒歩圏を削除';
+   removeRing.setAttribute('aria-label',pin.name+'の徒歩圏の線だけを削除');
+   removeRing.addEventListener('click',function(){if(v214RemoveRing(pin.id)){state.map.closePopup();v205Status('徒歩圏の線を削除しました。');}});popup.appendChild(removeRing);
+  }
+  popup.appendChild(hint);marker.bindPopup(popup,v215PopupOptions());
   marker.on('dragend',function(){var point=marker.getLatLng();
    if(!v205Point(point.lat,point.lng)){marker.setLatLng([pin.lat,pin.lng]);v205Status('対応範囲外です。位置を元に戻しました。');return;}
    var next=(state._v205Pins||[]).map(function(p){return p.id===pin.id?Object.assign({},p,{lat:point.lat,lng:point.lng}):p});
@@ -12291,43 +12299,56 @@ function v206SelectCandidate(){
  }
  v211DraftDetails();setHeight();
 }
-function v214RemoveRing(id){
+function v220DropRing(id){
  var rings=state._v214Rings;if(!rings||!rings[id])return;
  if(rings[id].halo)state.map.removeLayer(rings[id].halo);
  state.map.removeLayer(rings[id].layer);delete rings[id];
 }
+function v214RemoveRing(id){
+ var pins=state._v205Pins||[],pin=pins.find(function(p){return p.id===id});
+ if(pin&&pin.walk_minutes!==undefined){
+  var next=pins.map(function(p){var copy=Object.assign({},p);if(p.id===id)delete copy.walk_minutes;return copy;});
+  if(!v205SavePins(next))return false;
+ }
+ v220DropRing(id);return true;
+}
 function v214ShowRing(pin,minutes){
  minutes=Number(minutes);var radius=minutes*80;
  if(!Number.isFinite(minutes)||minutes<1||!Number.isFinite(radius)){v205Status('分数は1以上の数値で入力してください。');return false;}
- if(!state.map||!window.L||!v205Point(pin.lat,pin.lng))return false;
+ if(!state.map||!window.L||!pin||!v205Point(pin.lat,pin.lng))return false;
+ var pins=state._v205Pins||[];
+ if(!pins.some(function(p){return p.id===pin.id}))return false;
+ var next=pins.map(function(p){return p.id===pin.id?Object.assign({},p,{walk_minutes:minutes}):p;});
+ if(!v205SavePins(next))return false;
+ v205Status('「'+pin.name+'」から徒歩'+minutes+'分の目安（直線半径'+Math.round(radius)+'m）を表示・保存しました。');
+ return true;
+}
+function v220RenderRing(pin){
+ var minutes=pin.walk_minutes,radius=minutes*80;
  if(!state._v214Rings)state._v214Rings=Object.create(null);
  var existing=state._v214Rings[pin.id];
  if(existing){existing.layer.setLatLng([pin.lat,pin.lng]);existing.layer.setRadius(radius);
   if(existing.halo){existing.halo.setLatLng([pin.lat,pin.lng]);existing.halo.setRadius(radius);}
-  existing.minutes=minutes;}
- else{
-  // White casing separates the purple outline from every rent color.
+  existing.minutes=minutes;
+ }else{
   var halo=L.circle([pin.lat,pin.lng],{radius:radius,color:'#ffffff',weight:8,opacity:1,fill:false,interactive:false}).addTo(state.map);
   var circle=L.circle([pin.lat,pin.lng],{radius:radius,color:'#7c3aed',weight:4,opacity:1,fill:false,interactive:false}).addTo(state.map);
   state._v214Rings[pin.id]={layer:circle,halo:halo,minutes:minutes};
  }
- v205Status('「'+pin.name+'」から徒歩'+minutes+'分の目安（直線半径'+Math.round(radius)+'m）を表示しました。');
- return true;
 }
 function v214SyncRings(pins){
- var rings=state._v214Rings;if(!rings)return;
+ var rings=state._v214Rings||{};
  Object.keys(rings).forEach(function(id){
   var pin=pins.find(function(p){return p.id===id});
-  if(!pin){v214RemoveRing(id);return;}
-  rings[id].layer.setLatLng([pin.lat,pin.lng]);
-  if(rings[id].halo)rings[id].halo.setLatLng([pin.lat,pin.lng]);
+  if(!pin||pin.walk_minutes===undefined)v220DropRing(id);
  });
+ pins.forEach(function(pin){if(pin.walk_minutes!==undefined)v220RenderRing(pin);});
 }
 function v211DeletePopup(marker,pin,event,walkingOnly){
  if(event&&event.originalEvent){event.originalEvent.preventDefault();event.originalEvent.stopPropagation();}
  var popup=document.createElement('div'),title=document.createElement('div'),hint=document.createElement('p');
  popup.className='v215-pin-menu';title.className='v205-pin-popup-title';title.textContent=walkingOnly?pin.name+'の徒歩圏':pin.name;popup.appendChild(title);
- hint.textContent='徒歩1分＝80mの直線距離の目安です。道路・坂道・信号は反映しません。円は再読み込み・終了で消えます。';hint.style.fontSize='11px';popup.appendChild(hint);
+ hint.textContent='徒歩1分＝80mの直線距離の目安です。道路・坂道・信号は反映しません。円はピンと一緒にこのブラウザーへ保存され、次回も表示します。';hint.style.fontSize='11px';popup.appendChild(hint);
  var label=document.createElement('label');label.className='v215-minute-row';label.textContent='徒歩の分数：';
  var input=document.createElement('input');input.type='number';input.min='1';input.step='1';
  input.value=String((state._v214Rings&&state._v214Rings[pin.id])?state._v214Rings[pin.id].minutes:10);
@@ -12336,7 +12357,7 @@ function v211DeletePopup(marker,pin,event,walkingOnly){
  show.addEventListener('click',function(){if(v214ShowRing(pin,input.value))state.map.closePopup();});popup.appendChild(show);
  if(state._v214Rings&&state._v214Rings[pin.id]){
   var hide=document.createElement('button');hide.type='button';hide.textContent='この円を消す';
-  hide.addEventListener('click',function(){v214RemoveRing(pin.id);state.map.closePopup();v205Status('円を非表示にしました。');});popup.appendChild(hide);
+  hide.addEventListener('click',function(){if(v214RemoveRing(pin.id)){state.map.closePopup();v205Status('徒歩圏の線を削除しました。');}});popup.appendChild(hide);
  }
  if(!walkingOnly){
  var remove=document.createElement('button');remove.type='button';remove.className='v205-pin-delete';remove.textContent='ピンを削除…';
@@ -12953,7 +12974,7 @@ TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('state._v205SearchPend
 
 @st.cache_resource(show_spinner=False)
 def town_component_v121():
-    _asset_revision='v219-visible-walking-ring'
+    _asset_revision='v220-persistent-walking-ring'
     folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-'+_asset_revision)
     os.makedirs(folder,exist_ok=True)
     path=os.path.join(folder,'index.html')
@@ -12971,7 +12992,7 @@ def town_component_v121():
         with open(temp_path,'w',encoding='utf-8') as output:
             output.write(TOWN_COMPONENT_HTML_V121)
         os.replace(temp_path,path)
-    return st.components.v1.declare_component('sumai_town_map_v219',path=folder)
+    return st.components.v1.declare_component('sumai_town_map_v220',path=folder)
 
 @st.cache_resource(show_spinner=False)
 def _v216_api_budget():
