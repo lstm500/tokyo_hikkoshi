@@ -52,7 +52,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v220"
+BUILD = "REBUILD-01-v221"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -12324,6 +12324,9 @@ function v214ShowRing(pin,minutes){
  return true;
 }
 function v220RenderRing(pin){
+ // Dedicated pane: above rent polygons and focus fill, below stations/pins.
+ if(!state.map.getPane('walkingRingPane'))state.map.createPane('walkingRingPane');
+ var pane=state.map.getPane('walkingRingPane');pane.style.zIndex='660';pane.style.pointerEvents='none';
  var minutes=pin.walk_minutes,radius=minutes*80;
  if(!state._v214Rings)state._v214Rings=Object.create(null);
  var existing=state._v214Rings[pin.id];
@@ -12331,8 +12334,8 @@ function v220RenderRing(pin){
   if(existing.halo){existing.halo.setLatLng([pin.lat,pin.lng]);existing.halo.setRadius(radius);}
   existing.minutes=minutes;
  }else{
-  var halo=L.circle([pin.lat,pin.lng],{radius:radius,color:'#ffffff',weight:8,opacity:1,fill:false,interactive:false}).addTo(state.map);
-  var circle=L.circle([pin.lat,pin.lng],{radius:radius,color:'#7c3aed',weight:4,opacity:1,fill:false,interactive:false}).addTo(state.map);
+  var halo=L.circle([pin.lat,pin.lng],{pane:'walkingRingPane',radius:radius,color:'#ffffff',weight:8,opacity:1,fill:false,interactive:false}).addTo(state.map);
+  var circle=L.circle([pin.lat,pin.lng],{pane:'walkingRingPane',radius:radius,color:'#7c3aed',weight:4,opacity:1,fill:false,interactive:false}).addTo(state.map);
   state._v214Rings[pin.id]={layer:circle,halo:halo,minutes:minutes};
  }
 }
@@ -12974,7 +12977,7 @@ TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('state._v205SearchPend
 
 @st.cache_resource(show_spinner=False)
 def town_component_v121():
-    _asset_revision='v220-persistent-walking-ring'
+    _asset_revision='v221-walking-ring-pane'
     folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-'+_asset_revision)
     os.makedirs(folder,exist_ok=True)
     path=os.path.join(folder,'index.html')
@@ -12992,7 +12995,7 @@ def town_component_v121():
         with open(temp_path,'w',encoding='utf-8') as output:
             output.write(TOWN_COMPONENT_HTML_V121)
         os.replace(temp_path,path)
-    return st.components.v1.declare_component('sumai_town_map_v220',path=folder)
+    return st.components.v1.declare_component('sumai_town_map_v221',path=folder)
 
 @st.cache_resource(show_spinner=False)
 def _v216_api_budget():
