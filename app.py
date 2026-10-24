@@ -52,7 +52,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v217"
+BUILD = "REBUILD-01-v218"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -12152,6 +12152,10 @@ _V205_PIN_CSS = """
 .v215-pin-menu button{box-sizing:border-box;display:block;flex:none;width:100%;min-height:40px;padding:8px 10px;margin:0;border:1px solid #9eb4bd;border-radius:6px;background:#edf4f7;color:#173a5e;font-size:13px;line-height:1.3;white-space:normal;cursor:pointer;touch-action:manipulation}
 .v215-pin-menu button.v205-pin-delete{color:#a52c40;border-color:#ba7180;background:#fff}
 .v215-pin-menu .v204-popup-actions{display:flex;flex-wrap:wrap;gap:6px}
+.v215-pin-menu .v218-pin-actions{display:flex;flex-wrap:nowrap;align-items:stretch;gap:6px}
+.v215-pin-menu .v218-pin-actions>a,.v215-pin-menu .v218-pin-actions>button{
+ box-sizing:border-box;flex:1 1 0;width:auto;min-width:0;min-height:40px;margin:0;padding:8px 6px;
+ display:flex;align-items:center;justify-content:center;text-align:center;font-size:13px;line-height:1.35;white-space:normal;overflow-wrap:anywhere}
 .v215-pin-menu .v215-minute-row{display:flex;align-items:center;justify-content:space-between;gap:10px;margin:0;font-size:13px;white-space:nowrap}
 .v215-pin-menu input[type=number]{box-sizing:border-box;flex:0 0 84px;width:84px;min-width:0;min-height:40px;padding:6px;border:1px solid #9eb4bd;border-radius:6px;background:#fff;color:#173a5e;font-size:16px}
 .leaflet-tooltip.v205-pin-label,.leaflet-tooltip.v205-pin-label span{white-space:nowrap!important;writing-mode:horizontal-tb!important;word-break:keep-all!important}
@@ -12211,9 +12215,12 @@ function v205DrawPins(){
   var popup=document.createElement('div'),heading=document.createElement('div'),address=document.createElement('div');
   heading.className='v205-pin-popup-title';heading.textContent=pin.name;
   address.className='v205-pin-popup-address';address.textContent=pin.address||'地図で指定した場所';popup.className='v215-pin-menu';popup.appendChild(heading);popup.appendChild(address);
-  var actions=document.createElement('div');actions.className='v204-popup-actions';
+  var actions=document.createElement('div');actions.className='v204-popup-actions v218-pin-actions';
   var route=document.createElement('a');route.className='v167-suumo-link';route.textContent='経路案内 ↗';route.href=v204DirectionsUrl(pin);route.target='_blank';route.rel='noopener noreferrer';actions.appendChild(route);
-  var hint=document.createElement('div');hint.textContent='長押し・右クリックで徒歩の円・削除';hint.className='v205-pin-popup-address';
+  var walking=document.createElement('button');walking.type='button';walking.className='v218-walking-button';walking.textContent='徒歩圏を表示';
+  walking.setAttribute('aria-label',pin.name+'から徒歩圏の分数を指定して表示');
+  walking.addEventListener('click',function(){v211DeletePopup(marker,pin,null,true);});actions.appendChild(walking);
+  var hint=document.createElement('div');hint.textContent='長押し・右クリックでその他の操作';hint.className='v205-pin-popup-address';
   popup.appendChild(actions);popup.appendChild(hint);marker.bindPopup(popup,v215PopupOptions());
   marker.on('dragend',function(){var point=marker.getLatLng();
    if(!v205Point(point.lat,point.lng)){marker.setLatLng([pin.lat,pin.lng]);v205Status('対応範囲外です。位置を元に戻しました。');return;}
@@ -12310,10 +12317,10 @@ function v214SyncRings(pins){
   rings[id].layer.setLatLng([pin.lat,pin.lng]);
  });
 }
-function v211DeletePopup(marker,pin,event){
+function v211DeletePopup(marker,pin,event,walkingOnly){
  if(event&&event.originalEvent){event.originalEvent.preventDefault();event.originalEvent.stopPropagation();}
  var popup=document.createElement('div'),title=document.createElement('div'),hint=document.createElement('p');
- popup.className='v215-pin-menu';title.className='v205-pin-popup-title';title.textContent=pin.name;popup.appendChild(title);
+ popup.className='v215-pin-menu';title.className='v205-pin-popup-title';title.textContent=walkingOnly?pin.name+'の徒歩圏':pin.name;popup.appendChild(title);
  hint.textContent='徒歩1分＝80mの直線距離の目安です。道路・坂道・信号は反映しません。円は再読み込み・終了で消えます。';hint.style.fontSize='11px';popup.appendChild(hint);
  var label=document.createElement('label');label.className='v215-minute-row';label.textContent='徒歩の分数：';
  var input=document.createElement('input');input.type='number';input.min='1';input.step='1';
@@ -12325,8 +12332,10 @@ function v211DeletePopup(marker,pin,event){
   var hide=document.createElement('button');hide.type='button';hide.textContent='この円を消す';
   hide.addEventListener('click',function(){v214RemoveRing(pin.id);state.map.closePopup();v205Status('円を非表示にしました。');});popup.appendChild(hide);
  }
+ if(!walkingOnly){
  var remove=document.createElement('button');remove.type='button';remove.className='v205-pin-delete';remove.textContent='ピンを削除…';
  remove.addEventListener('click',function(){v214ConfirmDelete(marker,pin)});popup.appendChild(remove);
+ }
  var cancel=document.createElement('button');cancel.type='button';cancel.textContent='閉じる';cancel.addEventListener('click',function(){state.map.closePopup()});popup.appendChild(cancel);
  L.popup(v215PopupOptions()).setLatLng(marker.getLatLng()).setContent(popup).openOn(state.map);
 }
@@ -12938,7 +12947,7 @@ TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('state._v205SearchPend
 
 @st.cache_resource(show_spinner=False)
 def town_component_v121():
-    _asset_revision='v217-polygon-suumo'
+    _asset_revision='v218-pin-walking-button'
     folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-'+_asset_revision)
     os.makedirs(folder,exist_ok=True)
     path=os.path.join(folder,'index.html')
@@ -12956,7 +12965,7 @@ def town_component_v121():
         with open(temp_path,'w',encoding='utf-8') as output:
             output.write(TOWN_COMPONENT_HTML_V121)
         os.replace(temp_path,path)
-    return st.components.v1.declare_component('sumai_town_map_v217',path=folder)
+    return st.components.v1.declare_component('sumai_town_map_v218',path=folder)
 
 @st.cache_resource(show_spinner=False)
 def _v216_api_budget():
