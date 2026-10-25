@@ -52,7 +52,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v221"
+BUILD = "REBUILD-01-v222"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -12083,8 +12083,8 @@ function v204DirectionsUrl(point){
  url.searchParams.set('api','1');
  url.searchParams.set('destination',point.lat.toFixed(6)+','+point.lng.toFixed(6));
  // Omitting origin lets Google Maps use the device's current location.
- // Leave travel mode to Google Maps and the user's preferences.
- url.searchParams.set('dir_action','navigate');
+ // Match Burari: show walking-route confirmation; the user starts navigation.
+ url.searchParams.set('travelmode','walking');
  return url.href;
 }
 """
@@ -12977,7 +12977,7 @@ TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('state._v205SearchPend
 
 @st.cache_resource(show_spinner=False)
 def town_component_v121():
-    _asset_revision='v221-walking-ring-pane'
+    _asset_revision='v222-walking-route-preview'
     folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-'+_asset_revision)
     os.makedirs(folder,exist_ok=True)
     path=os.path.join(folder,'index.html')
@@ -12995,7 +12995,7 @@ def town_component_v121():
         with open(temp_path,'w',encoding='utf-8') as output:
             output.write(TOWN_COMPONENT_HTML_V121)
         os.replace(temp_path,path)
-    return st.components.v1.declare_component('sumai_town_map_v221',path=folder)
+    return st.components.v1.declare_component('sumai_town_map_v222',path=folder)
 
 @st.cache_resource(show_spinner=False)
 def _v216_api_budget():
