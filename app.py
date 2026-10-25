@@ -52,7 +52,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v224"
+BUILD = "REBUILD-01-v225"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -13034,9 +13034,43 @@ TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('<div id="town-search-
 TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('</style></head>',_V223_LOCATION_CSS+'</style></head>',1)
 TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('function render(args){',_V223_LOCATION_JS+'\nfunction render(args){',1)
 
+# v225: reserve station NAMES first when zoomed in. Long commute labels may
+# expand only into space not needed by another visible station's name.
+_v225_limit_start=TOWN_COMPONENT_HTML_V121.index(' var limit=zoom>=16?')
+_v225_limit_end=TOWN_COMPONENT_HTML_V121.index(';',_v225_limit_start)
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121[:_v225_limit_start]+TOWN_COMPONENT_HTML_V121[_v225_limit_start:_v225_limit_end].replace('var limit=','var limit=zoom>=13?stations.length:')+TOWN_COMPONENT_HTML_V121[_v225_limit_end:]
+_v225_loop=' for(var j=0;j<visible.length&&count<limit;j++){'
+_v225_pre=r"""
+ var detail=zoom>=13,namePlacements=[];
+ if(detail){
+  for(var k=0;k<visible.length;k++){
+   var stationName=String(visible[k].name||'');if(!stationName)continue;
+   var stationPoint=m.latLngToContainerPoint([visible[k].lat,visible[k].lng]);
+   if(reserveLabel(stationPoint,Array.from(stationName).length*12+19,20,boxes,size))namePlacements[k]=boxes[boxes.length-1];
+  }
+ }
+"""
+assert TOWN_COMPONENT_HTML_V121.count(_v225_loop)==1
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(_v225_loop,_v225_pre+_v225_loop,1)
+_v225_collision='   if(!reserveLabel(p,width,height,boxes,size))continue;'
+_v225_new=r"""   var nameOnly=false;
+   if(detail){
+    var own=namePlacements[j];if(!own)continue;
+    var others=boxes.filter(function(box){return box!==own;});
+    if(reserveLabel(p,width,height,others,size))boxes=others;
+    else nameOnly=true;
+   }else if(!reserveLabel(p,width,height,boxes,size))continue;"""
+assert TOWN_COMPONENT_HTML_V121.count(_v225_collision)==1
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(_v225_collision,_v225_new,1)
+_v225_markup="   var html='<span class=\"'+classes+'\">'+content+'</span>';"
+assert TOWN_COMPONENT_HTML_V121.count(_v225_markup)==1
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(_v225_markup,"   if(nameOnly){classes='station-chip v225-name-only';content=safeLabel(name);}\n"+_v225_markup,1)
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('</style></head>',
+ '.station-chip.v225-name-only{font-size:12px;line-height:18px;font-weight:850}\n</style></head>',1)
+
 @st.cache_resource(show_spinner=False)
 def town_component_v121():
-    _asset_revision='v224-fixed-landmark-pins'
+    _asset_revision='v225-detailed-station-labels'
     folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-'+_asset_revision)
     os.makedirs(folder,exist_ok=True)
     path=os.path.join(folder,'index.html')
@@ -13054,7 +13088,7 @@ def town_component_v121():
         with open(temp_path,'w',encoding='utf-8') as output:
             output.write(TOWN_COMPONENT_HTML_V121)
         os.replace(temp_path,path)
-    return st.components.v1.declare_component('sumai_town_map_v224',path=folder)
+    return st.components.v1.declare_component('sumai_town_map_v225',path=folder)
 
 @st.cache_resource(show_spinner=False)
 def _v216_api_budget():
