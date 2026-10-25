@@ -52,7 +52,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v222"
+BUILD = "REBUILD-01-v223"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -12126,10 +12126,14 @@ TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('</style></head>',_V20
 
 
 # v205: personal named landmarks, independent of rental observations.
-_V205_PIN_DOM = """<details id="v205-pins-panel"><summary>目印ピンを追加・表示</summary><label for="v205-pin-address">施設名・目印の名前で検索</label><input id="v205-pin-address" maxlength="180" placeholder="例：ヨドバシAKIBA（住所の入力は不要）"/><label for="v205-pin-name">ピンの名前（検索結果から自動入力・変更可）</label><input id="v205-pin-name" maxlength="60" placeholder="検索後に施設名が入ります"/><div class="v205-actions"><button type="button" id="v205-pin-search">名前で検索</button><button type="button" id="v205-pin-pick">地図をタップして指定</button><button type="button" id="v205-pin-cancel" hidden>仮ピンを取り消す</button></div><div id="v205-pin-candidates" hidden><label id="v206-result-label" for="v205-pin-candidate">検索結果</label><select id="v205-pin-candidate"></select><div id="v206-result-detail" role="status"></div><button type="button" id="v205-pin-add">確認して確定</button></div><div id="v205-pin-status" role="status" aria-live="polite"></div><div id="v205-pin-saved" hidden><label for="v205-pin-list">保存した目印</label><select id="v205-pin-list"></select><button type="button" id="v205-pin-jump">選んだピンへ移動</button></div><p class="v205-help">東京23区周辺の施設を名前で検索し、住所と位置を表示します。選択すると仮の印で位置を確認でき、「確認して確定」で保存します。確定したピンの長押しで徒歩の目安の円・削除メニューを開きます。情報：国土地理院・<a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener noreferrer">© OpenStreetMap contributors</a>。保存先はこのブラウザーです。</p></details>"""
+_V205_PIN_DOM = """<section id="v205-pins-panel" aria-label="目印ピン"><div class="v223-pin-columns"><div><label for="v205-pin-address">施設名・目印の名前で検索</label><input id="v205-pin-address" maxlength="180" placeholder="例：ヨドバシAKIBA" autocomplete="off"/></div><div id="v205-pin-saved"><label for="v205-pin-list">保存した目印</label><select id="v205-pin-list"></select><button type="button" id="v205-pin-jump">選んだピンへ移動</button></div></div><div id="v223-pin-editor" hidden><label for="v205-pin-name">ピンの名前（検索結果から自動入力・変更可）</label><input id="v205-pin-name" maxlength="60" placeholder="検索後に施設名が入ります"/><div class="v205-actions"><button type="button" id="v205-pin-search">名前で検索</button><button type="button" id="v205-pin-pick">地図をタップして指定</button><button type="button" id="v205-pin-cancel" hidden>仮ピンを取り消す</button></div></div><div id="v205-pin-candidates" hidden><label id="v206-result-label" for="v205-pin-candidate">検索結果</label><select id="v205-pin-candidate"></select><div id="v206-result-detail" role="status"></div><button type="button" id="v205-pin-add">確認して確定</button></div><div id="v205-pin-status" role="status" aria-live="polite"></div><p class="v205-help">施設名から住所と位置を検索し、仮ピンを確認してから確定します。保存先はこのブラウザーです。情報：国土地理院・<a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener noreferrer">© OpenStreetMap contributors</a>。</p></section>"""
+
 _V205_PIN_CSS = """
 #v205-pins-panel{padding:12px 13px;background:#fff;border-top:1px solid #d5dfdc;color:#173a5e;font:14px system-ui}
-#v205-pins-panel summary{font-weight:750;cursor:pointer;padding:5px 0}
+.v223-pin-columns{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:12px;align-items:start}
+.v223-pin-columns>div{min-width:0}
+.v223-pin-columns label{min-height:2.7em;display:flex!important;align-items:end}
+#v223-pin-editor[hidden]{display:none!important}
 #v205-pins-panel label{display:block;font-size:13px;font-weight:650;margin:10px 0 5px}
 #v205-pins-panel input,#v205-pins-panel select{box-sizing:border-box;width:100%;min-height:40px;border:1px solid #b9c7c3;border-radius:7px;background:#fff;color:#173a5e;padding:7px 9px;font-size:16px}
 #v205-pins-panel button{min-height:40px;padding:7px 10px;margin-top:8px;border:1px solid #a5b8b0;border-radius:7px;background:#eef5f1;color:#173a5e;font-size:13px;cursor:pointer;touch-action:manipulation}
@@ -12193,7 +12197,9 @@ function v205PinList(){
  if(!box||!select)return;
  var old=select.value;select.replaceChildren();
  (state._v205Pins||[]).forEach(function(pin){var opt=document.createElement('option');opt.value=pin.id;opt.textContent=pin.name;select.appendChild(opt)});
- box.hidden=!(state._v205Pins||[]).length;
+ box.hidden=false;
+ var empty=!(state._v205Pins||[]).length;select.disabled=empty;document.getElementById('v205-pin-jump').disabled=empty;
+ if(empty){var placeholder=document.createElement('option');placeholder.value='';placeholder.textContent='保存した目印はありません';select.appendChild(placeholder);}
  if((state._v205Pins||[]).some(function(p){return p.id===old}))select.value=old;
  setHeight();
 }
@@ -12448,11 +12454,14 @@ function v205InitPins(args){
  if(!state.map)return;
  if(!state._v205Initialized){
   state._v205Initialized=true;state._v205Pins=v205LoadPins();
-  document.getElementById('v205-pins-panel').addEventListener('toggle',setHeight);
+  var queryInput=document.getElementById('v205-pin-address');
+  queryInput.addEventListener('input',v223PinEditor);
+  queryInput.addEventListener('keydown',function(event){if(event.key==='Enter'&&!event.isComposing){event.preventDefault();v205SearchPin();}});
+  v223PinEditor();v223InitLocation();
   document.getElementById('v205-pin-search').addEventListener('click',v205SearchPin);
   document.getElementById('v205-pin-candidate').addEventListener('change',v206SelectCandidate);
   document.getElementById('v205-pin-pick').addEventListener('click',function(){
-   var name=document.getElementById('v205-pin-name').value.trim();
+   var name=document.getElementById('v205-pin-name').value.trim()||document.getElementById('v205-pin-address').value.trim();
    if(!name){v205Status('ピンの名前を入力してください。');return;}
    if(state._v205SearchPending){v205Status('施設名の検索が終わってから指定してください。');return;}
    state._v207DetailPending=null;v206ClearPreview();document.getElementById('v205-pin-candidates').hidden=true;
@@ -12975,9 +12984,64 @@ TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(' v189UpdateSuumo();\n
 TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('state._v205SearchPending||state._v207DetailPending)return;',
  'state._v205SearchPending||state._v207DetailPending||state._v217Pending)return;',1)
 
+_V223_LOCATION_DOM = '<div id="v223-location-bar"><button type="button" id="v223-locate">◎ 現在地を取得</button><span id="v223-location-status" role="status" aria-live="polite"></span></div>'
+_V223_LOCATION_CSS = """
+#v223-location-bar{display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding:10px 13px 0;background:#fff;color:#173a5e;font:13px system-ui}
+#v223-locate{min-height:40px;padding:8px 14px;border:1px solid #9eb4bd;border-radius:7px;background:#fff;color:#173a5e;font-size:14px;cursor:pointer;touch-action:manipulation}
+#v223-location-status{font-size:12px;line-height:1.4}
+.v223-location-icon{background:none;border:0;pointer-events:none}
+.v223-location-dot{display:block;box-sizing:border-box;width:22px;height:22px;border:3px solid #fff;border-radius:50%;background:#1a73e8;box-shadow:0 0 0 7px rgba(26,115,232,.18),0 1px 5px rgba(0,0,0,.45)}
+"""
+_V223_LOCATION_JS = r"""
+function v223PinEditor(){
+ var input=document.getElementById('v205-pin-address'),editor=document.getElementById('v223-pin-editor');
+ if(!input||!editor)return;
+ editor.hidden=!input.value.trim();
+ if(editor.hidden){
+  state._v205SearchPending=null;state._v207DetailPending=null;
+  document.getElementById('v205-pin-search').disabled=false;
+  document.getElementById('v205-pin-name').value='';v211CancelDraft();v205Status('');
+ }
+ setHeight();
+}
+function v223InitLocation(){
+ var button=document.getElementById('v223-locate');if(!button||button.dataset.ready)return;
+ button.dataset.ready='1';button.addEventListener('click',v223Locate);
+}
+function v223Locate(){
+ var button=document.getElementById('v223-locate'),status=document.getElementById('v223-location-status');
+ if(!button||button.disabled)return;
+ if(!navigator.geolocation){status.textContent='現在地の取得に対応していません。位置情報を利用できるブラウザーで開いてください。';setHeight();return;}
+ button.disabled=true;button.textContent='取得中…';status.textContent='位置情報を取得しています。';setHeight();
+ function done(){button.disabled=false;button.textContent='◎ 現在地を取得';setHeight();}
+ try{navigator.geolocation.getCurrentPosition(function(position){
+  try{
+   var point=position.coords,lat=Number(point.latitude),lng=Number(point.longitude),accuracy=Number(point.accuracy);
+   if(!Number.isFinite(lat)||!Number.isFinite(lng)||Math.abs(lat)>90||Math.abs(lng)>180)throw new Error('invalid coordinates');
+   if(!state.map.getPane('currentLocationPane'))state.map.createPane('currentLocationPane');
+   var pane=state.map.getPane('currentLocationPane');pane.style.zIndex='680';pane.style.pointerEvents='none';
+   if(state._v223Accuracy){state.map.removeLayer(state._v223Accuracy);state._v223Accuracy=null;}
+   if(Number.isFinite(accuracy)&&accuracy>0)state._v223Accuracy=L.circle([lat,lng],{pane:'currentLocationPane',radius:accuracy,color:'#1a73e8',weight:1,opacity:.35,fill:true,fillColor:'#1a73e8',fillOpacity:.09,interactive:false}).addTo(state.map);
+   if(state._v223Location)state._v223Location.setLatLng([lat,lng]);
+   else state._v223Location=L.marker([lat,lng],{pane:'currentLocationPane',interactive:false,keyboard:false,
+    icon:L.divIcon({className:'v223-location-icon',html:'<span class="v223-location-dot"></span>',iconSize:[22,22],iconAnchor:[11,11]})}).addTo(state.map);
+   state.map.setView([lat,lng],Math.max(15,state.map.getZoom()),{animate:false});
+   status.textContent='現在地を表示しました'+(Number.isFinite(accuracy)&&accuracy>0?'（取得精度：約'+Math.round(accuracy)+'m）':'')+'。移動後は再取得してください。';
+  }catch(error){status.textContent='現在地を表示できませんでした。もう一度お試しください。';}
+  done();
+ },function(error){
+  status.textContent=error&&error.code===1?'位置情報の利用が許可されていません。ブラウザー・端末の位置情報設定を確認してください。':error&&error.code===3?'現在地の取得が時間切れになりました。もう一度お試しください。':'現在地を取得できませんでした。端末の位置情報設定を確認して再取得してください。';done();
+ },{enableHighAccuracy:true,timeout:15000,maximumAge:0});}
+ catch(error){status.textContent='位置情報を取得できませんでした。ブラウザー・端末の位置情報設定を確認してください。';done();}
+}
+"""
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('<div id="town-search-panel">',_V223_LOCATION_DOM+'<div id="town-search-panel">',1)
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('</style></head>',_V223_LOCATION_CSS+'</style></head>',1)
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('function render(args){',_V223_LOCATION_JS+'\nfunction render(args){',1)
+
 @st.cache_resource(show_spinner=False)
 def town_component_v121():
-    _asset_revision='v222-walking-route-preview'
+    _asset_revision='v223-current-location-pin-ui'
     folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-'+_asset_revision)
     os.makedirs(folder,exist_ok=True)
     path=os.path.join(folder,'index.html')
@@ -12995,7 +13059,7 @@ def town_component_v121():
         with open(temp_path,'w',encoding='utf-8') as output:
             output.write(TOWN_COMPONENT_HTML_V121)
         os.replace(temp_path,path)
-    return st.components.v1.declare_component('sumai_town_map_v222',path=folder)
+    return st.components.v1.declare_component('sumai_town_map_v223',path=folder)
 
 @st.cache_resource(show_spinner=False)
 def _v216_api_budget():
