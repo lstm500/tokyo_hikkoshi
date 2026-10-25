@@ -52,7 +52,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v225"
+BUILD = "REBUILD-01-v226"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -13068,9 +13068,37 @@ TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(_v225_markup,"   if(na
 TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('</style></head>',
  '.station-chip.v225-name-only{font-size:12px;line-height:18px;font-weight:850}\n</style></head>',1)
 
+# v226: retain edge station labels without moving their geographic anchors.
+_v226_old="""   var stationPoint=m.latLngToContainerPoint([visible[k].lat,visible[k].lng]);
+   if(reserveLabel(stationPoint,Array.from(stationName).length*12+19,20,boxes,size))namePlacements[k]=boxes[boxes.length-1];"""
+_v226_new="""   var stationPoint=m.latLngToContainerPoint([visible[k].lat,visible[k].lng]);
+   var nameWidth=Array.from(stationName).length*12+19;
+   var labelPoint={x:Math.max(nameWidth/2+4,Math.min(size.x-nameWidth/2-4,stationPoint.x)),
+                   y:Math.max(14,Math.min(size.y-14,stationPoint.y))};
+   if(reserveLabel(labelPoint,nameWidth,20,boxes,size)){namePlacements[k]=boxes[boxes.length-1];namePositions[k]=labelPoint;}"""
+assert TOWN_COMPONENT_HTML_V121.count(_v226_old)==1
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('var detail=zoom>=13,namePlacements=[];','var detail=zoom>=13,namePlacements=[],namePositions=[];',1).replace(_v226_old,_v226_new,1)
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('if(reserveLabel(p,width,height,others,size))boxes=others;',
+ 'if(reserveLabel(namePositions[j],width,height,others,size))boxes=others;',1)
+_v226_markup="   var html='<span class=\"'+classes+'\">'+content+'</span>';"
+_v226_shift=r"""   var offsetX=detail&&namePositions[j]?namePositions[j].x-p.x:0;
+   var offsetY=detail&&namePositions[j]?namePositions[j].y-p.y:0;
+   var shifted=Math.abs(offsetX)>.5||Math.abs(offsetY)>.5;
+   var style=shifted?' style="left:'+offsetX.toFixed(2)+'px;top:'+offsetY.toFixed(2)+'px"':'';
+   if(shifted)classes+=' v226-shifted';
+   var html='<span class="'+classes+'"'+style+'>'+content+'</span>';
+   if(shifted){
+    var length=Math.hypot(offsetX,offsetY),angle=Math.atan2(offsetY,offsetX)*180/Math.PI;
+    html='<span class="v226-station-leader" style="width:'+length.toFixed(2)+'px;transform:rotate('+angle.toFixed(2)+'deg)"></span>'+html+'<span class="v226-station-anchor"></span>';
+   }"""
+assert TOWN_COMPONENT_HTML_V121.count(_v226_markup)==1
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(_v226_markup,_v226_shift,1)
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('</style></head>',
+ '.station-chip.v226-shifted::before{display:none}.v226-station-anchor{position:absolute;left:-3px;top:-3px;width:6px;height:6px;box-sizing:border-box;border:1px solid #fff;background:#0064b0;border-radius:50%;pointer-events:none}.v226-station-leader{position:absolute;left:0;top:0;height:1px;background:#173a5e;transform-origin:0 50%;pointer-events:none}\n</style></head>',1)
+
 @st.cache_resource(show_spinner=False)
 def town_component_v121():
-    _asset_revision='v225-detailed-station-labels'
+    _asset_revision='v226-station-edge-labels'
     folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-'+_asset_revision)
     os.makedirs(folder,exist_ok=True)
     path=os.path.join(folder,'index.html')
@@ -13088,7 +13116,7 @@ def town_component_v121():
         with open(temp_path,'w',encoding='utf-8') as output:
             output.write(TOWN_COMPONENT_HTML_V121)
         os.replace(temp_path,path)
-    return st.components.v1.declare_component('sumai_town_map_v225',path=folder)
+    return st.components.v1.declare_component('sumai_town_map_v226',path=folder)
 
 @st.cache_resource(show_spinner=False)
 def _v216_api_budget():
