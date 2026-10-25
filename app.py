@@ -52,7 +52,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v223"
+BUILD = "REBUILD-01-v224"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -12216,7 +12216,7 @@ function v205DrawPins(){
  if(!state._v205Layer)state._v205Layer=L.layerGroup().addTo(state.map);
  state._v205Layer.clearLayers();state._v205Markers={};state._v205PinSignature=signature;
  pins.forEach(function(pin){
-  var marker=L.marker([pin.lat,pin.lng],{pane:'personalPinPane',draggable:true,keyboard:true,title:pin.name,
+  var marker=L.marker([pin.lat,pin.lng],{pane:'personalPinPane',draggable:false,keyboard:true,title:pin.name,
    icon:L.divIcon({className:'v205-pin-icon',html:'<span class="v205-pin-dot"></span>',iconSize:[22,28],iconAnchor:[11,26],popupAnchor:[0,-25]})});
   var title=document.createElement('span');title.textContent=pin.name;
   marker.bindTooltip(title,{permanent:true,direction:'right',offset:[9,-17],className:'v205-pin-label'});
@@ -12236,11 +12236,6 @@ function v205DrawPins(){
    removeRing.addEventListener('click',function(){if(v214RemoveRing(pin.id)){state.map.closePopup();v205Status('徒歩圏の線を削除しました。');}});popup.appendChild(removeRing);
   }
   popup.appendChild(hint);marker.bindPopup(popup,v215PopupOptions());
-  marker.on('dragend',function(){var point=marker.getLatLng();
-   if(!v205Point(point.lat,point.lng)){marker.setLatLng([pin.lat,pin.lng]);v205Status('対応範囲外です。位置を元に戻しました。');return;}
-   var next=(state._v205Pins||[]).map(function(p){return p.id===pin.id?Object.assign({},p,{lat:point.lat,lng:point.lng}):p});
-   if(v205SavePins(next))v205Status('ピンの位置を保存しました。');else marker.setLatLng([pin.lat,pin.lng]);
-  });
   marker.addTo(state._v205Layer);state._v205Markers[pin.id]=marker;v211BindLongPress(marker,pin);
  });
 }
@@ -12257,7 +12252,7 @@ function v205AddPin(name,address,lat,lng){
  var pin={id:id,name:name,address:String(address||'').slice(0,180),lat:lat,lng:lng};
  if(!v205SavePins((state._v205Pins||[]).concat([pin])))return false;
  document.getElementById('v205-pin-candidates').hidden=true;
- v205FocusPin(pin);v205Status('「'+name+'」を保存しました。ピンはドラッグで位置を調整できます。');return true;
+ v205FocusPin(pin);v205Status('「'+name+'」を保存しました。ピンの位置は固定されています。');return true;
 }
 function v206ClearPreview(){
  if(state._v206Preview&&state.map){state.map.removeLayer(state._v206Preview);state._v206Preview=null;}
@@ -13041,7 +13036,7 @@ TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('function render(args)
 
 @st.cache_resource(show_spinner=False)
 def town_component_v121():
-    _asset_revision='v223-current-location-pin-ui'
+    _asset_revision='v224-fixed-landmark-pins'
     folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-'+_asset_revision)
     os.makedirs(folder,exist_ok=True)
     path=os.path.join(folder,'index.html')
@@ -13059,7 +13054,7 @@ def town_component_v121():
         with open(temp_path,'w',encoding='utf-8') as output:
             output.write(TOWN_COMPONENT_HTML_V121)
         os.replace(temp_path,path)
-    return st.components.v1.declare_component('sumai_town_map_v223',path=folder)
+    return st.components.v1.declare_component('sumai_town_map_v224',path=folder)
 
 @st.cache_resource(show_spinner=False)
 def _v216_api_budget():
