@@ -52,7 +52,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v228"
+BUILD = "REBUILD-01-v230"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -13748,8 +13748,24 @@ def _v228_station_line_matches(query,lines):
     return [{'station':station,'lines':found[station]} for station in sorted(found,key=lambda name:(key(name)!=wanted,not key(name).startswith(wanted),name))]
 
 
+def _v230_station_changed(slot):
+    state=st.session_state
+    line_key,station_key=(('commute_line_v160','commute_station_v160'),
+        ('commute_line_2_v164','commute_station_2_v164'),
+        ('commute_line_3_v228','commute_station_3_v228'))[slot-1]
+    station=state.get('v230_destination_'+str(slot),_COMMUTE_V160_NO_STATION)
+    lines=commute_lines_v160()
+    serving=[line for line,names in lines.items() if station in names]
+    # Legacy storage retains a serving line only for backward compatibility.
+    # The route engine receives the station and searches the complete graph.
+    state[line_key]=(state.get(line_key) if state.get(line_key) in serving else serving[0]) if serving else _COMMUTE_V160_NO_LINE
+    state[station_key]=station if serving else _COMMUTE_V160_NO_STATION
+    if slot==1:state['commute_destination_v159']=station if serving else '表示しない'
+    _v180_commit_commute_change()
+
+
 def _v228_station_lookup_ui(state,lines,ready):
-    st.markdown('**駅名から路線を探す**')
+    st.markdown('**駅名で勤務先を設定**')
     message=state.pop('_v228_station_applied','')
     if message:st.success(message)
     query=st.text_input('駅名を入力',key='v228_station_query',placeholder='例：池袋、東京、新宿（駅名の一部でも検索できます）')
@@ -13762,12 +13778,11 @@ def _v228_station_lookup_ui(state,lines,ready):
     station=st.selectbox('該当する駅',names,key='v228_station_match')
     options=next(row['lines'] for row in matches if row['station']==station)
     st.write('利用できる路線：'+' ／ '.join(options))
-    if state.get('v228_station_line') not in options:state['v228_station_line']=options[0]
-    line=st.selectbox('設定する路線',options,key='v228_station_line')
     slot=st.selectbox('設定する勤務先',[1,2,3],format_func=lambda value:'通勤先'+str(value),key='v228_station_slot')
     if st.button('この駅を勤務先に設定',key='v228_station_apply',disabled=not ready):
         fields={1:('commute_line_v160','commute_station_v160'),2:('commute_line_2_v164','commute_station_2_v164'),3:('commute_line_3_v228','commute_station_3_v228')}
-        line_key,station_key=fields[slot];state[line_key]=line;state[station_key]=station
+        line_key,station_key=fields[slot]
+        state[line_key]=options[0];state[station_key]=station
         if slot==1:state['commute_destination_v159']=station
         _v180_commit_commute_change()
         state['_v228_station_applied']='通勤先'+str(slot)+'に'+station+'駅を設定しました。'
@@ -14336,6 +14351,22 @@ _V170_COMMUTE_FIELDS = ('commute_line_v160','commute_station_v160',
                         'commute_line_3_v228','commute_station_3_v228')
 
 
+def _v229_remember_commute(state):
+    """Keep canonical values outside Streamlit's disposable widget keys."""
+    previous=state.get('_v229_commute_values') or {}
+    state['_v229_commute_values']={key:state.get(key,previous.get(key,
+        _COMMUTE_V160_NO_LINE if 'line_' in key else _COMMUTE_V160_NO_STATION))
+        for key in _V170_COMMUTE_FIELDS}
+
+
+def _v229_restore_commute_fields(state):
+    # st.rerun before these widgets render can remove their session keys.
+    # Restore only missing keys; a deliberate selection/clear must win.
+    previous=state.get('_v229_commute_values') or {}
+    for key in _V170_COMMUTE_FIELDS:
+        if key not in state and key in previous:state[key]=previous[key]
+
+
 def _v174_commute_token(text):
     value=str(text or '').lower()
     return value if re.fullmatch(r'[0-9a-f]{40}',value) else None
@@ -14421,6 +14452,7 @@ def _v180_commit_commute_change():
     state=st.session_state
     if not state.get('_v170_commute_loaded') or state.get('_v170_commute_pending'):
         return False
+    _v229_remember_commute(state)
     token=_v174_commute_token(state.get('_v174_commute_token'))
     if not token:
         state['_v174_commute_backup_error']='保存先のブラウザー識別情報を確認できません。'
@@ -14745,13 +14777,15 @@ def v170_validate_personal_commute(value,lines):
 
 def v170_commute_snapshot(state):
     """Only selected railway/station names; never property or other users' data."""
+    values=dict(state.get('_v229_commute_values') or {})
+    values.update({key:state[key] for key in _V170_COMMUTE_FIELDS if key in state})
     return {'schema':1,
-            'line1':str(state.get('commute_line_v160',_COMMUTE_V160_NO_LINE)),
-            'station1':str(state.get('commute_station_v160',_COMMUTE_V160_NO_STATION)),
-            'line2':str(state.get('commute_line_2_v164',_COMMUTE_V160_NO_LINE)),
-            'station2':str(state.get('commute_station_2_v164',_COMMUTE_V160_NO_STATION)),
-            'line3':str(state.get('commute_line_3_v228',_COMMUTE_V160_NO_LINE)),
-            'station3':str(state.get('commute_station_3_v228',_COMMUTE_V160_NO_STATION))}
+            'line1':str(values.get('commute_line_v160',_COMMUTE_V160_NO_LINE)),
+            'station1':str(values.get('commute_station_v160',_COMMUTE_V160_NO_STATION)),
+            'line2':str(values.get('commute_line_2_v164',_COMMUTE_V160_NO_LINE)),
+            'station2':str(values.get('commute_station_2_v164',_COMMUTE_V160_NO_STATION)),
+            'line3':str(values.get('commute_line_3_v228',_COMMUTE_V160_NO_LINE)),
+            'station3':str(values.get('commute_station_3_v228',_COMMUTE_V160_NO_STATION))}
 
 
 def v170_apply_browser_profile(state,message):
@@ -14777,6 +14811,7 @@ def v170_apply_browser_profile(state,message):
         restored={k:(_COMMUTE_V160_NO_LINE if 'line_' in k else _COMMUTE_V160_NO_STATION)
                   for k in _V170_COMMUTE_FIELDS}
     for key,value in restored.items():state[key]=value
+    _v229_remember_commute(state)
     first=restored['commute_station_v160']
     state['commute_destination_v159']=first if first!=_COMMUTE_V160_NO_STATION else '表示しない'
 
@@ -14794,6 +14829,7 @@ def v170_commute_profile_changed():
 def v170_commute_autosave_sync():
     """Restore browser state, back it up per recovery URL, and prevent stale writes."""
     state=st.session_state
+    _v229_restore_commute_fields(state)
     widget=v174_personal_commute_component()
     token=state.get('_v174_commute_token') or _v174_commute_url_token()
     if not state.get('_v170_commute_loaded'):
@@ -15181,60 +15217,17 @@ def main():
                     st.rerun()
                 else:st.warning('利用者名を入力してください。')
         st.caption('通勤先1・2・3は選択中の利用者ごとに自動保存します。保存・復元操作は不要です。')
-        # Destination 1: retain the existing state keys and the v159 upgrade path.
         available_lines=commute_lines_v160()
         _v228_station_lookup_ui(state,available_lines,commute_storage_ready)
-        if 'commute_line_v160' not in st.session_state:
-            previously=st.session_state.get('commute_destination_v159','表示しない')
-            matching_line=next((name for name,stations in available_lines.items()
-                                if previously in stations),_COMMUTE_V160_NO_LINE)
-            st.session_state['commute_line_v160']=matching_line
-            st.session_state['commute_station_v160']=(previously if matching_line!=_COMMUTE_V160_NO_LINE
-                                                      else _COMMUTE_V160_NO_STATION)
-        line_options=[_COMMUTE_V160_NO_LINE,*available_lines]
-        if st.session_state.get('commute_line_v160') not in line_options:
-            st.session_state['commute_line_v160']=_COMMUTE_V160_NO_LINE
-            st.session_state['commute_station_v160']=_COMMUTE_V160_NO_STATION
-        st.markdown('**通勤先1**')
-        first_line=st.selectbox(
-            '① 路線（通勤先1）',line_options,
-            key='commute_line_v160',on_change=_commute_line_changed_v160,
-            help='鉄道会社・路線名から選べます。',disabled=not commute_storage_ready)
-        first_station_options=[_COMMUTE_V160_NO_STATION,*available_lines.get(first_line,())]
-        if st.session_state.get('commute_station_v160') not in first_station_options:
-            st.session_state['commute_station_v160']=_COMMUTE_V160_NO_STATION
-        first_station=st.selectbox(
-            '② 駅（通勤先1）',first_station_options,
-            key='commute_station_v160',on_change=_v180_commit_commute_change,
-            disabled=(first_line==_COMMUTE_V160_NO_LINE or not commute_storage_ready))
-        st.session_state['commute_destination_v159']=(
-            first_station if first_station!=_COMMUTE_V160_NO_STATION else '表示しない')
-
-        # Destination 2 is optional, independent of destination 1.
-        st.markdown('**通勤先2（任意）**')
-        if st.session_state.get('commute_line_2_v164') not in line_options:
-            st.session_state['commute_line_2_v164']=_COMMUTE_V160_NO_LINE
-            st.session_state['commute_station_2_v164']=_COMMUTE_V160_NO_STATION
-        second_line=st.selectbox(
-            '① 路線（通勤先2）',line_options,
-            key='commute_line_2_v164',on_change=_commute_line_changed_v164_second,
-            help='2駅目が不要な場合は「路線を選択してください」のままで構いません。',disabled=not commute_storage_ready)
-        second_station_options=[_COMMUTE_V160_NO_STATION,*available_lines.get(second_line,())]
-        if st.session_state.get('commute_station_2_v164') not in second_station_options:
-            st.session_state['commute_station_2_v164']=_COMMUTE_V160_NO_STATION
-        second_station=st.selectbox(
-            '② 駅（通勤先2）',second_station_options,
-            key='commute_station_2_v164',on_change=_v180_commit_commute_change,
-            disabled=(second_line==_COMMUTE_V160_NO_LINE or not commute_storage_ready))
-
-        st.markdown('**通勤先3（任意）**')
-        if state.get('commute_line_3_v228') not in line_options:
-            state['commute_line_3_v228']=_COMMUTE_V160_NO_LINE
-            state['commute_station_3_v228']=_COMMUTE_V160_NO_STATION
-        third_line=st.selectbox('① 路線（通勤先3）',line_options,key='commute_line_3_v228',on_change=_v228_commute_line_changed_third,disabled=not commute_storage_ready)
-        third_options=[_COMMUTE_V160_NO_STATION,*available_lines.get(third_line,())]
-        if state.get('commute_station_3_v228') not in third_options:state['commute_station_3_v228']=_COMMUTE_V160_NO_STATION
-        st.selectbox('② 駅（通勤先3）',third_options,key='commute_station_3_v228',on_change=_v180_commit_commute_change,disabled=(third_line==_COMMUTE_V160_NO_LINE or not commute_storage_ready))
+        st.caption('勤務先は駅名だけで設定できます。利用路線・乗換駅は出発駅ごとに自動で選びます。')
+        station_options=[_COMMUTE_V160_NO_STATION,*sorted({name for names in available_lines.values() for name in names})]
+        for slot,station_key in enumerate(('commute_station_v160','commute_station_2_v164','commute_station_3_v228'),1):
+            widget_key='v230_destination_'+str(slot)
+            selected=state.get(station_key,_COMMUTE_V160_NO_STATION)
+            state[widget_key]=selected if selected in station_options else _COMMUTE_V160_NO_STATION
+            st.selectbox('通勤先'+str(slot)+'の最寄り駅'+('（任意）' if slot>1 else ''),station_options,
+                         key=widget_key,on_change=_v230_station_changed,args=(slot,),
+                         help='駅名を入力して絞り込めます。路線の指定は不要です。',disabled=not commute_storage_ready)
         chosen=commute_selected_destinations_v164()
         if chosen:
             st.caption('設定中：'+'　'.join(str(i+1)+'. '+name+'駅' for i,name in enumerate(chosen)))
