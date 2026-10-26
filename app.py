@@ -52,7 +52,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v230"
+BUILD = "REBUILD-01-v231"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -11270,7 +11270,7 @@ _V164_OLD_TIME = (
     "(state.commuteDestination?'（未計算）':''):"
     "'（'+commuteTime+'分-'+commuteTransfers+'回）';"
 )
-_V164_NEW_TIME = """   var dual=Boolean(state.commuteDestination2);
+_V164_NEW_TIME = """   var dual=Boolean(state.commuteDestination2)||(typeof s.commute2_min==='number'&&Number.isFinite(s.commute2_min));
    var timeLabel=(commuteTime===null||commuteTransfers===null)?
      (state.commuteDestination?'（未計算）':''):
      '（'+(dual?'1.':'')+commuteTime+'分-'+commuteTransfers+'回）';
@@ -11358,7 +11358,7 @@ TOWN_COMPONENT_HTML_V121 = TOWN_COMPONENT_HTML_V121.replace(_V172_EACH_OLD, _V17
 # v178: time / official-reference crowd rate / transfer count in the map label.
 # Do not misrepresent a per-line busiest segment rate as a measured station-pair rate.
 _V178_LABEL_OLD=_V164_NEW_TIME
-_V178_LABEL_NEW="""   var dual=Boolean(state.commuteDestination2);
+_V178_LABEL_NEW="""   var dual=Boolean(state.commuteDestination2)||(typeof s.commute2_min==='number'&&Number.isFinite(s.commute2_min));
    var pct=(typeof s.commute_crowding_pct==='number'&&isFinite(s.commute_crowding_pct)&&s.commute_crowding_pct>=0)?Math.round(s.commute_crowding_pct):null;
    var crowdLabel=pct===null?'不明':('参考'+pct+'%');
    var timeLabel=(commuteTime===null||commuteTransfers===null)?
@@ -12590,7 +12590,7 @@ def _v208_run_landmark_lookup(state,data):
     """Reuse AuditLog, its redaction, and the existing diagnostic_log storage."""
     audit=state.get('_v208_landmark_audit')
     if audit is None:
-        audit=AuditLog({'mode':'landmark','providers':['Photon / OpenStreetMap','Overpass','国土地理院']},
+        audit=AuditLog({'mode':'landmark','providers':['国土地理院 施設名検索','Photon / OpenStreetMap','Overpass']},
                        _v209_log_secrets())
         state['_v208_landmark_audit']=audit
     before_seq=audit.count
@@ -12605,7 +12605,7 @@ def _v208_run_landmark_lookup(state,data):
             records=audit.records()
             db.save_search({'id':audit.search_id,'status':'failed' if reply.get('error') else 'completed',
                 'started_at':records[0]['time'],'finished_at':utc_now(),
-                'conditions':{'mode':'landmark','providers':['Photon / OpenStreetMap','Overpass','国土地理院']},
+                'conditions':{'mode':'landmark','providers':['国土地理院 施設名検索','Photon / OpenStreetMap','Overpass']},
                 'summary':{'issues':[reply['error']] if reply.get('error') else ['施設名検索は成功・通信障害から復旧'],
                            'saved':0,'candidates':len(reply.get('candidates') or []),'operation':'施設名検索'}})
             state['_v208_landmark_storage_error']=''
@@ -12644,6 +12644,79 @@ def _v208_landmark_log_panel(state):
 _V212_NAME_CACHE={}
 
 
+# Independent Japanese facility index, in addition to the OSM-based providers.
+def _v231_name_key(value):
+    value=unicodedata.normalize('NFKC',str(value or '')).casefold()
+    value=value.replace('應','応').replace('學','学').replace('＆','&')
+    value=re.sub(r'[\W_]+','',value)
+    for word in ('株式会社','有限会社'):value=value.replace(word,'')
+    return value
+
+
+def _v231_query_variants(query):
+    values=[query,re.sub(r'\s+','',query)]
+    key=_v231_name_key(query)
+    # Known abbreviations, not a fuzzy conversion of unrelated facility names.
+    if key in ('慶応幼稚舎','慶応義塾幼稚舎'):
+        values+=['慶應義塾幼稚舎','慶応義塾幼稚舎']
+    elif '慶応' in query or '慶應' in query:
+        values+=[query.replace('慶応','慶應'),query.replace('慶應','慶応')]
+    values+=[unicodedata.normalize('NFKC',query),re.sub(r'\s+','',query).upper()]
+    return list(dict.fromkeys(values))
+
+
+def _v231_name_matches(query,name):
+    wanted=_v231_name_key(query);named=_v231_name_key(name)
+    if wanted=='慶応幼稚舎':wanted='慶応義塾幼稚舎'
+    if named=='慶応幼稚舎':named='慶応義塾幼稚舎'
+    return len(wanted)>=2 and wanted in named
+
+
+def _v231_gsi_document(web,query):
+    cache_key='gsi-facility-v231:'+query
+    cached=_V212_NAME_CACHE.get(cache_key)
+    if cached and time.monotonic()-cached['time']<3600:
+        trace(web,'landmark_cache_hit',{'provider':'国土地理院 施設名検索','query':query},stage='landmark.name_search')
+        return cached['doc'],dict(cached['info'])
+    doc,info=_v208_landmark_json(web,'https://msearch.gsi.go.jp/address-search/AddressSearch',{'q':query},'gsi_facility_search')
+    if not isinstance(doc,list):raise ValueError('GSI facility response is not an array')
+    info.update(provider='国土地理院 施設名検索',source='国土地理院（施設名検索）')
+    elements=[];decisions=[];seen=set()
+    for feature in doc:
+        try:
+            props=feature.get('properties') or {};geometry=feature.get('geometry') or {}
+            name=normal(props.get('title'))
+            if geometry.get('type')!='Point':raise ValueError('not_point')
+            lng,lat=map(float,geometry['coordinates'][:2])
+            if not (math.isfinite(lat) and math.isfinite(lng) and 35.45<=lat<=35.95 and 139.4<=lng<=140.05):raise ValueError('outside_supported_region')
+            if not _v231_name_matches(query,name):raise ValueError('facility_name_mismatch_or_address_representative')
+            ident=(name,round(lat,6),round(lng,6))
+            if ident in seen:continue
+            seen.add(ident)
+            # Name search supplies the facility point, not its street address.
+            # Reverse-geocode only accepted points; never use a town centre as a facility.
+            address=''
+            try:
+                reverse,_=_v208_landmark_json(web,'https://mreversegeocoder.gsi.go.jp/reverse-geocoder/LonLatToAddress',{'lat':lat,'lon':lng},'gsi_facility_address')
+                result=reverse.get('results') or {};ward=TOKYO_WARDS.get(str(result.get('muniCd') or ''));town=normal(result.get('lv01Nm'))
+                if ward and town:address='東京都'+ward+town+'（周辺住所・番地は未確認）'
+            except Exception as exc:
+                _v208_landmark_failure(web,{'query':query},exc,'gsi_facility_address')
+            tags={'name':name,'addr:full':address+'／登録位置・移転等は未確認' if address else '',
+                  'source':'https://maps.gsi.go.jp/','provider':'国土地理院（登録位置・移転等は未確認）'}
+            elements.append({'lat':lat,'lon':lng,'tags':tags})
+            decisions.append({'name':name,'lat':lat,'lng':lng,'address':address,'decision':'candidate','data_source':props.get('dataSource')})
+        except (ValueError,TypeError,KeyError,IndexError,AttributeError) as exc:
+            decisions.append({'name':str((feature.get('properties') or {}).get('title') or '') if isinstance(feature,dict) else '',
+                              'decision':'rejected','reason':str(exc)})
+    result={'elements':elements}
+    trace(web,'landmark_gsi_candidates',{'provider':'国土地理院 施設名検索','query':query,'received':len(doc),'accepted':len(elements),'decisions':decisions},stage='landmark.result')
+    if elements:
+        if len(_V212_NAME_CACHE)>=128:_V212_NAME_CACHE.clear()
+        _V212_NAME_CACHE[cache_key]={'time':time.monotonic(),'doc':result,'info':dict(info)}
+    return result,info
+
+
 def _v212_photon_document(web,query):
     cached=_V212_NAME_CACHE.get(query)
     if cached and time.monotonic()-cached['time']<3600:
@@ -12664,10 +12737,7 @@ def _v212_photon_document(web,query):
                 if geometry.get('type')!='Point':raise ValueError('geometry is not a Point')
                 lng,lat=map(float,geometry['coordinates'][:2]);name=normal(props.get('name'))
                 if not name:raise ValueError('facility name missing')
-                def name_key(value):
-                    return re.sub(r'[\W_]+','',unicodedata.normalize('NFKC',str(value)).casefold()).replace('株式会社','').replace('有限会社','')
-                requested=name_key(query);named=name_key(name)
-                if len(requested)>=3 and not (requested in named or (len(named)>=3 and named in requested)):
+                if not _v231_name_matches(query,name):
                     raise ValueError('facility name does not match query')
                 if not (math.isfinite(lat) and math.isfinite(lng) and 35.45<=lat<=35.95 and 139.4<=lng<=140.05):raise ValueError('outside supported region')
                 if props.get('countrycode') and str(props['countrycode']).upper()!='JP':raise ValueError('country is not Japan')
@@ -12781,21 +12851,39 @@ def _v216_web_document(web,query):
 
 
 def _v212_name_document(web,query,pattern):
-    # Preserve spaces in the first query; normalize punctuation/case only for retries.
-    variants=list(dict.fromkeys([query,re.sub(r'\s+','',query),
-        re.sub(r'\s+','',query).upper().replace('＆','&')]))
+    variants=_v231_query_variants(query)
+    # GSI has an independent Japanese facility index. OSM has complementary
+    # coverage for shops and companies. A provider outage does not stop others.
+    gsi=None
+    for variant in variants:
+        try:
+            doc,info=_v231_gsi_document(web,variant)
+            if doc['elements']:
+                gsi=(doc,info);break
+        except Exception as exc:
+            trace(web,'landmark_gsi_failed',{'query':variant,'provider':'国土地理院 施設名検索',
+                  'reason':str(exc),**(getattr(exc,'landmark_diagnostic',{}) or {}),**_v212_exception_details(exc)},'WARNING','landmark.name_search')
+            break
     empty=None
     for variant in variants:
         try:
             doc,info=_v212_photon_document(web,variant)
-            if doc['elements']:return doc,info
+            if doc['elements']:
+                if gsi:
+                    # Keep OSM first where it already works; a second index may
+                    # still contain a former campus. Different points stay as
+                    # distinct, explicitly attributed candidates for confirmation.
+                    for element in doc['elements']:element['tags'].setdefault('provider','Photon / OpenStreetMap')
+                    return {'elements':doc['elements']+gsi[0]['elements']},info
+                return doc,info
             empty=(doc,info)
+            if gsi:return gsi
             trace(web,'landmark_geocoder_empty',{'query':variant,'provider':'Photon','reason':'coverage_no_match'},stage='landmark.name_search')
         except Exception as exc:
             detail={**(getattr(exc,'diagnostic',{}) or {}),**(getattr(exc,'landmark_diagnostic',{}) or {}),**_v212_exception_details(exc)}
             trace(web,'landmark_geocoder_failed',{**detail,'query':variant,'provider':'Photon','reason':str(exc),'exception_type':type(exc).__name__},'ERROR','landmark.name_search')
-            if str(detail.get('status')) in ('401','403','429'):raise
             break
+    if gsi:return gsi
     extra=_v216_web_document(web,query)
     if extra and extra[0]['elements']:return extra
     try:return _v211_name_document(web,query,pattern)
@@ -12898,7 +12986,7 @@ def _v207_search_landmarks(data,audit=None):
                 key=(name,round(lat,5),round(lng,5))
                 if key in seen:continue
                 seen.add(key);reply['candidates'].append({'name':name,'title':name,'address':address[:180],
-                    'lat':lat,'lng':lng,'source':info.get('source') or info.get('provider','Overpass')+' / OpenStreetMap','source_url':str(tags.get('source') or ''),'address_checked':bool(address)})
+                    'lat':lat,'lng':lng,'source':tags.get('provider') or info.get('source') or info.get('provider','Overpass')+' / OpenStreetMap','source_url':str(tags.get('source') or ''),'address_checked':bool(address)})
             except (KeyError,TypeError,ValueError,AttributeError):continue
         reply['candidates'].sort(key=lambda p:(re.sub(r'\s+','',p['name']).casefold()!=compact.casefold(),p['name'],p['lat'],p['lng']))
         trace(web,'landmark_result',{'query':query,'ticket':ticket,'elements':len(doc['elements']),'candidates':len(reply['candidates'])},stage='landmark.result')
@@ -13105,7 +13193,7 @@ TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(' state.commuteDestina
  ' state.commuteDestination2=String(args.commute_destination_2||"");\n state.commuteDestination3=String(args.commute_destination_3||"");',1)
 _v228_anchor='   var p=m.latLngToContainerPoint([s.lat,s.lng]);'
 _v228_third=r"""
-   var third=Boolean(state.commuteDestination3);
+   var third=Boolean(state.commuteDestination3)||(typeof s.commute3_min==='number'&&Number.isFinite(s.commute3_min));
    var thirdMin=typeof s.commute3_min==='number'&&Number.isFinite(s.commute3_min)&&s.commute3_min>=0&&s.commute3_min<999?Math.round(s.commute3_min):null;
    var thirdTransfers=Number.isInteger(s.commute3_transfers)&&s.commute3_transfers>=0?s.commute3_transfers:null;
    var thirdPct=typeof s.commute3_crowding_pct==='number'&&Number.isFinite(s.commute3_crowding_pct)&&s.commute3_crowding_pct>=0?Math.round(s.commute3_crowding_pct):null;
@@ -13126,7 +13214,7 @@ TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('</style></head>',
 
 @st.cache_resource(show_spinner=False)
 def town_component_v121():
-    _asset_revision='v228-three-commute-destinations'
+    _asset_revision='v231-facility-search-and-commute-rows'
     folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-'+_asset_revision)
     os.makedirs(folder,exist_ok=True)
     path=os.path.join(folder,'index.html')
@@ -13144,7 +13232,7 @@ def town_component_v121():
         with open(temp_path,'w',encoding='utf-8') as output:
             output.write(TOWN_COMPONENT_HTML_V121)
         os.replace(temp_path,path)
-    return st.components.v1.declare_component('sumai_town_map_v228',path=folder)
+    return st.components.v1.declare_component('sumai_town_map_v231',path=folder)
 
 @st.cache_resource(show_spinner=False)
 def _v216_api_budget():
@@ -13706,12 +13794,12 @@ def _v228_commute_line_changed_third():
 
 
 def commute_selected_destinations_v164():
-    first=commute_current_destination_v160()
-    second=commute_current_destination_v164_second()
-    line=st.session_state.get('commute_line_3_v228',_COMMUTE_V160_NO_LINE)
-    station=st.session_state.get('commute_station_3_v228',_COMMUTE_V160_NO_STATION)
-    third=station if station in commute_lines_v160().get(line,()) else '表示しない'
-    return tuple(value for value in (first,second,third) if value!='表示しない')
+    # Read canonical preferences, including values retained when widget keys
+    # disappear during an interrupted render. A serving-line field is not a
+    # route restriction and must not suppress a valid station-only destination.
+    prefs=v170_commute_snapshot(st.session_state)
+    known={station for stations in commute_lines_v160().values() for station in stations}
+    return tuple(prefs.get(key) for key in ('station1','station2','station3') if prefs.get(key) in known)
 
 
 def town_station_refs_v164(destinations):
@@ -14966,7 +15054,7 @@ def _v209_saved_log_tools(state):
 
 def _v209_initial_settings(state):
             st.subheader('施設名検索API（任意）')
-            st.write('通常はPhoton / OpenStreetMapを使います。会社名などが見つからない場合は、Brave Search APIで住所候補を探し、国土地理院で位置を検索します。住所候補は検索ページの記載で、正確性は未確認です。仮ピンの住所と位置を必ず確認してください。')
+            st.write('通常は国土地理院の施設名検索とPhoton / OpenStreetMapを併用します。会社名などが見つからない場合は、Brave Search APIで住所候補を探し、国土地理院で位置を検索します。住所候補は検索ページの記載で、正確性は未確認です。仮ピンの住所と位置を必ず確認してください。')
             st.caption('利用する場合はBrave Search APIのキーを取得し、StreamlitのSecretsに次の3項目を設定してください。APIの利用料は契約によります。未設定では呼び出しません。上限は実行プロセスごとのリクエスト数で、再起動するとリセットされます。請求上限はAPI提供元で管理してください。')
             st.code('LANDMARK_BRAVE_API_KEY = "取得したAPIキー"\nLANDMARK_BRAVE_API_APPROVED = "YES"\nLANDMARK_BRAVE_API_MAX_REQUESTS = 25',language='toml')
             enabled=bool(_v216_setting('LANDMARK_BRAVE_API_KEY')) and str(_v216_setting('LANDMARK_BRAVE_API_APPROVED')).upper()=='YES'
