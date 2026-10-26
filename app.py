@@ -52,7 +52,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v226"
+BUILD = "REBUILD-01-v228"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -13096,9 +13096,37 @@ TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(_v226_markup,_v226_shi
 TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('</style></head>',
  '.station-chip.v226-shifted::before{display:none}.v226-station-anchor{position:absolute;left:-3px;top:-3px;width:6px;height:6px;box-sizing:border-box;border:1px solid #fff;background:#0064b0;border-radius:50%;pointer-events:none}.v226-station-leader{position:absolute;left:0;top:0;height:1px;background:#173a5e;transform-origin:0 50%;pointer-events:none}\n</style></head>',1)
 
+# v227: hide the floating touch-mode toggle, including its inline display style.
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('</style></head>',
+    '#touchmode{display:none!important}\n</style></head>',1)
+
+# v228: third commute destination, preserving the existing station-name layout.
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(' state.commuteDestination2=String(args.commute_destination_2||"");',
+ ' state.commuteDestination2=String(args.commute_destination_2||"");\n state.commuteDestination3=String(args.commute_destination_3||"");',1)
+_v228_anchor='   var p=m.latLngToContainerPoint([s.lat,s.lng]);'
+_v228_third=r"""
+   var third=Boolean(state.commuteDestination3);
+   var thirdMin=typeof s.commute3_min==='number'&&Number.isFinite(s.commute3_min)&&s.commute3_min>=0&&s.commute3_min<999?Math.round(s.commute3_min):null;
+   var thirdTransfers=Number.isInteger(s.commute3_transfers)&&s.commute3_transfers>=0?s.commute3_transfers:null;
+   var thirdPct=typeof s.commute3_crowding_pct==='number'&&Number.isFinite(s.commute3_crowding_pct)&&s.commute3_crowding_pct>=0?Math.round(s.commute3_crowding_pct):null;
+   var timeLabel3=!third?'':thirdMin===null||thirdTransfers===null?'③未計算':'③'+thirdMin+'分（'+(thirdPct===null?'不明':'参考'+thirdPct+'%')+'）-'+thirdTransfers+'回';
+"""
+assert TOWN_COMPONENT_HTML_V121.count(_v228_anchor)==1
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(_v228_anchor,_v228_third+_v228_anchor,1)
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('Array.from(timeLabel2).length)*(fontSize*.83)',
+ 'Array.from(timeLabel2).length,Array.from(timeLabel3).length)*(fontSize*.83)',1)
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('var height=dual?(compact?34:(major?41:37)):',
+ 'var height=third?(compact?51:(major?63:57)):dual?(compact?34:(major?41:37)):',1)
+_v228_old="'<span class=\"station-grid-spacer\" aria-hidden=\"true\"></span><span class=\"commute-time second\">'+safeLabel(timeLabel2)+'</span></span>':"
+_v228_new="'<span class=\"station-grid-spacer\" aria-hidden=\"true\"></span><span class=\"commute-time second\">'+safeLabel(timeLabel2)+'</span>'+(third?'<span class=\"commute-time third\">'+safeLabel(timeLabel3)+'</span>':'')+'</span>':"
+assert TOWN_COMPONENT_HTML_V121.count(_v228_old)==1
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(_v228_old,_v228_new,1)
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('</style></head>',
+ '.station-chip.dual .commute-time.third{grid-column:2;grid-row:3}\n</style></head>',1)
+
 @st.cache_resource(show_spinner=False)
 def town_component_v121():
-    _asset_revision='v226-station-edge-labels'
+    _asset_revision='v228-three-commute-destinations'
     folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-'+_asset_revision)
     os.makedirs(folder,exist_ok=True)
     path=os.path.join(folder,'index.html')
@@ -13116,7 +13144,7 @@ def town_component_v121():
         with open(temp_path,'w',encoding='utf-8') as output:
             output.write(TOWN_COMPONENT_HTML_V121)
         os.replace(temp_path,path)
-    return st.components.v1.declare_component('sumai_town_map_v226',path=folder)
+    return st.components.v1.declare_component('sumai_town_map_v228',path=folder)
 
 @st.cache_resource(show_spinner=False)
 def _v216_api_budget():
@@ -13672,41 +13700,79 @@ def commute_current_destination_v164_second():
     return station if station in commute_lines_v160().get(line,()) else '表示しない'
 
 
-def commute_selected_destinations_v164():
-    """Return at most two validated destinations in registered order.
+def _v228_commute_line_changed_third():
+    st.session_state['commute_station_3_v228']=_COMMUTE_V160_NO_STATION
+    _v180_commit_commute_change()
 
-    A selected second destination works on its own when the first is blank.
-    The single-destination map retains its old one-line label format.
-    """
+
+def commute_selected_destinations_v164():
     first=commute_current_destination_v160()
     second=commute_current_destination_v164_second()
-    return tuple(destination for destination in (first,second) if destination!='表示しない')
+    line=st.session_state.get('commute_line_3_v228',_COMMUTE_V160_NO_LINE)
+    station=st.session_state.get('commute_station_3_v228',_COMMUTE_V160_NO_STATION)
+    third=station if station in commute_lines_v160().get(line,()) else '表示しない'
+    return tuple(value for value in (first,second,third) if value!='表示しない')
 
 
 def town_station_refs_v164(destinations):
-    """Minutes and transfers for both targets come from the same route oracle.
-
-    Never guess missing travel times. Data payloads contain no Supabase secrets.
-    """
     destinations=tuple(destinations)
-    if len(destinations)>2:
-        raise ValueError('通勤先は2駅までです。')
+    if len(destinations)>3:raise ValueError('通勤先は3駅までです。')
     stations,wards=town_station_refs_v163(destinations[0] if destinations else '表示しない')
-    second=(commute_reference_crowd_v178(destinations[1])
-            if len(destinations)==2 else {})
-    missing=[]
-    for station in stations:
-        route=second.get(_commute_key(station['name']))
-        station['commute2_min']=route[0] if route is not None else None
-        station['commute2_transfers']=route[1] if route is not None else None
-        station['commute2_crowding_pct']=route[2] if route is not None else None
-        if len(destinations)==2 and not (isinstance(station['commute2_min'],int)
-                                           and isinstance(station['commute2_transfers'],int)):
-            missing.append(station['name'])
-    if missing:
-        raise AppError('通勤先2の経路データがない駅: '+', '.join(missing[:12])
-                       + (' ほか' if len(missing)>12 else ''))
+    for index in (2,3):
+        routes=commute_reference_crowd_v178(destinations[index-1]) if len(destinations)>=index else {}
+        missing=[]
+        for station in stations:
+            route=routes.get(_commute_key(station['name']))
+            prefix='commute'+str(index)+'_'
+            station[prefix+'min']=route[0] if route is not None else None
+            station[prefix+'transfers']=route[1] if route is not None else None
+            station[prefix+'crowding_pct']=route[2] if route is not None else None
+            if len(destinations)>=index and not (route is not None and isinstance(route[0],int) and isinstance(route[1],int)):
+                missing.append(station['name'])
+        if missing:raise AppError('通勤先'+str(index)+'の経路データがない駅: '+', '.join(missing[:12]))
     return stations,wards
+
+
+def _v228_station_line_matches(query,lines):
+    def key(value):
+        value=re.sub(r'\s+','',unicodedata.normalize('NFKC',str(value or ''))).casefold()
+        return value[:-1] if value.endswith('駅') else value
+    wanted=key(query)
+    if not wanted:return []
+    found={}
+    for line,stations in lines.items():
+        for station in stations:
+            if wanted in key(station):
+                found.setdefault(station,[])
+                if line not in found[station]:found[station].append(line)
+    return [{'station':station,'lines':found[station]} for station in sorted(found,key=lambda name:(key(name)!=wanted,not key(name).startswith(wanted),name))]
+
+
+def _v228_station_lookup_ui(state,lines,ready):
+    st.markdown('**駅名から路線を探す**')
+    message=state.pop('_v228_station_applied','')
+    if message:st.success(message)
+    query=st.text_input('駅名を入力',key='v228_station_query',placeholder='例：池袋、東京、新宿（駅名の一部でも検索できます）')
+    if not query.strip():return
+    matches=_v228_station_line_matches(query,lines)
+    if not matches:
+        st.caption('アプリ内の路線データに一致する駅がありません。表記を変えて検索してください。');return
+    names=[row['station'] for row in matches]
+    if state.get('v228_station_match') not in names:state['v228_station_match']=names[0]
+    station=st.selectbox('該当する駅',names,key='v228_station_match')
+    options=next(row['lines'] for row in matches if row['station']==station)
+    st.write('利用できる路線：'+' ／ '.join(options))
+    if state.get('v228_station_line') not in options:state['v228_station_line']=options[0]
+    line=st.selectbox('設定する路線',options,key='v228_station_line')
+    slot=st.selectbox('設定する勤務先',[1,2,3],format_func=lambda value:'通勤先'+str(value),key='v228_station_slot')
+    if st.button('この駅を勤務先に設定',key='v228_station_apply',disabled=not ready):
+        fields={1:('commute_line_v160','commute_station_v160'),2:('commute_line_2_v164','commute_station_2_v164'),3:('commute_line_3_v228','commute_station_3_v228')}
+        line_key,station_key=fields[slot];state[line_key]=line;state[station_key]=station
+        if slot==1:state['commute_destination_v159']=station
+        _v180_commit_commute_change()
+        state['_v228_station_applied']='通勤先'+str(slot)+'に'+station+'駅を設定しました。'
+        st.rerun()
+
 
 @st.fragment(run_every='6s')
 def town_choropleth_status():
@@ -13974,8 +14040,8 @@ def interactive_town_choropleth(group):
         state['_v118_choropleth_payload']=cached
         registry.request(_v168_visible_wards(geo)[:8])
     destinations=commute_selected_destinations_v164()
-    if len(destinations)==2:
-        st.caption(f'通勤先：1.{destinations[0]}駅／2.{destinations[1]}駅｜乗換回数が少ない経路を優先（同数なら最短時間・概算）')
+    if len(destinations)>=2:
+        st.caption('通勤先：'+'／'.join(str(i+1)+'.'+name+'駅' for i,name in enumerate(destinations))+'｜乗換回数が少ない経路を優先（同数なら最短時間・概算）')
     elif destinations:
         st.caption(f'通勤先：{destinations[0]}駅｜乗換回数が少ない経路を優先（同数なら最短時間・概算）')
     if destinations:
@@ -14005,7 +14071,8 @@ def interactive_town_choropleth(group):
                 custom_pin_reply=state.get('_v205_pin_reply'),
                 search_error=state.get('_v184_search_error'),
                 commute_destination=(destinations[0] if destinations else ''),
-                commute_destination_2=(destinations[1] if len(destinations)==2 else ''),
+                commute_destination_2=(destinations[1] if len(destinations)>=2 else ''),
+                commute_destination_3=(destinations[2] if len(destinations)>=3 else ''),
                 jump=state.get('_v182_map_jump'),
                 key='town_map_v184_'+str(reset),default=None)
     if isinstance(data,dict) and data.get('home_view_epoch')==int(state.get('_v202_home_epoch',0)):
@@ -14265,7 +14332,8 @@ _V174_PERSONAL_TOKEN_QUERY = 'commute_ref'
 _V174_PERSONAL_RECORD_PREFIX = 'personal-commute.v174.'
 _V169_COMMUTE_BROWSER_KEY = 'sumai-compass-commute-preferences-v1'
 _V170_COMMUTE_FIELDS = ('commute_line_v160','commute_station_v160',
-                        'commute_line_2_v164','commute_station_2_v164')
+                        'commute_line_2_v164','commute_station_2_v164',
+                        'commute_line_3_v228','commute_station_3_v228')
 
 
 def _v174_commute_token(text):
@@ -14288,7 +14356,9 @@ def _v174_commute_backup(value):
         prefs=item.get('prefs');valid=None
         if prefs is not None:
             if not isinstance(prefs,dict) or prefs.get('schema')!=1:return None
-            keys=('line1','station1','line2','station2')
+            prefs=dict(prefs)
+            prefs.setdefault('line3',_COMMUTE_V160_NO_LINE);prefs.setdefault('station3',_COMMUTE_V160_NO_STATION)
+            keys=('line1','station1','line2','station2','line3','station3')
             if not all(isinstance(prefs.get(k),str) and len(prefs[k])<=120 for k in keys):return None
             valid={'schema':1,**{k:prefs[k] for k in keys}}
         clean[key]={'name':name,'prefs':valid}
@@ -14304,7 +14374,7 @@ def _v174_backup_nonempty(backup):
     return bool(backup and (len(backup['profiles'])>1 or any(
         isinstance(profile.get('prefs'),dict) and any(
             profile['prefs'].get(field) not in (_COMMUTE_V160_NO_LINE,_COMMUTE_V160_NO_STATION,'')
-            for field in ('station1','station2'))
+            for field in ('station1','station2','station3'))
         for profile in backup['profiles'].values())))
 
 
@@ -14473,9 +14543,10 @@ _V170_PERSONAL_STORAGE_HTML = r"""<!doctype html><html lang="ja"><head><meta cha
  function has(obj,key){return Object.prototype.hasOwnProperty.call(obj,key);}
  function safePrefs(p){
    if(!p||typeof p!=='object'||Array.isArray(p)||p.schema!==1)return null;
-   const keys=['line1','station1','line2','station2'];
+   p=Object.assign({line3:'路線を選択してください',station3:'駅を選択してください'},p);
+   const keys=['line1','station1','line2','station2','line3','station3'];
    if(!keys.every(k=>typeof p[k]==='string'&&p[k].length<=120))return null;
-   return {schema:1,line1:p.line1,station1:p.station1,line2:p.line2,station2:p.station2};
+   return {schema:1,line1:p.line1,station1:p.station1,line2:p.line2,station2:p.station2,line3:p.line3,station3:p.station3};
  }
  function blankData(){return {schema:2,updated_at:0,active:'primary',profiles:{primary:{name:'このブラウザー',prefs:null}}};}
  function normalize(raw){
@@ -14638,7 +14709,7 @@ _V170_PERSONAL_STORAGE_HTML = r"""<!doctype html><html lang="ja"><head><meta cha
 @st.cache_resource(show_spinner=False)
 def v174_personal_commute_component():
     """v174 component reloads assets without changing browser storage origin."""
-    folder=os.path.join(tempfile.gettempdir(),'sumai-personal-commute-v170')
+    folder=os.path.join(tempfile.gettempdir(),'sumai-personal-commute-v228')
     os.makedirs(folder,exist_ok=True)
     path=os.path.join(folder,'index.html')
     previous=None
@@ -14649,7 +14720,7 @@ def v174_personal_commute_component():
         temporary=path+'.tmp-'+str(os.getpid())
         with open(temporary,'w',encoding='utf-8') as handle:handle.write(_V170_PERSONAL_STORAGE_HTML)
         os.replace(temporary,path)
-    return st.components.v1.declare_component('sumai_personal_commute_v170',path=folder)
+    return st.components.v1.declare_component('sumai_personal_commute_v228',path=folder)
 
 
 def v170_validate_personal_commute(value,lines):
@@ -14658,7 +14729,8 @@ def v170_validate_personal_commute(value,lines):
     result={}
     for line_key,station_key,stored_line,stored_station in (
         ('commute_line_v160','commute_station_v160','line1','station1'),
-        ('commute_line_2_v164','commute_station_2_v164','line2','station2')):
+        ('commute_line_2_v164','commute_station_2_v164','line2','station2'),
+        ('commute_line_3_v228','commute_station_3_v228','line3','station3')):
         line=value.get(stored_line)
         station=value.get(stored_station)
         if not isinstance(line,str) or line not in lines:
@@ -14677,7 +14749,9 @@ def v170_commute_snapshot(state):
             'line1':str(state.get('commute_line_v160',_COMMUTE_V160_NO_LINE)),
             'station1':str(state.get('commute_station_v160',_COMMUTE_V160_NO_STATION)),
             'line2':str(state.get('commute_line_2_v164',_COMMUTE_V160_NO_LINE)),
-            'station2':str(state.get('commute_station_2_v164',_COMMUTE_V160_NO_STATION))}
+            'station2':str(state.get('commute_station_2_v164',_COMMUTE_V160_NO_STATION)),
+            'line3':str(state.get('commute_line_3_v228',_COMMUTE_V160_NO_LINE)),
+            'station3':str(state.get('commute_station_3_v228',_COMMUTE_V160_NO_STATION))}
 
 
 def v170_apply_browser_profile(state,message):
@@ -15106,9 +15180,10 @@ def main():
                                                     'request_id':str(state['_v170_commute_nonce'])}
                     st.rerun()
                 else:st.warning('利用者名を入力してください。')
-        st.caption('通勤先1・2は選択中の利用者ごとに自動保存します。保存・復元操作は不要です。')
+        st.caption('通勤先1・2・3は選択中の利用者ごとに自動保存します。保存・復元操作は不要です。')
         # Destination 1: retain the existing state keys and the v159 upgrade path.
         available_lines=commute_lines_v160()
+        _v228_station_lookup_ui(state,available_lines,commute_storage_ready)
         if 'commute_line_v160' not in st.session_state:
             previously=st.session_state.get('commute_destination_v159','表示しない')
             matching_line=next((name for name,stations in available_lines.items()
@@ -15152,11 +15227,17 @@ def main():
             key='commute_station_2_v164',on_change=_v180_commit_commute_change,
             disabled=(second_line==_COMMUTE_V160_NO_LINE or not commute_storage_ready))
 
+        st.markdown('**通勤先3（任意）**')
+        if state.get('commute_line_3_v228') not in line_options:
+            state['commute_line_3_v228']=_COMMUTE_V160_NO_LINE
+            state['commute_station_3_v228']=_COMMUTE_V160_NO_STATION
+        third_line=st.selectbox('① 路線（通勤先3）',line_options,key='commute_line_3_v228',on_change=_v228_commute_line_changed_third,disabled=not commute_storage_ready)
+        third_options=[_COMMUTE_V160_NO_STATION,*available_lines.get(third_line,())]
+        if state.get('commute_station_3_v228') not in third_options:state['commute_station_3_v228']=_COMMUTE_V160_NO_STATION
+        st.selectbox('② 駅（通勤先3）',third_options,key='commute_station_3_v228',on_change=_v180_commit_commute_change,disabled=(third_line==_COMMUTE_V160_NO_LINE or not commute_storage_ready))
         chosen=commute_selected_destinations_v164()
-        if len(chosen)==2:
-            st.caption(f'設定中：① {chosen[0]}駅　② {chosen[1]}駅｜地図上は駅名＋1駅目の時間、その下に2駅目の時間を表示')
-        elif chosen:
-            st.caption(f'設定中：{chosen[0]}駅｜地図上は従来の1行表示')
+        if chosen:
+            st.caption('設定中：'+'　'.join(str(i+1)+'. '+name+'駅' for i,name in enumerate(chosen)))
         st.caption('地図には「①35分（参考136%）-2回」の形式で表示します。混雑率は国土交通省2025年度の路線代表最混雑区間から計算した参考値です。')
         st.caption('設定後、「住まいを探す」タブの地図に反映します。乗換回数最少を優先し、同数の場合に所要時間最短の経路を選びます（アプリ内路線データによる概算）。'
                    '現行時刻表・待ち時間・改札内移動・職場までの徒歩時間は含みません。')
