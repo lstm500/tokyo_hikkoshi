@@ -52,7 +52,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v232"
+BUILD = "REBUILD-01-v233"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -6066,6 +6066,24 @@ def find_named_link(soup,base_url,label,host=None,prefer=()):
     return max(choices,key=lambda x:x[0])[1] if choices else None
 
 
+
+def _v233_chintai_town_link(soup,base_url,town,code):
+    """Only a named town link under the exact municipality is a town selection."""
+    wanted=address_key(town);matches=set()
+    for a in soup.select('a[href]'):
+        label=normal(a.get_text(' ',strip=True))
+        label=re.sub(r'\s*\(\s*[\d,]+\s*件\s*\)\s*$','',label).strip()
+        if address_key(label)!=wanted:continue
+        target=urljoin(base_url,html.unescape(str(a.get('href') or ''))).split('#')[0]
+        parsed=urlparse(target)
+        if (parsed.scheme!='https' or parsed.hostname!='www.chintai.net' or parsed.username or parsed.password
+                or parsed.query or not re.fullmatch(r'/[a-z]+/area/'+re.escape(str(code))+r'\d{3}/list/',parsed.path)):
+            continue
+        matches.add(target)
+    if len(matches)>1:raise AppError('CHINTAIの町名に複数の地域コードが対応しています。選択を確定できません。')
+    return next(iter(matches),None)
+
+
 def provider_region_request(web,provider,region,munis,requested):
     provider=canonical_provider(provider);city=provider_city_name(region,munis);town=town_base_name(region.get('town',''))
     alias=PREF_ALIAS.get(str(region.get('pref','')))
@@ -6080,10 +6098,14 @@ def provider_region_request(web,provider,region,munis,requested):
         city_url=f'https://www.chintai.net/{alias}/area/{region["code"]}/list/'
         if not web.permitted(city_url):raise AppError('CHINTAIの地域ページの自動取得が許可されていません。')
         soup=BeautifulSoup(web.fetch(city_url).text,'html.parser')
-        region_url=find_named_link(soup,city_url,town,'www.chintai.net',('area','list'))
-        if not region_url:
-            raise AppError('CHINTAIで'+town+'の公開町域ページを確認できません。市区町村全体を代用しません。')
-        request={'url':region_url,'params':None,'precise':True}
+        region_url=_v233_chintai_town_link(soup,city_url,town,region['code'])
+        # A missing town control need not discard readable property data. Crawl
+        # the verified municipality and classify each listing by its own address.
+        request={'url':region_url or city_url,'params':None,'precise':bool(region_url),
+                 'selection_mode':'exact_town' if region_url else 'municipality_address_classification'}
+        trace(web,'chintai_town_selection',{'requested_town':town,'municipality_code':region['code'],
+              'selected_url':request['url'],'mode':request['selection_mode'],
+              'matching':'normalized_town_name_equals_link_label'},stage='search_conditions')
 
     elif provider=='スマイティ':
         root=provider_root(provider,region);host=PROVIDER_HOST[provider]
@@ -6423,8 +6445,15 @@ def _v232_chintai_detail(web,url,region,bounds,munis,layouts=None):
     def reject(stage,reason,observed):
         return reject_listing(web,'CHINTAI',url,stage,'condition_or_missing_data',reason,observed,'町丁目・家賃・対象間取り・建物種別・築年数の確認')
     raw_address=field('住所','所在地')
-    address=_v150_town_address(raw_address,region,require_chome=True)
-    if not address:return reject('address.town_chome','掲載住所から対象市区・町丁目を確定できません',raw_address)
+    # Requested town is a collection entry, never the saved property's address.
+    # Keep the selected municipality boundary, but use the listing's actual town.
+    address=_v150_town_address(raw_address,{'code':region.get('code')},require_chome=True)
+    if not address:return reject('address.town_chome','掲載住所から対象市区内の町丁目を確定できません',raw_address)
+    actual_key=town_chome_key(address)
+    if not town_matches(region.get('town',''),actual_key.split('|',1)[1]):
+        trace(web,'chintai_actual_town_classified',{'requested_town':region.get('town'),
+              'published_address':raw_address,'stored_address':address,'map_town_key':actual_key,
+              'decision':'save_under_actual_address_if_other_filters_pass'},stage='location')
     layout=parsed_layout(field('間取り'),rough=False)
     kind=field('建物種別','物件種別','種別')
     house=any(token in kind for token in ('戸建','貸家','テラス','タウンハウス'))
@@ -6444,7 +6473,7 @@ def _v232_chintai_detail(web,url,region,bounds,munis,layouts=None):
     if not rent or rent<=0:return reject('detail.rent','家賃を取得できません',field('家賃','賃料'))
     location={'latitude':None,'longitude':None,'coordinate_precision':'town',
               'location_method':'CHINTAI掲載住所→町丁目','map_address':address,
-              'address_match':'掲載住所と対象市区町名を照合','inferred_address':address}
+              'address_match':'掲載住所の町丁目を確定・対象市区コードを照合','inferred_address':address}
     heading=soup.select_one('h1')
     title=heading.get_text(' ',strip=True) if heading else 'CHINTAI掲載物件'
     row=partial_listing('CHINTAI',url,title,address,layout,rent,None,None,region,bounds,location,
