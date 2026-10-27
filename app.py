@@ -52,7 +52,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v236"
+BUILD = "REBUILD-01-v237"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -6272,6 +6272,9 @@ def detail_link_candidates(soup,base_url,provider,town=None,require_town_context
         label=normal(a.get_text(' ',strip=True));context=_candidate_context(a);path=u.path
         if re.search(r'/souba/|/sitemap/|/theme/|/rent/|/areas?/?$|/stations?/',path,re.I):continue
         is_strong=bool(strong and re.search(strong,path,re.I))
+        # CHINTAI detail IDs have an explicit public URL format. Navigation
+        # links must never become a room merely because nearby text has rent.
+        if provider=='CHINTAI' and not is_strong:continue
         contextual=bool(re.search(r'詳細|物件|部屋|賃貸',label)) and bool(re.search(r'\d+(?:\.\d+)?\s*万円|\d{4,}\s*円',context))
         if not (is_strong or contextual):continue
         if require_town_context and wanted:
@@ -6521,44 +6524,112 @@ def chintai_area_groups(regions,munis):
     return suumo_area_groups(regions,munis)
 
 
+def _v237_chintai_search_url(url,params,scope_url=None):
+    u=urlparse(url);scope=urlparse(scope_url or url)
+    pattern=r'^/[a-z]+/area/\d{5}(?:\d{3})?/list/(?:page([1-9]\d*)/)?$'
+    for value in (u,scope):
+        if (value.scheme!='https' or value.hostname!='www.chintai.net' or value.username or value.password
+            or value.port not in (None,443) or not re.fullmatch(pattern,value.path)):
+            raise AppError('CHINTAIの条件付き検索URLを確認できません。')
+    base=re.sub(r'page[1-9]\d*/$','',scope.path)
+    if re.sub(r'page[1-9]\d*/$','',u.path)!=base:
+        raise AppError('CHINTAIのページ送りが選択した地域から外れました。')
+    query=parse_qs(u.query,keep_blank_values=True)
+    for key,value in params.items():query[key]=[str(value)]
+    return u._replace(query=urlencode(query,doseq=True),fragment='').geturl()
+
+
+def _v237_chintai_verify_filters(soup,params):
+    selected={str(n.get('value')) for n in soup.select('input[name="b"][checked]')}
+    observed={'b':sorted(selected)}
+    for name in ('h','sf'):
+        control=soup.select_one('select[name="'+name+'"]')
+        options=control.select('option[selected]') if control else []
+        # CHINTAI sometimes marks both the default and actual option selected.
+        # For a single select the browser uses the last selected option.
+        choice=options[-1] if options else control.select_one('option') if control else None
+        observed[name]=str(choice.get('value')) if choice else None
+    if selected!={params['b']} or any(observed[k]!=params[k] for k in ('h','sf')):
+        error=AppError('CHINTAIの検索結果に建物種別・築年数・面積の指定が反映されたことを確認できません。')
+        error.diagnostic={'requested':dict(params),'observed':observed}
+        raise error
+    return observed
+
+
+def _v237_chintai_next_page(soup,current,scope_url,params):
+    now=re.search(r'/page([1-9]\d*)/$',urlparse(current).path)
+    number=int(now.group(1)) if now else 1
+    candidates=[]
+    for anchor in soup.select('.list_pager a[href], a[rel="next"]'):
+        target=urljoin(current,html.unescape(str(anchor.get('href') or '')))
+        parsed=urlparse(target);match=re.search(r'/page([1-9]\d*)/$',parsed.path)
+        label=normal(anchor.get_text(' ',strip=True))
+        is_next='next' in (anchor.get('rel') or []) or bool(re.search(r'次|NEXT',label,re.I))
+        if match and int(match.group(1))>number:
+            candidates.append((int(match.group(1)),_v237_chintai_search_url(target,params,scope_url)))
+        elif is_next:
+            raise AppError('CHINTAIの次ページの地域・ページ番号を確認できません。')
+    if not candidates:return None
+    next_number,target=min(candidates)
+    if next_number!=number+1:raise AppError('CHINTAIのページ送りに欠番があります。未完了です。')
+    return target
+
+
 def chintai_collect(web,region,bounds,munis,emit):
-    current=provider_region_request(web,'CHINTAI',region,munis,None)['url']
-    seen_pages=set();seen_page_urls=set();seen_urls=set();page=0
-    while current:
-        if current in seen_page_urls:raise AppError('CHINTAIのページURLが循環しました。未完了です。')
-        seen_page_urls.add(current)
-        web.check_cancel();page+=1;emit('message',f'CHINTAI {region["label"]} {page}ページ目')
-        if not web.permitted(current):raise AppError('CHINTAIの一覧取得が許可されていません。')
-        reply=web.fetch(current);soup=BeautifulSoup(reply.text,'html.parser')
-        signature=hashlib.sha256(reply.content).hexdigest()
-        if signature in seen_pages:raise AppError('CHINTAIのページ送りが同じ一覧を返しました。未完了です。')
-        seen_pages.add(signature)
-        links=detail_link_candidates(soup,reply.url,'CHINTAI')
-        # A malformed/challenge/error page is not evidence of an empty town.
-        if not links and not re.search(r'(?:該当|検索結果|物件)[^。]{0,30}(?:0件|ありません|見つかりません)',soup.get_text(' ',strip=True)):
-            raise AppError('CHINTAIの一覧から募集リンクを読めません。未完了です。')
-        fresh=[u for u in links if u not in seen_urls];emit('candidate',len(fresh))
-        for url in fresh:
-            seen_urls.add(url);web.check_cancel()
-            pid_match=re.fullmatch(r'/detail/bk-([A-Za-z0-9_-]+)/?',urlparse(url).path)
-            property_id='CHINTAI:bk:'+pid_match.group(1) if pid_match else None
-            obtained=getattr(web,'acquired_ids',{}).get(property_id)
-            if obtained and recent_acquisition(obtained):
-                emit('skipped',1);continue
-            emit('detail',1)
-            try:row=_v232_chintai_detail(web,url,region,bounds,munis)
-            except SearchCancelled:raise
-            except Exception as exc:
-                trace(web,'listing_failed',{'provider':'CHINTAI','url':url,'reason':str(exc),'exception_type':type(exc).__name__},'ERROR','rejection')
-                emit('issue','CHINTAI｜'+str(exc));emit('incomplete',1);continue
-            if row:emit('unit',row)
-            else:emit('rejected',1)
-        next_url=generic_next_page(soup,reply.url,'CHINTAI')
-        # Detect a disabled parser rather than silently truncating a live next control.
-        next_control=soup.select_one('a[rel="next"]')
-        if next_control and not next_url:raise AppError('CHINTAIの次ページを解釈できません。未完了です。')
-        trace(web,'page_end',{'provider':'CHINTAI','page':page,'new_candidates':len(fresh),'next_url':next_url},stage='pagination')
-        current=next_url
+    base_url=provider_region_request(web,'CHINTAI',region,munis,None)['url']
+    # Verified against CHINTAI's public search controls: b=2 mansion, b=3
+    # house/terrace, h=5 <=15 years, sf=50 >=50 m2. No <=40-year option
+    # exists, so houses retain their existing detail-level <=40-year check.
+    searches=(('mansion','マンション・築15年以内',{'b':'2','h':'5','sf':'0'}),
+              ('house','一戸建て・50㎡以上',{'b':'3','h':'99','sf':'50'}))
+    seen_ids=set()
+    for kind,label,params in searches:
+        web.check_cancel()
+        current=_v237_chintai_search_url(base_url,params)
+        trace(web,'chintai_search_filters',{'provider':'CHINTAI','kind':kind,'url':current,
+            'parameters':params,'detail_checks':'existing layout/type/age/walk/rent/address checks retained',
+            'house_age_max_in_detail':40 if kind=='house' else None},stage='search_conditions')
+        seen_pages=set();seen_page_urls=set();page=0
+        while current:
+            if current in seen_page_urls:raise AppError('CHINTAIのページURLが循環しました。未完了です。')
+            seen_page_urls.add(current)
+            web.check_cancel();page+=1;emit('message',f'CHINTAI {region["label"]}｜{label} {page}ページ目')
+            if not web.permitted(current):raise AppError('CHINTAIの一覧取得が許可されていません。')
+            reply=web.fetch(current);soup=BeautifulSoup(reply.text,'html.parser')
+            _v237_chintai_search_url(reply.url,params,base_url)
+            observed=_v237_chintai_verify_filters(soup,params)
+            signature=hashlib.sha256(reply.content).hexdigest()
+            if signature in seen_pages:raise AppError('CHINTAIのページ送りが同じ一覧を返しました。未完了です。')
+            seen_pages.add(signature)
+            links=detail_link_candidates(soup,reply.url,'CHINTAI')
+            # A broken page is never interpreted as a zero-result search.
+            empty=bool(re.search(r'(?:該当|検索結果|物件)[^。]{0,40}(?:0件|ありません|見つかりません)',soup.get_text(' ',strip=True)))
+            if not links and not empty:raise AppError('CHINTAIの一覧から募集リンクを読めません。未完了です。')
+            fresh=[]
+            for url in links:
+                match=re.fullmatch(r'/detail/bk-([A-Za-z0-9_-]+)/?',urlparse(url).path)
+                if not match:continue
+                property_id='CHINTAI:bk:'+match.group(1)
+                if property_id in seen_ids:continue
+                seen_ids.add(property_id);fresh.append((url,property_id))
+            emit('candidate',len(fresh))
+            for url,property_id in fresh:
+                web.check_cancel()
+                obtained=getattr(web,'acquired_ids',{}).get(property_id)
+                if obtained and recent_acquisition(obtained):emit('skipped',1);continue
+                emit('detail',1)
+                try:row=_v232_chintai_detail(web,url,region,bounds,munis)
+                except SearchCancelled:raise
+                except Exception as exc:
+                    trace(web,'listing_failed',{'provider':'CHINTAI','url':url,'reason':str(exc),
+                        'exception_type':type(exc).__name__,'traceback':traceback.format_exc()},'ERROR','rejection')
+                    emit('issue','CHINTAI｜'+str(exc));emit('incomplete',1);continue
+                if row:emit('unit',row)
+                else:emit('rejected',1)
+            next_url=_v237_chintai_next_page(soup,current,base_url,params)
+            trace(web,'page_end',{'provider':'CHINTAI','kind':kind,'page':page,
+                'url':current,'verified_filters':observed,'new_candidates':len(fresh),'next_url':next_url},stage='pagination')
+            current=next_url
 
 
 
@@ -6720,7 +6791,7 @@ def search_all(db,conditions,screen,state=None):
                 audit.add('search_conditions','provider_enabled','INFO',{'provider':'HOME’S','mansion':{'max_age':15,'layout_groups':[list(x) for x in HOMES_LAYOUT_GROUPS]},'house':{'max_age':40,'min_area_sqm':50},'filter_mode':'city -> 町域 -> mansion groups + kodate -> detail -> 地図を見る'})
                 continue
             available[provider]=['ALL'];generic_providers.append(provider)
-            audit.add('search_conditions','provider_enabled','INFO',{'provider':provider,'layouts':list(ALL_TARGET_LAYOUTS),'filter_mode':'one public town-list crawl + explicit detail layout verification'})
+            audit.add('search_conditions','provider_enabled','INFO',{'provider':provider,'layouts':list(ALL_TARGET_LAYOUTS),'filter_mode':('separate mansion <=15y and house >=50sqm public searches + detail validation' if provider=='CHINTAI' else 'one public town-list crawl + explicit detail layout verification')})
         jobs=[];provider_targets=[]
         for provider in conditions['providers']:
             if provider not in available:continue
