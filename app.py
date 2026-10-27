@@ -52,7 +52,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v233"
+BUILD = "REBUILD-01-v234"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -6576,6 +6576,9 @@ def search_all(db,conditions,screen,state=None):
     web=getattr(state,'shared_web',None) or PublicWeb();web.audit=audit
     web.address_points=getattr(db,'address_points',None)
     web.http_cache.clear();web.failed_detail_urls.clear();web.unavailable_hosts.clear();web.claimed_ids=set()
+    # Every enabled source uses this post-save cache, including CHINTAI-only runs.
+    # Reset it for each search so a reused controller cannot carry stale IDs.
+    web.acquired_ids={}
     if hasattr(state,'request_starts'):web.host_last_request=state.request_starts
     if hasattr(state,'cancel_event'):web.cancel_event=state.cancel_event
     if hasattr(web,'configure'):web.configure(getattr(db,'web_config',{}))
@@ -6586,7 +6589,7 @@ def search_all(db,conditions,screen,state=None):
         screen['bar'].progress(.05+.15*done/max(1,total),text=f'{stage} {done}/{total}')
         screen['status'].info(f'検索実行中｜{stage} {done}/{total}｜{count}地域｜取得失敗 {errors}件｜経過 {int(time.monotonic()-started)}秒')
     try:
-        if 'SUUMO' in conditions['providers']:
+        if any(p in ('SUUMO','CHINTAI') for p in conditions['providers']):
             unavailable_until=float(getattr(db,'acquisition_ledger_disabled_until',0) or 0)
             if time.monotonic()<unavailable_until:
                 web.acquired_ids={}
@@ -6781,19 +6784,33 @@ def search_all(db,conditions,screen,state=None):
                     processed_now=len(saved)+errors_now
                     state.live_metrics={'processed':processed_now,'saved':len(saved),'errors':errors_now,'skipped':skipped}
                     screen['status'].info(f'検索実行中｜処理 {processed_now}件｜保存 {len(saved)}件｜未保存 {errors_now}件｜スキップ {skipped}件')
+                    save_phase='listing_write_and_readback';chunk=[]
                     try:
                         for offset in range(0,len(batch),200):
+                            save_phase='listing_write_and_readback'
                             chunk=batch[offset:offset+200];saved.update(db.save_units(chunk));state.new_last_saved_at=utc_now()
                             for row in chunk:save_failed_keys.discard(compact_listing_key(row))
                             for row in chunk:
                                 if row.get('property_id'):acquisition_pending[row['property_id']]=row
+                            save_phase='acquisition_ledger_write'
                             db.save_acquisition_ids(chunk)
                             for row in chunk:acquisition_pending.pop(row.get('property_id'),None)
+                            save_phase='acquisition_memory_update'
                             for row in chunk:
                                 if row.get('property_id'):web.acquired_ids[row['property_id']]=row['fetched_at']
                     except Exception as exc:
                         for row in batch:save_failed_keys.add(compact_listing_key(row))
-                        issues.append(str(exc) if isinstance(exc,AppError) else type(exc).__name__);log('保存エラー｜'+(str(exc) if isinstance(exc,AppError) else type(exc).__name__))
+                        confirmed_count=sum(compact_listing_key(row) in saved for row in batch)
+                        message=str(exc) if isinstance(exc,AppError) else type(exc).__name__+': '+str(exc)
+                        audit.add('database','save_exception','ERROR',{
+                            'operation':save_phase,'exception_type':type(exc).__name__,'message':str(exc),
+                            'traceback':traceback.format_exc(),'batch_count':len(batch),
+                            'readback_confirmed_count':confirmed_count,
+                            'unconfirmed_count':len(batch)-confirmed_count,
+                            'property_ids':[row.get('property_id') for row in chunk],
+                            'diagnostic':getattr(exc,'diagnostic',{})})
+                        label='保存後の管理情報更新エラー' if confirmed_count==len(batch) else '保存エラー'
+                        issues.append(label+'｜'+message);log(issues[-1])
                     # Browser session holds unconfirmed rows separately; no claim of persistence.
                     state.new_units=list(units.values())
                     state.new_saved_keys=list(saved)
