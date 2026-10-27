@@ -52,7 +52,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v231"
+BUILD = "REBUILD-01-v232"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -96,11 +96,11 @@ SUUMO_MAP_ONLY_ADDRESS_POLICY = 'published_town_first_unique_property_map_fallba
 # The detached-house branch is additive: do not weaken/remove the existing mansion flow.
 HOMES_TEXT_ADDRESS_FORBIDDEN = True
 HOMES_MAP_ONLY_ADDRESS_POLICY = 'map_image_or_published_center_plus_identity_v1'
-AUTOMATIC_REGION_PROVIDERS = ['SUUMO']
+AUTOMATIC_REGION_PROVIDERS = ['SUUMO','CHINTAI']
 
-PROVIDER_OPTIONS = ('SUUMO',)
+PROVIDER_OPTIONS = ('SUUMO','CHINTAI')
 PROVIDER_CANONICAL = {"HOMES":"HOME’S","HOME’S":"HOME’S","スマイティ":"スマイティ","SUUMO":"SUUMO","カナリー":"カナリー",
-                      "アットホーム":"アットホーム","CHINTAI":"CHINTAI","Comfy":"Comfy","アパマンショップ":"アパマンショップ"}
+                      "アットホーム":"アットホーム","CHINTAI":"CHINTAI","CINTAI":"CHINTAI","Comfy":"Comfy","アパマンショップ":"アパマンショップ"}
 PROVIDER_DISPLAY = {"HOME’S":"HOMES",**{x:x for x in PROVIDER_OPTIONS if x!="HOMES"}}
 PROVIDER_HOST = {
     "スマイティ":"sumaity.com","HOME’S":"www.homes.co.jp","SUUMO":"suumo.jp","カナリー":"web.canary-app.jp",
@@ -676,9 +676,10 @@ create index if not exists housing_units_v1_range on public.housing_units_v1(nam
 create table if not exists public.housing_searches_v1 (
  namespace text not null, id text not null, status text not null,
  started_at timestamptz not null, finished_at timestamptz,
- conditions jsonb not null, summary jsonb not null default '{}'::jsonb,
+ conditions jsonb not null, summary jsonb not null default '{}'::jsonb, source text not null default 'SUUMO',
  primary key(namespace,id)
 );
+alter table public.housing_searches_v1 add column if not exists source text not null default 'SUUMO';
 -- Optional for existing databases: run these non-destructive indexes in SQL Editor
 -- if housing_searches_v1 GET (the acquisition ledger) returns HTTP 500/timeout.
 create index if not exists housing_searches_v1_status_id
@@ -1052,9 +1053,9 @@ def compact_saved_listing(row):
             parsed_stamp=datetime.fromisoformat(str(stamp).replace('Z','+00:00'))
             if parsed_stamp.tzinfo is None:return None
             stamp=parsed_stamp.astimezone(timezone.utc).isoformat(timespec='seconds')
-        result={'rent':int(round(float(rent))),'layout':layout,'address':address[:220],'dwelling_type':dwelling_type,'fetched_at':stamp or None}
+        result={'source':listing_source(row),'rent':int(round(float(rent))),'layout':layout,'address':address[:220],'dwelling_type':dwelling_type,'fetched_at':stamp or None}
         property_id=row.get('property_id')
-        if isinstance(property_id,str) and re.fullmatch(r'SUUMO:(?:bc|jnc):\d+',property_id):result['property_id']=property_id
+        if isinstance(property_id,str) and re.fullmatch(r'(?:SUUMO:(?:bc|jnc):\d+|CHINTAI:bk:[A-Za-z0-9_-]+)',property_id):result['property_id']=property_id
         return result
     except (ValueError,TypeError,AttributeError):return None
 
@@ -1104,9 +1105,9 @@ def partial_listing(provider,url,title,address,layout,rent,fees,area,region,boun
     # published address identifies a map-renderable town/chome.  Never invent
     # a point at the search-region centroid; it would corrupt point maps.
     if provider in ('HOME’S','HOMES') and not precise:return None
-    if provider=='SUUMO' and not precise and not town_chome_key(address):return None
+    if provider in ('SUUMO','CHINTAI') and not precise and not town_chome_key(address):return None
     if not precise:
-        if provider=='SUUMO':
+        if provider in ('SUUMO','CHINTAI'):
             location={**location,'latitude':None,'longitude':None,
                       'coordinate_precision':'town','location_method':location.get('location_method') or 'SUUMO掲載所在地→町丁目',
                       'map_address':address,'address_match':'町丁目確定・建物位置未確認'}
@@ -1363,7 +1364,7 @@ class Database:
             if property_id in unique and unique[property_id]['finished_at']>=stamp:continue
             unique[property_id]={'namespace':self.namespace,'id':('acquired.v150.' if row.get('address_quality_version')==4 else 'acquired.')+hashlib.sha256(property_id.encode()).hexdigest(),
                 'status':'rental_acquisition','started_at':stamp,'finished_at':stamp,
-                'conditions':{'provider':'SUUMO','property_id':property_id,'schema':2},
+                'conditions':{'provider':listing_source(row),'property_id':property_id,'schema':2},
                 'summary':{'last_success_at':stamp,'listing_key':compact_listing_key(row),
                            'address_complete':not saved_address_requires_reacquisition(row.get('address') or row.get('inferred_address')),
                            'map_compatible':bool(town_chome_key(row.get('address') or row.get('inferred_address'))),
@@ -1401,10 +1402,10 @@ class Database:
                 stamps={str(r.get('id','')).removeprefix('listing.'):((r.get('summary') or {}).get('listing') or {}).get('fetched_at') for r in previous}
                 for key,compact in batch:
                     if not compact.get('fetched_at') and stamps.get(key):compact['fetched_at']=stamps[key]
-            payload=[dict(namespace=self.namespace,id='listing.'+storage_keys[key],status='rental_listing',started_at=utc_now(),finished_at=None,
+            payload=[dict(namespace=self.namespace,id='listing.'+storage_keys[key],source=compact['source'],status='rental_listing',started_at=utc_now(),finished_at=None,
                 conditions={'record_type':'rental_listing','schema':8 if key in v150_keys else 7,
-                            'fields':['property_id','rent','layout','address','dwelling_type','fetched_at'],
-                            'address_origin':'suumo_source_or_map_town_chome' if key in v150_keys else 'legacy_provider_mapping',
+                            'fields':['source','property_id','rent','layout','address','dwelling_type','fetched_at'],
+                            'source':compact['source'],'address_origin':('chintai_published_town_chome' if compact['source']=='CHINTAI' else 'suumo_source_or_map_town_chome' if key in v150_keys else 'legacy_provider_mapping'),
                             'map_granularity':'town_chome' if key in v150_keys else 'street_number'},
                 summary={'listing':compact}) for key,compact in batch]
             result=self.call('POST',SEARCH_TABLE,{'on_conflict':'namespace,id','select':'id'},payload,'resolution=ignore-duplicates,return=representation')
@@ -1434,7 +1435,7 @@ class Database:
             confirmed=self.call('GET',SEARCH_TABLE,{
                 'namespace':'eq.'+self.namespace,
                 'id':'in.('+','.join(expected_by_id)+')',
-                'select':'id,summary','limit':len(expected_by_id)})
+                'select':'id,source,summary','limit':len(expected_by_id)})
             if not isinstance(confirmed,list):
                 raise AppError('Supabaseに保存した物件の住所・家賃の再読込に失敗しました。')
             seen=set()
@@ -1448,6 +1449,8 @@ class Database:
                     got.get('layout')!=expected.get('layout') or
                     got.get('rent')!=expected.get('rent') or
                     got.get('property_id')!=expected.get('property_id') or
+                    canonical_provider(got.get('source'))!=expected['source'] or
+                    item.get('source')!=expected['source'] or
                     not town_chome_key(got.get('address'))):
                     raise AppError('保存後の読み戻しで住所・家賃・間取り・物件IDの不一致を検出しました。')
                 seen.add(rid)
@@ -1534,7 +1537,7 @@ class Database:
                 cond=row.get('conditions') or {};summary=row.get('summary') or {}
                 pid=normal(cond.get('property_id'))
                 stamp=summary.get('last_success_at') or row.get('finished_at')
-                if not re.fullmatch(r'SUUMO:(?:bc|jnc):\d+',pid) or not recent_acquisition(stamp):continue
+                if not re.fullmatch(r'(?:SUUMO:(?:bc|jnc):\d+|CHINTAI:bk:[A-Za-z0-9_-]+)',pid) or not recent_acquisition(stamp):continue
                 complete=summary.get('address_complete')
                 key=normal(summary.get('listing_key'))
                 version=summary.get('address_quality_version')
@@ -6379,8 +6382,118 @@ def athome_collect(web,region,bounds,munis,emit):
     return public_portal_collect(web,region,bounds,munis,emit,'アットホーム')
 
 
+# v232: source-aware, map-compatible CHINTAI collection.
+def _v232_enabled_providers(values):
+    return list(dict.fromkeys(canonical_provider(p) for p in (values or []) if canonical_provider(p) in PROVIDER_OPTIONS)) or ['SUUMO']
+
+
+def listing_source(row):
+    if not isinstance(row,dict):return 'SUUMO'
+    pid=str(row.get('property_id') or '')
+    source=canonical_provider(row.get('source') or row.get('provider') or (pid.split(':',1)[0] if ':' in pid else 'SUUMO'))
+    if pid.startswith('CHINTAI:'):source='CHINTAI'
+    elif pid.startswith('SUUMO:'):source='SUUMO'
+    return source
+
+
+def _v232_chintai_fields(soup):
+    # CHINTAI has several th/td pairs in one tr. Reading a whole tr's first td
+    # confuses floor size with construction year, or direction with building type.
+    result={}
+    for tr in soup.select('tr'):
+        children=tr.find_all(['th','td'],recursive=False)
+        for i,cell in enumerate(children[:-1]):
+            if cell.name=='th' and children[i+1].name=='td':
+                name=normal(cell.get_text(' ',strip=True))
+                result.setdefault(name,normal(children[i+1].get_text(' ',strip=True)))
+    for dt in soup.select('dt'):
+        dd=dt.find_next_sibling('dd')
+        if dd:result.setdefault(normal(dt.get_text(' ',strip=True)),normal(dd.get_text(' ',strip=True)))
+    return result
+
+
+def _v232_chintai_detail(web,url,region,bounds,munis,layouts=None):
+    begin_listing(web,'CHINTAI',url)
+    if not web.permitted(url):raise AppError('CHINTAIの詳細取得が許可されていません。')
+    match=re.fullmatch(r'/detail/bk-([A-Za-z0-9_-]+)/?',urlparse(url).path)
+    if not match:raise AppError('CHINTAIの募集IDを確認できません。')
+    pid='CHINTAI:bk:'+match[1]
+    reply=web.fetch(url);soup=BeautifulSoup(reply.text,'html.parser');fields=_v232_chintai_fields(soup)
+    def field(*names):return next((fields[name] for name in names if fields.get(name)), '')
+    def reject(stage,reason,observed):
+        return reject_listing(web,'CHINTAI',url,stage,'condition_or_missing_data',reason,observed,'町丁目・家賃・対象間取り・建物種別・築年数の確認')
+    raw_address=field('住所','所在地')
+    address=_v150_town_address(raw_address,region,require_chome=True)
+    if not address:return reject('address.town_chome','掲載住所から対象市区・町丁目を確定できません',raw_address)
+    layout=parsed_layout(field('間取り'),rough=False)
+    kind=field('建物種別','物件種別','種別')
+    house=any(token in kind for token in ('戸建','貸家','テラス','タウンハウス'))
+    if not house and 'マンション' not in kind:return reject('detail.building_type','マンション・一戸建てではありません',kind)
+    age,ym=age_info(field('築年','築年月','築年数'))
+    if age is None or age>(40 if house else 15):return reject('detail.age','築年数が未確認、または対象外です',field('築年','築年月','築年数'))
+    raw_area=field('専有面積','面積');m=re.search(r'\d+(?:\.\d+)?',raw_area);area=float(m[0]) if m else None
+    if house and (area is None or area<50):return reject('detail.area','一戸建ては50㎡以上が対象です',raw_area)
+    allowed=set(x for group in SUUMO_LAYOUT_GROUPS for x in group)
+    # S付き間取りも既存の地図グループで同じように扱う。
+    if not layout or (not house and layout.replace('S','') not in allowed):return reject('detail.layout','対象間取りではありません',field('間取り'))
+    transport=field('交通');walks=[int(v) for v in re.findall(r'徒歩\s*(\d+)\s*分',transport)]
+    if not walks or min(walks)>15:return reject('detail.walk','徒歩15分以内の交通を確認できません',transport)
+    raw_rent=field('家賃','賃料')
+    rent_match=re.match(r'^\s*(\d[\d,]*(?:\.\d+)?)\s*(万円|円)',raw_rent)
+    rent=optional_amount(''.join(rent_match.groups())) if rent_match else None
+    if not rent or rent<=0:return reject('detail.rent','家賃を取得できません',field('家賃','賃料'))
+    location={'latitude':None,'longitude':None,'coordinate_precision':'town',
+              'location_method':'CHINTAI掲載住所→町丁目','map_address':address,
+              'address_match':'掲載住所と対象市区町名を照合','inferred_address':address}
+    heading=soup.select_one('h1')
+    title=heading.get_text(' ',strip=True) if heading else 'CHINTAI掲載物件'
+    row=partial_listing('CHINTAI',url,title,address,layout,rent,None,None,region,bounds,location,
+                        field('構造'),age,ym,field('物件階層'),dwelling_type='house' if house else 'mansion')
+    if row:
+        row.update(property_id=pid,source='CHINTAI',address_quality_version=4)
+        trace(web,'chintai_detail_accepted',{'property_id':pid,'source':'CHINTAI','address':address,
+              'town_key':town_chome_key(address),'layout':layout,'rent':rent,'dwelling_type':row['dwelling_type']},stage='parser')
+    return row
+
+
+def chintai_area_groups(regions,munis):
+    # Group once per town instead of downloading its list once for each chome.
+    return suumo_area_groups(regions,munis)
+
+
 def chintai_collect(web,region,bounds,munis,emit):
-    return public_portal_collect(web,region,bounds,munis,emit,'CHINTAI')
+    current=provider_region_request(web,'CHINTAI',region,munis,None)['url']
+    seen_pages=set();seen_page_urls=set();seen_urls=set();page=0
+    while current:
+        if current in seen_page_urls:raise AppError('CHINTAIのページURLが循環しました。未完了です。')
+        seen_page_urls.add(current)
+        web.check_cancel();page+=1;emit('message',f'CHINTAI {region["label"]} {page}ページ目')
+        if not web.permitted(current):raise AppError('CHINTAIの一覧取得が許可されていません。')
+        reply=web.fetch(current);soup=BeautifulSoup(reply.text,'html.parser')
+        signature=hashlib.sha256(reply.content).hexdigest()
+        if signature in seen_pages:raise AppError('CHINTAIのページ送りが同じ一覧を返しました。未完了です。')
+        seen_pages.add(signature)
+        links=detail_link_candidates(soup,reply.url,'CHINTAI')
+        # A malformed/challenge/error page is not evidence of an empty town.
+        if not links and not re.search(r'(?:該当|検索結果|物件)[^。]{0,30}(?:0件|ありません|見つかりません)',soup.get_text(' ',strip=True)):
+            raise AppError('CHINTAIの一覧から募集リンクを読めません。未完了です。')
+        fresh=[u for u in links if u not in seen_urls];emit('candidate',len(fresh))
+        for url in fresh:
+            seen_urls.add(url);web.check_cancel();emit('detail',1)
+            try:row=_v232_chintai_detail(web,url,region,bounds,munis)
+            except SearchCancelled:raise
+            except Exception as exc:
+                trace(web,'listing_failed',{'provider':'CHINTAI','url':url,'reason':str(exc),'exception_type':type(exc).__name__},'ERROR','rejection')
+                emit('issue','CHINTAI｜'+str(exc));emit('incomplete',1);continue
+            if row:emit('unit',row)
+            else:emit('rejected',1)
+        next_url=generic_next_page(soup,reply.url,'CHINTAI')
+        # Detect a disabled parser rather than silently truncating a live next control.
+        next_control=soup.select_one('a[rel="next"]')
+        if next_control and not next_url:raise AppError('CHINTAIの次ページを解釈できません。未完了です。')
+        trace(web,'page_end',{'provider':'CHINTAI','page':page,'new_candidates':len(fresh),'next_url':next_url},stage='pagination')
+        current=next_url
+
 
 
 def comfy_collect(web,region,bounds,munis,emit):
@@ -6400,8 +6513,7 @@ PROVIDER_COLLECTORS={
 
 def search_all(db,conditions,screen,state=None):
     if state is None: state=st.session_state
-    # SUUMO-only release: ignore stale multi-provider requests from stored settings.
-    conditions['providers']=['SUUMO']
+    conditions['providers']=_v232_enabled_providers(conditions.get('providers'))
     bounds=tuple(conditions['bounds']);started=time.monotonic()
     audit=getattr(state,'audit',None) or AuditLog(conditions,(getattr(db,'key',''),));state.audit=audit;db.audit=audit
     DIAG_CONTEXT.audit=audit;DIAG_CONTEXT.scope={}
@@ -6528,7 +6640,7 @@ def search_all(db,conditions,screen,state=None):
         jobs=[];provider_targets=[]
         for provider in conditions['providers']:
             if provider not in available:continue
-            targets=list(suumo_groups.values()) if provider=='SUUMO' else list(homes_groups.values()) if provider=='HOME’S' else regions
+            targets=list(suumo_groups.values()) if provider=='SUUMO' else list(homes_groups.values()) if provider=='HOME’S' else chintai_area_groups(regions,munis) if provider=='CHINTAI' else regions
             provider_targets.append((provider,targets))
         for number in range(max((len(targets) for _,targets in provider_targets),default=0)):
             for provider,targets in provider_targets:
@@ -7652,7 +7764,7 @@ def fetch_facilities(center,kind):
 
 
 def csv_bytes(rows):
-    keys=['property_id','rent','layout','address','dwelling_type','fetched_at'];file=io.StringIO();writer=csv.DictWriter(file,fieldnames=keys);writer.writeheader()
+    keys=['source','property_id','rent','layout','address','dwelling_type','fetched_at'];file=io.StringIO();writer=csv.DictWriter(file,fieldnames=keys);writer.writeheader()
     for row in rows:
         compact=compact_saved_listing(row)
         if compact:writer.writerow(compact)
@@ -7663,7 +7775,7 @@ def read_csv(content):
     try:
         rows=[]
         for raw in csv.DictReader(io.StringIO(content.decode('utf-8-sig'))):
-            row={'property_id':normal(raw.get('property_id')) or None,'rent':int(raw['rent']),'layout':normal(raw['layout']),'address':normal(raw['address']),
+            row={'source':normal(raw.get('source')) or 'SUUMO','property_id':normal(raw.get('property_id')) or None,'rent':int(raw['rent']),'layout':normal(raw['layout']),'address':normal(raw['address']),
                  'dwelling_type':normalized_dwelling_type(raw.get('dwelling_type') or 'mansion'),'fetched_at':normal(raw.get('fetched_at')) or None}
             compact=compact_saved_listing(row)
             if not compact:raise ValueError()
@@ -7806,7 +7918,7 @@ class SavedLoadJob:
     def export_storage_record_audit(self):
         # Build diagnostic rows only when explicitly requested.
         with self.lock:
-            return [{'Supabase行ID':r.get('storage_id'),'物件ID':r.get('property_id') or '',
+            return [{'Supabase行ID':r.get('storage_id'),'取得元':listing_source(r),'物件ID':r.get('property_id') or '',
                      '家賃':r.get('rent'),'間取り':r.get('layout'),
                      '住所':r.get('address'),'取得日時':r.get('fetched_at') or '',
                      '分類':'物件ID確認済み・地図表示対象' if r.get('property_id') else '旧形式IDなし・地図表示対象'}
@@ -8225,9 +8337,9 @@ def remember_search():
         code=state.get('manual_ward','13116')
         selected=list(state.get('new_providers',[]))
         providers=[canonical_provider(p) for p in selected]
-        providers=[p for p in dict.fromkeys(providers) if p=='SUUMO']
+        providers=[p for p in dict.fromkeys(providers) if p in PROVIDER_OPTIONS]
         if not providers:
-            state.new_search={'status':'failed','summary':{'issues':['区・町名検索ではSUUMOを取得元に選択してください。'],'saved':0,'confirmed':0}}
+            state.new_search={'status':'failed','summary':{'issues':['区・町名検索の取得元を選択してください。'],'saved':0,'confirmed':0}}
             return
         state.new_request={'bounds':[34,138,37,141],'providers':providers,'ward_code':code,
                            'town_codes':list(state.get('manual_selected_'+code,[])), 'mode':'ward_search',
@@ -8235,7 +8347,7 @@ def remember_search():
         state.new_map_loaded=True
         return
     selected=list(state.get('new_providers',[]))
-    providers=[p for p in dict.fromkeys(canonical_provider(p) for p in selected) if p=='SUUMO']
+    providers=[p for p in dict.fromkeys(canonical_provider(p) for p in selected) if p in PROVIDER_OPTIONS]
     bounds=state.get('new_bounds')
     state.new_preferences={'new_providers':selected}
     state.new_map_loaded=True
@@ -8996,7 +9108,7 @@ def automatic_task_plan(settings):
     providers=[p for p in dict.fromkeys(providers) if p in AUTOMATIC_REGION_PROVIDERS]
     target_sets=[]
     for provider in providers:
-        groups=suumo_area_groups(regions,munis) if provider=='SUUMO' else homes_area_groups(regions,munis)
+        groups=suumo_area_groups(regions,munis) if provider in ('SUUMO','CHINTAI') else homes_area_groups(regions,munis)
         target_sets.append((provider,groups))
     plan=[]
     # Finishing all towns of the first ward is required before starting the
@@ -9007,7 +9119,7 @@ def automatic_task_plan(settings):
         for number in range(max((len(groups) for _,groups in ward_groups),default=0)):
             for provider,groups in ward_groups:
                 if number>=len(groups):continue
-                g=groups[number];town=g.get('suumo_town') if provider=='SUUMO' else g.get('homes_town')
+                g=groups[number];town=g.get('suumo_town') if provider in ('SUUMO','CHINTAI') else g.get('homes_town')
                 plan.append({'index':len(plan),'ward_code':ward,'provider':provider,
                              'label':(g.get('label') or ('東京都'+str(g.get('city_name') or '')+str(town or g.get('town') or '')))+'｜'+PROVIDER_DISPLAY.get(provider,provider),
                              'town':town or g.get('town') or '',
@@ -9234,7 +9346,7 @@ class AutomaticCollection:
     """One low-concurrency collection loop per saved namespace; no Streamlit UI in its thread."""
     def __init__(self,db,settings,summary=None):
         settings=dict(settings)
-        settings['providers']=['SUUMO']
+        settings['providers']=_v232_enabled_providers(settings.get('providers'))
         settings.pop('homes_disabled_reason',None)
         settings.pop('homes_disabled_at',None)
         validate_automatic_settings(settings);validate_automatic_summary(summary or {})
@@ -9369,7 +9481,7 @@ class AutomaticCollection:
                     active_regions=[r for r in (self.settings.get('auto_regions') or [])
                                     if str(r.get('code'))==ward]
                     if not active_regions:raise AppError('選択区の収集対象を確認できません：'+TOKYO_WARDS[ward])
-                    conditions={'bounds':[34,138,37,141],'ward_code':ward,'providers':['SUUMO'],
+                    conditions={'bounds':[34,138,37,141],'ward_code':ward,'providers':[current_task['provider']],
                                 'mode':'automatic_collection','auto_task_index':index,'auto_task_label':current_task['label'],
                                 'auto_task_identity':current_task['identity'],
                                 'auto_controller_index':index,
@@ -9554,7 +9666,7 @@ def get_automatic_collection():
             old_snapshot=controller.snapshot()
             previous_settings=dict(old_snapshot.get('settings') or {})
             new_settings=dict(previous_settings)
-            new_settings['providers']=['SUUMO']
+            new_settings['providers']=_v232_enabled_providers(new_settings.get('providers'))
             new_settings.pop('homes_disabled_reason',None)
             new_settings.pop('homes_disabled_at',None)
             summary=dict(old_snapshot.get('summary') or {})
@@ -9594,7 +9706,7 @@ def restore_automatic_collection():
             if not isinstance(rows,list):raise AppError('自動収集設定を読み取れません。')
             if not rows:return
             settings=rows[0].get('conditions') or {};summary=rows[0].get('summary') or {}
-            settings['providers']=['SUUMO']
+            settings['providers']=_v232_enabled_providers(settings.get('providers'))
             settings.pop('homes_disabled_reason',None)
             settings.pop('homes_disabled_at',None)
             validate_automatic_settings(settings);validate_automatic_summary(summary)
@@ -9620,7 +9732,7 @@ def validate_automatic_settings(settings):
     ):raise AppError('対象町名の設定が不正です。')
     automatic_ward_town_filters(settings)
     providers=[canonical_provider(p) for p in (settings.get('providers') or [])]
-    if providers!=['SUUMO']:raise AppError('SUUMO-only automatic collection requires SUUMO.')
+    if not providers or any(p not in PROVIDER_OPTIONS for p in providers):raise AppError('取得元はSUUMO・CHINTAIから選択してください。')
 
 def validate_automatic_summary(summary):
     if not isinstance(summary,dict):raise AppError('自動収集の進捗形式が不正です。')
@@ -9642,7 +9754,7 @@ def start_automatic_collection(ward_codes,interval_minutes=0,town_codes=None,*,r
         # Backwards-compatible one-ward callers.
         filters={ward:(list(dict.fromkeys(town_codes or [])) if ward==wards[0] else []) for ward in wards}
     settings={'enabled':True,'ward_code':wards[0],'ward_codes':wards,
-              'providers':list(AUTOMATIC_REGION_PROVIDERS),'interval_minutes':0,
+              'providers':_v232_enabled_providers(st.session_state.get('automatic_providers_v232',AUTOMATIC_REGION_PROVIDERS)),'interval_minutes':0,
               'created_at':utc_now(),'town_codes':list(filters[wards[0]]),
               'town_codes_by_ward':filters}
     validate_automatic_settings(settings)
@@ -9709,7 +9821,7 @@ def schedule_automatic_upgrade(controller):
         if key in pending:return True
         pending.add(key)
     desired_settings=dict(snap.get('settings') or {});desired_settings['enabled']=True
-    desired_settings['providers']=['SUUMO']
+    desired_settings['providers']=_v232_enabled_providers(desired_settings.get('providers'))
     def handoff():
         try:
             # Stop is cooperative even when the metadata save fails. Wait until the
@@ -9920,7 +10032,7 @@ def automatic_collection_ward_filter_ui(ward_codes, filters, busy=False):
 
 @st.fragment(run_every='16s')
 def automatic_collection_panel():
-    st.subheader('アプリ内の自動収集（SUUMO）')
+    st.subheader('アプリ内の自動収集（SUUMO・CHINTAI）')
     memory=cloud_memory_pressure()
     if memory:
         st.caption(f"処理と非回収キャッシュの目安 {memory['effective_mib']}/{memory['limit_mib']} MiB" 
@@ -9981,7 +10093,8 @@ def automatic_collection_panel():
     filters=st.session_state['automatic_town_filters']
     collection_wards,chosen_filters=automatic_collection_ward_filter_ui(ward_codes,filters,busy)
     st.caption('取得順：'+(' → '.join(TOKYO_WARDS[code] for code in collection_wards) if collection_wards else '区を選択してください'))
-    st.caption('SUUMOのみで町ごとに最後のページまで検索します。マンションは築15年以内、ワンルーム/1K/1DK・1LDK/2K/2DK・2LDK/3K/3DK、一戸建て・その他は築40年以内・50㎡以上を対象とします。')
+    st.multiselect('自動収集の取得元',list(PROVIDER_OPTIONS),default=_v232_enabled_providers(saved.get('providers') or AUTOMATIC_REGION_PROVIDERS),key='automatic_providers_v232',disabled=busy)
+    st.caption('選択した取得元で町ごとに最後のページまで検索します。マンションは築15年以内、ワンルーム/1K/1DK・1LDK/2K/2DK・2LDK/3K/3DK、一戸建て・その他は築40年以内・50㎡以上を対象とします。')
     manual=active_job();manual_busy=bool(manual and not manual.snapshot()['finished'])
     cannot_start=busy or manual_busy or not collection_wards
     if st.button('選択した区で自動収集を開始・再開',key='automatic_start',disabled=cannot_start):
@@ -15120,7 +15233,7 @@ def _v209_initial_settings(state):
             st.caption('旧アプリの物件や検索状態を使用しません。旧テーブルのデータは削除しません。')
             st.caption(f'実行中の版：{BUILD}')
             with st.expander('取得・集計の範囲'):
-                st.write('SUUMOのみで検索します。マンションは築15年以内、ワンルーム/1K/1DK・1LDK/2K/2DK・2LDK/3K/3DK。一戸建て・その他は築40年以内・50㎡以上。地図の色分けに必要な町丁目はSUUMO掲載所在地を優先し、不足時のみ物件固有地図から照合します。')
+                st.write('SUUMO・CHINTAIで検索します。マンションは築15年以内、ワンルーム/1K/1DK・1LDK/2K/2DK・2LDK/3K/3DK。一戸建て・その他は築40年以内・50㎡以上。地図の色分けに必要な町丁目はSUUMO掲載所在地を優先し、不足時のみ物件固有地図から照合します。')
                 st.caption('住所照合：SUUMOの所在地を市区・町丁目に正規化。町丁目を特定できない場合だけ物件固有のマーカーから国土地理院の逆ジオコーディングを利用します。番地を作りません。')
                 st.write('データベースへ保存する募集項目は家賃・間取り・種別・町丁目（既存の詳細住所は保持）・取得日時です。UTCで保存し画面はJST表示します。管理費・面積・築年数・画像・緯度経度は募集データに保存しません。')
                 st.write('募集情報は既存SupabaseのJSON領域を利用し、追加SQLは不要です。過去のschema 3〜7は書き換えず、集計時に町丁目へ正規化。新規schema 8のデータと同じ区域で表示します。')
@@ -15201,8 +15314,8 @@ def main():
             current_provider_state=[x for x in dict.fromkeys(current_provider_state) if x in PROVIDER_OPTIONS]
             if not current_provider_state:current_provider_state=['SUUMO']
             if list(state.get('new_providers',[]))!=current_provider_state:state.new_providers=current_provider_state
-        providers=st.multiselect('物件の取得元（SUUMOのみ）',list(PROVIDER_OPTIONS),default=provider_defaults,key='new_providers',disabled=True)
-        st.caption('現在はSUUMOのみを取得元に使用します。')
+        providers=st.multiselect('物件の取得元',list(PROVIDER_OPTIONS),default=provider_defaults,key='new_providers')
+        st.caption('SUUMO・CHINTAIを選択できます。掲載住所から町丁目を確認し、同じ家賃地図へ集計します。')
         scope=st.radio('検索方法',['地図の表示範囲','区・町名を選択'],horizontal=True,key='manual_search_scope')
         searching=automatic_busy() or bool(active_job() and not active_job().snapshot()['finished'])
         if scope=='区・町名を選択':
