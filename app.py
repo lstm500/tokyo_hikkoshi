@@ -52,7 +52,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v234"
+BUILD = "REBUILD-01-v236"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -686,6 +686,9 @@ create index if not exists housing_searches_v1_status_id
     on public.housing_searches_v1(namespace,status,id);
 create index if not exists housing_searches_v1_acquisition_recent
     on public.housing_searches_v1(namespace,status,finished_at,id);
+create index if not exists housing_searches_v1_acquisition_provider_id
+    on public.housing_searches_v1(namespace,(conditions->>'provider'),id)
+    where status='rental_acquisition';
 create table if not exists public.housing_places_v1 (
  namespace text not null, key text not null, title text not null, kind text not null,
  latitude double precision not null, longitude double precision not null,
@@ -1362,7 +1365,7 @@ class Database:
                 stamp=parsed.astimezone(timezone.utc).isoformat()
             except (ValueError,TypeError,AttributeError):raise AppError('物件IDの取得日時を確認できません。') from None
             if property_id in unique and unique[property_id]['finished_at']>=stamp:continue
-            unique[property_id]={'namespace':self.namespace,'id':('acquired.v150.' if row.get('address_quality_version')==4 else 'acquired.')+hashlib.sha256(property_id.encode()).hexdigest(),
+            unique[property_id]={'namespace':self.namespace,'source':listing_source(row),'id':('acquired.v150.' if row.get('address_quality_version')==4 else 'acquired.')+hashlib.sha256(property_id.encode()).hexdigest(),
                 'status':'rental_acquisition','started_at':stamp,'finished_at':stamp,
                 'conditions':{'provider':listing_source(row),'property_id':property_id,'schema':2},
                 'summary':{'last_success_at':stamp,'listing_key':compact_listing_key(row),
@@ -1419,11 +1422,17 @@ class Database:
                 entry_pid=entry['conditions'].get('property_id')
                 matching=next((key for key,compact in batch if compact.get('property_id')==entry_pid),None)
                 if matching is not None:entry['summary']['listing_key']=storage_keys[matching]
-            rest=updates+ledger
-            if rest:
-                response=self.call('POST',SEARCH_TABLE,{'on_conflict':'namespace,id','select':'id'},rest,'resolution=merge-duplicates,return=representation')
+            # PostgREST bulk writes require identical top-level keys. Listing
+            # rows have `source`, whereas acquisition records have their provider
+            # inside conditions. Keep the two record types in separate requests.
+            for record_type,records in (('listing_update',updates),('acquisition_ledger',ledger)):
+                if not records:continue
+                response=self.call('POST',SEARCH_TABLE,{'on_conflict':'namespace,id','select':'id'},records,'resolution=merge-duplicates,return=representation')
                 returned={r.get('id') for r in response if isinstance(r,dict)} if isinstance(response,list) else set()
-                if not {r['id'] for r in rest}<=returned:raise AppError('募集情報の更新・取得済みIDの保存を確認できません。')
+                if not {r['id'] for r in records}<=returned:
+                    error=AppError('募集情報の更新・取得済みIDの保存を確認できません。')
+                    error.diagnostic={'operation':record_type,'rows':len(records)}
+                    raise error
             for row in ledger:
                 pid=row['conditions']['property_id']
                 self.covered_acquisitions[pid]=(row['finished_at'],row['summary']['listing_key'])
@@ -1467,9 +1476,11 @@ class Database:
             # Only fully read-back-verified units may advance the shared skip cache.
             shared=_v147_shared_acquisition_ledger()
             with shared['lock']:
-                entry=shared['items'].get((self.url,self.namespace))
-                if entry:
+                for cache_key,entry in shared['items'].items():
+                    if cache_key[:2]!=(self.url,self.namespace):continue
+                    scope=cache_key[2] if len(cache_key)>2 else None
                     for _,listing in batch:
+                        if scope is not None and listing_source(listing) not in scope:continue
                         pid=listing.get('property_id')
                         if pid and listing.get('fetched_at') and town_chome_key(listing.get('address')):
                             entry['ids'][pid]=listing['fetched_at']
@@ -1498,30 +1509,45 @@ class Database:
         returned={r.get('id') for r in result if isinstance(r,dict)} if isinstance(result,list) else set()
         if not {r['id'] for r in payload}<=returned:raise AppError('物件IDの取得済み管理情報を保存できません。')
 
-    def load_recent_acquisition_ids(self):
+    def load_recent_acquisition_ids(self,providers=None,on_progress=None,cancel_event=None,max_seconds=None):
         """Read acquisition IDs once per controller, without re-reading every listing.
 
         New ledger entries contain the address-complete flag at write time. Only
         legacy ledger entries require indexed point lookups. An incomplete or
         unlinked saved listing is NEVER allowed to suppress reacquisition.
         """
+        scope=tuple(sorted(set(canonical_provider(p) for p in providers))) if providers is not None else None
+        if scope is not None and (not scope or any(p not in PROVIDER_OPTIONS for p in scope)):
+            raise AppError('取得済みIDの対象サイトを確認できません。')
+        load_started=time.monotonic()
+        def progress(stage,pages=0,records=0):
+            if cancel_event is not None and cancel_event.is_set():raise SearchCancelled()
+            if max_seconds is not None and time.monotonic()-load_started>=max_seconds:
+                error=AppError('取得済みIDの照会時間を超えたため、重複確認は保存時に行います。')
+                error.diagnostic={'code':'ACQUISITION_BUDGET','operation':'acquisition_ledger_load'}
+                raise error
+            if on_progress:on_progress(stage,pages,records)
+        progress('開始')
         now=time.monotonic()
         shared=_v147_shared_acquisition_ledger()
-        shared_key=(self.url,self.namespace)
+        shared_key=(self.url,self.namespace) if scope is None else (self.url,self.namespace,scope)
         with shared['lock']:
             saved_entry=shared['items'].get(shared_key)
             if saved_entry and now-saved_entry['loaded_at']<1200:
                 self.acquisition_cache=dict(saved_entry['ids'])
-                self.acquisition_cache_at=now
+                self.acquisition_cache_at=now;self.acquisition_cache_scope=scope
                 self.last_acquisition_load_stats={'source':'app_process_cache','recent_ids':len(self.acquisition_cache),
-                                                   'full_listing_scan':False,'pages':0}
+                                                   'full_listing_scan':False,'pages':0,'providers':list(scope) if scope else None}
+                progress('キャッシュ確認済み',0,len(self.acquisition_cache))
                 return dict(self.acquisition_cache)
         cached=getattr(self,'acquisition_cache',None)
-        if cached is not None and now-getattr(self,'acquisition_cache_at',0)<28800:
+        if cached is not None and getattr(self,'acquisition_cache_scope',None)==scope and now-getattr(self,'acquisition_cache_at',0)<28800:
+            progress('キャッシュ確認済み',0,len(cached))
             return dict(cached)
         cutoff=acquisition_cutoff().isoformat(timespec='seconds')
         ledger={};legacy={};last_id='';pages=0;raw_count=0
         while True:
+            progress('取得済みID読込',pages,raw_count)
             params={'namespace':'eq.'+self.namespace,
                     'status':'eq.rental_acquisition',
                     'finished_at':'gte.'+cutoff,
@@ -1529,15 +1555,18 @@ class Database:
                     'select':'id,conditions,summary,finished_at',
                     'order':'id.asc','limit':500}
             if last_id:params['id']='gt.'+last_id
+            if scope is not None:params['conditions->>provider']='in.('+','.join(scope)+')'
             rows=self.call('GET',SEARCH_TABLE,params)
             if not isinstance(rows,list):raise AppError('取得済み物件IDを確認できません。')
             pages+=1;raw_count+=len(rows)
+            progress('取得済みID読込',pages,raw_count)
             for row in rows:
                 if not str(row.get('id') or '').startswith('acquired.'):continue
                 cond=row.get('conditions') or {};summary=row.get('summary') or {}
                 pid=normal(cond.get('property_id'))
                 stamp=summary.get('last_success_at') or row.get('finished_at')
                 if not re.fullmatch(r'(?:SUUMO:(?:bc|jnc):\d+|CHINTAI:bk:[A-Za-z0-9_-]+)',pid) or not recent_acquisition(stamp):continue
+                if scope is not None and pid.split(':',1)[0] not in scope:continue
                 complete=summary.get('address_complete')
                 key=normal(summary.get('listing_key'))
                 version=summary.get('address_quality_version')
@@ -1556,6 +1585,7 @@ class Database:
         unique_keys=sorted({key for _,key in legacy.values()})
         addresses={};lookups=0
         for offset in range(0,len(unique_keys),125):
+            progress('旧取得済み住所確認',pages,raw_count)
             batch=unique_keys[offset:offset+125]
             rows=self.call('GET',SEARCH_TABLE,{'namespace':'eq.'+self.namespace,
                 'id':'in.('+','.join('listing.'+key for key in batch)+')',
@@ -1573,12 +1603,13 @@ class Database:
             if address is None:requeued_missing+=1;continue
             if not town_chome_key(address):requeued_incomplete+=1;continue
             ledger[pid]=stamp
-        self.last_acquisition_load_stats={'pages':pages,'raw_records':raw_count,
+        progress('完了',pages,raw_count)
+        self.last_acquisition_load_stats={'pages':pages,'raw_records':raw_count,'providers':list(scope) if scope else None,
             'recent_ids':len(ledger),'full_listing_scan':False,
             'address_lookup_batches':lookups,'legacy_ledger_rows':len(legacy),
             'requeued_incomplete_address':requeued_incomplete,
             'requeued_missing_listing':requeued_missing,'cache_seconds':28800}
-        self.acquisition_cache=dict(ledger);self.acquisition_cache_at=now
+        self.acquisition_cache=dict(ledger);self.acquisition_cache_at=now;self.acquisition_cache_scope=scope
         with shared['lock']:
             if len(shared['items'])>=6:shared['items'].pop(next(iter(shared['items'])))
             shared['items'][shared_key]={'ids':dict(ledger),'loaded_at':now}
@@ -6508,7 +6539,13 @@ def chintai_collect(web,region,bounds,munis,emit):
             raise AppError('CHINTAIの一覧から募集リンクを読めません。未完了です。')
         fresh=[u for u in links if u not in seen_urls];emit('candidate',len(fresh))
         for url in fresh:
-            seen_urls.add(url);web.check_cancel();emit('detail',1)
+            seen_urls.add(url);web.check_cancel()
+            pid_match=re.fullmatch(r'/detail/bk-([A-Za-z0-9_-]+)/?',urlparse(url).path)
+            property_id='CHINTAI:bk:'+pid_match.group(1) if pid_match else None
+            obtained=getattr(web,'acquired_ids',{}).get(property_id)
+            if obtained and recent_acquisition(obtained):
+                emit('skipped',1);continue
+            emit('detail',1)
             try:row=_v232_chintai_detail(web,url,region,bounds,munis)
             except SearchCancelled:raise
             except Exception as exc:
@@ -6582,13 +6619,24 @@ def search_all(db,conditions,screen,state=None):
     if hasattr(state,'request_starts'):web.host_last_request=state.request_starts
     if hasattr(state,'cancel_event'):web.cancel_event=state.cancel_event
     if hasattr(web,'configure'):web.configure(getattr(db,'web_config',{}))
+    def collection_stage(message):
+        state.last_collection_stage=message;state.last_activity_at=time.monotonic()
+        screen['status'].info('検索実行中｜'+message)
+    def acquisition_progress(stage,pages,records):
+        message='取得済みIDの確認｜'+stage+f'｜{pages}ページ・{records}件'
+        collection_stage(message)
+        if pages==0 or pages%10==0 or stage=='完了':
+            audit.add('database','acquisition_ledger_progress','INFO',
+                      {'stage':stage,'pages':pages,'records':records,'providers':conditions['providers']})
     def region_update(stage,done,total,count,errors):
+        state.last_collection_stage=stage;state.last_activity_at=time.monotonic()
         if done and done==total:audit.add('geography','region_progress','INFO',{'stage':stage,'done':done,'total':total,'regions':count,'failures':errors})
         audit.persist(db)
         if stage.startswith('地名取得先を切替'): log(stage)
         screen['bar'].progress(.05+.15*done/max(1,total),text=f'{stage} {done}/{total}')
         screen['status'].info(f'検索実行中｜{stage} {done}/{total}｜{count}地域｜取得失敗 {errors}件｜経過 {int(time.monotonic()-started)}秒')
     try:
+        web.check_cancel()
         if any(p in ('SUUMO','CHINTAI') for p in conditions['providers']):
             unavailable_until=float(getattr(db,'acquisition_ledger_disabled_until',0) or 0)
             if time.monotonic()<unavailable_until:
@@ -6600,24 +6648,28 @@ def search_all(db,conditions,screen,state=None):
                 log(issue)
             else:
                 try:
-                    web.acquired_ids=db.load_recent_acquisition_ids()
+                    web.acquired_ids=db.load_recent_acquisition_ids(providers=conditions['providers'],
+                        on_progress=acquisition_progress,cancel_event=web.cancel_event,max_seconds=20)
                     db.acquisition_ledger_disabled_until=0
                 except AppError as exc:
                     diagnostic=getattr(exc,'diagnostic',{}) or {}
                     status=int(diagnostic.get('status') or 0)
-                    if status not in (500,502,503,504):raise
+                    budget_exhausted=diagnostic.get('code')=='ACQUISITION_BUDGET'
+                    if status not in (500,502,503,504) and not budget_exhausted:raise
                     # Optional de-duplication ledger only; database write failures
                     # are never swallowed or counted as successful saves.
                     web.acquired_ids={}
                     db.acquisition_cache=None
                     db.acquisition_ledger_disabled_until=time.monotonic()+3600
-                    issue='Supabase取得済みIDの参照に失敗（HTTP '+str(status)+'）。この検索では重複スキップを使わず収集します。'
+                    issue=('取得済みIDの照会時間を超えました。重複確認は保存時に行い、物件検索を続けます。'
+                           if budget_exhausted else 'Supabase取得済みIDの参照に失敗（HTTP '+str(status)+'）。この検索では重複スキップを使わず収集します。')
                     issues.append(issue)
                     audit.add('database','acquisition_ledger_unavailable','ERROR',{'message':str(exc),
                         'diagnostic':diagnostic,'fallback':'re-fetch_with_database_save_validation',
                         'next_ledger_probe_seconds':3600})
                     log(issue)
-        screen['status'].info('検索実行中｜地域の町名リストを取得しています')
+        web.check_cancel()
+        collection_stage('地域の町名リストを取得しています')
         if conditions.get('auto_regions') and conditions.get('auto_munis'):
             regions,munis,region_errors=conditions['auto_regions'],conditions['auto_munis'],0
         elif conditions.get('ward_code'):
@@ -8418,7 +8470,9 @@ class SearchJob:
             def progress(self,value,text=''):
                 with job.lock: job.progress=value
             def info(self,value):
-                with job.lock: job.message=value;job.updated_at=utc_now()
+                with job.lock:
+                    job.message=value;job.updated_at=utc_now()
+                    job.state.last_collection_stage=str(value)[:170]
             def code(self,value,language=None):
                 with job.lock: job.text=value
         screen={k:Display() for k in ('bar','status','log')}
@@ -15273,6 +15327,8 @@ def _v209_initial_settings(state):
             st.caption('HTTP 500が繰り返される場合：下記の補助インデックスSQLをSupabase SQL Editorで1回実行してください。既存レコードは削除しません。')
             performance_sql='''create index if not exists housing_searches_v1_status_id on public.housing_searches_v1(namespace,status,id);
     create index if not exists housing_searches_v1_acquisition_recent on public.housing_searches_v1(namespace,status,finished_at,id);
+    create index if not exists housing_searches_v1_acquisition_provider_id
+        on public.housing_searches_v1(namespace,(conditions->>'provider'),id) where status='rental_acquisition';
     analyze public.housing_searches_v1;'''
             st.code(performance_sql,language='sql')
             st.download_button('DB検索高速化SQLをダウンロード',performance_sql,'supabase_indexes.sql','text/plain',key='database_index_sql')
