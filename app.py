@@ -52,7 +52,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v237"
+BUILD = "REBUILD-01-v239"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -6452,6 +6452,77 @@ def listing_source(row):
     return source
 
 
+def _v238_chintai_clean_address(value):
+    """Remove navigation text, keeping linked address text and published numbers."""
+    if hasattr(value,'get_text'):
+        node=BeautifulSoup(str(value),'html.parser')
+        for tag in node.select('script,style,button'):tag.decompose()
+        for tag in list(node.select('a')):
+            label=normal(tag.get_text(' ',strip=True)).replace(' ','')
+            if re.match(r'^(?:この物件の地図|地図(?:で|を|を見る)|周辺(?:環境|地図)|アクセスマップ)',label):tag.decompose()
+        value=node.get_text(' ',strip=True)
+    value=normal(value)
+    value=re.split(r'(?:この物件の地図を見る|地図で物件の周辺環境をチェック|地図を見る|地図を表示|周辺地図|周辺環境を(?:チェック|確認)|アクセスマップ)',value,maxsplit=1)[0]
+    return value.rstrip(' \t\r\n（(【[').strip()
+
+
+def _v238_chintai_town_address(web,raw,region):
+    """Canonicalize this listing's address; never infer it from the requested town."""
+    clean=_v238_chintai_clean_address(raw)
+    candidate=address_key(clean).replace(' ','').replace('　','').removeprefix('東京都')
+    ward=next((w for w in sorted(TOKYO_WARDS.values(),key=len,reverse=True) if candidate.startswith(w)),None)
+    code=str(region.get('code') or '')
+    if not ward or code not in TOKYO_WARDS or TOKYO_WARDS[code]!=ward:return None
+    rest=candidate[len(ward):]
+    def verified(town,proof):
+        address='東京都'+ward+town
+        trace(web,'chintai_address_verified',{'published_address':str(raw),'cleaned_address':clean,
+            'stored_address':address,'map_town_key':ward+'|'+town,'verification':proof},stage='location')
+        return address
+    # Explicit chome remains authoritative and uses the existing ward validator.
+    if re.search(r'\d+丁目',rest):
+        address=_v150_town_address(clean,{'code':code},require_chome=True)
+        return verified(address.removeprefix('東京都'+ward),'published_chome') if address else None
+    # Exact geometry keys independently prove a non-chome town. Also accept
+    # its published lot numbers without turning them into a fictional chome.
+    for town in dict.fromkeys((rest,re.split(r'\d',rest,maxsplit=1)[0])):
+        if not town or not _v150_boundary_key_exists(ward+'|'+town):continue
+        tail=rest[len(town):]
+        if not tail or re.match(r'^\d+(?:[-ー−－番地号]|$)',tail):
+            return verified(town,'existing_official_town_polygon')
+    # Geometry may still be loading. Reuse the existing bounded-by-city town
+    # catalog cache, whose source is the Address Base Registry; do not guess.
+    url='https://japanese-addresses-v2.geoloniamaps.com/api/ja/'+quote('東京都',safe='')+'/'+quote(ward,safe='')+'.json'
+    failed=getattr(web,'_v238_town_catalog_failed_until',{})
+    if time.monotonic()<failed.get(ward,0):return None
+    try:catalog=catalog_json(web,url)
+    except SearchCancelled:raise
+    except Exception as exc:
+        failed[ward]=time.monotonic()+60;web._v238_town_catalog_failed_until=failed
+        trace(web,'chintai_address_catalog_unavailable',{'url':url,'cleaned_address':clean,
+            'exception_type':type(exc).__name__,'message':str(exc)},'WARNING','location')
+        return None
+    names=set()
+    for row in catalog.get('data',[]):
+        if not isinstance(row,dict):continue
+        town=address_key(''.join(str(row.get(k) or '') for k in ('oaza_cho','chome','koaza')))
+        if town:names.add(town)
+    hits=[]
+    for town in names:
+        if '丁目' in town or not rest.startswith(town):continue
+        tail=rest[len(town):]
+        if not tail or re.match(r'^\d+(?:[-ー−－番地号]|$)',tail):hits.append(town)
+    if hits:
+        # Longest exact official name prevents shorter-name prefix collisions.
+        return verified(max(hits,key=len),'address_base_registry_town')
+    # Retain supported abbreviated chome notation only when the exact chome
+    # exists in the catalog. A broad town alone cannot become a guessed chome.
+    address=_v150_town_address(clean,{'code':code},require_chome=True)
+    if address and address.removeprefix('東京都'+ward) in names:
+        return verified(address.removeprefix('東京都'+ward),'address_base_registry_chome')
+    return None
+
+
 def _v232_chintai_fields(soup):
     # CHINTAI has several th/td pairs in one tr. Reading a whole tr's first td
     # confuses floor size with construction year, or direction with building type.
@@ -6461,10 +6532,19 @@ def _v232_chintai_fields(soup):
         for i,cell in enumerate(children[:-1]):
             if cell.name=='th' and children[i+1].name=='td':
                 name=normal(cell.get_text(' ',strip=True))
-                result.setdefault(name,normal(children[i+1].get_text(' ',strip=True)))
+                value=children[i+1]
+                if name in ('住所','所在地'):
+                    result.setdefault('_v238_raw_address',normal(value.get_text(' ',strip=True)))
+                    result.setdefault(name,_v238_chintai_clean_address(value))
+                else:result.setdefault(name,normal(value.get_text(' ',strip=True)))
     for dt in soup.select('dt'):
         dd=dt.find_next_sibling('dd')
-        if dd:result.setdefault(normal(dt.get_text(' ',strip=True)),normal(dd.get_text(' ',strip=True)))
+        if dd:
+            name=normal(dt.get_text(' ',strip=True))
+            if name in ('住所','所在地'):
+                result.setdefault('_v238_raw_address',normal(dd.get_text(' ',strip=True)))
+                result.setdefault(name,_v238_chintai_clean_address(dd))
+            else:result.setdefault(name,normal(dd.get_text(' ',strip=True)))
     return result
 
 
@@ -6481,8 +6561,13 @@ def _v232_chintai_detail(web,url,region,bounds,munis,layouts=None):
     raw_address=field('住所','所在地')
     # Requested town is a collection entry, never the saved property's address.
     # Keep the selected municipality boundary, but use the listing's actual town.
-    address=_v150_town_address(raw_address,{'code':region.get('code')},require_chome=True)
-    if not address:return reject('address.town_chome','掲載住所から対象市区内の町丁目を確定できません',raw_address)
+    address=_v238_chintai_town_address(web,raw_address,region)
+    if fields.get('_v238_raw_address')!=raw_address:
+        trace(web,'chintai_address_text_cleaned',{'raw_address':fields.get('_v238_raw_address'),
+            'cleaned_address':raw_address,'stored_address':address},stage='location')
+    if not address:return reject('address.town_chome','掲載住所から対象市区内の正式な町名・町丁目を確定できません',
+        {'raw_address':fields.get('_v238_raw_address') or raw_address,'cleaned_address':raw_address,
+         'municipality_code':region.get('code')})
     actual_key=town_chome_key(address)
     if not town_matches(region.get('town',''),actual_key.split('|',1)[1]):
         trace(web,'chintai_actual_town_classified',{'requested_town':region.get('town'),
@@ -6656,7 +6741,7 @@ def search_all(db,conditions,screen,state=None):
     DIAG_CONTEXT.audit=audit;DIAG_CONTEXT.scope={}
     search=dict(id=audit.search_id,status='started',
                 started_at=utc_now(),finished_at=None,conditions=conditions,summary={})
-    units={};saved=set();issues=[];logs=[];acquisition_pending={};q=None;provider_fallbacks=[]
+    units={};saved=set();issues=[];warnings=[];logs=[];acquisition_pending={};q=None;provider_fallbacks=[]
     candidate=detail=rejected=skipped=incomplete=issue_events=0
     def log(message):
         audit.add('progress',diagnosis_code(message) if 'エラー' in message or '失敗' in message else 'progress','INFO',{'message':message})
@@ -6712,16 +6797,20 @@ def search_all(db,conditions,screen,state=None):
             unavailable_until=float(getattr(db,'acquisition_ledger_disabled_until',0) or 0)
             if time.monotonic()<unavailable_until:
                 web.acquired_ids={}
-                issue='取得済みID参照は前回のHTTP 5xxで一時停止中です（最大60分）。物件検索・保存確認は継続します。'
-                issues.append(issue)
+                paused=getattr(db,'acquisition_ledger_pause_reason',{}) or {}
+                cause=('照会時間の上限超過' if paused.get('code')=='ACQUISITION_BUDGET'
+                       else 'HTTP '+str(paused['status']) if paused.get('status') else '前回の照会失敗または時間超過')
+                issue='取得済みIDの事前照会は'+cause+'のため一時停止中です。重複確認は保存時に行い、物件検索を続けます。'
+                warnings.append(issue)
                 audit.add('database','acquisition_ledger_circuit_open','WARNING',
-                    {'remaining_seconds':round(unavailable_until-time.monotonic()),'fallback':'fetch_and_check_save'})
+                    {'remaining_seconds':round(unavailable_until-time.monotonic()),'reason':paused,'blocking':False,'fallback':'fetch_and_check_save'})
                 log(issue)
             else:
                 try:
                     web.acquired_ids=db.load_recent_acquisition_ids(providers=conditions['providers'],
                         on_progress=acquisition_progress,cancel_event=web.cancel_event,max_seconds=20)
                     db.acquisition_ledger_disabled_until=0
+                    db.acquisition_ledger_pause_reason={}
                 except AppError as exc:
                     diagnostic=getattr(exc,'diagnostic',{}) or {}
                     status=int(diagnostic.get('status') or 0)
@@ -6732,12 +6821,13 @@ def search_all(db,conditions,screen,state=None):
                     web.acquired_ids={}
                     db.acquisition_cache=None
                     db.acquisition_ledger_disabled_until=time.monotonic()+3600
+                    db.acquisition_ledger_pause_reason={'code':diagnostic.get('code'),'status':status or None}
                     issue=('取得済みIDの照会時間を超えました。重複確認は保存時に行い、物件検索を続けます。'
                            if budget_exhausted else 'Supabase取得済みIDの参照に失敗（HTTP '+str(status)+'）。この検索では重複スキップを使わず収集します。')
-                    issues.append(issue)
-                    audit.add('database','acquisition_ledger_unavailable','ERROR',{'message':str(exc),
+                    warnings.append(issue)
+                    audit.add('database','acquisition_ledger_unavailable','WARNING',{'message':str(exc),
                         'diagnostic':diagnostic,'fallback':'re-fetch_with_database_save_validation',
-                        'next_ledger_probe_seconds':3600})
+                        'next_ledger_probe_seconds':3600,'blocking':False})
                     log(issue)
         web.check_cancel()
         collection_stage('地域の町名リストを取得しています')
@@ -6952,7 +7042,7 @@ def search_all(db,conditions,screen,state=None):
                 metrics=f'処理 {processed_now}件｜保存 {len(saved)}件｜未保存 {errors_now}件｜スキップ {skipped}件'
                 screen['bar'].progress(.2+.75*done/max(1,len(jobs)),text=metrics)
                 screen['status'].info('検索実行中｜'+metrics)
-        search['status']='cancelled' if web.cancel_event.is_set() else 'partial' if issues else 'completed'
+        search['status']='cancelled' if web.cancel_event.is_set() else 'partial' if issues or incomplete else 'completed'
         search['summary']={'confirmed':len(units),'saved':len(saved),'candidate':candidate,'detail':detail,'rejected':rejected,'already_acquired':skipped,'incomplete_tasks':incomplete,
                            'processed':len(saved)+rejected,'errors':rejected,
                            'retained_with_missing_fields':sum(bool(r.get('missing_fields')) for r in units.values()),'price_unknown':sum(not r.get('rent') for r in units.values()),'issues':issues[-100:],'elapsed':round(time.monotonic()-started,3),'tasks':len(jobs),
@@ -7024,7 +7114,7 @@ def search_all(db,conditions,screen,state=None):
             'terminal_rejected':rejected,'unsaved':unsaved,'ui_processed':final_processed,'ui_errors':final_errors,
             'accounted_candidates':final_candidate,'reason':'候補・処理・保存・スキップと内部イベントの件数差を検出'})
     state.live_metrics={'processed':final_processed,'saved':len(saved),'errors':final_errors,'skipped':skipped}
-    search['summary'].update(confirmed=len(units),elapsed=round(time.monotonic()-started,3),new_saved=len(saved & getattr(db,'job_new_keys',set())),updated_saved=len(saved-getattr(db,'job_new_keys',set())),processed=final_processed,errors=final_errors,candidate=final_candidate,discovered_candidate=candidate,already_acquired=skipped,rejected=rejected,detail=detail,unfinished_on_stop=unfinished,last_saved_at=getattr(state,'new_last_saved_at',None),saved=len(saved),unsaved=unsaved,acquisition_ids_pending=len(acquisition_pending),issues=issues[-100:],provider_fallbacks=provider_fallbacks,homes_http403_fallback=bool(provider_fallbacks))
+    search['summary'].update(confirmed=len(units),elapsed=round(time.monotonic()-started,3),new_saved=len(saved & getattr(db,'job_new_keys',set())),updated_saved=len(saved-getattr(db,'job_new_keys',set())),processed=final_processed,errors=final_errors,candidate=final_candidate,discovered_candidate=candidate,already_acquired=skipped,rejected=rejected,detail=detail,unfinished_on_stop=unfinished,last_saved_at=getattr(state,'new_last_saved_at',None),saved=len(saved),unsaved=unsaved,acquisition_ids_pending=len(acquisition_pending),issues=issues[-100:],warnings=warnings[-20:],provider_fallbacks=provider_fallbacks,homes_http403_fallback=bool(provider_fallbacks))
     if unsaved:
         audit.add('database','unsaved_listings','ERROR',{'stage':'stop.final_save' if web.cancel_event.is_set() else 'search.final_save','unsaved':unsaved,'retained_in_server_memory':True})
         for row in units.values():
@@ -10327,13 +10417,15 @@ def automatic_collection_panel():
             # Mobile browsers became sluggish when a 50+ row interactive dataframe
             # was rebuilt every fragment poll.  Keep the same information as plain text.
             lines=[]
+            unconfirmed={int(x) for x in summary.get('incomplete_task_indices',[]) if str(x).isdigit()}
             for i,label in enumerate(labels):
-                status='検索中' if busy and i==current_index else '完了' if i in completed else '待機'
+                status='検索中' if busy and i==current_index else '完了' if i in completed else '未確認' if i in unconfirmed else '待機'
                 lines.append(f'{status}｜{i+1}/{total}｜{label}')
             with st.expander('検索対象の町一覧',expanded=False):st.code('\n'.join(lines),language=None)
         elif busy:
             st.caption('検索対象の町名をバックグラウンドで確認しています。')
 
+        for notice in summary.get('last_summary',{}).get('warnings',[])[:2]:st.caption(notice)
         for issue in summary.get('last_summary',{}).get('issues',[])[:4]:st.error(issue)
         if snap['error']:st.error(snap['error'])
     if st.session_state.get('automatic_settings_error'):st.error(st.session_state.automatic_settings_error)
