@@ -52,7 +52,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v241"
+BUILD = "REBUILD-01-v242"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -14229,20 +14229,34 @@ def _v228_station_line_matches(query,lines):
     return [{'station':station,'lines':found[station]} for station in sorted(found,key=lambda name:(key(name)!=wanted,not key(name).startswith(wanted),name))]
 
 
-def _v230_station_changed(slot):
+def _v242_store_station(slot,station):
     state=st.session_state
     line_key,station_key=(('commute_line_v160','commute_station_v160'),
         ('commute_line_2_v164','commute_station_2_v164'),
         ('commute_line_3_v228','commute_station_3_v228'))[slot-1]
-    station=state.get('v230_destination_'+str(slot),_COMMUTE_V160_NO_STATION)
-    lines=commute_lines_v160()
-    serving=[line for line,names in lines.items() if station in names]
-    # Legacy storage retains a serving line only for backward compatibility.
-    # The route engine receives the station and searches the complete graph.
+    serving=[line for line,names in commute_lines_v160().items() if station in names]
     state[line_key]=(state.get(line_key) if state.get(line_key) in serving else serving[0]) if serving else _COMMUTE_V160_NO_LINE
     state[station_key]=station if serving else _COMMUTE_V160_NO_STATION
     if slot==1:state['commute_destination_v159']=station if serving else '表示しない'
-    _v180_commit_commute_change()
+    _v229_remember_commute(state)
+    return _v180_commit_commute_change()
+
+
+def _v242_destination_widget_key(state,slot,station):
+    identity=json.dumps([state.get('_v170_commute_active','primary'),slot,station],ensure_ascii=False)
+    return 'v242_destination_'+str(slot)+'_'+hashlib.sha256(identity.encode('utf-8')).hexdigest()[:16]
+
+
+def _v230_station_changed(slot,widget_key=None,profile_id=None,rendered_station=None):
+    state=st.session_state
+    if widget_key is None:widget_key='v230_destination_'+str(slot)
+    else:
+        if profile_id!=state.get('_v170_commute_active','primary'):return False
+        # Ignore callbacks from a previous rendering after a search registration
+        # or profile restoration has already changed the canonical destination.
+        current=v170_commute_snapshot(state).get('station'+str(slot),_COMMUTE_V160_NO_STATION)
+        if current!=rendered_station:return False
+    return _v242_store_station(slot,state.get(widget_key,_COMMUTE_V160_NO_STATION))
 
 
 def _v241_station_search():
@@ -14250,22 +14264,40 @@ def _v241_station_search():
     state['_v241_station_searched_query']=str(state.get('v228_station_query') or '').strip()
 
 
-def _v241_station_apply():
-    # Callbacks run before main/autosave and before the destination widgets render.
-    # Keep both widget and canonical values in sync, including destination 3.
+def _v241_station_apply(slot,match_key,profile_id):
+    # Forms submit the selected station atomically. Bind the target slot to
+    # this rendered submit button and never reuse another query's widget key.
     state=st.session_state
-    if not state.get('_v170_commute_loaded') or state.get('_v170_commute_pending'):return
-    station=state.get('v228_station_match')
-    if str(state.get('v228_station_query') or '').strip()!=state.get('_v241_station_searched_query',''):return
-    matches=_v228_station_line_matches(state.get('_v241_station_searched_query',''),commute_lines_v160())
-    if station not in {row['station'] for row in matches}:return
-    slot=state.get('v228_station_slot',1)
-    if slot not in (1,2,3):return
-    state['v230_destination_'+str(slot)]=station
-    _v230_station_changed(slot)
-    # Retain the choice even if remote backup is temporarily unavailable.
-    _v229_remember_commute(state)
-    state['_v228_station_applied']='通勤先'+str(slot)+'に'+station+'駅を設定しました。'
+    state.pop('_v242_station_result',None)
+    station=state.get(match_key)
+    if not state.get('_v170_commute_loaded') or state.get('_v170_commute_pending'):
+        state['_v242_station_result']={'error':'通勤設定を読み込み中です。読み込み後にもう一度設定してください。'}
+        return
+    if profile_id!=state.get('_v170_commute_active','primary'):
+        state['_v242_station_result']={'error':'利用者が切り替わりました。設定先を確認して、もう一度設定してください。'}
+        return
+    known={name for names in commute_lines_v160().values() for name in names}
+    if slot not in (1,2,3) or station not in known:
+        state['_v242_station_result']={'error':'設定する駅を検索結果から選び直してください。'}
+        return
+    verified=_v242_store_station(slot,station)
+    expected=v170_commute_snapshot(state)
+    if expected.get('station'+str(slot))!=station:
+        state['_v242_station_result']={'error':'勤務先への反映を確認できませんでした。もう一度設定してください。'}
+        return
+    state['_v242_station_result']={'slot':slot,'station':station,'profile_id':profile_id,
+        'prefs':expected,'browser_saved':False,'cloud_saved':bool(verified)}
+
+
+def _v242_station_save_ack(state,message,prefs,signature,active):
+    result=state.get('_v242_station_result')
+    if not isinstance(result,dict) or result.get('error'):return
+    if (message.get('event')=='saved' and message.get('signature')==signature
+            and message.get('profile_id')==active==result.get('profile_id')
+            and result.get('prefs')==prefs and message.get('prefs')==prefs):
+        result['browser_saved']=message.get('persisted') is True
+        result['browser_checked']=True
+
 
 
 def _v228_station_lookup_ui(state,lines,ready):
@@ -14278,32 +14310,45 @@ def _v228_station_lookup_ui(state,lines,ready):
     .st-key-v241_station_result_row [data-testid="stColumn"]:last-child {flex:2 1 0!important;}
     </style>""",unsafe_allow_html=True)
     st.markdown('**駅名で勤務先を設定**')
-    message=state.pop('_v228_station_applied','')
-    if message:st.success(message)
+    result=state.get('_v242_station_result') or {}
+    if result.get('error'):st.error(result['error'])
+    elif result.get('profile_id')==state.get('_v170_commute_active','primary'):
+        prefix='通勤先'+str(result['slot'])+'に'+result['station']+'駅を設定しました。'
+        if v170_commute_snapshot(state)!=result.get('prefs'):
+            st.warning('勤務先の設定が変更されています。現在の設定は下の最寄り駅欄で確認してください。')
+        elif result.get('browser_saved'):
+            st.success(prefix+' ブラウザーへの保存を確認しました。')
+        elif result.get('browser_checked'):
+            st.warning(prefix+' ブラウザーへの保存を確認できません。再読み込みする前に保存制限を確認してください。')
+        else:st.caption(prefix+' ブラウザーへの保存を確認中です。')
     with st.container(key='v241_station_query_row'):
-        entry,search=st.columns([3,1],vertical_alignment='bottom')
-        with entry:
-            query=st.text_input('駅名を入力',key='v228_station_query',placeholder='例：池袋、東京、新宿',
-                                disabled=not ready)
-        with search:
-            st.button('検索',key='v241_station_search',on_click=_v241_station_search,
-                      disabled=not ready,use_container_width=True)
+        with st.form('v242_station_query_form',border=False):
+            entry,search=st.columns([3,1],vertical_alignment='bottom')
+            with entry:
+                query=st.text_input('駅名を入力',key='v228_station_query',placeholder='例：池袋、東京、新宿',
+                                    disabled=not ready)
+            with search:
+                st.form_submit_button('検索',key='v241_station_search',on_click=_v241_station_search,
+                          disabled=not ready,use_container_width=True)
     searched=state.get('_v241_station_searched_query','')
     if not searched:return
     matches=_v228_station_line_matches(searched,lines)
     if not matches:
         st.caption('アプリ内の路線データに一致する駅がありません。表記を変えて検索してください。');return
     names=[row['station'] for row in matches]
-    if state.get('v228_station_match') not in names:state['v228_station_match']=names[0]
+    match_key='v242_station_match_'+hashlib.sha256(searched.encode('utf-8')).hexdigest()[:16]
+    if state.get(match_key) not in names:state[match_key]=names[0]
     slot=st.selectbox('設定する勤務先',[1,2,3],format_func=lambda value:'通勤先'+str(value),
                       key='v228_station_slot',disabled=not ready)
     with st.container(key='v241_station_result_row'):
-        result,apply=st.columns([3,2],vertical_alignment='bottom')
-        with result:
-            station=st.selectbox('該当する駅',names,key='v228_station_match',disabled=not ready)
-        with apply:
-            st.button('通勤先'+str(slot)+'に設定',key='v228_station_apply',on_click=_v241_station_apply,
-                      disabled=not ready or query.strip()!=searched,use_container_width=True)
+        with st.form('v242_station_result_form',border=False):
+            result,apply=st.columns([3,2],vertical_alignment='bottom')
+            with result:
+                station=st.selectbox('該当する駅',names,key=match_key,disabled=not ready)
+            with apply:
+                st.form_submit_button('通勤先'+str(slot)+'に設定',key='v228_station_apply',on_click=_v241_station_apply,
+                          args=(slot,match_key,state.get('_v170_commute_active','primary')),
+                          disabled=not ready or query.strip()!=searched,use_container_width=True)
     options=next(row['lines'] for row in matches if row['station']==station)
     st.write('利用できる路線：'+' ／ '.join(options))
 
@@ -15312,7 +15357,13 @@ _V170_PERSONAL_STORAGE_HTML = r"""<!doctype html><html lang="ja"><head><meta cha
        if(old!==JSON.stringify(prefs)){
          data.profiles[id].prefs=prefs;write(data);
        }
-       stateReport('saved',request,data,token,{signature:String(args.signature||''),profile_id:id});
+       let persisted=false;
+       try{
+         const readback=JSON.parse(getStored(KEY)||'null');
+         persisted=persistentStorageAvailable&&readback&&readback.active===id&&readback.profiles&&
+           readback.profiles[id]&&JSON.stringify(safePrefs(readback.profiles[id].prefs))===JSON.stringify(prefs);
+       }catch(error){}
+       stateReport('saved',request,data,token,{signature:String(args.signature||''),profile_id:id,persisted:!!persisted});
        return;
      }
    }catch(error){fallback(action==='read'?'loaded':'failed',request);}
@@ -15479,6 +15530,7 @@ def v170_commute_autosave_sync():
                    prefs=prefs,signature=signature,
                    key='v170_browser_personal_prefs',default=None,height=1)
     if isinstance(message,dict):
+        _v242_station_save_ack(state,message,prefs,signature,active)
         if message.get('event')=='stale_profile':
             state['_v170_commute_loaded']=False
             st.rerun()
@@ -15812,11 +15864,12 @@ def main():
         st.caption('勤務先は駅名だけで設定できます。利用路線・乗換駅は出発駅ごとに自動で選びます。')
         station_options=[_COMMUTE_V160_NO_STATION,*sorted({name for names in available_lines.values() for name in names})]
         for slot,station_key in enumerate(('commute_station_v160','commute_station_2_v164','commute_station_3_v228'),1):
-            widget_key='v230_destination_'+str(slot)
             selected=state.get(station_key,_COMMUTE_V160_NO_STATION)
-            state[widget_key]=selected if selected in station_options else _COMMUTE_V160_NO_STATION
+            selected=selected if selected in station_options else _COMMUTE_V160_NO_STATION
+            widget_key=_v242_destination_widget_key(state,slot,selected)
             st.selectbox('通勤先'+str(slot)+'の最寄り駅'+('（任意）' if slot>1 else ''),station_options,
-                         key=widget_key,on_change=_v230_station_changed,args=(slot,),
+                         key=widget_key,index=station_options.index(selected),on_change=_v230_station_changed,
+                         args=(slot,widget_key,state.get('_v170_commute_active','primary'),selected),
                          help='駅名を入力して絞り込めます。路線の指定は不要です。',disabled=not commute_storage_ready)
         chosen=commute_selected_destinations_v164()
         if chosen:
