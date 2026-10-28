@@ -52,7 +52,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v239"
+BUILD = "REBUILD-01-v240"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -10687,11 +10687,15 @@ def town_aggregate_record(raw_rows):
         identity=compact.get('property_id') or 'legacy:'+str(storage_id)
         stamp=compact.get('fetched_at') or ''
         if identity not in latest or latest[identity][0]<=stamp:
-            latest[identity]=(stamp,group,town,compact['rent'])
+            latest[identity]=(stamp,group,town,compact['rent'],listing_source(compact))
     totals={group:{} for group in TOWN_GROUPS}
-    for _,group,town,rent in latest.values():
+    sources={source:{'groups':{g:{} for g in TOWN_GROUPS},'listing_count':0} for source in PROVIDER_OPTIONS}
+    for _,group,town,rent,source in latest.values():
         node=totals[group].setdefault(town,[0,0]);node[0]+=int(rent);node[1]+=1
-    return {'schema':1,'groups':totals,'listing_count':len(latest),
+        if source in sources:
+            node=sources[source]['groups'][group].setdefault(town,[0,0]);node[0]+=int(rent);node[1]+=1
+            sources[source]['listing_count']+=1
+    return {'schema':1,'groups':totals,'sources':sources,'listing_count':len(latest),
             'examined':examined,'unmatched':examined-len(latest),'updated_at':utc_now()}
 
 
@@ -10708,14 +10712,14 @@ def town_aggregate_streaming(raw_rows):
             db.execute('PRAGMA journal_mode=OFF')
             db.execute('PRAGMA temp_store=FILE')
             db.execute('PRAGMA cache_size=-1024')
-            db.execute('CREATE TABLE latest (identity TEXT PRIMARY KEY, stamp TEXT NOT NULL, grp TEXT NOT NULL, town TEXT NOT NULL, rent INTEGER NOT NULL) WITHOUT ROWID')
+            db.execute('CREATE TABLE latest (identity TEXT PRIMARY KEY, stamp TEXT NOT NULL, grp TEXT NOT NULL, town TEXT NOT NULL, rent INTEGER NOT NULL, src TEXT NOT NULL) WITHOUT ROWID')
             examined=0
             batch=[]
             def flush():
                 if not batch:return
-                db.executemany("""INSERT INTO latest(identity,stamp,grp,town,rent)
-                    VALUES(?,?,?,?,?) ON CONFLICT(identity) DO UPDATE SET
-                    stamp=excluded.stamp,grp=excluded.grp,town=excluded.town,rent=excluded.rent
+                db.executemany("""INSERT INTO latest(identity,stamp,grp,town,rent,src)
+                    VALUES(?,?,?,?,?,?) ON CONFLICT(identity) DO UPDATE SET
+                    stamp=excluded.stamp,grp=excluded.grp,town=excluded.town,rent=excluded.rent,src=excluded.src
                     WHERE excluded.stamp >= latest.stamp""",batch)
                 batch.clear()
             for storage_id,listing in raw_rows:
@@ -10725,14 +10729,19 @@ def town_aggregate_streaming(raw_rows):
                 group=town_layout_group(compact);town=town_chome_key(compact['address'])
                 if not group or not town:continue
                 identity=compact.get('property_id') or 'legacy:'+str(storage_id)
-                batch.append((identity,compact.get('fetched_at') or '',group,town,int(compact['rent'])))
+                batch.append((identity,compact.get('fetched_at') or '',group,town,int(compact['rent']),listing_source(compact)))
                 if len(batch)>=100:flush()
             flush()
             totals={group:{} for group in TOWN_GROUPS}
             for grp,town,total,count in db.execute('SELECT grp,town,SUM(rent),COUNT(*) FROM latest GROUP BY grp,town'):
                 totals[grp][town]=[int(total),int(count)]
+            sources={source:{'groups':{g:{} for g in TOWN_GROUPS},'listing_count':0} for source in PROVIDER_OPTIONS}
+            for src,grp,town,total,count in db.execute('SELECT src,grp,town,SUM(rent),COUNT(*) FROM latest GROUP BY src,grp,town'):
+                if src in sources:
+                    sources[src]['groups'][grp][town]=[int(total),int(count)]
+                    sources[src]['listing_count']+=int(count)
             latest_count=int(db.execute('SELECT COUNT(*) FROM latest').fetchone()[0])
-            return {'schema':1,'groups':totals,'listing_count':latest_count,
+            return {'schema':1,'groups':totals,'sources':sources,'listing_count':latest_count,
                     'examined':examined,'unmatched':examined-latest_count,'updated_at':utc_now()}
         finally:
             db.close()
@@ -13588,9 +13597,17 @@ TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(_v228_old,_v228_new,1)
 TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('</style></head>',
  '.station-chip.dual .commute-time.third{grid-column:2;grid-row:3}\n</style></head>',1)
 
+
+# v240: source selector stays inside the map iframe, beside geolocation.
+_V240_SOURCE_JS="function v240Source(value){return value==='SUUMO'||value==='CHINTAI'?value:'ALL';}\nfunction v240Provider(){return state._v240Source==='CHINTAI'?'CHINTAI':'SUUMO';}\nfunction v240PopupKey(place){return v240Provider()+'|'+(state._v240Group||'group1')+'|'+v189SelectionKey(place);}\nfunction v240ChintaiUrl(place,value){\n try{var u=new URL(value),city=(state._v189WardCodes||{})[place.ward];\n  if(!city||u.protocol!=='https:'||u.hostname!=='www.chintai.net'||u.username||u.password||u.port)return '';\n  if(!new RegExp('^/tokyo/area/'+city+'[0-9]{3}/list/$').test(u.pathname))return '';\n  var house=state._v240Group==='house';\n  if(u.searchParams.get('b')!==(house?'3':'2')||u.searchParams.get('h')!==(house?'99':'5'))return '';\n  return u.href;\n }catch(e){return '';}\n}\nfunction v240UpdatePopup(entry){\n if(!entry)return;\n var provider=v240Provider(),key=v240PopupKey(entry.place),reply=state._v217Reply,request=state._v217Pending,url='',error='';\n if(provider==='SUUMO')url=v217Url(entry.place,entry.props.suumo_url);\n if(reply&&reply.key===key){\n  if(!url)url=provider==='CHINTAI'?v240ChintaiUrl(entry.place,reply.url):v217Url(entry.place,reply.url);\n  error=reply.error||'';\n }\n if(url){entry.link.href=url;entry.link.removeAttribute('aria-disabled');entry.link.textContent=provider+'で検索 ↗';\n  entry.help.textContent=provider==='CHINTAI'?'CHINTAI町名：'+entry.place.name+'｜'+(state._v240Group==='house'?'一戸建て・50㎡以上（築40年以内は掲載先で確認）':'マンション・築15年以内')+'｜丁目を含む町全体':\n   'SUUMO町名：'+String(entry.props.suumo_town||entry.place.name)+'｜'+String(entry.props.suumo_conditions||'')+'｜駅徒歩15分以内・住所順・50件（丁目を含む町全体）';\n }else{entry.link.removeAttribute('href');entry.link.setAttribute('aria-disabled','true');\n  entry.link.textContent=request&&request.key===key?provider+' 確認中…':error?provider+' 再試行':provider+'で検索';\n  entry.help.textContent=error||(request&&request.key===key?provider+'の町名を確認しています。':provider+'ボタンでこの町名を確認します。');\n }\n if(entry.layer.getPopup){var popup=entry.layer.getPopup();if(popup&&popup.isOpen&&popup.isOpen()&&popup.update)popup.update();}\n}\nfunction v240RequestPopup(entry){\n if(!entry||!entry.place.ward||!entry.place.name)return;\n var key=v240PopupKey(entry.place);if(state._v217Pending&&state._v217Pending.key===key)return;\n var ticket='source_popup_'+Date.now()+'_'+Math.random().toString(36).slice(2,10);\n state._v217Reply=null;state._v217Pending={ticket:ticket,key:key};v240UpdatePopup(entry);\n hostMessage('streamlit:setComponentValue',{dataType:'json',value:{event:'polygon_suumo_v217',ticket:ticket,\n  search_source:state._v240Source||'ALL',ward:entry.place.ward,name:entry.place.name,kind:entry.place.kind,\n  home_view_epoch:state._v202HomeEpoch}});\n}\nfunction v240RenderSource(args){\n var source=v240Source(args.map_source),group=args.map_layout_group||'group1';\n if(state._v240Source!==source||state._v240Group!==group){state._v217Pending=null;state._v217Reply=null;}\n state._v240Source=source;state._v240Group=group;\n var select=document.getElementById('v240-source');if(!select)return;\n select.value=source;select.dataset.selected=source==='ALL'?'false':'true';\n if(!select.dataset.ready){select.dataset.ready='1';select.addEventListener('change',function(){\n  var chosen=v240Source(select.value);if(chosen===state._v240Source)return;\n  state._v240Source=chosen;state._v217Pending=null;state._v217Reply=null;\n  select.dataset.selected=chosen==='ALL'?'false':'true';v240UpdatePopup(state._v217Active);\n  var value={event:'map_source_v240',source:chosen,home_view_epoch:state._v202HomeEpoch};\n  if(state.map){var b=state.map.getBounds();value.bounds={_southWest:{lat:b.getSouth(),lng:b.getWest()},_northEast:{lat:b.getNorth(),lng:b.getEast()}};value.zoom=state.map.getZoom();}\n  hostMessage('streamlit:setComponentValue',{dataType:'json',value:value});\n });}\n v240UpdatePopup(state._v217Active);\n}\nv217UpdatePopup=v240UpdatePopup;\nv217RequestPopup=v240RequestPopup;\n"
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('<span id="v223-location-status"', '<select id="v240-source" aria-label="データソースを選択"><option value="ALL">データソース：全部</option><option value="SUUMO">データソース：SUUMO</option><option value="CHINTAI">データソース：CHINTAI</option></select><span id="v223-location-status"',1)
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('</style></head>','#v240-source{flex:1 1 0;min-width:0;min-height:40px;max-width:270px;padding:8px 10px;border:1px solid #9eb4bd;border-radius:7px;background:#fff;color:#173a5e;font:14px system-ui;cursor:pointer}#v240-source:focus{outline:3px solid #aacbdc}#v240-source[data-selected="true"]{background:#e9f1f5;border-color:#174d6b}#v223-location-status{flex-basis:100%}'+'</style></head>',1)
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('function render(args){',_V240_SOURCE_JS+'\nfunction render(args){',1)
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(' args=args||{};',' args=args||{};\n v240RenderSource(args);',1)
+
 @st.cache_resource(show_spinner=False)
 def town_component_v121():
-    _asset_revision='v231-facility-search-and-commute-rows'
+    _asset_revision='v240-map-source'
     folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-'+_asset_revision)
     os.makedirs(folder,exist_ok=True)
     path=os.path.join(folder,'index.html')
@@ -13608,7 +13625,7 @@ def town_component_v121():
         with open(temp_path,'w',encoding='utf-8') as output:
             output.write(TOWN_COMPONENT_HTML_V121)
         os.replace(temp_path,path)
-    return st.components.v1.declare_component('sumai_town_map_v231',path=folder)
+    return st.components.v1.declare_component('sumai_town_map_v240',path=folder)
 
 @st.cache_resource(show_spinner=False)
 def _v216_api_budget():
@@ -14440,6 +14457,61 @@ def town_search_catalog_v184(db_path,db_mtime):
     return rows,wards
 
 
+def _v240_map_source(value):
+    source=canonical_provider(value)
+    return source if source in ('SUUMO','CHINTAI') else 'ALL'
+
+
+def _v240_source_groups(summary,source):
+    summary=summary if isinstance(summary,dict) else {}
+    source=_v240_map_source(source)
+    if source=='ALL':return summary.get('groups') or {}
+    return ((summary.get('sources') or {}).get(source) or {}).get('groups') or {}
+
+
+def _v240_resolve_property_search(state,data,group):
+    source=_v240_map_source(state.get('_v240_map_source'))
+    provider='CHINTAI' if source=='CHINTAI' else 'SUUMO'
+    ward=str(data.get('ward') or '')[:30];name=str(data.get('name') or '')[:90];kind=str(data.get('kind') or '')
+    key=provider+'|'+group+'|'+ward+'|'+name+'|'+kind
+    reply={'key':key,'ticket':str(data.get('ticket') or '')[:100],'url':'','error':'','provider':provider}
+    # An old reply/request must not switch the destination after changing source.
+    if data.get('search_source')!=source:return reply
+    if provider=='SUUMO':
+        reply.update(_v189_resolve_suumo_selection(state,data,group));reply['key']=key;reply['provider']=provider
+        return reply
+    city=_V167_WARD_TO_CODE.get(ward)
+    if not city or kind not in ('ward','town','chome') or group not in TOWN_GROUPS:
+        reply['error']='CHINTAIの検索地域を確認できません。';return reply
+    town=town_base_name(name)
+    try:
+        cache=state.setdefault('_v240_chintai_town_urls',{})
+        cache_key=city+'|'+town
+        base=cache.get(cache_key)
+        if not base:
+            city_url='https://www.chintai.net/tokyo/area/'+city+'/list/'
+            if kind=='ward':base=city_url
+            else:
+                web=PublicWeb();web.configure(rental_network_settings())
+                if not web.permitted(city_url):raise AppError('CHINTAIの地域確認を実行できません。')
+                soup=BeautifulSoup(web.fetch(city_url).text,'html.parser')
+                base=_v233_chintai_town_link(soup,city_url,town,city)
+                if not base:raise AppError('CHINTAIで同じ町名の検索地域を確認できません。')
+                if len(cache)>=128:cache.pop(next(iter(cache)))
+                cache[cache_key]=base
+        house=group=='house'
+        params={'b':'3' if house else '2','h':'99' if house else '5','sf':'50' if house else '0','j':'6'}
+        if not house:params['m']={'group0':['0','1','2'],'group1':['3','4','5'],'group2':['6','7','8']}[group]
+        target=urlparse(base)
+        allowed=r'^/tokyo/area/'+city+(r'/list/$' if kind=='ward' else r'\d{3}/list/$')
+        if target.scheme!='https' or target.hostname!='www.chintai.net' or target.username or target.password or target.port not in (None,443) or not re.fullmatch(allowed,target.path):
+            raise AppError('CHINTAIの地域URLを確認できません。')
+        reply['url']=target._replace(query=urlencode(params,doseq=True),fragment='').geturl()
+    except Exception as exc:
+        reply['error']=str(exc) if isinstance(exc,AppError) else 'CHINTAIの検索地域の確認に失敗しました。再試行してください。'
+    return reply
+
+
 @st.fragment
 def interactive_town_choropleth(group):
     """Leaflet map persists in the browser across Streamlit fragment reruns.
@@ -14450,6 +14522,7 @@ def interactive_town_choropleth(group):
     """
     state=st.session_state
     group=state.get('layout_display_group',group)
+    source=_v240_map_source(state.get('_v240_map_source'))
     # Only this explicit user action launches the asynchronous DB aggregation.
     if st.button('保存物件を再集計',key='recompute_v143_town_map'):
         job=current_town_summary_worker()
@@ -14496,7 +14569,7 @@ def interactive_town_choropleth(group):
     suumo_oz_codes.update(registry.snapshot())
     oz_signature=hashlib.sha256(repr(sorted(suumo_oz_codes.items())).encode('utf-8')).hexdigest()[:12]
     # Code arrivals update popup links independently; do not close an open popup.
-    signature=(BUILD,group,revision,reset,snap['revision'],summary_version,bool(ready))
+    signature=(BUILD,group,source,revision,reset,snap['revision'],summary_version,bool(ready))
     cached=state.get('_v118_choropleth_payload')
     bounds=state.get('new_bounds')
     center=bounds_center(bounds) if bounds else state.get('new_view_center',_V202_HOME_CENTER)
@@ -14505,7 +14578,7 @@ def interactive_town_choropleth(group):
                   or not _v156_view_is_covered(bounds,cached.get('window')))
     if needs_update:
         window=_v156_town_render_window(bounds,center) if bounds else _V202_HOME_WINDOW
-        groups=(snap['summary'] or {}).get('groups') or {}
+        groups=_v240_source_groups(snap['summary'],source)
         geo,limited,count=town_colored_shapes(groups,group,shapes if ready else {},window,include_no_data=False,
                                               suumo_oz_codes=suumo_oz_codes)
         # The window MUST be part of the Leaflet data revision: keeping the
@@ -14513,7 +14586,7 @@ def interactive_town_choropleth(group):
         payload_key=hashlib.sha256(repr((signature,window)).encode('utf-8')).hexdigest()[:20]
         cached={'signature':signature,'layer_signature':payload_key,
                 'window':window,'geo':geo,'limited':limited,
-                'ready':bool(ready and snap['ready']),
+                'ready':bool(ready and snap['ready'] and (source=='ALL' or isinstance((snap['summary'] or {}).get('sources'),dict))),
                 'colored_count':geo['render_stats']['with_rent'],
                 'no_data_count':geo['render_stats']['without_rent'],'center':center}
         state['_v118_choropleth_payload']=cached
@@ -14528,7 +14601,7 @@ def interactive_town_choropleth(group):
     if cached['ready']:
         st.caption(f"着色 {cached['colored_count']}町丁目｜保存家賃のない地域は背景地図のまま表示")
     else:
-        st.caption('保存物件の再集計を押すと、家賃の色分けをバックグラウンドで作成します')
+        st.caption('取得元別の集計を作成中です。完了後に選択したデータソースの家賃を表示します。' if source!='ALL' and snap['running'] else '保存物件の再集計を押すと、家賃の色分けをバックグラウンドで作成します')
     search_catalog=[];search_ward_bounds=[]
     if ready and isinstance(shapes,TownBoundaryStore):
         try:
@@ -14537,7 +14610,7 @@ def interactive_town_choropleth(group):
             pass
     stations,wards=town_station_refs_v164(destinations)
     widget=town_component_v121()
-    data=widget(center=list(center),zoom=_v202_view_zoom(state.get('new_view_zoom')),geo=cached['geo'],
+    data=widget(map_source=source,map_layout_group=group,center=list(center),zoom=_v202_view_zoom(state.get('new_view_zoom')),geo=cached['geo'],
                 home_view_epoch=int(state.get('_v202_home_epoch',0)),home_center=list(_V202_HOME_CENTER),
                 signature=cached['layer_signature'],stations=stations,wards=wards,
                 search_catalog=search_catalog,search_district_names=list(TOKYO_WARDS.values()),
@@ -14556,6 +14629,19 @@ def interactive_town_choropleth(group):
                 key='town_map_v184_'+str(reset),default=None)
     if isinstance(data,dict) and data.get('home_view_epoch')==int(state.get('_v202_home_epoch',0)):
         current=viewport_bounds(data)
+        if data.get('event')=='map_source_v240':
+            selected=_v240_map_source(data.get('source'))
+            if selected!=source:
+                state['_v240_map_source']=selected
+                state.pop('_v217_suumo_reply',None)
+                if current:
+                    state['new_bounds']=current;state['new_view_center']=bounds_center(current)
+                    state['new_view_zoom']=_v202_view_zoom(data.get('zoom'),state.get('new_view_zoom',11))
+                if selected!='ALL' and not isinstance((snap['summary'] or {}).get('sources'),dict):
+                    if snap['running'] or store.start():
+                        state['_v183_manual_refresh_wait']=True
+                        state['_v183_manual_start_revision']=snap['revision']
+                st.rerun(scope='fragment')
         if data.get('event')=='custom_pin_search_v205':
             ticket=str(data.get('ticket') or '')[:100]
             if ticket and ticket!=state.get('_v205_last_pin_ticket'):
@@ -14566,7 +14652,7 @@ def interactive_town_choropleth(group):
             ticket=str(data.get('ticket') or '')[:100]
             if ticket and ticket!=state.get('_v217_last_suumo_ticket'):
                 state['_v217_last_suumo_ticket']=ticket
-                state['_v217_suumo_reply']=_v189_resolve_suumo_selection(state,data,group)
+                state['_v217_suumo_reply']=_v240_resolve_property_search(state,data,group)
                 st.rerun(scope='fragment')
         if data.get('event')=='town_suumo_v189':
             ticket=str(data.get('ticket') or '')[:100]
