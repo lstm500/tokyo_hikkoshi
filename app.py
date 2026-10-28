@@ -52,7 +52,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v240"
+BUILD = "REBUILD-01-v241"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -14245,29 +14245,67 @@ def _v230_station_changed(slot):
     _v180_commit_commute_change()
 
 
+def _v241_station_search():
+    state=st.session_state
+    state['_v241_station_searched_query']=str(state.get('v228_station_query') or '').strip()
+
+
+def _v241_station_apply():
+    # Callbacks run before main/autosave and before the destination widgets render.
+    # Keep both widget and canonical values in sync, including destination 3.
+    state=st.session_state
+    if not state.get('_v170_commute_loaded') or state.get('_v170_commute_pending'):return
+    station=state.get('v228_station_match')
+    if str(state.get('v228_station_query') or '').strip()!=state.get('_v241_station_searched_query',''):return
+    matches=_v228_station_line_matches(state.get('_v241_station_searched_query',''),commute_lines_v160())
+    if station not in {row['station'] for row in matches}:return
+    slot=state.get('v228_station_slot',1)
+    if slot not in (1,2,3):return
+    state['v230_destination_'+str(slot)]=station
+    _v230_station_changed(slot)
+    # Retain the choice even if remote backup is temporarily unavailable.
+    _v229_remember_commute(state)
+    state['_v228_station_applied']='通勤先'+str(slot)+'に'+station+'駅を設定しました。'
+
+
 def _v228_station_lookup_ui(state,lines,ready):
+    st.markdown("""<style>
+    .st-key-v241_station_query_row [data-testid="stHorizontalBlock"],
+    .st-key-v241_station_result_row [data-testid="stHorizontalBlock"] {flex-wrap:nowrap!important;gap:0.5rem;}
+    .st-key-v241_station_query_row [data-testid="stColumn"],
+    .st-key-v241_station_result_row [data-testid="stColumn"] {min-width:0!important;width:0!important;flex:3 1 0!important;}
+    .st-key-v241_station_query_row [data-testid="stColumn"]:last-child {flex:1 1 0!important;}
+    .st-key-v241_station_result_row [data-testid="stColumn"]:last-child {flex:2 1 0!important;}
+    </style>""",unsafe_allow_html=True)
     st.markdown('**駅名で勤務先を設定**')
     message=state.pop('_v228_station_applied','')
     if message:st.success(message)
-    query=st.text_input('駅名を入力',key='v228_station_query',placeholder='例：池袋、東京、新宿（駅名の一部でも検索できます）')
-    if not query.strip():return
-    matches=_v228_station_line_matches(query,lines)
+    with st.container(key='v241_station_query_row'):
+        entry,search=st.columns([3,1],vertical_alignment='bottom')
+        with entry:
+            query=st.text_input('駅名を入力',key='v228_station_query',placeholder='例：池袋、東京、新宿',
+                                disabled=not ready)
+        with search:
+            st.button('検索',key='v241_station_search',on_click=_v241_station_search,
+                      disabled=not ready,use_container_width=True)
+    searched=state.get('_v241_station_searched_query','')
+    if not searched:return
+    matches=_v228_station_line_matches(searched,lines)
     if not matches:
         st.caption('アプリ内の路線データに一致する駅がありません。表記を変えて検索してください。');return
     names=[row['station'] for row in matches]
     if state.get('v228_station_match') not in names:state['v228_station_match']=names[0]
-    station=st.selectbox('該当する駅',names,key='v228_station_match')
+    slot=st.selectbox('設定する勤務先',[1,2,3],format_func=lambda value:'通勤先'+str(value),
+                      key='v228_station_slot',disabled=not ready)
+    with st.container(key='v241_station_result_row'):
+        result,apply=st.columns([3,2],vertical_alignment='bottom')
+        with result:
+            station=st.selectbox('該当する駅',names,key='v228_station_match',disabled=not ready)
+        with apply:
+            st.button('通勤先'+str(slot)+'に設定',key='v228_station_apply',on_click=_v241_station_apply,
+                      disabled=not ready or query.strip()!=searched,use_container_width=True)
     options=next(row['lines'] for row in matches if row['station']==station)
     st.write('利用できる路線：'+' ／ '.join(options))
-    slot=st.selectbox('設定する勤務先',[1,2,3],format_func=lambda value:'通勤先'+str(value),key='v228_station_slot')
-    if st.button('この駅を勤務先に設定',key='v228_station_apply',disabled=not ready):
-        fields={1:('commute_line_v160','commute_station_v160'),2:('commute_line_2_v164','commute_station_2_v164'),3:('commute_line_3_v228','commute_station_3_v228')}
-        line_key,station_key=fields[slot]
-        state[line_key]=options[0];state[station_key]=station
-        if slot==1:state['commute_destination_v159']=station
-        _v180_commit_commute_change()
-        state['_v228_station_applied']='通勤先'+str(slot)+'に'+station+'駅を設定しました。'
-        st.rerun()
 
 
 @st.fragment(run_every='6s')
