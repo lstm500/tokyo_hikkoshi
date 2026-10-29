@@ -52,7 +52,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v248"
+BUILD = "REBUILD-01-v249"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -13635,9 +13635,18 @@ TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(' updateOverlay(args.g
 TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace("function initMap(args){", "function initMap(args){\n try{localStorage.removeItem('sumai-supermarkets-v244')}catch(e){}",1)
 TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('sumai_town_map_v243','sumai_town_map_v246').replace('sumai_town_map_v245','sumai_town_map_v246')
 
+
+# v249: saved supermarket overlay; no POI search on map movement.
+_V249_SUPERMARKET_JS = "\nfunction v249ApplySupermarketMode(visible){\n state._v247SupermarketOverlayVisible=!!visible;\n if(state.overlay)state.overlay.eachLayer(function(layer){\n  if(layer.setStyle)layer.setStyle({fillOpacity:layer.feature&&layer.feature.properties&&layer.feature.properties.has_data===true?(visible?.32:.81):0});\n });\n var button=document.getElementById('v249-supermarket-toggle');\n if(button){button.textContent=visible?'スーパー ON':'スーパー OFF';button.setAttribute('aria-pressed',String(!!visible));}\n var refresh=document.getElementById('v249-supermarket-refresh');if(refresh)refresh.hidden=!visible;\n var legend=document.getElementById('v249-supermarket-legend');if(legend)legend.hidden=!visible;\n}\nfunction v249SupermarketCommand(refresh){\n var value={event:'supermarket_v249',visible:!!state._v247SupermarketOverlayVisible,refresh:!!refresh,\n  ticket:'supermarket_'+Date.now()+'_'+Math.random().toString(36).slice(2,9),home_view_epoch:state._v202HomeEpoch};\n if(state.map){var b=state.map.getBounds();value.bounds={_southWest:{lat:b.getSouth(),lng:b.getWest()},_northEast:{lat:b.getNorth(),lng:b.getEast()}};value.zoom=state.map.getZoom();}\n hostMessage('streamlit:setComponentValue',{dataType:'json',value:value});\n}\nfunction v249SupermarketPopup(shop){\n var box=document.createElement('div');box.className='v249-supermarket-popup';\n var title=document.createElement('strong');title.textContent=shop.name;box.appendChild(title);\n [shop.price_label,shop.address,shop.verification].forEach(function(text){var row=document.createElement('div');row.textContent=text||'';box.appendChild(row)});\n [['公式ページ',shop.website],['地図情報の出典',shop.source_url]].forEach(function(pair){\n  try{var url=new URL(pair[1]);if(!/^https?:$/.test(url.protocol)||url.username||url.password)return;\n   var link=document.createElement('a');link.textContent=pair[0]+' ↗';link.href=url.href;link.target='_blank';link.rel='noopener noreferrer';box.appendChild(link);\n  }catch(e){}\n });\n return box;\n}\nfunction v249DrawSupermarkets(){\n if(!state.map)return;\n if(!state._v249Layer){state.map.createPane('supermarketPane');state.map.getPane('supermarketPane').style.zIndex='610';state._v249Layer=L.layerGroup().addTo(state.map);}\n var bounds=state.map.getBounds().pad(.1),visible=!!state._v247SupermarketOverlayVisible;\n var rows=visible?(state._v249Rows||[]).filter(function(s){return bounds.contains([s.lat,s.lng])}):[];\n var key=(visible?'on':'off')+'|'+state._v249Revision+'|'+JSON.stringify(rows.map(function(s){return s.ward+'|'+s.id}));\n if(key===state._v249DrawKey)return;\n state._v249DrawKey=key;state._v249Layer.clearLayers();\n rows.forEach(function(shop){\n  L.circleMarker([shop.lat,shop.lng],{pane:'supermarketPane',radius:5,color:'#fff',weight:2,fillColor:shop.color,fillOpacity:1,bubblingMouseEvents:false})\n   .bindPopup(function(){return v249SupermarketPopup(shop)},{maxWidth:250,autoPanPadding:[12,12]}).addTo(state._v249Layer);\n });\n}\nfunction v249RenderSupermarkets(args){\n if(!state.map)return;\n var button=document.getElementById('v249-supermarket-toggle'),refresh=document.getElementById('v249-supermarket-refresh');\n if(button&&!button.dataset.ready){button.dataset.ready='1';button.addEventListener('click',function(){\n  v249ApplySupermarketMode(!state._v247SupermarketOverlayVisible);v249DrawSupermarkets();v249SupermarketCommand(false);\n });refresh.addEventListener('click',function(){v249SupermarketCommand(true)});\n state.map.on('moveend zoomend',v249DrawSupermarkets);}\n state._v249Rows=Array.isArray(args.supermarkets)?args.supermarkets:[];\n state._v249Revision=String(args.supermarket_revision||0);\n v249ApplySupermarketMode(args.supermarket_overlay_visible===true);v249DrawSupermarkets();\n var status=document.getElementById('v249-supermarket-status');\n if(status){status.hidden=!state._v247SupermarketOverlayVisible;status.textContent=args.supermarket_loading?'保存済みスーパーを読み込み中…':args.supermarket_error?'スーパー読込失敗：'+args.supermarket_error:'保存済みスーパー '+state._v249Rows.length+'件'+(state._v249Rows.length?'':'（周辺設備タブで取得してください）');}\n setHeight();\n}\n"
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('function render(args){',_V249_SUPERMARKET_JS+'\nfunction render(args){',1)
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('<span id="v223-location-status"','<button type="button" id="v249-supermarket-toggle" aria-pressed="false">スーパー OFF</button><button type="button" id="v249-supermarket-refresh" hidden>スーパー再読込</button><span id="v249-supermarket-status" role="status" hidden></span>'+'<span id="v223-location-status"',1)
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('<div id="map"></div>','<div id="v249-supermarket-legend" hidden><span><i style="background:#2466c0"></i>とても安い</span><span><i style="background:#19a8cd"></i>安い</span><span><i style="background:#b68a26"></i>標準</span><span><i style="background:#d64b43"></i>やや高い</span><span><i style="background:#551b31"></i>高い</span><span><i style="background:#7f8b91"></i>未分類</span></div>'+'<div id="map"></div>',1)
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('</style></head>','#v249-supermarket-toggle,#v249-supermarket-refresh{min-height:40px;border:1px solid #9eb4bd;border-radius:7px;background:#fff;color:#173a5e;padding:8px 10px;font:13px system-ui;cursor:pointer}#v249-supermarket-toggle[aria-pressed="true"]{background:#d9eaf3;border-color:#174d6b}#v249-supermarket-legend{font:11px system-ui;color:#173a5e;background:#f5f3ed;padding:4px 10px;line-height:1.7;box-sizing:border-box}#v249-supermarket-legend span{display:inline-block;margin-right:10px;white-space:nowrap}#v249-supermarket-legend i{display:inline-block;width:8px;height:8px;border:1px solid #fff;border-radius:50%;margin-right:3px}.v249-supermarket-popup{font:13px system-ui;color:#173a5e;line-height:1.6;overflow-wrap:anywhere}.v249-supermarket-popup a{display:block;color:#175e96}#v249-supermarket-status{flex-basis:100%;font:12px system-ui;color:#173a5e;overflow-wrap:anywhere}[hidden]{display:none!important}'+'</style></head>',1)
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(' redrawStations();\n setHeight();',' redrawStations();\n v249RenderSupermarkets(args);\n setHeight();',1)
+
 @st.cache_resource(show_spinner=False)
 def town_component_v121():
-    _asset_revision='v247-rent-colors'
+    _asset_revision='v249-supermarket-overlay'
     folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-'+_asset_revision)
     os.makedirs(folder,exist_ok=True)
     path=os.path.join(folder,'index.html')
@@ -13655,7 +13664,7 @@ def town_component_v121():
         with open(temp_path,'w',encoding='utf-8') as output:
             output.write(TOWN_COMPONENT_HTML_V121)
         os.replace(temp_path,path)
-    return st.components.v1.declare_component('sumai_town_map_v247',path=folder)
+    return st.components.v1.declare_component('sumai_town_map_v249',path=folder)
 
 @st.cache_resource(show_spinner=False)
 def _v216_api_budget():
@@ -14387,6 +14396,10 @@ def _v228_station_lookup_ui(state,lines,ready):
 def town_choropleth_status():
     """Read-only progress for an exclusively manual, background map job."""
     state=st.session_state
+    supermarket_loader=state.get('_v249_supermarket_loader')
+    if state.get('_v249_supermarket_wait') and supermarket_loader and not supermarket_loader.snapshot()['running']:
+        state['_v249_supermarket_wait']=False
+        st.rerun()
     store=current_town_summary_worker()
     snap=store.snapshot()
     if state.get('_v183_manual_refresh_wait') and not snap['running']:
@@ -14952,6 +14965,68 @@ def _v246_equipment_results():
     st.caption('価格目安はチェーンの暫定分類です。店頭価格の比較結果ではありません。')
 
 
+
+class _V249SupermarketMapLoader:
+    """Load only saved POIs, once on demand; never query Overpass from the map."""
+    def __init__(self):
+        self.lock=threading.RLock();self.running=False;self.initialized=False
+        self.rows=[];self.revision=0;self.error=''
+    def snapshot(self):
+        with self.lock:return dict(running=self.running,initialized=self.initialized,
+            rows=self.rows,revision=self.revision,error=self.error)
+    def start(self):
+        with self.lock:
+            if self.running:return False
+            self.running=True;self.initialized=True;self.error=''
+        threading.Thread(target=self.run,daemon=True,name='saved-supermarket-map-v249').start()
+        return True
+    def run(self):
+        try:
+            db=Database()
+            ids=','.join(_v246_record_id(w) for w in TOKYO_WARDS.values())
+            records=db.call('GET',SEARCH_TABLE,{'namespace':'eq.'+db.namespace,
+                'status':'eq.equipment_supermarket_v246','id':'in.('+ids+')',
+                'select':'id,summary','limit':len(TOKYO_WARDS)})
+            rows=_v249_saved_supermarket_rows(records)
+            with self.lock:self.rows=rows;self.revision+=1
+        except Exception as exc:
+            with self.lock:self.error=str(exc)[:300]
+        finally:
+            with self.lock:self.running=False
+
+
+def _v249_saved_supermarket_rows(records):
+    if not isinstance(records,list):raise AppError('保存したスーパーの応答形式が不正です。')
+    result={}
+    for item in records:
+        if not isinstance(item,dict):raise AppError('保存したスーパーの形式が不正です。')
+        payload=item.get('summary') or {};ward=payload.get('ward');rows=payload.get('rows')
+        if (ward not in TOKYO_WARDS.values() or payload.get('schema')!=246
+            or item.get('id')!=_v246_record_id(ward) or not isinstance(rows,list)
+            or payload.get('digest')!=_v246_digest(rows)):
+            raise AppError('保存したスーパーの整合性を確認できません。以前の表示を保持します。')
+        for row in rows:
+            try:
+                lat,lng=float(row['lat']),float(row['lng']);name=normal(row['name'])
+                if not name or not (35.50<=lat<=35.95 and 139.50<=lng<=139.98):continue
+                identity=str(row['id'])
+                label=row.get('price_label')
+                rank=_V246_PRICE_LABELS.index(label) if label in _V246_PRICE_LABELS else 5
+                result[(ward,identity)]={'id':identity,'ward':ward,'name':name[:180],
+                    'lat':lat,'lng':lng,'address':str(row.get('address') or '住所詳細未収録')[:300],
+                    'price_label':_V246_PRICE_LABELS[rank],'color':_V246_PRICE_COLORS[rank],
+                    'website':_v246_public_url(row.get('website')),
+                    'source_url':_v246_public_url(row.get('source_url')),
+                    'verification':str(row.get('verification') or '営業状況・公式店舗情報は未確認')[:180]}
+            except (KeyError,TypeError,ValueError):continue
+    return list(result.values())
+
+
+def _v249_supermarket_loader():
+    state=st.session_state
+    if '_v249_supermarket_loader' not in state:state['_v249_supermarket_loader']=_V249SupermarketMapLoader()
+    return state['_v249_supermarket_loader']
+
 def _v240_map_source(value):
     source=canonical_provider(value)
     return source if source in ('SUUMO','CHINTAI') else 'ALL'
@@ -15087,6 +15162,12 @@ def interactive_town_choropleth(group):
     state=st.session_state
     group=state.get('layout_display_group',group)
     source=_v240_map_source(state.get('_v240_map_source'))
+    supermarket_visible=bool(state.get('_v249_supermarket_visible',False))
+    supermarket_loader=_v249_supermarket_loader()
+    supermarket_snapshot=supermarket_loader.snapshot()
+    if supermarket_visible and not supermarket_snapshot['initialized']:
+        if supermarket_loader.start():state['_v249_supermarket_wait']=True
+        supermarket_snapshot=supermarket_loader.snapshot()
     # Only this explicit user action launches the asynchronous DB aggregation.
     if st.button('保存物件を再集計',key='recompute_v143_town_map'):
         job=current_town_summary_worker()
@@ -15188,6 +15269,11 @@ def interactive_town_choropleth(group):
     data=widget(chintai_town_urls=(_v243_chintai_urls(cached['geo'],group) if source=='CHINTAI' else {}),map_source=source,map_layout_group=group,center=list(center),zoom=_v202_view_zoom(state.get('new_view_zoom')),geo=cached['geo'],
                 home_view_epoch=int(state.get('_v202_home_epoch',0)),home_center=list(_V202_HOME_CENTER),
                 signature=cached['layer_signature'],stations=stations,wards=wards,
+                supermarket_overlay_visible=supermarket_visible,
+                supermarkets=supermarket_snapshot['rows'] if supermarket_visible else [],
+                supermarket_revision=supermarket_snapshot['revision'],
+                supermarket_loading=supermarket_snapshot['running'],
+                supermarket_error=supermarket_snapshot['error'],
                 search_catalog=search_catalog,search_district_names=list(TOKYO_WARDS.values()),
                 search_ward_bounds=search_ward_bounds,
                 suumo_ward_urls={ward:_v189_suumo_search_url(code,group) for code,ward in TOKYO_WARDS.items()},
@@ -15207,6 +15293,17 @@ def interactive_town_choropleth(group):
             state['_v245_map_diagnostics']=[{k:str(row.get(k,''))[:160] for k in ('time','status','provider','detail')}
                 for row in data['map_diagnostics'][-40:] if isinstance(row,dict)]
         current=viewport_bounds(data)
+        if data.get('event')=='supermarket_v249':
+            ticket=str(data.get('ticket') or '')[:100]
+            if ticket and ticket!=state.get('_v249_supermarket_ticket'):
+                state['_v249_supermarket_ticket']=ticket
+                state['_v249_supermarket_visible']=data.get('visible') is True
+                if data.get('refresh') is True and supermarket_loader.start():
+                    state['_v249_supermarket_wait']=True
+                if current:
+                    state['new_bounds']=current;state['new_view_center']=bounds_center(current)
+                    state['new_view_zoom']=_v202_view_zoom(data.get('zoom'),state.get('new_view_zoom',11))
+                st.rerun(scope='fragment')
         if data.get('event')=='map_source_v240':
             selected=_v240_map_source(data.get('source'))
             if selected!=source:
