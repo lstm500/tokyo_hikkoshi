@@ -52,7 +52,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v243"
+BUILD = "REBUILD-01-v244"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -13615,6 +13615,12 @@ TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(
 TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('v243-chintai-directory','v243-chintai-directory').replace('sumai_town_map_v243','sumai_town_map_v243')
 
 
+
+_V244_SUPERMARKET_JS = 'function v244Supermarkets(args){\n var m=state.map;if(!m)return;\n if(!state._v244Init){\n  state._v244Init=true;state._v244Rows=[];state._v244On=!!args.supermarket_enabled;state._v244Stamp=\'\';\n  try{var old=JSON.parse(localStorage.getItem(\'sumai-supermarkets-v244\')||\'null\');if(old&&Array.isArray(old.rows)){state._v244Rows=old.rows;state._v244Stamp=old.updated_at||\'\';}}catch(e){}\n  if(!m.getPane(\'supermarketPins\')){m.createPane(\'supermarketPins\');m.getPane(\'supermarketPins\').style.zIndex=\'675\';}\n  state._v244Layer=L.layerGroup().addTo(m);\n  window.addEventListener(\'resize\',function(){clearTimeout(state._v244Resize);state._v244Resize=setTimeout(setHeight,120)});\n  var bar=document.createElement(\'div\');bar.id=\'v244-supermarkets\';bar.style.cssText=\'padding:7px 12px;background:white;color:#183d52;font:13px system-ui;border-top:1px solid #d4dddd;display:flex;gap:9px;align-items:center;flex-wrap:wrap\';\n  var label=document.createElement(\'label\');label.style.cssText=\'display:flex;gap:5px;align-items:center;cursor:pointer\';var check=document.createElement(\'input\');check.type=\'checkbox\';check.checked=state._v244On;check.id=\'v244-supermarket-on\';label.append(check,document.createTextNode(\'スーパー（品川区・港区）\'));bar.appendChild(label);\n  var refresh=document.createElement(\'button\');refresh.textContent=\'更新\';refresh.type=\'button\';refresh.style.cssText=\'padding:5px 10px;color:#183d52;background:white;border:1px solid #a1b5bc;border-radius:5px\';bar.appendChild(refresh);\n  var status=document.createElement(\'span\');status.id=\'v244-supermarket-status\';bar.appendChild(status);\n  var legend=document.createElement(\'div\');legend.id=\'v244-supermarket-legend\';legend.style.cssText=\'flex-basis:100%;display:none;font-size:11px;line-height:1.7\';\n  [[\'#2466c0\',\'とても安い\'],[\'#19a8cd\',\'安い\'],[\'#b68a26\',\'標準\'],[\'#d64b43\',\'やや高い\'],[\'#551b31\',\'高い\'],[\'#7f8b91\',\'未分類\']].forEach(function(x){var item=document.createElement(\'span\');item.style.cssText=\'margin-right:9px;white-space:nowrap\';var dot=document.createElement(\'span\');dot.style.cssText=\'display:inline-block;width:8px;height:8px;border-radius:50%;background:\'+x[0]+\';margin-right:3px\';item.append(dot,document.createTextNode(x[1]));legend.appendChild(item)});\n  var detail=document.createElement(\'div\');detail.textContent=\'価格目安はチェーンの暫定分類です。店舗・商品・特売で異なります。初期5店は公式店舗情報確認済み。全店網羅ではありません。追加情報：© OpenStreetMap contributors\';legend.appendChild(detail);bar.appendChild(legend);\n  var host=document.getElementById(\'v223-location-row\')||document.getElementById(\'v223-locate\')?.parentElement||document.getElementById(\'map\');host.insertAdjacentElement(\'afterend\',bar);\n  function event(kind){hostMessage(\'streamlit:setComponentValue\',{dataType:\'json\',value:{event:kind,ticket:\'supermarket_\'+Date.now()+\'_\'+Math.random().toString(36).slice(2),enabled:state._v244On,home_view_epoch:state._v202HomeEpoch}})}\n  check.addEventListener(\'change\',function(){state._v244On=check.checked;v244Draw();setHeight();event(\'supermarket_toggle_v244\')});refresh.onclick=function(){check.checked=true;state._v244On=true;v244Draw();setHeight();event(\'supermarket_refresh_v244\')};\n }\n if(args.supermarket_data&&Array.isArray(args.supermarket_data.rows)&&String(args.supermarket_data.updated_at||\'\')>=state._v244Stamp){\n  state._v244Rows=args.supermarket_data.rows;state._v244Stamp=String(args.supermarket_data.updated_at||\'\');\n  try{localStorage.setItem(\'sumai-supermarkets-v244\',JSON.stringify(args.supermarket_data))}catch(e){}\n }\n document.getElementById(\'v244-supermarket-status\').textContent=state._v244On?(args.supermarket_loading?\'取得中…\':args.supermarket_error||(\'表示 \'+state._v244Rows.length+\'店\')):\'\';\n v244Draw();\n}\nfunction v244Draw(){\n if(!state._v244Layer)return;document.getElementById(\'v244-supermarket-legend\').style.display=state._v244On?\'block\':\'none\';\n if(state.overlay)state.overlay.eachLayer(function(layer){if(layer.setStyle)layer.setStyle({fillOpacity:state._v244On?.32:.81})});\n var key=state._v244Stamp+\'|\'+state._v244On;if(state._v244DrawKey===key)return;state._v244DrawKey=key;\n state._v244Layer.clearLayers();if(!state._v244On)return;\n var colors=[\'#2466c0\',\'#19a8cd\',\'#b68a26\',\'#d64b43\',\'#551b31\',\'#7f8b91\'];\n state._v244Rows.forEach(function(s){\n  if(!s||!Number.isFinite(s.lat)||!Number.isFinite(s.lng)||![\'品川区\',\'港区\'].includes(s.ward))return;\n  var color=colors.includes(s.color)?s.color:\'#7f8b91\';\n  var icon=L.divIcon({className:\'v244-store-hit\',html:\'<span style="position:absolute;left:8px;top:8px;width:10px;height:10px;border:2px solid white;border-radius:50%;box-shadow:0 0 0 1px #344c59,0 1px 4px #333;background:\'+color+\'"></span>\',iconSize:[30,30],iconAnchor:[15,15]});\n  var pin=L.marker([s.lat,s.lng],{icon:icon,pane:\'supermarketPins\',draggable:false,title:String(s.name||\'スーパー\')});\n  var el=document.createElement(\'div\');el.style.cssText=\'max-width:240px;font:13px system-ui;line-height:1.6\';var title=document.createElement(\'strong\');title.textContent=s.name;el.appendChild(title);\n  var price=document.createElement(\'div\');price.textContent=\'価格目安：\'+String(s.price_label||\'未分類\');price.style.color=color;el.appendChild(price);\n  var address=document.createElement(\'div\');address.textContent=s.address||s.ward;el.appendChild(address);\n  var note=document.createElement(\'small\');note.textContent=\'チェーンの価格傾向による暫定分類。店頭価格の比較結果ではありません。\';el.appendChild(note);\n  function link(text,value){try{var u=new URL(value);if(![\'https:\',\'http:\'].includes(u.protocol)||u.username||u.password)return;var a=document.createElement(\'a\');a.textContent=text;a.href=u.href;a.target=\'_blank\';a.rel=\'noopener noreferrer\';a.style.cssText=\'display:block;margin-top:5px\';el.appendChild(a)}catch(e){}}\n  if(s.website)link(s.verified?\'店舗公式ページ\':\'店舗サイト（OSM掲載・公式確認前）\',s.website);link(\'位置情報の出典\',s.source_url);pin.bindPopup(el);pin.addTo(state._v244Layer);\n });\n}\n'
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('function render(args){',_V244_SUPERMARKET_JS+'\nfunction render(args){',1)
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(' updateOverlay(args.geo,args.signature);',' updateOverlay(args.geo,args.signature);\n v244Supermarkets(args);',1)
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('v243-chintai-directory','v244-supermarkets').replace('sumai_town_map_v243','sumai_town_map_v244')
+
 @st.cache_resource(show_spinner=False)
 def town_component_v121():
     _asset_revision='v243-chintai-directory'
@@ -13635,7 +13641,7 @@ def town_component_v121():
         with open(temp_path,'w',encoding='utf-8') as output:
             output.write(TOWN_COMPONENT_HTML_V121)
         os.replace(temp_path,path)
-    return st.components.v1.declare_component('sumai_town_map_v243',path=folder)
+    return st.components.v1.declare_component('sumai_town_map_v244',path=folder)
 
 @st.cache_resource(show_spinner=False)
 def _v216_api_budget():
@@ -14367,6 +14373,11 @@ def _v228_station_lookup_ui(state,lines,ready):
 def town_choropleth_status():
     """Read-only progress for an exclusively manual, background map job."""
     state=st.session_state
+    if state.get('_v244_supermarkets_enabled'):
+        market=_v244_supermarket_store().snapshot()
+        current=(market['revision'],market['running'],market['error'])
+        if current!=state.get('_v244_sent_catalog'):
+            state['_v244_sent_catalog']=current;st.rerun()
     store=current_town_summary_worker()
     snap=store.snapshot()
     if state.get('_v183_manual_refresh_wait') and not snap['running']:
@@ -14548,6 +14559,115 @@ def town_search_catalog_v184(db_path,db_mtime):
             # Town search must still work using the areas table.
             pass
     return rows,wards
+
+
+# Public supermarket POIs only. Price categories are the user's provisional chain classification.
+_V244_PRICE_LABELS=('とても安い','安い','標準','やや高い','高い','未分類')
+_V244_PRICE_COLORS=('#2466c0','#19a8cd','#b68a26','#d64b43','#551b31','#7f8b91')
+_V244_CHAINS=(
+ (0,('オーケー','ロピア','業務スーパー','トライアル','ビッグエー','エイビイ','フーコット')),
+ (1,('ベイシア','ジャパンミート','生鮮市場top','ベルクス','ベルク','西友')),
+ (3,('東急ストア','京王ストア','そうてつローゼン','ピーコック','三徳')),
+ (4,('成城石井','クイーンズ伊勢丹','紀ノ国屋','明治屋','ナショナル麻布','nationalazabu','kinokuniya')),
+ (2,('ヤオコー','三和','イオン','イトーヨーカドー','ヨークフーズ','まいばすけっと','ライフ','サミット','マルエツ','いなげや','カスミ')))
+
+
+def _v244_price(name,brand=''):
+    def key(v):return re.sub(r'[\s・ー－-]+','',unicodedata.normalize('NFKC',str(v))).casefold()
+    text=key(name)+' '+key(brand)
+    # Separate formats are not silently assigned their parent company's price.
+    if any(x in text for x in ('リンコス','ビオラル','bioral','肉のハナマサ')):return 5
+    if re.search(r'(?i)(?:^|\W)ok(?:\W|$)',str(brand or name)):return 0
+    for rank,aliases in _V244_CHAINS:
+        if any(key(alias) in text for alias in aliases):return rank
+    return 5
+
+
+def _v244_public_url(value):
+    try:
+        u=urlparse(str(value or ''))
+        if u.scheme in ('http','https') and u.hostname and not u.username and not u.password:return u.geturl()
+    except ValueError:pass
+    return ''
+
+
+def _v244_supermarket_rows(doc,ward):
+    if not isinstance(doc,dict) or not isinstance(doc.get('elements'),list):raise AppError('スーパー一覧の応答形式が不正です。')
+    if doc.get('remark'):raise AppError('スーパー一覧の取得が未完了です。再試行してください。')
+    rows=[];seen=set()
+    for el in doc['elements']:
+        tags=el.get('tags') or {};point=el.get('center') or el
+        if tags.get('shop')!='supermarket' or any(tags.get(k) for k in ('disused:shop','abandoned:shop')):continue
+        if tags.get('access')=='private' or tags.get('opening_hours')=='closed':continue
+        name=normal(tags.get('name:ja') or tags.get('name') or '')
+        if not name:continue
+        try:lat=float(point['lat']);lng=float(point['lon'])
+        except (KeyError,ValueError,TypeError):continue
+        if not (35.55<=lat<=35.70 and 139.65<=lng<=139.82):continue
+        city=tags.get('addr:city') or tags.get('addr:ward') or ward
+        if ('区' in city and ward not in city):continue
+        address=normal(tags.get('addr:full') or ''.join(str(tags.get(k) or '') for k in ('addr:province','addr:city','addr:suburb','addr:quarter','addr:neighbourhood','addr:street','addr:housenumber')))
+        if not address or address in ('東京都',ward,'東京都'+ward):address=ward+'（住所詳細未収録）'
+        identity=(address_key(name),round(lat,4),round(lng,4))
+        if identity in seen:continue
+        seen.add(identity);rank=_v244_price(name,tags.get('brand',''))
+        rows.append({'id':str(el.get('type'))+'/'+str(el.get('id')),'name':name,'ward':ward,
+            'address':address,'lat':lat,'lng':lng,'price_label':_V244_PRICE_LABELS[rank],
+            'color':_V244_PRICE_COLORS[rank],'website':_v244_public_url(tags.get('website') or tags.get('contact:website')),
+            'source_url':'https://www.openstreetmap.org/'+str(el.get('type'))+'/'+str(el.get('id'))})
+    return rows
+
+
+_V244_SUPERMARKET_SEED = [{'id': 'official:ok-togoshi', 'name': 'オーケー 戸越店', 'ward': '品川区', 'address': '東京都品川区戸越5-15-4', 'lat': 35.6096423, 'lng': 139.7152734, 'website': 'https://ok-corporation.jp/shop/togoshi.html', 'source_url': 'https://ok-corporation.jp/shop/togoshi.html', 'verified': True}, {'id': 'official:life-osaki', 'name': 'ライフ 大崎ニューシティ店', 'ward': '品川区', 'address': '東京都品川区大崎1丁目6-4 5号館', 'lat': 35.6201969, 'lng': 139.7291071, 'website': 'https://store.lifecorp.jp/detail/east878/', 'source_url': 'https://mapfan.com/spots/SC5AQ,6K6,1R', 'verified': True}, {'id': 'official:seiyu-oimachi', 'name': '西友 大井町店', 'ward': '品川区', 'address': '東京都品川区東大井5-18-1', 'lat': 35.6061721, 'lng': 139.7359608, 'website': 'https://www.seiyu.co.jp/shop/西友大井町店/', 'source_url': 'https://mapfan.com/spots/SC5AQ,0D0,T0', 'verified': True}, {'id': 'official:seijo-oimachi', 'name': '成城石井 アトレ大井町店', 'ward': '品川区', 'address': '東京都品川区大井1-2-1 アトレ大井町1F', 'lat': 35.6062122, 'lng': 139.734841, 'website': 'https://shop.seijoishii.com/seijoishii/spot/detail?code=0021', 'source_url': 'https://mapfan.com/spots/SC5AQ,FFDS,H', 'verified': True}, {'id': 'official:peacock-shibaura', 'name': 'ピーコックストア 芝浦アイランド店', 'ward': '港区', 'address': '東京都港区芝浦4丁目22-2', 'lat': 35.641186029254, 'lng': 139.75281009084, 'website': 'https://aeonfoodstyle.com/stores/7933/', 'source_url': 'https://mapfan.com/spots/SC5AQ,F06S,7', 'verified': True}]
+
+
+def _v244_seed_rows():
+    rows=[dict(row) for row in _V244_SUPERMARKET_SEED]
+    for row in rows:
+        rank=_v244_price(row["name"]);row["price_label"]=_V244_PRICE_LABELS[rank];row["color"]=_V244_PRICE_COLORS[rank]
+    return rows
+
+
+class _V244SupermarketStore:
+    def __init__(self):
+        self.lock=threading.RLock();self.rows=_v244_seed_rows();self.running=False;self.error='';self.revision=0;self.updated_at='2026-10-29T00:00:00+00:00';self.last_time=0;self.last_attempt=0
+    def snapshot(self):
+        with self.lock:return {'rows':list(self.rows),'running':self.running,'error':self.error,'revision':self.revision,'updated_at':self.updated_at}
+    def start(self,force=False):
+        with self.lock:
+            if self.running or (not force and time.time()-self.last_attempt<60) or (not force and self.rows and time.time()-self.last_time<7*86400):return False
+            self.running=True;self.error='';self.last_attempt=time.time()
+        threading.Thread(target=self.run,daemon=True,name='supermarket-2wards').start();return True
+    def run(self):
+        try:
+            result=[]
+            for ward in ('品川区','港区'):
+                query='[out:json][timeout:20];area["ISO3166-2"="JP-13"]->.t;rel(area.t)["boundary"="administrative"]["name"="'+ward+'"];map_to_area->.w;nwr(area.w)["shop"="supermarket"];out center tags;'
+                error=None
+                for endpoint in ('https://overpass-api.de/api/interpreter','https://overpass.private.coffee/api/interpreter'):
+                    try:
+                        response=requests.get(endpoint,params={'data':query},timeout=(4,25),allow_redirects=False)
+                        response.raise_for_status();data=response.json()
+                        rows=_v244_supermarket_rows(data,ward)
+                        if not rows:raise AppError(ward+'のスーパーを確認できませんでした。')
+                        result.extend(rows);error=None;break
+                    except (requests.RequestException,ValueError,AppError) as exc:error=exc
+                if error:raise AppError(ward+'のスーパー情報を取得できません。保存済みの店舗を表示しています。')
+            # Retain the official initial records and their verified names/coordinates.
+            verified=_v244_seed_rows()
+            result=[row for row in result if not any(
+                address_key(row['name']).replace(' ','')==address_key(seed['name']).replace(' ','')
+                and meters((row['lat'],row['lng']),(seed['lat'],seed['lng']))<100 for seed in verified)]+verified
+            with self.lock:
+                self.rows=result;self.updated_at=utc_now();self.last_time=time.time();self.revision+=1
+        except Exception as exc:
+            with self.lock:self.error=str(exc) if isinstance(exc,AppError) else type(exc).__name__
+        finally:
+            with self.lock:self.running=False
+
+
+@st.cache_resource(show_spinner=False)
+def _v244_supermarket_store():return _V244SupermarketStore()
 
 
 def _v240_map_source(value):
@@ -14773,8 +14893,10 @@ def interactive_town_choropleth(group):
         except (OSError,sqlite3.Error,ValueError,TypeError):
             pass
     stations,wards=town_station_refs_v164(destinations)
+    supermarket=_v244_supermarket_store().snapshot()
+    state['_v244_sent_catalog']=(supermarket['revision'],supermarket['running'],supermarket['error'])
     widget=town_component_v121()
-    data=widget(chintai_town_urls=(_v243_chintai_urls(cached['geo'],group) if source=='CHINTAI' else {}),map_source=source,map_layout_group=group,center=list(center),zoom=_v202_view_zoom(state.get('new_view_zoom')),geo=cached['geo'],
+    data=widget(supermarket_enabled=bool(state.get('_v244_supermarkets_enabled')),supermarket_data={'rows':supermarket['rows'],'updated_at':supermarket['updated_at']},supermarket_loading=supermarket['running'],supermarket_error=supermarket['error'],chintai_town_urls=(_v243_chintai_urls(cached['geo'],group) if source=='CHINTAI' else {}),map_source=source,map_layout_group=group,center=list(center),zoom=_v202_view_zoom(state.get('new_view_zoom')),geo=cached['geo'],
                 home_view_epoch=int(state.get('_v202_home_epoch',0)),home_center=list(_V202_HOME_CENTER),
                 signature=cached['layer_signature'],stations=stations,wards=wards,
                 search_catalog=search_catalog,search_district_names=list(TOKYO_WARDS.values()),
@@ -14793,6 +14915,11 @@ def interactive_town_choropleth(group):
                 key='town_map_v184_'+str(reset),default=None)
     if isinstance(data,dict) and data.get('home_view_epoch')==int(state.get('_v202_home_epoch',0)):
         current=viewport_bounds(data)
+        if data.get('event') in ('supermarket_toggle_v244','supermarket_refresh_v244') and data.get('ticket') and data.get('ticket')!=state.get('_v244_last_ticket'):
+            state['_v244_last_ticket']=data['ticket']
+            enabled=data.get('enabled') is True;state['_v244_supermarkets_enabled']=enabled
+            if enabled:_v244_supermarket_store().start(force=data.get('event')=='supermarket_refresh_v244')
+            st.rerun(scope='fragment')
         if data.get('event')=='map_source_v240':
             selected=_v240_map_source(data.get('source'))
             if selected!=source:
