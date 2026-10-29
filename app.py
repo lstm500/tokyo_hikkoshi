@@ -52,7 +52,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v246"
+BUILD = "REBUILD-01-v247"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -13625,13 +13625,19 @@ TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace("value:{bounds:{_south
 TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('v244-supermarkets','v245-map-recovery').replace('sumai_town_map_v244','sumai_town_map_v245')
 
 
-TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('fillOpacity:.81','fillOpacity:.32')
+# Normal rent display keeps its original strength. The soft preset is reserved
+# for an explicitly enabled supermarket overlay; equipment collection alone does not enable it.
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('fillOpacity:.81','fillOpacity:(state._v247SupermarketOverlayVisible?.32:.81)')
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('function render(args){',
+    'function render(args){\n var v247OldMode=!!state._v247SupermarketOverlayVisible;\n state._v247SupermarketOverlayVisible=!!(args && args.supermarket_overlay_visible===true);',1)
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(' updateOverlay(args.geo,args.signature);',
+    " updateOverlay(args.geo,args.signature);\n if(v247OldMode!==state._v247SupermarketOverlayVisible && state.overlay){state.overlay.eachLayer(function(layer){if(layer.setStyle)layer.setStyle({fillOpacity:layer.feature && layer.feature.properties && layer.feature.properties.has_data===true?(state._v247SupermarketOverlayVisible?.32:.81):0})})}",1)
 TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace("function initMap(args){", "function initMap(args){\n try{localStorage.removeItem('sumai-supermarkets-v244')}catch(e){}",1)
 TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('sumai_town_map_v243','sumai_town_map_v246').replace('sumai_town_map_v245','sumai_town_map_v246')
 
 @st.cache_resource(show_spinner=False)
 def town_component_v121():
-    _asset_revision='v246-equipment-tab'
+    _asset_revision='v247-rent-colors'
     folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-'+_asset_revision)
     os.makedirs(folder,exist_ok=True)
     path=os.path.join(folder,'index.html')
@@ -13649,7 +13655,7 @@ def town_component_v121():
         with open(temp_path,'w',encoding='utf-8') as output:
             output.write(TOWN_COMPONENT_HTML_V121)
         os.replace(temp_path,path)
-    return st.components.v1.declare_component('sumai_town_map_v246',path=folder)
+    return st.components.v1.declare_component('sumai_town_map_v247',path=folder)
 
 @st.cache_resource(show_spinner=False)
 def _v216_api_budget():
@@ -14595,6 +14601,104 @@ def _v246_public_url(value):
 
 
 # Equipment collection is manual and independent of the rent-map render path.
+def _v247_collect_log(job,db):
+    """Persist one bounded diagnostic per manual run; never runs from the rent map."""
+    with job.lock:
+        rows=[dict(r) for r in job.logs]
+        payload={'schema':247,'run_id':job.run_id,'started_at':job.started_at,'finished_at':utc_now(),
+            'wards':list(job.wards),'progress':{k:dict(v) for k,v in job.progress.items()},
+            'events':rows,'dropped_events':job.dropped_logs,'status':job.status}
+    payload['digest']=_v246_digest(payload)
+    identity='equipment.supermarket.log.v247.'+job.run_id
+    db.save_search({'id':identity,'source':'OpenStreetMap','status':'equipment_supermarket_log_v247',
+        'started_at':job.started_at,'finished_at':payload['finished_at'],'conditions':{'kind':'supermarket_log'},'summary':payload})
+    found=db.call('GET',SEARCH_TABLE,{'namespace':'eq.'+db.namespace,'id':'eq.'+identity,'select':'summary','limit':1})
+    if not isinstance(found,list) or not found or found[0].get('summary',{}).get('digest')!=payload['digest']:
+        raise AppError('取得ログの保存を読み戻しで確認できません。画面からJSONをダウンロードしてください。')
+    with job.lock:job.log_saved=True;job.log_error=''
+
+
+def _v247_load_logs(db):
+    records=db.call('GET',SEARCH_TABLE,{'namespace':'eq.'+db.namespace,'status':'eq.equipment_supermarket_log_v247',
+        'select':'id,summary,finished_at','order':'finished_at.desc,id.desc','limit':20})
+    if not isinstance(records,list):raise AppError('保存した取得ログを読み込めません。')
+    out=[]
+    for record in records:
+        p=record.get('summary') or {}
+        if p.get('schema')!=247 or not isinstance(p.get('events'),list):continue
+        check=dict(p);digest=check.pop('digest',None)
+        if digest!=_v246_digest(check):raise AppError('取得ログの整合性を確認できません。')
+        out.append(p)
+    return out
+
+
+def _v247_analyze_logs(events):
+    counts={}
+    def add(reason,count=1):counts[reason]=counts.get(reason,0)+count
+    exclusions=[]
+    for row in events:
+        stage=row.get('stage')
+        if stage=='http_response':
+            status=int(row.get('status') or 0)
+            if status>=400:add('通信：HTTP '+str(status))
+        elif stage=='fetch_failed':
+            kind=row.get('error_type','不明')
+            if 'Timeout' in kind:add('通信：タイムアウト')
+            elif kind!='HTTPError':add('取得・解析：'+kind)
+        elif stage=='ward_failed':add('区の処理が未完了')
+        elif stage=='parse_completed':
+            for item in row.get('rejections',[]):
+                reason=item.get('reason','不明');add('候補の除外：'+reason)
+                exclusions.append(dict(区=row.get('ward',''),店名=item.get('name',''),理由=reason,
+                    段階=item.get('stage','候補整理'),ID=item.get('id',''),URL=item.get('url','')))
+            if row.get('rejections_truncated'):add('除外詳細の記録上限超過',int(row['rejections_truncated']))
+    return [{'分類・原因':reason,'件数':count} for reason,count in counts.items()],exclusions
+
+
+def _v247_equipment_log_tools(state):
+    with st.expander('周辺設備の取得ログ'):
+        st.caption('取得ごとにログを保存します。通信失敗と、閉店・住所不一致・位置不明・重複による除外を区別します。')
+        if st.button('保存した取得ログを読み込む',key='equipment_load_logs_v247'):
+            try:
+                with st.spinner('保存した取得ログを読み込んでいます…'):
+                    state['_v247_saved_equipment_logs']=_v247_load_logs(Database())
+                state.pop('_v247_log_load_error',None)
+            except Exception as exc:state['_v247_log_load_error']=str(exc)[:300]
+        if state.get('_v247_log_load_error'):st.warning(state['_v247_log_load_error'])
+        job=state.get('_v246_equipment_job');current=[];current_run=None;error=''
+        if job:
+            with job.lock:
+                current=[dict(r) for r in job.logs];saved=job.log_saved;error=job.log_error;dropped=job.dropped_logs
+                current_run={'run_id':job.run_id,'started_at':job.started_at,'wards':list(job.wards),'status':job.status,'progress':{k:dict(v) for k,v in job.progress.items()},'dropped_events':dropped}
+            if error:st.warning('取得ログの保存は未確認です：'+error)
+            elif current:st.caption('現在の取得ログ：保存・読み戻し確認済み' if saved else '現在の取得ログ：処理中／保存前')
+            if dropped:st.warning(f'記録上限により古いイベント{dropped}件は省略されています。')
+        runs=state.get('_v247_saved_equipment_logs',[])
+        options=['現在のセッション']+[p['run_id'] for p in runs]
+        lookup={p['run_id']:p for p in runs}
+        if state.get('equipment_log_choice_v247','現在のセッション') not in options:state['equipment_log_choice_v247']='現在のセッション'
+        st.caption('保存済みログは直近20回を読み込みます。通信の件数は試行回数で、店舗数とは異なります。')
+        choice=st.selectbox('確認する取得ログ',options,key='equipment_log_choice_v247',
+            format_func=lambda value:value if value=='現在のセッション' else acquisition_time_jst(lookup[value].get('started_at',''))+'｜'+'・'.join(lookup[value].get('wards',[])))
+        payload=lookup.get(choice)
+        events=payload['events'] if payload else current
+        summary,excluded=_v247_analyze_logs(events)
+        if payload and payload.get('dropped_events'):st.warning('この取得ログは記録上限を超えたイベントを含みます。')
+        if summary:st.dataframe(summary,hide_index=True,use_container_width=True)
+        failures=[{'区':r.get('ward',''),'段階':r.get('operation') or r.get('stage',''),'HTTP':r.get('status',''),
+            '失敗理由':r.get('message') or r.get('body_preview',''),'取得先':r.get('endpoint','')}
+            for r in events if r.get('stage') in ('fetch_failed','ward_failed','job_failed') or (r.get('stage')=='http_response' and int(r.get('status') or 0)>=400)]
+        if failures:st.dataframe(failures,hide_index=True,use_container_width=True)
+        if excluded:st.dataframe(excluded,hide_index=True,use_container_width=True)
+        if not events:st.caption('取得後に「ログ表示を更新」を押すか、保存した取得ログを読み込んでください。')
+        metadata={k:v for k,v in (payload or current_run or {}).items() if k!='events'}
+        export={'run':metadata,'events':events,'analysis':summary,'excluded_candidates':excluded,'log_persistence_error':error if not payload else ''}
+        st.download_button('周辺設備の詳細ログ JSON',json.dumps(export,ensure_ascii=False,indent=2).encode('utf-8'),
+            'sumai_equipment_log.json','application/json',key='equipment_log_v246',disabled=not events,on_click='ignore')
+        st.download_button('取得できなかった候補CSV',csv_bytes_from_rows(excluded),'sumai_equipment_exclusions.csv','text/csv',
+            key='equipment_exclusions_v247',disabled=not excluded,on_click='ignore')
+
+
 def _v246_record_id(ward):
     return 'equipment.supermarket.v246.'+next(code for code,name in TOKYO_WARDS.items() if name==ward)
 
@@ -14620,23 +14724,31 @@ def _v246_parse(doc,ward):
     if not any(e.get('type')=='relation' and (e.get('tags') or {}).get('name')==ward
         and (e.get('tags') or {}).get('boundary')=='administrative' for e in elements if isinstance(e,dict)):
         raise AppError('対象区の境界を確認できません。0店舗として完了扱いにはしません。')
-    rows=[];rejected=0;duplicates=0
+    rows=[];rejected=0;duplicates=0;rejections=[];truncated=0
+    def reject(el,name,reason):
+        nonlocal truncated
+        identity=str(el.get('type',''))+'/'+str(el.get('id',''))
+        if len(rejections)<500:
+            rejections.append({'id':identity,'name':name,'reason':reason,'stage':'候補整理',
+                'url':'https://www.openstreetmap.org/'+identity if el.get('type') in ('node','way','relation') and str(el.get('id','')).isdigit() else ''})
+        else:truncated+=1
     for e in elements:
         if not isinstance(e,dict):continue
         t=e.get('tags') or {};name=normal(t.get('name:ja') or t.get('name') or '')
         if t.get('shop')!='supermarket' and not (t.get('shop')=='convenience' and re.search('まいばすけっと|ビッグ.?エー',name)):continue
         if any(t.get(k) for k in ('disused:shop','abandoned:shop','demolished:shop')) or t.get('opening_hours')=='closed' or t.get('access')=='private':
-            rejected+=1;continue
+            rejected+=1;reject(e,name,'閉店・廃止または非公開');continue
         p=e.get('center') or e
         try:lat=float(p['lat']);lng=float(p['lon'])
-        except (KeyError,ValueError,TypeError):rejected+=1;continue
+        except (KeyError,ValueError,TypeError):rejected+=1;reject(e,name,'緯度経度が未収録または不正');continue
         city=str(t.get('addr:city') or t.get('addr:ward') or '')
         address=normal(t.get('addr:full') or ''.join(str(t.get(k) or '') for k in ('addr:province','addr:city','addr:suburb','addr:quarter','addr:neighbourhood','addr:street','addr:housenumber')))
         other=[w for w in TOKYO_WARDS.values() if w!=ward and w in city+' '+address]
-        if not name or other or not (35.50<=lat<=35.95 and 139.50<=lng<=139.98):rejected+=1;continue
-        if e.get('type') not in ('node','way','relation') or not str(e.get('id','')).isdigit():rejected+=1;continue
+        if not name or other or not (35.50<=lat<=35.95 and 139.50<=lng<=139.98):
+            rejected+=1;reject(e,name,'店名が未収録' if not name else '住所が対象区と不一致' if other else '位置が対象範囲外');continue
+        if e.get('type') not in ('node','way','relation') or not str(e.get('id','')).isdigit():rejected+=1;reject(e,name,'掲載IDが不正');continue
         identity=str(e['type'])+'/'+str(e['id'])
-        if any(r['id']==identity or (address_key(r['name'])==address_key(name) and meters((lat,lng),(r['lat'],r['lng']))<60) for r in rows):duplicates+=1;continue
+        if any(r['id']==identity or (address_key(r['name'])==address_key(name) and meters((lat,lng),(r['lat'],r['lng']))<60) for r in rows):duplicates+=1;reject(e,name,'同一IDまたは同名・近接地点の重複');continue
         rank=_v246_price(name,t.get('brand',''))
         rows.append({'id':identity,'ward':ward,'name':name,'address':address or '住所詳細未収録',
             'lat':lat,'lng':lng,'price_label':_V246_PRICE_LABELS[rank],'color':_V246_PRICE_COLORS[rank],
@@ -14645,7 +14757,7 @@ def _v246_parse(doc,ward):
             'position_basis':'OSM掲載地点' if e['type']=='node' else 'OSM建物・敷地の中心',
             'verification':'営業状況・公式店舗情報は未確認'})
     if len(rows)>5000:raise AppError('取得件数が上限を超えました。データを確認してください。')
-    return sorted(rows,key=lambda r:(r['name'],r['id'])),{'excluded':rejected,'duplicates':duplicates}
+    return sorted(rows,key=lambda r:(r['name'],r['id'])),{'excluded':rejected,'duplicates':duplicates,'rejections':rejections,'rejections_truncated':truncated}
 
 
 def _v246_load(db,ward):
@@ -14673,19 +14785,21 @@ def _v246_save(db,ward,rows,stats):
 class _V246EquipmentJob:
     def __init__(self):
         self.lock=threading.RLock();self.stop=threading.Event();self.running=False;self.status='待機中'
-        self.progress={};self.data={};self.logs=[];self.wards=[]
+        self.progress={};self.data={};self.logs=[];self.wards=[];self.run_id='';self.started_at='';self.log_saved=False;self.log_error='';self.dropped_logs=0
     def snapshot(self):
         with self.lock:return {'running':self.running,'status':self.status,'progress':{k:dict(v) for k,v in self.progress.items()},
-            'wards':list(self.wards),'count':sum(len(self.data.get(w,{}).get('rows',[])) for w in self.wards)}
+            'log_saved':self.log_saved,'log_error':self.log_error,'wards':list(self.wards),'count':sum(len(self.data.get(w,{}).get('rows',[])) for w in self.wards)}
     def log(self,ward,stage,**detail):
         with self.lock:
-            self.logs.append(dict(time=utc_now(),ward=ward,stage=stage,**detail));self.logs=self.logs[-200:]
+            self.logs.append(dict(time=utc_now(),ward=ward,stage=stage,**detail))
+            if len(self.logs)>1000:self.dropped_logs+=1;self.logs=self.logs[-1000:]
     def start(self,wards,force=False,load_only=False):
         wards=list(dict.fromkeys(w for w in wards if w in TOKYO_WARDS.values()))
         if not wards:return False
         with self.lock:
             if self.running:return False
             self.running=True;self.stop.clear();self.wards=wards;self.status='保存結果を確認中'
+            self.logs=[];self.dropped_logs=0;self.log_saved=False;self.log_error='';self.started_at=utc_now();self.run_id=hashlib.sha256(os.urandom(32)).hexdigest()[:24]
             self.progress={w:{'状態':'待機','保存件数':0,'詳細':''} for w in wards}
         threading.Thread(target=self.run,args=(wards,force,load_only),daemon=True,name='equipment-manual-v246').start();return True
     def run(self,wards,force=False,load_only=False):
@@ -14710,8 +14824,8 @@ class _V246EquipmentJob:
                         try:
                             response=None
                             response=requests.get(endpoint,params={'data':_v246_query(ward)},headers={'User-Agent':'SumaiCompass/246 (manual supermarket collection)'},timeout=(4,40),allow_redirects=False)
-                            self.log(ward,'http_response',endpoint=endpoint,status=response.status_code,elapsed=round(time.monotonic()-begin,2))
-                            response.raise_for_status();rows,stats=_v246_parse(response.json(),ward);last=None;break
+                            self.log(ward,'http_response',endpoint=endpoint,status=response.status_code,elapsed=round(time.monotonic()-begin,2),content_type=getattr(response,'headers',{}).get('content-type',''),body_preview=str(getattr(response,'text',''))[:240] if response.status_code>=400 or 'json' not in getattr(response,'headers',{}).get('content-type','') else '')
+                            response.raise_for_status();rows,stats=_v246_parse(response.json(),ward);self.log(ward,'parse_completed',count=len(rows),**stats);last=None;break
                         except Exception as exc:
                             last=exc;self.log(ward,'fetch_failed',error_type=type(exc).__name__,message=str(exc)[:400],endpoint=endpoint,elapsed=round(time.monotonic()-begin,2))
                             if getattr(locals().get('response'),'status_code',0) in (403,429):break
@@ -14724,15 +14838,19 @@ class _V246EquipmentJob:
                     confirmed=_v246_save(db,ward,rows,stats)
                     with self.lock:
                         self.data[ward]=confirmed;self.progress[ward]={'状態':'完了','保存件数':len(rows),'詳細':f"重複除外 {stats['duplicates']}件／対象外 {stats['excluded']}件"}
-                    self.log(ward,'saved_and_verified',count=len(rows),**stats)
+                    self.log(ward,'saved_and_verified',count=len(rows))
                 except Exception as exc:
-                    self.log(ward,'ward_failed',error_type=type(exc).__name__,message=str(exc)[:400])
+                    self.log(ward,'ward_failed',error_type=type(exc).__name__,message=str(exc)[:400],operation=self.status)
                     with self.lock:self.progress[ward]={'状態':'未完了','保存件数':len(self.data.get(ward,{}).get('rows',[])),'詳細':str(exc)[:240]}
             with self.lock:self.status='中止しました。保存済みの区は保持しています。' if self.stop.is_set() else '処理終了'
         except Exception as exc:
             self.log('','job_failed',error_type=type(exc).__name__,message=str(exc)[:400])
             with self.lock:self.status=str(exc)[:240]
         finally:
+            if not load_only:
+                try:_v247_collect_log(self,db if 'db' in locals() else Database())
+                except Exception as exc:
+                    with self.lock:self.log_error=str(exc)[:300];self.log_saved=False
             with self.lock:self.running=False
     def rows(self):
         with self.lock:return [dict(r) for w in self.wards for r in self.data.get(w,{}).get('rows',[])]
@@ -14767,6 +14885,8 @@ def _v246_equipment_panel():
         job.stop.set();st.info('中止を受け付けました。通信中の区は通信終了後に保存・確認して停止します。')
     st.caption('通常は完了した区を読み込み、未完了の区から再開します。再取得に失敗しても以前の保存結果は削除しません。')
     st.write(snap['status'])
+    if snap.get('log_error'):st.warning('取得ログの保存は未確認です：'+snap['log_error'])
+    elif snap.get('log_saved'):st.caption('取得ログ：保存・読み戻し確認済み')
     progress=snap['progress'];done=sum(r['状態']=='完了' for r in progress.values())
     if progress:
         st.progress(done/len(progress));st.caption(f'完了 {done}/{len(progress)}区｜読み込んだ店舗 {snap["count"]}件')
@@ -16036,15 +16156,7 @@ def _v209_log_tools(state):
         st.json(diagnostic['rent_overlay'],expanded=False)
         st.download_button('背景地図の詳細ログ JSON',json.dumps(diagnostic,ensure_ascii=False,indent=2).encode('utf-8'),
             'sumai_basemap_log.json','application/json',key='basemap_log_v245',disabled=not rows)
-    with st.expander('周辺設備の取得ログ'):
-        job=state.get('_v246_equipment_job')
-        if job:
-            with job.lock:rows=[dict(r) for r in job.logs]
-        else:rows=[]
-        st.caption('現在のセッションの取得・保存・失敗理由を記録します。')
-        if rows:st.dataframe(rows,hide_index=True,use_container_width=True)
-        st.download_button('周辺設備の詳細ログ JSON',json.dumps(rows,ensure_ascii=False,indent=2).encode('utf-8'),
-            'sumai_equipment_log.json','application/json',key='equipment_log_v246',disabled=not rows,on_click='ignore')
+    _v247_equipment_log_tools(state)
     _v208_landmark_log_panel(state)
     if state.get('_v217_suumo_audit'):
         with st.expander('SUUMO町名検索のログ'):
