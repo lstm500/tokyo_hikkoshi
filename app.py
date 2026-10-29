@@ -52,7 +52,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v247"
+BUILD = "REBUILD-01-v248"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -14709,8 +14709,10 @@ def _v246_digest(rows):
 
 def _v246_query(ward):
     if ward not in TOKYO_WARDS.values():raise AppError('東京23区から選択してください。')
-    return ('[out:json][timeout:30];area["ISO3166-2"="JP-13"]->.t;'
-        'rel(area.t)["boundary"="administrative"]["name"="'+ward+'"]->.r;.r out tags;'
+    # Resolve only the named ward in the Tokyo bbox; avoid the Tokyo-wide area join.
+    return ('[out:json][timeout:60];'
+        'rel["boundary"="administrative"]["admin_level"="8"]["name"="'+ward+'"]'
+        '(35.50,139.50,35.95,139.98)->.r;.r out tags;'
         '.r map_to_area->.w;('
         'nwr(area.w)["shop"="supermarket"];'
         'nwr(area.w)["shop"="convenience"]["name"~"まいばすけっと|ビッグ.?エー"]'
@@ -14782,6 +14784,53 @@ def _v246_save(db,ward,rows,stats):
     return confirmed
 
 
+def _v248_fetch_supermarkets(job,ward):
+    """Bounded failover; incomplete or cancelled responses never replace saved rows."""
+    query=_v246_query(ward)
+    endpoints=('https://overpass-api.de/api/interpreter',
+               'https://overpass.private.coffee/api/interpreter')
+    failures=[]
+    for number,endpoint in enumerate(endpoints,1):
+        if job.stop.is_set():return None,{}
+        with job.lock:job.status=f'{ward}：スーパーを取得中（取得先{number}/{len(endpoints)}）'
+        begin=time.monotonic();response=None
+        job.log(ward,'fetch_started',endpoint=endpoint,attempt=number,
+            query=query,query_timeout_seconds=60,connect_timeout_seconds=10,read_timeout_seconds=100)
+        try:
+            # Overpass queue time is additional to query execution time. The
+            # client must allow both, rather than cutting a live request at 40s.
+            response=requests.get(endpoint,params={'data':query},
+                headers={'User-Agent':'SumaiCompass/248 (manual supermarket collection)'},
+                timeout=(10,100),allow_redirects=False)
+            job.log(ward,'http_response',endpoint=endpoint,status=response.status_code,
+                elapsed=round(time.monotonic()-begin,2),
+                content_type=response.headers.get('content-type',''),
+                body_preview=response.text[:240] if response.status_code>=400 or 'json' not in response.headers.get('content-type','') else '')
+            response.raise_for_status()
+            if response.status_code!=200:raise AppError('取得先が通常のJSON応答を返しませんでした。')
+            if job.stop.is_set():return None,{}
+            doc=response.json()
+            if isinstance(doc,dict) and doc.get('remark'):
+                job.log(ward,'server_incomplete',endpoint=endpoint,message=str(doc['remark'])[:600])
+                raise AppError('取得先で検索が未完了：'+str(doc['remark'])[:180])
+            rows,stats=_v246_parse(doc,ward)
+            if job.stop.is_set():return None,{}
+            job.log(ward,'parse_completed',count=len(rows),**stats)
+            return rows,stats
+        except Exception as exc:
+            status=getattr(response,'status_code',None)
+            failures.append(type(exc).__name__+(' HTTP '+str(status) if status and status>=400 else ''))
+            job.log(ward,'fetch_failed',endpoint=endpoint,attempt=number,status=status,
+                error_type=type(exc).__name__,message=str(exc)[:400],
+                elapsed=round(time.monotonic()-begin,2))
+            # Do not switch endpoints after an explicit denial or rate limit.
+            if status in (403,429):break
+            if number<len(endpoints) and job.stop.wait(2):return None,{}
+    if job.stop.is_set():return None,{}
+    raise AppError('位置情報を取得できませんでした。'+'／'.join(failures)+
+        '。通信先・待機時間・検索内容は取得ログで確認できます。以前の保存結果は保持しています。')
+
+
 class _V246EquipmentJob:
     def __init__(self):
         self.lock=threading.RLock();self.stop=threading.Event();self.running=False;self.status='待機中'
@@ -14817,23 +14866,10 @@ class _V246EquipmentJob:
                         continue
                     if self.stop.is_set():break
                     with self.lock:self.status=ward+'：スーパーを取得中';self.progress[ward]['状態']='取得中'
-                    rows=None;stats={};last=None
-                    for endpoint in ('https://overpass-api.de/api/interpreter','https://overpass.private.coffee/api/interpreter'):
-                        if self.stop.is_set():break
-                        begin=time.monotonic()
-                        try:
-                            response=None
-                            response=requests.get(endpoint,params={'data':_v246_query(ward)},headers={'User-Agent':'SumaiCompass/246 (manual supermarket collection)'},timeout=(4,40),allow_redirects=False)
-                            self.log(ward,'http_response',endpoint=endpoint,status=response.status_code,elapsed=round(time.monotonic()-begin,2),content_type=getattr(response,'headers',{}).get('content-type',''),body_preview=str(getattr(response,'text',''))[:240] if response.status_code>=400 or 'json' not in getattr(response,'headers',{}).get('content-type','') else '')
-                            response.raise_for_status();rows,stats=_v246_parse(response.json(),ward);self.log(ward,'parse_completed',count=len(rows),**stats);last=None;break
-                        except Exception as exc:
-                            last=exc;self.log(ward,'fetch_failed',error_type=type(exc).__name__,message=str(exc)[:400],endpoint=endpoint,elapsed=round(time.monotonic()-begin,2))
-                            if getattr(locals().get('response'),'status_code',0) in (403,429):break
+                    rows,stats=_v248_fetch_supermarkets(self,ward)
                     if rows is None:
-                        if self.stop.is_set():
-                            with self.lock:self.progress[ward]['状態']='中止'
-                            break
-                        raise AppError('位置情報を取得できませんでした。'+(str(last)[:160] if isinstance(last,AppError) else type(last).__name__)+ '。以前の保存結果は保持しています。')
+                        with self.lock:self.progress[ward]['状態']='中止'
+                        break
                     with self.lock:self.status=ward+'：保存・読み戻し確認中'
                     confirmed=_v246_save(db,ward,rows,stats)
                     with self.lock:
