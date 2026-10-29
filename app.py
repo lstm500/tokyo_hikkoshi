@@ -52,7 +52,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v244"
+BUILD = "REBUILD-01-v245"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -13621,9 +13621,18 @@ TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('function render(args)
 TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(' updateOverlay(args.geo,args.signature);',' updateOverlay(args.geo,args.signature);\n v244Supermarkets(args);',1)
 TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('v243-chintai-directory','v244-supermarkets').replace('sumai_town_map_v243','sumai_town_map_v244')
 
+
+_V245_BASEMAP_JS = 'function v245Basemap(){\n var providers=[\n  {name:\'国土地理院・淡色\',url:\'https://cyberjapandata.gsi.go.jp/xyz/pale/{z}/{x}/{y}.png\',attribution:\'<a href="https://maps.gsi.go.jp/development/ichiran.html" target="_blank" rel="noopener">国土地理院</a>\'},\n  {name:\'国土地理院・標準\',url:\'https://cyberjapandata.gsi.go.jp/xyz/std/{z}/{x}/{y}.png\',attribution:\'<a href="https://maps.gsi.go.jp/development/ichiran.html" target="_blank" rel="noopener">国土地理院</a>\'},\n  {name:\'OpenStreetMap\',url:\'https://tile.openstreetmap.org/{z}/{x}/{y}.png\',attribution:\'&copy; <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap contributors</a>\'}\n ];\n var panel=document.createElement(\'div\');panel.id=\'v245-basemap-status\';panel.setAttribute(\'role\',\'status\');\n panel.style.cssText=\'display:none;padding:9px 12px;background:#fff5df;color:#583e0c;font:13px system-ui;line-height:1.6;box-sizing:border-box;overflow-wrap:anywhere\';\n var message=document.createElement(\'span\'),retry=document.createElement(\'button\');retry.type=\'button\';retry.textContent=\'背景地図を再読み込み\';retry.style.cssText=\'margin:4px 8px;padding:7px 10px;border:1px solid #9eb4bd;border-radius:6px;background:#fff;color:#173a5e;cursor:pointer\';panel.append(message,retry);document.getElementById(\'map\').insertAdjacentElement(\'afterend\',panel);\n var logs=[];try{var saved=JSON.parse(localStorage.getItem(\'sumai-map-log-v245\')||\'[]\');if(Array.isArray(saved))logs=saved.slice(-40)}catch(e){}\n state._v245Logs=logs;\n function record(status,provider,detail){logs.push({time:new Date().toISOString(),status:status,provider:provider,detail:detail});if(logs.length>40)logs.shift();try{localStorage.setItem(\'sumai-map-log-v245\',JSON.stringify(logs))}catch(e){}}\n function publish(){state.sentBounds=\'\';setTimeout(emitBounds,0)}\n function status(text){message.textContent=text;panel.style.display=text?\'block\':\'none\';setHeight()}\n var generation=0,timer=null,layer=null;\n function start(index){\n  var token=++generation,provider=providers[index],loaded=0,failed=0,switched=false;\n  if(timer)clearTimeout(timer);\n  if(layer)state.map.removeLayer(layer);\n  function next(reason){if(token!==generation||switched)return;switched=true;clearTimeout(timer);record(\'failed\',provider.name,reason+\' / tile errors=\'+failed);if(index+1<providers.length){status(\'背景地図を切り替えています…\');setTimeout(function(){if(token===generation)start(index+1)},0)}else{status(\'背景地図を取得できませんでした。通信を確認し、再読み込みしてください。家賃・ピンの表示は別に保持します。\');publish()}}\n  function watch(){clearTimeout(timer);timer=setTimeout(function(){if(!loaded)next(\'timeout: 8000ms\')},8000)}\n  layer=L.tileLayer(provider.url,{attribution:provider.attribution,maxNativeZoom:18,maxZoom:19,keepBuffer:1,pane:\'grayBase\',updateWhenIdle:true});state._v245Base=layer;\n  layer.on(\'loading\',function(){if(token!==generation||switched)return;loaded=0;failed=0;watch()});\n  layer.on(\'tileload\',function(){if(token!==generation||switched)return;loaded++;clearTimeout(timer);if(loaded===1){status(\'\');record(\'loaded\',provider.name,\'visible tile loaded\');publish()}});\n  layer.on(\'tileerror\',function(){if(token!==generation||switched)return;failed++;if(!loaded&&failed>=3)next(\'tile image load error\')});\n  layer.on(\'load\',function(){if(token!==generation||switched)return;clearTimeout(timer);if(!loaded&&failed)next(\'all visible tiles failed\');else if(failed){record(\'partial_failure\',provider.name,\'tile errors=\'+failed);status(\'背景地図の一部を取得できませんでした。再読み込みをお試しください。\');publish()}});\n  record(\'request\',provider.name,\'start\');watch();layer.addTo(state.map);\n }\n retry.onclick=function(){retry.style.background=\'#d9eaf3\';setTimeout(function(){retry.style.background=\'#fff\'},500);status(\'背景地図を再読み込みしています…\');record(\'retry\',\'all\',\'user retry\');start(0)};\n state.map.createPane(\'grayBase\');var pane=state.map.getPane(\'grayBase\');pane.style.zIndex=\'200\';pane.style.filter=\'grayscale(1) contrast(.68) brightness(1.12)\';pane.style.opacity=\'.42\';\n status(\'背景地図を読み込んでいます…\');start(0);\n}\n'
+_a=TOWN_COMPONENT_HTML_V121.index(" var base=L.tileLayer(")
+_b=TOWN_COMPONENT_HTML_V121.index(" state.map.createPane('townNamePane')",_a)
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121[:_a]+" v245Basemap();\n"+TOWN_COMPONENT_HTML_V121[_b:]
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('function initMap(args){',_V245_BASEMAP_JS+'\nfunction initMap(args){',1)
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace("value:{bounds:{_southWest:","value:{map_diagnostics:state._v245Logs||[],bounds:{_southWest:",1)
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('v244-supermarkets','v245-map-recovery').replace('sumai_town_map_v244','sumai_town_map_v245')
+
 @st.cache_resource(show_spinner=False)
 def town_component_v121():
-    _asset_revision='v243-chintai-directory'
+    _asset_revision='v245-map-recovery'
     folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-'+_asset_revision)
     os.makedirs(folder,exist_ok=True)
     path=os.path.join(folder,'index.html')
@@ -13641,7 +13650,7 @@ def town_component_v121():
         with open(temp_path,'w',encoding='utf-8') as output:
             output.write(TOWN_COMPONENT_HTML_V121)
         os.replace(temp_path,path)
-    return st.components.v1.declare_component('sumai_town_map_v244',path=folder)
+    return st.components.v1.declare_component('sumai_town_map_v245',path=folder)
 
 @st.cache_resource(show_spinner=False)
 def _v216_api_budget():
@@ -14873,6 +14882,13 @@ def interactive_town_choropleth(group):
                 'no_data_count':geo['render_stats']['without_rent'],'center':center}
         state['_v118_choropleth_payload']=cached
         registry.request(_v168_visible_wards(geo)[:8])
+    state['_v245_rent_diagnostics']={
+        'time':datetime.now(timezone.utc).isoformat(), 'source':source, 'layout_group':group,
+        'summary_ready':bool(snap.get('ready')), 'summary_loading':bool(snap.get('running')),
+        'summary_error':str(snap.get('error') or '')[:300], 'summary_updated_at':str(summary_version),
+        'selected_group_towns':len((_v240_source_groups(snap.get('summary'),source) or {}).get(group,{}) or {}),
+        'boundary_ready':bool(ready), 'boundary_loading':bool(busy), 'boundary_error':str(error or '')[:300],
+        'visible_colored_towns':cached['colored_count']}
     if source=='CHINTAI':
         for city in _v168_visible_wards(cached['geo'])[:1]:_v243_chintai_directory_future(city)
     destinations=commute_selected_destinations_v164()
@@ -14884,6 +14900,8 @@ def interactive_town_choropleth(group):
         st.caption('混雑率は国土交通省2025年度の路線別「最混雑区間」を乗車時間で加重した参考値。実際の各駅間・時間帯の平均ではありません。公表値がない路線を含む経路は「不明」です。')
     if cached['ready']:
         st.caption(f"着色 {cached['colored_count']}町丁目｜保存家賃のない地域は背景地図のまま表示")
+        if not cached['colored_count']:
+            st.caption('現在の表示範囲・間取り・データソースに一致する保存家賃は表示されていません。取得済み物件を反映するには「保存物件を再集計」を押してください。背景地図の通信とは別の状態です。')
     else:
         st.caption('取得元別の集計を作成中です。完了後に選択したデータソースの家賃を表示します。' if source!='ALL' and snap['running'] else '保存物件の再集計を押すと、家賃の色分けをバックグラウンドで作成します')
     search_catalog=[];search_ward_bounds=[]
@@ -14914,6 +14932,9 @@ def interactive_town_choropleth(group):
                 jump=state.get('_v182_map_jump'),
                 key='town_map_v184_'+str(reset),default=None)
     if isinstance(data,dict) and data.get('home_view_epoch')==int(state.get('_v202_home_epoch',0)):
+        if isinstance(data.get('map_diagnostics'),list):
+            state['_v245_map_diagnostics']=[{k:str(row.get(k,''))[:160] for k in ('time','status','provider','detail')}
+                for row in data['map_diagnostics'][-40:] if isinstance(row,dict)]
         current=viewport_bounds(data)
         if data.get('event') in ('supermarket_toggle_v244','supermarket_refresh_v244') and data.get('ticket') and data.get('ticket')!=state.get('_v244_last_ticket'):
             state['_v244_last_ticket']=data['ticket']
@@ -15897,6 +15918,14 @@ def _v209_initial_settings(state):
 def _v209_log_tools(state):
     st.subheader('ログ出力')
     st.button('ログ表示を更新',key='settings_refresh_logs_v209')
+    with st.expander('背景地図の読み込みログ'):
+        rows=state.get('_v245_map_diagnostics',[])
+        if rows:st.dataframe(rows,hide_index=True,use_container_width=True)
+        else:st.caption('地図を表示すると、背景地図の取得結果が記録されます。')
+        diagnostic={'background_tiles':rows,'rent_overlay':state.get('_v245_rent_diagnostics',{})}
+        st.json(diagnostic['rent_overlay'],expanded=False)
+        st.download_button('背景地図の詳細ログ JSON',json.dumps(diagnostic,ensure_ascii=False,indent=2).encode('utf-8'),
+            'sumai_basemap_log.json','application/json',key='basemap_log_v245',disabled=not rows)
     _v208_landmark_log_panel(state)
     if state.get('_v217_suumo_audit'):
         with st.expander('SUUMO町名検索のログ'):
