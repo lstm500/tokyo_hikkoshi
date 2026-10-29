@@ -52,7 +52,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v249"
+BUILD = "REBUILD-01-v251"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -13637,7 +13637,7 @@ TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('sumai_town_map_v243',
 
 
 # v249: saved supermarket overlay; no POI search on map movement.
-_V249_SUPERMARKET_JS = "\nfunction v249ApplySupermarketMode(visible){\n state._v247SupermarketOverlayVisible=!!visible;\n if(state.overlay)state.overlay.eachLayer(function(layer){\n  if(layer.setStyle)layer.setStyle({fillOpacity:layer.feature&&layer.feature.properties&&layer.feature.properties.has_data===true?(visible?.32:.81):0});\n });\n var button=document.getElementById('v249-supermarket-toggle');\n if(button){button.textContent=visible?'スーパー ON':'スーパー OFF';button.setAttribute('aria-pressed',String(!!visible));}\n var refresh=document.getElementById('v249-supermarket-refresh');if(refresh)refresh.hidden=!visible;\n var legend=document.getElementById('v249-supermarket-legend');if(legend)legend.hidden=!visible;\n}\nfunction v249SupermarketCommand(refresh){\n var value={event:'supermarket_v249',visible:!!state._v247SupermarketOverlayVisible,refresh:!!refresh,\n  ticket:'supermarket_'+Date.now()+'_'+Math.random().toString(36).slice(2,9),home_view_epoch:state._v202HomeEpoch};\n if(state.map){var b=state.map.getBounds();value.bounds={_southWest:{lat:b.getSouth(),lng:b.getWest()},_northEast:{lat:b.getNorth(),lng:b.getEast()}};value.zoom=state.map.getZoom();}\n hostMessage('streamlit:setComponentValue',{dataType:'json',value:value});\n}\nfunction v249SupermarketPopup(shop){\n var box=document.createElement('div');box.className='v249-supermarket-popup';\n var title=document.createElement('strong');title.textContent=shop.name;box.appendChild(title);\n [shop.price_label,shop.address,shop.verification].forEach(function(text){var row=document.createElement('div');row.textContent=text||'';box.appendChild(row)});\n [['公式ページ',shop.website],['地図情報の出典',shop.source_url]].forEach(function(pair){\n  try{var url=new URL(pair[1]);if(!/^https?:$/.test(url.protocol)||url.username||url.password)return;\n   var link=document.createElement('a');link.textContent=pair[0]+' ↗';link.href=url.href;link.target='_blank';link.rel='noopener noreferrer';box.appendChild(link);\n  }catch(e){}\n });\n return box;\n}\nfunction v249DrawSupermarkets(){\n if(!state.map)return;\n if(!state._v249Layer){state.map.createPane('supermarketPane');state.map.getPane('supermarketPane').style.zIndex='610';state._v249Layer=L.layerGroup().addTo(state.map);}\n var bounds=state.map.getBounds().pad(.1),visible=!!state._v247SupermarketOverlayVisible;\n var rows=visible?(state._v249Rows||[]).filter(function(s){return bounds.contains([s.lat,s.lng])}):[];\n var key=(visible?'on':'off')+'|'+state._v249Revision+'|'+JSON.stringify(rows.map(function(s){return s.ward+'|'+s.id}));\n if(key===state._v249DrawKey)return;\n state._v249DrawKey=key;state._v249Layer.clearLayers();\n rows.forEach(function(shop){\n  L.circleMarker([shop.lat,shop.lng],{pane:'supermarketPane',radius:5,color:'#fff',weight:2,fillColor:shop.color,fillOpacity:1,bubblingMouseEvents:false})\n   .bindPopup(function(){return v249SupermarketPopup(shop)},{maxWidth:250,autoPanPadding:[12,12]}).addTo(state._v249Layer);\n });\n}\nfunction v249RenderSupermarkets(args){\n if(!state.map)return;\n var button=document.getElementById('v249-supermarket-toggle'),refresh=document.getElementById('v249-supermarket-refresh');\n if(button&&!button.dataset.ready){button.dataset.ready='1';button.addEventListener('click',function(){\n  v249ApplySupermarketMode(!state._v247SupermarketOverlayVisible);v249DrawSupermarkets();v249SupermarketCommand(false);\n });refresh.addEventListener('click',function(){v249SupermarketCommand(true)});\n state.map.on('moveend zoomend',v249DrawSupermarkets);}\n state._v249Rows=Array.isArray(args.supermarkets)?args.supermarkets:[];\n state._v249Revision=String(args.supermarket_revision||0);\n v249ApplySupermarketMode(args.supermarket_overlay_visible===true);v249DrawSupermarkets();\n var status=document.getElementById('v249-supermarket-status');\n if(status){status.hidden=!state._v247SupermarketOverlayVisible;status.textContent=args.supermarket_loading?'保存済みスーパーを読み込み中…':args.supermarket_error?'スーパー読込失敗：'+args.supermarket_error:'保存済みスーパー '+state._v249Rows.length+'件'+(state._v249Rows.length?'':'（周辺設備タブで取得してください）');}\n setHeight();\n}\n"
+_V249_SUPERMARKET_JS = "\nfunction v249ApplySupermarketMode(visible){\n var changed=state._v247SupermarketOverlayVisible!==!!visible;\n state._v247SupermarketOverlayVisible=!!visible;\n if(changed&&state.overlay)state.overlay.eachLayer(function(layer){\n  if(layer.setStyle)layer.setStyle({fillOpacity:layer.feature&&layer.feature.properties&&layer.feature.properties.has_data===true?(visible?.32:.81):0});\n });\n var button=document.getElementById('v249-supermarket-toggle');\n if(button){button.textContent=visible?'スーパー ON':'スーパー OFF';button.setAttribute('aria-pressed',String(!!visible));}\n var refresh=document.getElementById('v249-supermarket-refresh');if(refresh)refresh.hidden=!visible;\n var legend=document.getElementById('v249-supermarket-legend');if(legend)legend.hidden=!visible;\n}\nfunction v249SupermarketCommand(refresh){\n var value={event:'supermarket_v249',visible:!!state._v247SupermarketOverlayVisible,refresh:!!refresh,\n  ticket:'supermarket_'+Date.now()+'_'+Math.random().toString(36).slice(2,9),home_view_epoch:state._v202HomeEpoch};\n if(state.map){var b=state.map.getBounds();value.bounds={_southWest:{lat:b.getSouth(),lng:b.getWest()},_northEast:{lat:b.getNorth(),lng:b.getEast()}};value.zoom=state.map.getZoom();}\n hostMessage('streamlit:setComponentValue',{dataType:'json',value:value});\n}\nfunction v249SupermarketPopup(shop){\n var box=document.createElement('div');box.className='v249-supermarket-popup';\n var title=document.createElement('strong');title.textContent=shop.name;box.appendChild(title);\n [shop.price_label,shop.address,shop.verification].forEach(function(text){var row=document.createElement('div');row.textContent=text||'';box.appendChild(row)});\n [['公式ページ',shop.website],['地図情報の出典',shop.source_url]].forEach(function(pair){\n  try{var url=new URL(pair[1]);if(!/^https?:$/.test(url.protocol)||url.username||url.password)return;\n   var link=document.createElement('a');link.textContent=pair[0]+' ↗';link.href=url.href;link.target='_blank';link.rel='noopener noreferrer';box.appendChild(link);\n  }catch(e){}\n });\n return box;\n}\nfunction v249DrawSupermarkets(){\n if(!state.map)return;\n if(!state._v249Layer){state.map.createPane('supermarketPane');state.map.getPane('supermarketPane').style.zIndex='610';state._v249Layer=L.layerGroup().addTo(state.map);}\n var bounds=state.map.getBounds().pad(.1),visible=!!state._v247SupermarketOverlayVisible;\n var rows=visible?(state._v249Rows||[]).filter(function(s){return bounds.contains([s.lat,s.lng])}):[];\n var key=(visible?'on':'off')+'|'+state._v249Revision+'|'+JSON.stringify(rows.map(function(s){return s.ward+'|'+s.id}));\n if(key===state._v249DrawKey)return;\n state._v249DrawKey=key;state._v249Layer.clearLayers();\n rows.forEach(function(shop){\n  L.circleMarker([shop.lat,shop.lng],{pane:'supermarketPane',radius:5,color:'#fff',weight:2,fillColor:shop.color,fillOpacity:1,bubblingMouseEvents:false})\n   .bindPopup(function(){return v249SupermarketPopup(shop)},{maxWidth:250,autoPanPadding:[12,12]}).addTo(state._v249Layer);\n });\n}\nfunction v249RenderSupermarkets(args){\n if(!state.map)return;\n var button=document.getElementById('v249-supermarket-toggle'),refresh=document.getElementById('v249-supermarket-refresh');\n if(button&&!button.dataset.ready){button.dataset.ready='1';button.addEventListener('click',function(){\n  v249ApplySupermarketMode(!state._v247SupermarketOverlayVisible);v249DrawSupermarkets();v249SupermarketCommand(false);\n });refresh.addEventListener('click',function(){v249SupermarketCommand(true)});\n state.map.on('moveend zoomend',v249DrawSupermarkets);}\n state._v249Rows=Array.isArray(args.supermarkets)?args.supermarkets:[];\n state._v249Revision=String(args.supermarket_revision||0);\n v249ApplySupermarketMode(args.supermarket_overlay_visible===true);v249DrawSupermarkets();\n var status=document.getElementById('v249-supermarket-status');\n if(status){status.hidden=!state._v247SupermarketOverlayVisible;status.textContent=args.supermarket_loading?'保存済みスーパーを読み込み中…':args.supermarket_error?'スーパー読込失敗：'+args.supermarket_error:'保存済みスーパー '+state._v249Rows.length+'件'+(state._v249Rows.length?'':'（周辺設備タブで取得してください）');}\n setHeight();\n}\n"
 TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('function render(args){',_V249_SUPERMARKET_JS+'\nfunction render(args){',1)
 TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('<span id="v223-location-status"','<button type="button" id="v249-supermarket-toggle" aria-pressed="false">スーパー OFF</button><button type="button" id="v249-supermarket-refresh" hidden>スーパー再読込</button><span id="v249-supermarket-status" role="status" hidden></span>'+'<span id="v223-location-status"',1)
 TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('<div id="map"></div>','<div id="v249-supermarket-legend" hidden><span><i style="background:#2466c0"></i>とても安い</span><span><i style="background:#19a8cd"></i>安い</span><span><i style="background:#b68a26"></i>標準</span><span><i style="background:#d64b43"></i>やや高い</span><span><i style="background:#551b31"></i>高い</span><span><i style="background:#7f8b91"></i>未分類</span></div>'+'<div id="map"></div>',1)
@@ -14397,6 +14397,12 @@ def town_choropleth_status():
     """Read-only progress for an exclusively manual, background map job."""
     state=st.session_state
     supermarket_loader=state.get('_v249_supermarket_loader')
+    equipment=state.get('_v246_equipment_job')
+    if equipment and supermarket_loader and state.get('_v249_supermarket_visible'):
+        with equipment.lock:stamp=tuple(sorted((ward,payload.get('updated_at','')) for ward,payload in equipment.data.items()))
+        if stamp and stamp!=state.get('_v250_supermarket_saved_stamp') and not supermarket_loader.snapshot()['running']:
+            if supermarket_loader.start():
+                state['_v250_supermarket_saved_stamp']=stamp;state['_v249_supermarket_wait']=True
     if state.get('_v249_supermarket_wait') and supermarket_loader and not supermarket_loader.snapshot()['running']:
         state['_v249_supermarket_wait']=False
         st.rerun()
@@ -14614,35 +14620,132 @@ def _v246_public_url(value):
 
 
 # Equipment collection is manual and independent of the rent-map render path.
+def _v251_log_digest(payload):
+    # JSONB may round-trip integral JSON numbers as either int or float.
+    def canonical(value):
+        if isinstance(value,float) and math.isfinite(value) and value.is_integer():return int(value)
+        if isinstance(value,dict):return {str(k):canonical(v) for k,v in value.items()}
+        if isinstance(value,(list,tuple)):return [canonical(v) for v in value]
+        return value
+    return _v246_digest(canonical(payload))
+
+
 def _v247_collect_log(job,db):
-    """Persist one bounded diagnostic per manual run; never runs from the rent map."""
     with job.lock:
-        rows=[dict(r) for r in job.logs]
-        payload={'schema':247,'run_id':job.run_id,'started_at':job.started_at,'finished_at':utc_now(),
+        payload={'schema':247,'checksum_schema':2,'run_id':job.run_id,'started_at':job.started_at,'finished_at':utc_now(),
             'wards':list(job.wards),'progress':{k:dict(v) for k,v in job.progress.items()},
-            'events':rows,'dropped_events':job.dropped_logs,'status':job.status}
-    payload['digest']=_v246_digest(payload)
+            'events':[dict(r) for r in job.logs],'dropped_events':job.dropped_logs,'status':job.status}
+    payload['digest']=_v251_log_digest(payload)
     identity='equipment.supermarket.log.v247.'+job.run_id
     db.save_search({'id':identity,'source':'OpenStreetMap','status':'equipment_supermarket_log_v247',
         'started_at':job.started_at,'finished_at':payload['finished_at'],'conditions':{'kind':'supermarket_log'},'summary':payload})
     found=db.call('GET',SEARCH_TABLE,{'namespace':'eq.'+db.namespace,'id':'eq.'+identity,'select':'summary','limit':1})
-    if not isinstance(found,list) or not found or found[0].get('summary',{}).get('digest')!=payload['digest']:
-        raise AppError('取得ログの保存を読み戻しで確認できません。画面からJSONをダウンロードしてください。')
+    actual=(found[0].get('summary') or {}) if isinstance(found,list) and found else {}
+    check={k:v for k,v in actual.items() if k!='digest'}
+    if actual.get('digest')!=payload['digest'] or _v251_log_digest(check)!=payload['digest']:
+        raise AppError('取得ログの保存内容を読み戻しで確認できません。セッションのJSONを保存してください。')
     with job.lock:job.log_saved=True;job.log_error=''
 
 
 def _v247_load_logs(db):
+    # List metadata only, not twenty potentially large event arrays.
     records=db.call('GET',SEARCH_TABLE,{'namespace':'eq.'+db.namespace,'status':'eq.equipment_supermarket_log_v247',
-        'select':'id,summary,finished_at','order':'finished_at.desc,id.desc','limit':20})
+        'select':'id,finished_at,run_id:summary->>run_id,started_at:summary->>started_at,wards:summary->wards,status:summary->>status',
+        'order':'finished_at.desc,id.desc','limit':20})
     if not isinstance(records,list):raise AppError('保存した取得ログを読み込めません。')
     out=[]
     for record in records:
-        p=record.get('summary') or {}
-        if p.get('schema')!=247 or not isinstance(p.get('events'),list):continue
-        check=dict(p);digest=check.pop('digest',None)
-        if digest!=_v246_digest(check):raise AppError('取得ログの整合性を確認できません。')
-        out.append(p)
+        if not isinstance(record,dict) or not str(record.get('id','')).startswith('equipment.supermarket.log.v247.'):continue
+        out.append({'id':record['id'],'run_id':record.get('run_id') or record['id'],
+            'started_at':record.get('started_at') or record.get('finished_at',''),
+            'wards':record.get('wards') if isinstance(record.get('wards'),list) else [],'status':record.get('status','')})
     return out
+
+
+def _v251_read_log(db,identity):
+    if not str(identity).startswith('equipment.supermarket.log.v247.'):raise AppError('取得ログIDが不正です。')
+    records=db.call('GET',SEARCH_TABLE,{'namespace':'eq.'+db.namespace,'id':'eq.'+identity,'select':'id,summary','limit':1})
+    if not isinstance(records,list) or not records:raise AppError('選択した取得ログがありません。')
+    raw=records[0].get('summary')
+    payload=dict(raw) if isinstance(raw,dict) else {'raw_summary':raw,'events':[]}
+    check={k:v for k,v in payload.items() if k!='digest'}
+    digest=payload.get('digest')
+    valid=(digest==(_v251_log_digest(check) if payload.get('checksum_schema')==2 else _v246_digest(check))) if digest else False
+    warning='' if valid else 'このログは整合性を確認できません。内容を未検証として表示・出力します。'
+    if not isinstance(payload.get('events'),list):warning+=' イベント配列の形式が不正です。元データをJSONに含めます。'
+    return payload,warning
+
+
+def _v251_prepare_log_export(payload,events,error='',warning=''):
+    events=[r for r in events if isinstance(r,dict)]
+    try:summary,excluded=_v247_analyze_logs(events)
+    except Exception as exc:summary=[];excluded=[];warning+=' ログの集計失敗：'+type(exc).__name__
+    failures=[{'区':r.get('ward',''),'段階':r.get('operation') or r.get('stage',''),'HTTP':r.get('status',''),
+        '失敗理由':r.get('message') or r.get('body_preview',''),'取得先':r.get('endpoint') or r.get('url','')}
+        for r in events if r.get('stage') in ('fetch_failed','ward_failed','job_failed','official_directory_failed','official_store_unresolved')]
+    export={'run':payload,'events':events,'analysis':summary,'excluded_candidates':excluded,
+        'log_persistence_error':error,'integrity_warning':warning}
+    return {'summary':summary,'excluded':excluded,'failures':failures,'warning':warning,
+        'json':json.dumps(export,ensure_ascii=False,indent=2,default=str).encode('utf-8'),
+        'csv':csv_bytes_from_rows(excluded)}
+
+
+def _v247_equipment_log_tools(state):
+    with st.expander('周辺設備の取得ログ'):
+        st.caption('通信失敗と、閉店・住所不一致・位置不明・重複による除外を区別します。')
+        if st.button('保存した取得ログを読み込む',key='equipment_load_logs_v247'):
+            try:
+                state['_v247_saved_equipment_logs']=_v247_load_logs(Database())
+                state.pop('_v251_selected_log',None);state.pop('_v251_equipment_export',None)
+                state.pop('_v247_log_load_error',None)
+                job=state.get('_v246_equipment_job')
+                if not job or not job.logs:
+                    runs=state['_v247_saved_equipment_logs']
+                    if runs:state['equipment_log_choice_v247']=runs[0]['run_id']
+            except Exception as exc:state['_v247_log_load_error']=str(exc)[:300]
+        if state.get('_v247_log_load_error'):st.warning(state['_v247_log_load_error'])
+        runs=state.get('_v247_saved_equipment_logs',[])
+        lookup={p['run_id']:p for p in runs};options=['現在のセッション',*lookup]
+        if state.get('equipment_log_choice_v247','現在のセッション') not in options:state['equipment_log_choice_v247']='現在のセッション'
+        st.caption('直近20回の一覧から、選択した1回だけ読み込みます。')
+        choice=st.selectbox('確認する取得ログ',options,key='equipment_log_choice_v247',
+            format_func=lambda v:v if v=='現在のセッション' else acquisition_time_jst(lookup[v].get('started_at',''))+'｜'+'・'.join(lookup[v].get('wards',[])))
+        payload={};events=[];error='';warning='';key=None;available=False
+        if choice in lookup:
+            identity=lookup[choice]['id'];selected=state.get('_v251_selected_log')
+            if not selected or selected['id']!=identity:
+                try:
+                    payload,warning=_v251_read_log(Database(),identity)
+                    selected={'id':identity,'payload':payload,'warning':warning};state['_v251_selected_log']=selected
+                except Exception as exc:st.warning(str(exc));selected=None
+            if selected:
+                payload=selected['payload'];warning=selected['warning'];available=True
+                events=payload.get('events') if isinstance(payload.get('events'),list) else []
+                key=('saved',identity,payload.get('digest'),warning)
+        else:
+            job=state.get('_v246_equipment_job')
+            if job:
+                with job.lock:
+                    events=list(job.logs);error=job.log_error
+                    payload={'run_id':job.run_id,'started_at':job.started_at,'wards':list(job.wards),
+                        'status':job.status,'progress':{k:dict(v) for k,v in job.progress.items()},'dropped_events':job.dropped_logs}
+                    key=('current',job.run_id,len(events),job.dropped_logs,events[-1].get('time') if events else '',error)
+                available=bool(events or job.run_id)
+            if error:st.warning('取得ログの保存は未確認です：'+error)
+        if warning:st.warning(warning)
+        prepared=state.get('_v251_equipment_export')
+        if available and (not prepared or prepared['key']!=key):
+            prepared={'key':key,**_v251_prepare_log_export(payload,events,error,warning)};state['_v251_equipment_export']=prepared
+        if not available:prepared=None;st.caption('保存ログを読み込むか、取得を実行してください。')
+        if prepared:
+            if prepared['summary']:st.dataframe(prepared['summary'],hide_index=True,use_container_width=True)
+            if prepared['failures']:st.dataframe(prepared['failures'],hide_index=True,use_container_width=True)
+            if prepared['excluded']:st.dataframe(prepared['excluded'],hide_index=True,use_container_width=True)
+            if payload.get('dropped_events'):st.warning('記録上限を超えたイベントが含まれます。')
+        st.download_button('周辺設備の詳細ログ JSON',prepared['json'] if prepared else b'',
+            'sumai_equipment_log.json','application/json',key='equipment_log_v246',disabled=not available,on_click='ignore')
+        st.download_button('取得できなかった候補CSV',prepared['csv'] if prepared else b'',
+            'sumai_equipment_exclusions.csv','text/csv',key='equipment_exclusions_v247',disabled=not bool(prepared and prepared['excluded']),on_click='ignore')
 
 
 def _v247_analyze_logs(events):
@@ -14659,6 +14762,10 @@ def _v247_analyze_logs(events):
             if 'Timeout' in kind:add('通信：タイムアウト')
             elif kind!='HTTPError':add('取得・解析：'+kind)
         elif stage=='ward_failed':add('区の処理が未完了')
+        elif stage=='official_directory_failed':add('公式一覧の取得・解析失敗')
+        elif stage=='official_store_unresolved':
+            add('公式店舗の照合未完了')
+            exclusions.append(dict(区=row.get('ward',''),店名=row.get('name',''),理由=row.get('reason',''),段階='公式店舗照合',ID='',URL=row.get('url','')))
         elif stage=='parse_completed':
             for item in row.get('rejections',[]):
                 reason=item.get('reason','不明');add('候補の除外：'+reason)
@@ -14667,49 +14774,6 @@ def _v247_analyze_logs(events):
             if row.get('rejections_truncated'):add('除外詳細の記録上限超過',int(row['rejections_truncated']))
     return [{'分類・原因':reason,'件数':count} for reason,count in counts.items()],exclusions
 
-
-def _v247_equipment_log_tools(state):
-    with st.expander('周辺設備の取得ログ'):
-        st.caption('取得ごとにログを保存します。通信失敗と、閉店・住所不一致・位置不明・重複による除外を区別します。')
-        if st.button('保存した取得ログを読み込む',key='equipment_load_logs_v247'):
-            try:
-                with st.spinner('保存した取得ログを読み込んでいます…'):
-                    state['_v247_saved_equipment_logs']=_v247_load_logs(Database())
-                state.pop('_v247_log_load_error',None)
-            except Exception as exc:state['_v247_log_load_error']=str(exc)[:300]
-        if state.get('_v247_log_load_error'):st.warning(state['_v247_log_load_error'])
-        job=state.get('_v246_equipment_job');current=[];current_run=None;error=''
-        if job:
-            with job.lock:
-                current=[dict(r) for r in job.logs];saved=job.log_saved;error=job.log_error;dropped=job.dropped_logs
-                current_run={'run_id':job.run_id,'started_at':job.started_at,'wards':list(job.wards),'status':job.status,'progress':{k:dict(v) for k,v in job.progress.items()},'dropped_events':dropped}
-            if error:st.warning('取得ログの保存は未確認です：'+error)
-            elif current:st.caption('現在の取得ログ：保存・読み戻し確認済み' if saved else '現在の取得ログ：処理中／保存前')
-            if dropped:st.warning(f'記録上限により古いイベント{dropped}件は省略されています。')
-        runs=state.get('_v247_saved_equipment_logs',[])
-        options=['現在のセッション']+[p['run_id'] for p in runs]
-        lookup={p['run_id']:p for p in runs}
-        if state.get('equipment_log_choice_v247','現在のセッション') not in options:state['equipment_log_choice_v247']='現在のセッション'
-        st.caption('保存済みログは直近20回を読み込みます。通信の件数は試行回数で、店舗数とは異なります。')
-        choice=st.selectbox('確認する取得ログ',options,key='equipment_log_choice_v247',
-            format_func=lambda value:value if value=='現在のセッション' else acquisition_time_jst(lookup[value].get('started_at',''))+'｜'+'・'.join(lookup[value].get('wards',[])))
-        payload=lookup.get(choice)
-        events=payload['events'] if payload else current
-        summary,excluded=_v247_analyze_logs(events)
-        if payload and payload.get('dropped_events'):st.warning('この取得ログは記録上限を超えたイベントを含みます。')
-        if summary:st.dataframe(summary,hide_index=True,use_container_width=True)
-        failures=[{'区':r.get('ward',''),'段階':r.get('operation') or r.get('stage',''),'HTTP':r.get('status',''),
-            '失敗理由':r.get('message') or r.get('body_preview',''),'取得先':r.get('endpoint','')}
-            for r in events if r.get('stage') in ('fetch_failed','ward_failed','job_failed') or (r.get('stage')=='http_response' and int(r.get('status') or 0)>=400)]
-        if failures:st.dataframe(failures,hide_index=True,use_container_width=True)
-        if excluded:st.dataframe(excluded,hide_index=True,use_container_width=True)
-        if not events:st.caption('取得後に「ログ表示を更新」を押すか、保存した取得ログを読み込んでください。')
-        metadata={k:v for k,v in (payload or current_run or {}).items() if k!='events'}
-        export={'run':metadata,'events':events,'analysis':summary,'excluded_candidates':excluded,'log_persistence_error':error if not payload else ''}
-        st.download_button('周辺設備の詳細ログ JSON',json.dumps(export,ensure_ascii=False,indent=2).encode('utf-8'),
-            'sumai_equipment_log.json','application/json',key='equipment_log_v246',disabled=not events,on_click='ignore')
-        st.download_button('取得できなかった候補CSV',csv_bytes_from_rows(excluded),'sumai_equipment_exclusions.csv','text/csv',
-            key='equipment_exclusions_v247',disabled=not excluded,on_click='ignore')
 
 
 def _v246_record_id(ward):
@@ -14844,6 +14908,251 @@ def _v248_fetch_supermarkets(job,ward):
         '。通信先・待機時間・検索内容は取得ログで確認できます。以前の保存結果は保持しています。')
 
 
+# v250: official store directories supplement OSM; unknown coordinates remain unresolved.
+_V250_OFFICIAL_CHAINS=('ライフ','まいばすけっと','マルエツ','オーケー')
+_V250_OFFICIAL_HOSTS=frozenset(('store.lifecorp.jp','www.mybasket.co.jp','www.maruetsu.co.jp','ok-corporation.jp'))
+
+
+def _v250_directory_url(chain,ward):
+    if chain=='ライフ':return 'https://store.lifecorp.jp/'+quote('東京都')+'/'+quote(ward)+'/'
+    if chain=='まいばすけっと':return 'https://www.mybasket.co.jp/shop/'
+    if chain=='マルエツ':return 'https://www.maruetsu.co.jp/store/shop_area/tokyo/'
+    return 'https://ok-corporation.jp/shop/field/pref/eq/'+quote('東京都')+'/_and_/town/lk/'+quote(ward)+'/'
+
+
+def _v250_detail_url(url,chain):
+    try:
+        u=urlparse(url)
+        if u.scheme!='https' or u.hostname not in _V250_OFFICIAL_HOSTS or u.username or u.password or u.port not in (None,443):return ''
+        patterns={'ライフ':('store.lifecorp.jp',r'/detail/[a-zA-Z0-9_-]+/'),
+            'まいばすけっと':('www.mybasket.co.jp',r'/shop/detail/\d+\.html'),
+            'マルエツ':('www.maruetsu.co.jp',r'/store/\d+/'),
+            'オーケー':('ok-corporation.jp',r'/shop/[a-zA-Z0-9_-]+\.html')}
+        host,pattern=patterns[chain]
+        return u._replace(query='',fragment='').geturl() if u.hostname==host and re.fullmatch(pattern,u.path) else ''
+    except (ValueError,KeyError):return ''
+
+
+def _v250_fetch_official(job,url):
+    cache=getattr(job,'_v250_http_cache',None)
+    if cache is None:cache={};job._v250_http_cache=cache
+    if url in cache:return cache[url]
+    original=url
+    for _ in range(4):
+        u=urlparse(url)
+        if u.scheme!='https' or u.hostname not in _V250_OFFICIAL_HOSTS or u.username or u.password or u.port not in (None,443):raise AppError('公式店舗URLの取得先が不正です。')
+        if job.stop.is_set():raise SearchCancelled()
+        starts=getattr(job,'_v250_host_starts',{})
+        if job.stop.wait(max(0,starts.get(u.hostname,0)+1-time.monotonic())):raise SearchCancelled()
+        starts[u.hostname]=time.monotonic();job._v250_host_starts=starts
+        response=requests.get(url,headers={'User-Agent':'SumaiCompass/250 (manual official store directory verification)'},timeout=(6,20),allow_redirects=False)
+        job.log('','official_http_response',endpoint=url,status=response.status_code)
+        if response.status_code in (301,302,303,307,308):
+            url=urljoin(url,response.headers.get('Location',''));continue
+        response.raise_for_status()
+        if response.status_code!=200:raise AppError('公式店舗ページが正常な応答を返しません。')
+        response.encoding=response_encoding(response)
+        text=response.text
+        cache[original]=text
+        return text
+    raise AppError('公式店舗ページの転送回数が上限を超えました。')
+
+
+def _v250_address(text,ward):
+    text=unicodedata.normalize('NFKC',str(text)).replace('　',' ')
+    m=re.search(r'東京都'+re.escape(ward)+r'[^\s<>〒\n]{2,180}',text)
+    if not m:return ''
+    return m.group(0)
+
+
+def _v250_directory_candidates(text,url,chain,ward):
+    soup=BeautifulSoup(text,'html.parser');out={}
+    for anchor in soup.select('a[href]'):
+        target=_v250_detail_url(urljoin(url,html.unescape(anchor.get('href',''))),chain)
+        if not target:continue
+        node=anchor;chosen=None
+        for _ in range(8):
+            if not node or node.name in ('body','html','main'):break
+            visible=node.get_text(' ',strip=True)
+            # Stay within this store's card, not the page-wide ward menu.
+            addresses=re.findall(r'東京都[^\s<>]{1,25}?区[^\s<>]{1,100}',normal(visible))
+            if any('東京都'+ward in address for address in addresses):
+                detail_urls={_v250_detail_url(urljoin(url,a.get('href','')),chain) for a in node.select('a[href]')}
+                detail_urls.discard('')
+                if len(detail_urls)<=1:chosen=node;break
+            node=node.parent
+        if chosen is None:continue
+        name_node=chosen.select_one('h2,h3,h4,.__name,.rt_cf_s_tenpo_nm_kanji')
+        name=normal(name_node.get_text(' ',strip=True) if name_node else anchor.get_text(' ',strip=True))
+        if not name or name in ('詳しく見る','店舗詳細','詳細はこちら'):continue
+        address_node=chosen.select_one('.rt_cf_s_tenpo_jusho,[itemprop="streetAddress"]')
+        address=_v250_address(address_node.get_text(' ',strip=True) if address_node else normal(chosen.get_text(' ',strip=True)),ward)
+        if address:out[target]={'url':target,'name':name,'address':address,'chain':chain}
+    # Canly's public page data contains the same listed stores and coordinates.
+    # Join by exact official store URL/name; no per-store request is needed.
+    if chain=='ライフ':
+        script=soup.select_one('script#__NEXT_DATA__')
+        try:document=json.loads(script.get_text()) if script else {}
+        except (ValueError,TypeError):document={}
+        for node in json_nodes(document):
+            if not isinstance(node,dict) or not node.get('storeCode'):continue
+            target=_v250_detail_url('https://store.lifecorp.jp/detail/'+str(node['storeCode'])+'/',chain)
+            candidate=out.get(target)
+            if not candidate or normal(node.get('nameKanji'))!=candidate['name']:continue
+            address=_v250_address(node.get('address',''),ward)
+            try:lat,lng=float(node['latitude']),float(node['longitude'])
+            except (KeyError,ValueError,TypeError):continue
+            if address and 35.50<=lat<=35.95 and 139.50<=lng<=139.98:
+                candidate['directory_point']=(lat,lng)
+                candidate['address']=str(node['address'])
+    # Life publishes an exact ward total; do not silently accept a broken selector.
+    visible=normal(soup.get_text(' ',strip=True))
+    expected=None
+    if chain=='ライフ':
+        m=re.search(re.escape(ward)+r'の店舗一覧です[（(](\d+)店舗[）)]',visible)
+        if m:expected=int(m.group(1))
+        if expected is not None and expected!=len(out):raise AppError('ライフ公式一覧の件数と解析件数が一致しません。')
+    if not out and not (expected==0 or re.search(r'(?:該当|検索結果|店舗)[^。]{0,30}(?:0件|ありません|見つかりません)',visible)):
+        raise AppError(chain+'公式一覧の対象区の店舗を確認できません。')
+    return list(out.values())
+
+
+def _v250_point_from_official(soup,text,name):
+    points=[]
+    def add(lat,lng,basis):
+        try:
+            lat,lng=float(lat),float(lng)
+            if 35.50<=lat<=35.95 and 139.50<=lng<=139.98:points.append((lat,lng,basis))
+        except (TypeError,ValueError):pass
+    for script in soup.select('script[type="application/ld+json"]'):
+        try:document=json.loads(script.get_text())
+        except (ValueError,TypeError):continue
+        for node in json_nodes(document):
+            if not isinstance(node,dict):continue
+            geo=node.get('geo')
+            if isinstance(geo,dict) and (not node.get('name') or address_key(re.split(r'[｜|]',str(node['name']),maxsplit=1)[0].strip())==address_key(name)):
+                add(geo.get('latitude'),geo.get('longitude'),'公式店舗ページの構造化座標')
+    lat=soup.select_one('[itemprop="latitude"]');lng=soup.select_one('[itemprop="longitude"]')
+    if lat and lng:add(lat.get('content') or lat.get_text(),lng.get('content') or lng.get_text(),'公式店舗ページの構造化座標')
+    for node in soup.select('[data-lat][data-lng],iframe[src],a[href]'):
+        if node.has_attr('data-lat'):add(node.get('data-lat'),node.get('data-lng'),'公式店舗ページの地図座標');continue
+        value=html.unescape(str(node.get('src') or node.get('href') or ''))
+        if 'maps' not in value:continue
+        pairs=re.findall(r'!2d(-?\d+\.\d+)!3d(-?\d+\.\d+)',value)
+        for lng,lat in pairs:add(lat,lng,'公式店舗ページの地図座標')
+        for key,values in parse_qs(urlparse(value).query).items():
+            if key in ('q','query','ll','center'):
+                for v in values:
+                    m=re.fullmatch(r'\s*(-?\d+\.\d+)\s*,\s*(-?\d+\.\d+)\s*',v)
+                    if m:add(m[1],m[2],'公式店舗ページの地図座標')
+    unique={(round(lat,5),round(lng,5)):(lat,lng,basis) for lat,lng,basis in points}
+    return next(iter(unique.values())) if len(unique)==1 else None
+
+
+def _v250_parse_official_detail(text,candidate,ward):
+    soup=BeautifulSoup(text,'html.parser');root=soup.select_one('main') or soup
+    heading=root.select_one('h1') or root.select_one('h2')
+    name=normal(heading.get_text(' ',strip=True)) if heading else candidate['name']
+    if name in ('店舗情報','店舗詳細','店舗・チラシ','店舗・チラシ情報'):name=candidate['name']
+    if not any(token in name for token in (candidate['chain'],'リンコス')):
+        # MyBasket detail headings can contain the branch name only.
+        if candidate['chain']=='まいばすけっと':name='まいばすけっと '+name
+        elif candidate['chain']=='オーケー':name='オーケー '+name
+        else:raise AppError('公式店舗ページの店名を確認できません。')
+    visible=normal(root.get_text(' ',strip=True))
+    # Read only this store's labelled address, not an unrelated footer address.
+    address=''
+    for label in root.find_all(['h2','h3','th','dt']):
+        if normal(label.get_text(' ',strip=True)) not in ('住所','所在地','店舗住所'):continue
+        if label.name in ('th','dt'):
+            next_node=label.find_next_sibling(['td','dd'])
+            if next_node:address=_v250_address(next_node.get_text(' ',strip=True),ward)
+        else:
+            texts=[]
+            for sibling in label.next_siblings:
+                if getattr(sibling,'name',None) in ('h1','h2','h3'):break
+                texts.append(sibling.get_text(' ',strip=True) if hasattr(sibling,'get_text') else str(sibling))
+            address=_v250_address(normal(' '.join(texts)),ward)
+        if address:break
+    if not address:
+        node=root.select_one('.rt_cf_s_tenpo_jusho,[itemprop="streetAddress"]')
+        if node:address=_v250_address(node.get_text(' ',strip=True),ward)
+    if not address:
+        # Exact same-ward listing card is a primary source too.
+        address=candidate['address'] if candidate['address'] in visible.replace(' ','') else ''
+    if not address:raise AppError('公式店舗ページの対象区の住所を確認できません。')
+    if re.search(r'(?:当店|この店舗|本店舗).{0,20}(?:閉店しました|営業を終了)',visible):raise AppError('公式店舗ページに閉店の記載があります。')
+    point=_v250_point_from_official(soup,text,name)
+    if not point:raise AppError('公式店舗の座標を一意に確認できません。町の代表点は使用しません。')
+    return _v251_official_store_row(candidate,ward,name,address,point)
+
+
+def _v251_official_store_row(candidate,ward,name,address,point):
+    lat,lng,basis=point;rank=_v246_price(name,candidate['chain'])
+    return {'id':'official:'+hashlib.sha256(candidate['url'].encode()).hexdigest()[:24],
+        'ward':ward,'name':name,'address':address,'lat':lat,'lng':lng,
+        'price_label':_V246_PRICE_LABELS[rank],'color':_V246_PRICE_COLORS[rank],
+        'website':candidate['url'],'source_url':candidate['url'],'position_basis':basis,
+        'verification':'公式店舗一覧・店舗ページ照合済み','official_checked_at':utc_now()}
+
+
+def _v250_merge_supermarkets(existing,official):
+    rows=[dict(row) for row in existing];added=matched=0
+    def token(value):
+        return re.sub(r'ドラッグプラス|スーパー|ストア|[^\w一-龥ぁ-んァ-ヶ]','',unicodedata.normalize('NFKC',str(value)).casefold()).removesuffix('店')
+    for new in official:
+        found=None
+        for index,old in enumerate(rows):
+            same_url=bool(new.get('website')) and (old.get('website')==new['website'] or old.get('source_url')==new['source_url'])
+            same_name=token(old.get('name'))==token(new['name'])
+            near=meters((old['lat'],old['lng']),(new['lat'],new['lng']))<150
+            generic_near=any(token(old.get('name'))==token(chain) and token(new['name']).startswith(token(chain)) for chain in _V250_OFFICIAL_CHAINS) and meters((old['lat'],old['lng']),(new['lat'],new['lng']))<40
+            if same_url or (same_name and near) or generic_near:found=index;break
+        if found is None:rows.append(new);added+=1
+        else:
+            rows[found]={**rows[found],**new,'id':rows[found]['id']};matched+=1
+    return sorted(rows,key=lambda r:(r['name'],r['id'])),added,matched
+
+
+def _v250_supplement_supermarkets(job,ward,rows):
+    official=[];coverage=[];unresolved=[]
+    for chain in _V250_OFFICIAL_CHAINS:
+        if job.stop.is_set():raise SearchCancelled()
+        with job.lock:job.status=ward+'：'+chain+'公式店舗を照合中'
+        report={'chain':chain,'candidates':0,'verified':0,'unresolved':0,'complete':False}
+        url=_v250_directory_url(chain,ward)
+        try:
+            candidates=_v250_directory_candidates(_v250_fetch_official(job,url),url,chain,ward)
+            report['candidates']=len(candidates)
+            for candidate in candidates:
+                if job.stop.is_set():raise SearchCancelled()
+                try:
+                    if candidate.get('directory_point'):
+                        lat,lng=candidate['directory_point']
+                        row=_v251_official_store_row(candidate,ward,candidate['name'],candidate['address'],
+                            (lat,lng,'公式店舗一覧の公開店舗座標'))
+                    else:
+                        row=_v250_parse_official_detail(_v250_fetch_official(job,candidate['url']),candidate,ward)
+                    official.append(row);report['verified']+=1
+                    job.log(ward,'official_store_verified',chain=chain,name=row['name'],url=candidate['url'])
+                except SearchCancelled:raise
+                except Exception as exc:
+                    report['unresolved']+=1
+                    item={'chain':chain,'name':candidate['name'],'url':candidate['url'],'reason':str(exc)[:240]}
+                    unresolved.append(item);job.log(ward,'official_store_unresolved',**item)
+            report['complete']=report['unresolved']==0
+        except SearchCancelled:raise
+        except Exception as exc:
+            report['error']=str(exc)[:240]
+            job.log(ward,'official_directory_failed',chain=chain,url=url,error_type=type(exc).__name__,message=str(exc)[:400])
+        coverage.append(report)
+    merged,added,matched=_v250_merge_supermarkets(rows,official)
+    stats={'official_catalog_version':250,'official_complete':all(r['complete'] for r in coverage),
+        'official_coverage':coverage,'official_added':added,'official_matched':matched,'official_unresolved':unresolved}
+    job.log(ward,'official_supplement_completed',**stats)
+    return merged,stats
+
+
 class _V246EquipmentJob:
     def __init__(self):
         self.lock=threading.RLock();self.stop=threading.Event();self.running=False;self.status='待機中'
@@ -14874,23 +15183,40 @@ class _V246EquipmentJob:
                     previous=_v246_load(db,ward)
                     if previous:
                         with self.lock:self.data[ward]=previous
-                    if load_only or (previous and not force):
+                    if load_only or (previous and not force and previous.get('stats',{}).get('official_catalog_version')==250 and previous.get('stats',{}).get('official_complete') is True):
                         with self.lock:self.progress[ward]={'状態':'完了' if previous else '未取得','保存件数':len(previous['rows']) if previous else 0,'詳細':'保存結果を読み込みました' if previous else '保存結果はありません'}
                         continue
                     if self.stop.is_set():break
                     with self.lock:self.status=ward+'：スーパーを取得中';self.progress[ward]['状態']='取得中'
-                    rows,stats=_v248_fetch_supermarkets(self,ward)
+                    if previous and not force:
+                        rows=[dict(r) for r in previous['rows']];stats=dict(previous.get('stats') or {})
+                    else:
+                        rows,stats=_v248_fetch_supermarkets(self,ward)
+                        if rows is not None and previous:
+                            rows=list({r['id']:dict(r) for r in [*previous['rows'],*rows]}.values())
                     if rows is None:
+                        with self.lock:self.progress[ward]['状態']='中止'
+                        break
+                    rows,official_stats=_v250_supplement_supermarkets(self,ward,rows)
+                    stats.update(official_stats)
+                    if self.stop.is_set():
                         with self.lock:self.progress[ward]['状態']='中止'
                         break
                     with self.lock:self.status=ward+'：保存・読み戻し確認中'
                     confirmed=_v246_save(db,ward,rows,stats)
                     with self.lock:
-                        self.data[ward]=confirmed;self.progress[ward]={'状態':'完了','保存件数':len(rows),'詳細':f"重複除外 {stats['duplicates']}件／対象外 {stats['excluded']}件"}
+                        self.data[ward]=confirmed;self.progress[ward]={'状態':'完了' if stats.get('official_complete') else '補完一部未完了','保存件数':len(rows),'詳細':f"公式追加 {stats.get('official_added',0)}件／照合 {stats.get('official_matched',0)}件／未確認 {sum(r.get('unresolved',0) for r in stats.get('official_coverage',[]))}件"}
                     self.log(ward,'saved_and_verified',count=len(rows))
+                except SearchCancelled:
+                    with self.lock:self.progress[ward]['状態']='中止'
+                    break
                 except Exception as exc:
                     self.log(ward,'ward_failed',error_type=type(exc).__name__,message=str(exc)[:400],operation=self.status)
                     with self.lock:self.progress[ward]={'状態':'未完了','保存件数':len(self.data.get(ward,{}).get('rows',[])),'詳細':str(exc)[:240]}
+                if not load_only:
+                    try:_v247_collect_log(self,db)
+                    except Exception as exc:
+                        with self.lock:self.log_error=str(exc)[:300];self.log_saved=False
             with self.lock:self.status='中止しました。保存済みの区は保持しています。' if self.stop.is_set() else '処理終了'
         except Exception as exc:
             self.log('','job_failed',error_type=type(exc).__name__,message=str(exc)[:400])
@@ -14921,11 +15247,10 @@ rows.forEach(s=>{const el=document.createElement('div');const name=document.crea
 if(rows.length)map.fitBounds(rows.map(s=>[s.lat,s.lng]),{padding:[20,20],maxZoom:15});</script></body></html>'''.replace('DATA',data,1)
 
 
-@st.fragment(run_every='3s')
-def _v246_equipment_panel():
+def _v251_equipment_panel_body():
     st.subheader('スーパーの位置情報を取得')
     job=_v246_equipment_job();snap=job.snapshot()
-    st.caption('区全域のOSM掲載情報を手動取得します。営業状況・公式店舗情報・全店舗の網羅性は未確認です。住まいの地図では自動検索しません。')
+    st.caption('OSMに加え、ライフ・まいばすけっと・マルエツ・オーケーの公式店舗情報を照合・補完して保存します。全店舗の網羅は保証しません。住まいの地図では再検索しません。')
     wards=st.multiselect('取得する区',list(TOKYO_WARDS.values()),default=['品川区','港区'],key='equipment_wards_v246',disabled=snap['running'])
     force=st.checkbox('完了した区も再取得する',key='equipment_force_v246',disabled=snap['running'])
     if st.button('選択した区のスーパーを取得・再開',key='equipment_start_v246',type='primary',disabled=snap['running'] or not wards,use_container_width=True):
@@ -14943,6 +15268,15 @@ def _v246_equipment_panel():
     if st.button('保存したスーパーを読み込む',key='equipment_load_v246',disabled=snap['running'] or not wards):
         job.start(wards,load_only=True);st.rerun(scope='fragment')
     st.caption('取得ログは「設定 → ログ出力」にあります。情報：© OpenStreetMap contributors / ODbL。')
+
+
+def _v246_equipment_panel():
+    job=_v246_equipment_job();polling=job.snapshot()['running']
+    @st.fragment(run_every='3s' if polling else None)
+    def panel():
+        _v251_equipment_panel_body()
+        if job.snapshot()['running']!=polling:st.rerun()
+    panel()
 
 
 @st.fragment
@@ -14966,6 +15300,25 @@ def _v246_equipment_results():
 
 
 
+
+# Verified on the official ward directory and embedded store coordinates, 2026-10-30.
+_V251_VERIFIED_LIFE = [{'id': 'official:b30a237f5b799550d41d6f4e', 'ward': '品川区', 'name': 'ライフ大井町トラックス店', 'address': '東京都品川区広町2-1-3 OIMACHI TRACKS 2階 店番号233', 'lat': 35.607943, 'lng': 139.734065, 'price_label': '標準', 'color': '#b68a26', 'website': 'https://store.lifecorp.jp/detail/683/', 'source_url': 'https://store.lifecorp.jp/detail/683/', 'position_basis': '公式店舗一覧の公開店舗座標', 'verification': '公式店舗一覧・店舗ページ照合済み', 'official_checked_at': '2026-10-29T16:44:58+00:00'}, {'id': 'official:ad0a3d4d1b7ffd517568f5ed', 'ward': '品川区', 'name': 'ライフ大崎ニューシティ店', 'address': '東京都品川区大崎1丁目6-4 5号館', 'lat': 35.62025218, 'lng': 139.7291512, 'price_label': '標準', 'color': '#b68a26', 'website': 'https://store.lifecorp.jp/detail/east878/', 'source_url': 'https://store.lifecorp.jp/detail/east878/', 'position_basis': '公式店舗一覧の公開店舗座標', 'verification': '公式店舗一覧・店舗ページ照合済み', 'official_checked_at': '2026-10-29T16:44:58+00:00'}, {'id': 'official:f346ea6eb0ce1aeee3f8e5c4', 'ward': '品川区', 'name': 'ライフ大崎百反通店', 'address': '東京都品川区大崎4丁目13-2', 'lat': 35.61814399, 'lng': 139.719022, 'price_label': '標準', 'color': '#b68a26', 'website': 'https://store.lifecorp.jp/detail/east864/', 'source_url': 'https://store.lifecorp.jp/detail/east864/', 'position_basis': '公式店舗一覧の公開店舗座標', 'verification': '公式店舗一覧・店舗ページ照合済み', 'official_checked_at': '2026-10-29T16:44:58+00:00'}, {'id': 'official:54590a97a71bd001326a334b', 'ward': '品川区', 'name': 'ライフドラッグプラス品川御殿山店', 'address': '東京都品川区北品川5丁目4-1', 'lat': 35.62163333, 'lng': 139.7315808, 'price_label': '標準', 'color': '#b68a26', 'website': 'https://store.lifecorp.jp/detail/east618/', 'source_url': 'https://store.lifecorp.jp/detail/east618/', 'position_basis': '公式店舗一覧の公開店舗座標', 'verification': '公式店舗一覧・店舗ページ照合済み', 'official_checked_at': '2026-10-29T16:44:58+00:00'}, {'id': 'official:c1a124b6705b49641605fb94', 'ward': '品川区', 'name': 'ライフ東五反田店', 'address': '東京都品川区東五反田2丁目19-6', 'lat': 35.6249445, 'lng': 139.7297227, 'price_label': '標準', 'color': '#b68a26', 'website': 'https://store.lifecorp.jp/detail/east612/', 'source_url': 'https://store.lifecorp.jp/detail/east612/', 'position_basis': '公式店舗一覧の公開店舗座標', 'verification': '公式店舗一覧・店舗ページ照合済み', 'official_checked_at': '2026-10-29T16:44:58+00:00'}, {'id': 'official:548de54c68347799aba7b670', 'ward': '品川区', 'name': 'ライフ武蔵小山店', 'address': '東京都品川区小山2丁目7-14', 'lat': 35.6207399, 'lng': 139.7079886, 'price_label': '標準', 'color': '#b68a26', 'website': 'https://store.lifecorp.jp/detail/east836/', 'source_url': 'https://store.lifecorp.jp/detail/east836/', 'position_basis': '公式店舗一覧の公開店舗座標', 'verification': '公式店舗一覧・店舗ページ照合済み', 'official_checked_at': '2026-10-29T16:44:58+00:00'}]
+
+def _v251_seed_verified_stores(db,records):
+    if not isinstance(records,list):return records
+    ward='品川区';identity=_v246_record_id(ward)
+    found=next((r for r in records if isinstance(r,dict) and r.get('id')==identity),None)
+    previous=(found.get('summary') or {}) if found else {}
+    if previous.get('stats',{}).get('official_snapshot_v251'):return records
+    old=previous.get('rows',[])
+    if not isinstance(old,list) or (found and previous.get('digest')!=_v246_digest(old)):return records
+    merged,added,matched=_v250_merge_supermarkets(old,_V251_VERIFIED_LIFE)
+    stats={**(previous.get('stats') or {}),'official_snapshot_v251':True,
+        'official_snapshot_added':added,'official_snapshot_matched':matched}
+    confirmed=_v246_save(db,ward,merged,stats)
+    return [r for r in records if not isinstance(r,dict) or r.get('id')!=identity]+[{'id':identity,'summary':confirmed}]
+
+
 class _V249SupermarketMapLoader:
     """Load only saved POIs, once on demand; never query Overpass from the map."""
     def __init__(self):
@@ -14987,8 +15340,21 @@ class _V249SupermarketMapLoader:
             records=db.call('GET',SEARCH_TABLE,{'namespace':'eq.'+db.namespace,
                 'status':'eq.equipment_supermarket_v246','id':'in.('+ids+')',
                 'select':'id,summary','limit':len(TOKYO_WARDS)})
-            rows=_v249_saved_supermarket_rows(records)
-            with self.lock:self.rows=rows;self.revision+=1
+            warnings=[]
+            try:records=_v251_seed_verified_stores(db,records)
+            except Exception as exc:warnings.append('公式補完の保存未確認：'+str(exc))
+            if not isinstance(records,list):raise AppError('スーパーの保存応答形式が不正です。')
+            rows=[]
+            for record in records:
+                try:rows.extend(_v249_saved_supermarket_rows([record]))
+                except Exception as exc:
+                    warnings.append(str(record.get('id',''))+'：'+str(exc))
+                    code=str(record.get('id','')).rsplit('.',1)[-1]
+                    ward=TOKYO_WARDS.get(code)
+                    with self.lock:rows.extend(r for r in self.rows if r.get('ward')==ward)
+            with self.lock:
+                self.rows=rows;self.revision+=1
+                self.error='一部の保存データが未確認です：'+'／'.join(warnings) if warnings else ''
         except Exception as exc:
             with self.lock:self.error=str(exc)[:300]
         finally:
@@ -15265,12 +15631,13 @@ def interactive_town_choropleth(group):
         except (OSError,sqlite3.Error,ValueError,TypeError):
             pass
     stations,wards=town_station_refs_v164(destinations)
+    supermarket_window=_v156_town_render_window(bounds,center) if bounds else None
     widget=town_component_v121()
     data=widget(chintai_town_urls=(_v243_chintai_urls(cached['geo'],group) if source=='CHINTAI' else {}),map_source=source,map_layout_group=group,center=list(center),zoom=_v202_view_zoom(state.get('new_view_zoom')),geo=cached['geo'],
                 home_view_epoch=int(state.get('_v202_home_epoch',0)),home_center=list(_V202_HOME_CENTER),
                 signature=cached['layer_signature'],stations=stations,wards=wards,
                 supermarket_overlay_visible=supermarket_visible,
-                supermarkets=supermarket_snapshot['rows'] if supermarket_visible else [],
+                supermarkets=[r for r in supermarket_snapshot['rows'] if not supermarket_window or in_rectangle((r['lat'],r['lng']),supermarket_window)] if supermarket_visible else [],
                 supermarket_revision=supermarket_snapshot['revision'],
                 supermarket_loading=supermarket_snapshot['running'],
                 supermarket_error=supermarket_snapshot['error'],
