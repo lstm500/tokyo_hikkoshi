@@ -52,7 +52,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v242"
+BUILD = "REBUILD-01-v243"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -13605,9 +13605,19 @@ TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('</style></head>','#v2
 TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('function render(args){',_V240_SOURCE_JS+'\nfunction render(args){',1)
 TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(' args=args||{};',' args=args||{};\n v240RenderSource(args);',1)
 
+# v243: public ward directories are reused; only verified town URLs enter the client.
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(
+    "if(provider==='SUUMO')url=v217Url(entry.place,entry.props.suumo_url);",
+    "if(provider==='SUUMO')url=v217Url(entry.place,entry.props.suumo_url);else url=v240ChintaiUrl(entry.place,(state._v243ChintaiUrls||{})[entry.place.ward+'|'+entry.place.name]);",1)
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(
+    "var source=v240Source(args.map_source),group=args.map_layout_group||'group1';",
+    "state._v243ChintaiUrls=args.chintai_town_urls||{};var source=v240Source(args.map_source),group=args.map_layout_group||'group1';",1)
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('v243-chintai-directory','v243-chintai-directory').replace('sumai_town_map_v243','sumai_town_map_v243')
+
+
 @st.cache_resource(show_spinner=False)
 def town_component_v121():
-    _asset_revision='v240-map-source'
+    _asset_revision='v243-chintai-directory'
     folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-'+_asset_revision)
     os.makedirs(folder,exist_ok=True)
     path=os.path.join(folder,'index.html')
@@ -13625,7 +13635,7 @@ def town_component_v121():
         with open(temp_path,'w',encoding='utf-8') as output:
             output.write(TOWN_COMPONENT_HTML_V121)
         os.replace(temp_path,path)
-    return st.components.v1.declare_component('sumai_town_map_v240',path=folder)
+    return st.components.v1.declare_component('sumai_town_map_v243',path=folder)
 
 @st.cache_resource(show_spinner=False)
 def _v216_api_budget():
@@ -14552,6 +14562,78 @@ def _v240_source_groups(summary,source):
     return ((summary.get('sources') or {}).get(source) or {}).get('groups') or {}
 
 
+@st.cache_resource(show_spinner=False)
+def _v243_chintai_directory():
+    return {'lock':threading.RLock(),'items':{},'flights':{},
+            'pool':futures.ThreadPoolExecutor(max_workers=2,thread_name_prefix='chintai-town-directory')}
+
+
+def _v243_load_chintai_directory(city):
+    if city not in TOKYO_WARDS:raise AppError('CHINTAIの区を確認できません。')
+    url='https://www.chintai.net/tokyo/area/'+city+'/list/'
+    web=PublicWeb();web.configure(rental_network_settings())
+    if not web.permitted(url):raise AppError('CHINTAIの地域確認を実行できません。')
+    soup=BeautifulSoup(web.fetch(url).text,'html.parser')
+    candidates={}
+    for a in soup.select('a[href]'):
+        label=re.sub(r'\s*\(\s*[\d,]+\s*件\s*\)\s*$','',normal(a.get_text(' ',strip=True))).strip()
+        target=urlparse(urljoin(url,html.unescape(str(a.get('href') or ''))).split('#')[0])
+        if (target.scheme=='https' and target.hostname=='www.chintai.net' and not target.query
+                and not target.username and not target.password and target.port is None
+                and re.fullmatch(r'/tokyo/area/'+city+r'\d{3}/list/',target.path)):
+            candidates.setdefault(address_key(label),set()).add(target.geturl())
+    result={town:next(iter(urls)) for town,urls in candidates.items() if town and len(urls)==1}
+    if not result:raise AppError('CHINTAIの町名一覧を確認できません。')
+    return result
+
+
+def _v243_chintai_directory_future(city):
+    cache=_v243_chintai_directory();now=time.monotonic()
+    with cache['lock']:
+        item=cache['items'].get(city)
+        if item and now<item['expires']:return None
+        flight=cache['flights'].get(city)
+        if flight is not None:return flight
+        def load():
+            try:
+                links=_v243_load_chintai_directory(city)
+                with cache['lock']:cache['items'][city]={'links':links,'expires':time.monotonic()+86400}
+                return links
+            except Exception:
+                with cache['lock']:cache['items'][city]={'links':{},'expires':time.monotonic()+30}
+                raise
+            finally:
+                with cache['lock']:cache['flights'].pop(city,None)
+        flight=cache['pool'].submit(load);cache['flights'][city]=flight
+        return flight
+
+
+def _v243_chintai_base(city,town):
+    flight=_v243_chintai_directory_future(city)
+    if flight is not None:return flight.result().get(address_key(town))
+    cache=_v243_chintai_directory()
+    with cache['lock']:return cache['items'][city]['links'].get(address_key(town))
+
+
+def _v243_chintai_urls(geo,group):
+    cache=_v243_chintai_directory();result={}
+    with cache['lock']:
+        for feature in geo.get('features',[]):
+            props=feature.get('properties') or {};ward=props.get('suumo_ward');name=props.get('suumo_name')
+            city=_V167_WARD_TO_CODE.get(ward);item=cache['items'].get(city)
+            if not name or not item or item['expires']<=time.monotonic():continue
+            base=item['links'].get(address_key(town_base_name(name)))
+            if base:result[str(ward)+'|'+name]=_v243_chintai_search_url(base,group)
+    return result
+
+
+def _v243_chintai_search_url(base,group):
+    house=group=='house'
+    params={'b':'3' if house else '2','h':'99' if house else '5','sf':'50' if house else '0','j':'6'}
+    if not house:params['m']={'group0':['0','1','2'],'group1':['3','4','5'],'group2':['6','7','8']}[group]
+    return urlparse(base)._replace(query=urlencode(params,doseq=True),fragment='').geturl()
+
+
 def _v240_resolve_property_search(state,data,group):
     source=_v240_map_source(state.get('_v240_map_source'))
     provider='CHINTAI' if source=='CHINTAI' else 'SUUMO'
@@ -14575,10 +14657,7 @@ def _v240_resolve_property_search(state,data,group):
             city_url='https://www.chintai.net/tokyo/area/'+city+'/list/'
             if kind=='ward':base=city_url
             else:
-                web=PublicWeb();web.configure(rental_network_settings())
-                if not web.permitted(city_url):raise AppError('CHINTAIの地域確認を実行できません。')
-                soup=BeautifulSoup(web.fetch(city_url).text,'html.parser')
-                base=_v233_chintai_town_link(soup,city_url,town,city)
+                base=_v243_chintai_base(city,town)
                 if not base:raise AppError('CHINTAIで同じ町名の検索地域を確認できません。')
                 if len(cache)>=128:cache.pop(next(iter(cache)))
                 cache[cache_key]=base
@@ -14674,6 +14753,8 @@ def interactive_town_choropleth(group):
                 'no_data_count':geo['render_stats']['without_rent'],'center':center}
         state['_v118_choropleth_payload']=cached
         registry.request(_v168_visible_wards(geo)[:8])
+    if source=='CHINTAI':
+        for city in _v168_visible_wards(cached['geo'])[:1]:_v243_chintai_directory_future(city)
     destinations=commute_selected_destinations_v164()
     if len(destinations)>=2:
         st.caption('通勤先：'+'／'.join(str(i+1)+'.'+name+'駅' for i,name in enumerate(destinations))+'｜乗換回数が少ない経路を優先（同数なら最短時間・概算）')
@@ -14693,7 +14774,7 @@ def interactive_town_choropleth(group):
             pass
     stations,wards=town_station_refs_v164(destinations)
     widget=town_component_v121()
-    data=widget(map_source=source,map_layout_group=group,center=list(center),zoom=_v202_view_zoom(state.get('new_view_zoom')),geo=cached['geo'],
+    data=widget(chintai_town_urls=(_v243_chintai_urls(cached['geo'],group) if source=='CHINTAI' else {}),map_source=source,map_layout_group=group,center=list(center),zoom=_v202_view_zoom(state.get('new_view_zoom')),geo=cached['geo'],
                 home_view_epoch=int(state.get('_v202_home_epoch',0)),home_center=list(_V202_HOME_CENTER),
                 signature=cached['layer_signature'],stations=stations,wards=wards,
                 search_catalog=search_catalog,search_district_names=list(TOKYO_WARDS.values()),
