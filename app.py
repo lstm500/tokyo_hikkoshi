@@ -52,7 +52,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v256"
+BUILD = "REBUILD-01-v257"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -14931,6 +14931,7 @@ _V250_OFFICIAL_HOSTS=frozenset(('store.lifecorp.jp','www.mybasket.co.jp','www.ma
 
 
 def _v250_directory_url(chain,ward):
+    if chain in _V257_NEW_CHAINS:return _V257_DIRECTORIES[chain]
     if chain in _V256_NEW_CHAINS:return _V256_DIRECTORIES[chain]
     if chain in _V255_NEW_CHAINS:return _V255_DIRECTORIES[chain]
     if chain=='ライフ':return 'https://store.lifecorp.jp/'+quote('東京都')+'/'+quote(ward)+'/'
@@ -14940,6 +14941,7 @@ def _v250_directory_url(chain,ward):
 
 
 def _v250_detail_url(url,chain):
+    if chain in _V257_NEW_CHAINS:return _v257_detail_url(url,chain)
     if chain in _V256_NEW_CHAINS:return _v256_detail_url(url,chain)
     if chain in _V255_NEW_CHAINS:return _v255_detail_url(url,chain)
     try:
@@ -15051,6 +15053,7 @@ def _v250_directory_candidates(text,url,chain,ward):
 
 
 def _v254_official_candidates(job,url,chain,ward):
+    if chain in _V257_NEW_CHAINS:return _v257_candidates(job,chain,ward)
     if chain in _V256_NEW_CHAINS:return _v256_candidates(job,chain,ward)
     if chain in _V255_NEW_CHAINS:return _v255_candidates(job,chain,ward)
     text=_v250_fetch_official(job,url)
@@ -15647,6 +15650,268 @@ def _v256_resolve_store(job,candidate,ward):
 
 
 
+# v257: remaining fifteen public store catalogs. No automatic map-time fetching.
+_V257_NEW_CHAINS=('イトーヨーカドー','ヨークフーズ','サミット','いなげや','カスミ','東急ストア','京王ストア','そうてつローゼン','ピーコック','三徳','成城石井','クイーンズ伊勢丹','紀ノ国屋','明治屋','ナショナル麻布')
+_V257_DIRECTORIES=dict(zip(_V257_NEW_CHAINS,(
+ 'https://stores.itoyokado.co.jp/all/','https://www.york-inc.com/store/',
+ 'https://mng.content-smt-site.net/wp-json/wp/v2/store?per_page=100&page=1',
+ 'https://stores.inageya.co.jp/','https://www.kasumi.co.jp/tenpotop/area/tokyo/',
+ 'https://www.tokyu-store.co.jp/shop/result.html','https://www.keiostore.co.jp/business/store_list.html',
+ 'https://rosen.mikke-sales.com/api/v1/pub/flyers/rosen/',
+ 'https://aeonfoodstyle.com/stores/?yagou=peacock',
+ 'https://www.shufoo.net/pntweb/categoryShopList/101/162149/',
+ 'https://shop.seijoishii.com/seijoishii/api/proxy2/shop/list?address=13&datum=wgs84&offset=0&limit=100',
+ 'https://www.im-food.co.jp/shops/','https://www.e-kinokuniya.com/sitemap.xml',
+ 'https://meidi-ya-store.com/store_all/','https://www.national-azabu.com/stores_guide/')))
+_V257_PATTERNS={
+ 'イトーヨーカドー':('stores.itoyokado.co.jp',r'/detail/[\w-]+/'),
+ 'ヨークフーズ':('www.york-inc.com',r'/store/[\w-]+\.html'),
+ 'サミット':('mng.content-smt-site.net',r'/wp-json/wp/v2/store/\d+'),
+ 'いなげや':('stores.inageya.co.jp',r'/store/'),
+ 'カスミ':('www.kasumi.co.jp',r'/tenpotop/tokyo/[^/]+/\d+/'),
+ '東急ストア':('www.tokyu-store.co.jp',r'/shop/detail\.html'),
+ '京王ストア':('www.keiostore.co.jp',r'/business/store\d+\.html'),
+ 'そうてつローゼン':('rosen.mikke-sales.com',r'/stores/[a-z0-9_-]+'),
+ 'ピーコック':('aeonfoodstyle.com',r'/stores/\d+/'),
+ '三徳':('www.shufoo.net',r'/pntweb/shopDetail/\d+/'),
+ '成城石井':('shop.seijoishii.com',r'/seijoishii/spot/detail'),
+ 'クイーンズ伊勢丹':('www.im-food.co.jp',r'/shops/[\w-]+\.html'),
+ '紀ノ国屋':('www.e-kinokuniya.com',r'/store/[\w-]+/[\w-]+'),
+ '明治屋':('meidi-ya-store.com',r'/[\w-]+_store/'),
+ 'ナショナル麻布':('www.national-azabu.com',r'/stores_guide/')}
+
+
+def _v257_detail_url(url,chain):
+    try:
+        u=urlparse(url.strip());host,path=_V257_PATTERNS[chain]
+        if u.scheme!='https' or u.hostname!=host or u.username or u.password or u.port not in (None,443) or not re.fullmatch(path,u.path):return ''
+        key={'いなげや':'s','東急ストア':'pdid','成城石井':'code'}.get(chain)
+        q=parse_qs(u.query)
+        if key:
+            if set(q)!={key} or len(q[key])!=1 or not re.fullmatch(r'[a-zA-Z0-9_-]+',q[key][0]):return ''
+        elif u.query:return ''
+        return u._replace(fragment='').geturl()
+    except (ValueError,KeyError):return ''
+
+
+def _v257_entry(chain,name,address,url,node=None,point=None,branch=''):
+    address=_v256_address(address);name=normal(name);target=_v257_detail_url(url,chain)
+    if not name or not address or not target:raise AppError(chain+'店舗一覧の店名・住所・URLを確認できません。')
+    found=point or (_v256_point(node,name) if node is not None else None)
+    if found:
+        try:lat,lng=float(found[0]),float(found[1])
+        except (ValueError,TypeError):raise AppError('公開店舗座標の形式が不正です。')
+        # Outside Tokyo is retained in the catalog, then excluded by exact ward.
+        found=(lat,lng) if 35.50<=lat<=35.95 and 139.50<=lng<=139.98 else None
+    return {'chain':chain,'name':name,'branch':branch or name,'address':address,'ward':_v255_ward(address),
+        'url':target,'directory_point':found,'catalog_entry':chain=='ナショナル麻布'}
+
+
+def _v257_parse_catalog(text,chain,url):
+    s=BeautifulSoup(text,'html.parser');out=[]
+    def add(name,address,target,node=None,point=None,branch=''):
+        out.append(_v257_entry(chain,name,address,urljoin(url,target),node,point,branch))
+    if chain=='イトーヨーカドー':
+        tag=s.select_one('#__NEXT_DATA__');d=json.loads(tag.get_text())['props']['pageProps'] if tag else {}
+        if not isinstance(d.get('shops'),list) or not isinstance(d.get('totalCount'),int):raise AppError('イトーヨーカドー公開店舗データを確認できません。')
+        for r in d['shops']:
+            if r.get('openStatus')!='IS_ALREADY_OPEN':continue
+            add(r['nameKanji'],r['address'],'https://stores.itoyokado.co.jp/detail/'+str(r['storeCode'])+'/',point=(r['latitude'],r['longitude']))
+    elif chain=='サミット':
+        records=json.loads(text)
+        if not isinstance(records,list):raise AppError('サミット公開一覧の形式が不正です。')
+        for r in records:
+            f=r['acf']
+            if 'summit' not in f.get('store_select',[]):continue
+            if r.get('status')!='publish':continue
+            branch=BeautifulSoup(r['title']['rendered'],'html.parser').get_text()
+            add('サミットストア '+branch,f['store_address'],'https://mng.content-smt-site.net/wp-json/wp/v2/store/'+str(r['id']),BeautifulSoup('<iframe src="'+html.escape(f['store_map'],quote=True)+'"></iframe>','html.parser'),branch=branch)
+    elif chain=='成城石井':
+        d=json.loads(text)
+        if not isinstance(d.get('items'),list) or not isinstance(d.get('count',{}).get('total'),int):raise AppError('成城石井公開一覧の件数が不正です。')
+        for r in d['items']:
+            if r.get('status')!='normal':continue
+            branch=r['name'];name=branch if '成城石井' in branch else '成城石井 '+branch
+            add(name,r['address_name'],'https://shop.seijoishii.com/seijoishii/spot/detail?code='+r['code'],point=(r['coord']['lat'],r['coord']['lon']),branch=branch)
+    elif chain=='そうてつローゼン':
+        d=json.loads(text)
+        if d.get('name')!='そうてつローゼン' or not isinstance(d.get('items'),list):raise AppError('ローゼン公式チラシ一覧を確認できません。')
+        for r in d['items']:
+            if r.get('prefecture')!='東京':continue
+            add(r['storeName'],'東京都'+r['address'],'https://rosen.mikke-sales.com/stores/'+r['directory'])
+    elif chain=='ヨークフーズ':
+        for card in s.select('.store-index-card'):
+            a=card.select_one('.store-index-card__title a');ad=card.select_one('.store-index-card__desc.is-access')
+            if not a or not ad:raise AppError('ヨーク公式一覧の店舗区画が変わっています。')
+            if 'ヨークフーズ' in a.get_text():add(a.get_text(),ad.get_text(),a['href'])
+    elif chain in ('いなげや','カスミ','東急ストア','クイーンズ伊勢丹','明治屋'):
+        selector={'いなげや':'a[href*="?s="]','カスミ':'a.c-table-2__txt','東急ストア':'a[href*="pdid="]','クイーンズ伊勢丹':'a[href]','明治屋':'a[href]'}[chain]
+        root=s.select_one('table.shopTbl01') if chain=='クイーンズ伊勢丹' else s
+        if root is None:raise AppError('クイーンズ伊勢丹公式一覧の区画が変わっています。')
+        seen=set()
+        for a in root.select(selector):
+            target=_v257_detail_url(urljoin(url,a['href']),chain);tr=a.find_parent('tr')
+            if not target or not tr or target in seen:continue
+            td=tr.find_all('td',recursive=False)
+            if not td:continue
+            if chain=='カスミ':ad=next((n for n in td if '東京都' in n.get_text()),None)
+            else:ad=td[1] if len(td)>1 else None
+            if ad is None:raise AppError(chain+'公式一覧の住所列を確認できません。')
+            branch=normal(a.get_text());name=branch
+            if chain in ('クイーンズ伊勢丹','明治屋'):name=chain+' '+branch
+            add(name,ad.get_text(' ',strip=True),target,branch=branch);seen.add(target)
+    elif chain=='京王ストア':
+        for card in s.select('.store-list-area-content'):
+            a=card.select_one('.store-list-area-ttl a');ad=card.select_one('.store-list-area-details__item--place')
+            if not a or not ad:raise AppError('京王ストア公式一覧の店舗情報を確認できません。')
+            branch=normal(a.get_text());typ='キッチンコート' if '--kitchencourt' in str(a.parent.get('class')) else '京王ストア'
+            add(typ+' '+branch,ad.get_text(),a['href'],branch=branch)
+    elif chain=='ピーコック':
+        for card in s.select('.store_list__item'):
+            a=card.select_one('.store_list__item__head a');ad=card.select_one('.address');name=card.select_one('.store_name')
+            if not a or not ad or not name:raise AppError('ピーコック公式一覧の店舗情報を確認できません。')
+            if 'ピーコック' in name.get_text():add(name.get_text(),ad.get_text(),a['href'])
+    elif chain=='三徳':
+        for dl in s.select('dl'):
+            a=dl.select_one('dt a[href*="/shopDetail/"]');ad=dl.select_one('.address')
+            if not a or not ad:continue
+            name=re.sub(r'[（(]\d+枚[）)]\s*$','',normal(a.get_text()))
+            if not re.match(r'三[徳德]',name):raise AppError('三徳チラシ一覧に別企業の店舗が含まれています。')
+            add(name,ad.get_text(),a['href'])
+        m=re.search(r'一覧[（(](\d+)件[）)]',s.get_text(' ',strip=True))
+        if not m or int(m.group(1))!=len(out):raise AppError('三徳チラシ一覧の総件数と解析件数が一致しません。')
+    elif chain=='ナショナル麻布':
+        for dl in s.select('dl.stores_list-item'):
+            img=dl.select_one('dt img[alt]');ad=dl.select_one('.detail-ja')
+            if not img or not ad:raise AppError('ナショナル麻布公式一覧を確認できません。')
+            add(img['alt'],ad.get_text(' ',strip=True),url,dl)
+    else:raise AppError('未対応の店舗一覧です。')
+    if not out:raise AppError(chain+'店舗一覧を解析できません。店舗なしとして保存しません。')
+    keys=[r['url']+'|'+r['name'] for r in out]
+    if len(keys)!=len(set(keys)):raise AppError(chain+'店舗一覧に重複があります。')
+    return out
+
+
+def _v257_kino_detail(text,url):
+    s=BeautifulSoup(text,'html.parser');tag=s.select_one('#__NEXT_DATA__')
+    p=json.loads(tag.get_text())['props']['pageProps']['posts']['postData'] if tag else {}
+    if p.get('status')!='publish':raise AppError('紀ノ国屋店舗情報の公開状態を確認できません。')
+    sections=json.loads(p['sectionJSON']);parts=[r['data'] for r in sections if r.get('partsID')=='shopInformationDetail']
+    if len(parts)!=1:raise AppError('紀ノ国屋店舗詳細の区画を確認できません。')
+    d=parts[0];ad=[r['content'] for r in d['shopLoop'] if r.get('item')=='所在地']
+    if len(ad)!=1:raise AppError('紀ノ国屋店舗の所在地を確認できません。')
+    return _v257_entry('紀ノ国屋','紀ノ国屋 '+d['shopName'],BeautifulSoup(ad[0],'html.parser').get_text(),url,BeautifulSoup(d['map'],'html.parser'),branch=d['shopName'])
+
+
+def _v257_candidates(job,chain,ward):
+    cache=getattr(job,'_v255_catalog_cache',None)
+    if cache is None:cache={};job._v255_catalog_cache=cache
+    if chain not in cache:
+        url=_V257_DIRECTORIES[chain];text=_v250_fetch_official(job,url)
+        if chain=='紀ノ国屋':
+            import xml.etree.ElementTree as ET
+            root=ET.fromstring(text)
+            links=[n.text for n in root.iter() if n.tag.rsplit('}',1)[-1]=='loc' and n.text and _v257_detail_url(n.text,chain) and '/KINOKUNIYABakery/' not in n.text]
+            if not links or len(links)>150 or len(links)!=len(set(links)):raise AppError('紀ノ国屋公開サイトマップの店舗件数を確認できません。')
+            entries=[];errors=[]
+            job._v255_catalog_errors=getattr(job,'_v255_catalog_errors',{})
+            job._v255_catalog_errors[chain]='公開サイトマップ掲載店舗のみ。公式一覧全体との件数照合は未完了です。'
+            job.log('','official_catalog_scope_limited',chain=chain,endpoint=url,message=job._v255_catalog_errors[chain])
+            for target in links:
+                try:entries.append(_v257_kino_detail(_v250_fetch_official(job,target),target))
+                except SearchCancelled:raise
+                except Exception as exc:errors.append(target+' '+str(exc)[:120]);job.log('','official_catalog_store_failed',chain=chain,url=target,message=str(exc)[:200])
+            if errors:
+                job._v255_catalog_errors=getattr(job,'_v255_catalog_errors',{});job._v255_catalog_errors[chain]='店舗詳細未取得 '+str(len(errors))+'件'
+        else:
+            entries=_v257_parse_catalog(text,chain,url)
+            if chain=='イトーヨーカドー':
+                d=json.loads(BeautifulSoup(text,'html.parser').select_one('#__NEXT_DATA__').get_text())['props']['pageProps'];total=d['totalCount'];pages=d['maxPage'];raw=len(d['shops'])
+                if not 1<=pages<=20:raise AppError('公式店舗一覧のページ数が不正です。')
+                for page in range(2,pages+1):
+                    t=_v250_fetch_official(job,url+'?page='+str(page));pd=json.loads(BeautifulSoup(t,'html.parser').select_one('#__NEXT_DATA__').get_text())['props']['pageProps']
+                    if pd['totalCount']!=total:raise AppError('取得中に公式店舗件数が変わりました。再取得してください。')
+                    raw+=len(pd['shops']);entries+=_v257_parse_catalog(t,chain,url)
+                if raw!=total:raise AppError('イトーヨーカドー公式一覧の総件数が一致しません。')
+            elif chain=='成城石井':
+                d=json.loads(text);total=d['count']['total'];raw=len(d['items'])
+                if not 0<total<=500:raise AppError('成城石井東京都検索の件数が不正です。')
+                for offset in range(100,total,100):
+                    t=_v250_fetch_official(job,url.replace('offset=0','offset='+str(offset)));pd=json.loads(t)
+                    if pd['count']['total']!=total:raise AppError('成城石井公式一覧の件数が取得中に変わりました。')
+                    raw+=len(pd['items']);entries+=_v257_parse_catalog(t,chain,url)
+                if raw!=total:raise AppError('成城石井公式一覧の総件数が一致しません。')
+            elif chain=='サミット':
+                records=json.loads(text);page=1;ids=[r['id'] for r in records]
+                while len(records)==100:
+                    page+=1
+                    if page>10:raise AppError('サミット公式一覧のページ数が上限を超えています。')
+                    t=_v250_fetch_official(job,url.rsplit('&page=',1)[0]+'&page='+str(page));records=json.loads(t)
+                    if not isinstance(records,list):raise AppError('サミット公式一覧のページ形式が不正です。')
+                    ids.extend(r['id'] for r in records)
+                    if records:entries+=_v257_parse_catalog(t,chain,url)
+                if len(ids)!=len(set(ids)):raise AppError('サミット公式一覧のページに重複があります。')
+        if len({r['url']+'|'+r['name'] for r in entries})!=len(entries):raise AppError(chain+'公式一覧のページ間に重複があります。')
+        cache[chain]=entries
+        job.log('','official_catalog_verified',chain=chain,count=len(entries),endpoint=url)
+        if chain in ('三徳','そうてつローゼン'):job.log('','official_publisher_catalog',chain=chain,endpoint=url,message='公式サイトのメンテナンスに対応するチラシ掲載情報。店舗名・住所・店舗座標を照合します。')
+    rows=[dict(r) for r in cache[chain] if r['ward']==ward]
+    job.log(ward,'official_ward_candidates',chain=chain,count=len(rows),catalog_count=len(cache[chain]),complete=not getattr(job,'_v255_catalog_errors',{}).get(chain))
+    return rows
+
+
+def _v257_resolve_store(job,candidate,ward):
+    c=dict(candidate);chain=c['chain'];source=c['url'];basis='公式店舗一覧の公開店舗座標'
+    if c.get('directory_point'):point=(*c['directory_point'],basis)
+    else:
+        if chain=='そうてつローゼン':
+            # This published flyer entry is joined by exact branch and full house address.
+            if c['name']!='そうてつローゼン 品川南大井店' or _v256_postal_key(c['address'])!=_v256_postal_key('東京都品川区南大井4丁目14番6号'):raise AppError('ローゼン掲載店舗の座標確認先が未確認です。')
+            source='https://chirashi.kurashiru.com/stores/379bd20f-3feb-4424-9921-0d40a07e0f8d'
+        text=_v250_fetch_official(job,source);s=BeautifulSoup(text,'html.parser')
+        _v256_confirm_address(s,c,ward)
+        visible=unicodedata.normalize('NFKC',s.get_text(' ',strip=True)).replace('德','徳')
+        branch=unicodedata.normalize('NFKC',c.get('branch') or c['name']).replace('德','徳')
+        if re.sub(r'\s+','',branch) not in re.sub(r'\s+','',visible):raise AppError('店舗詳細の店名が一致しません。')
+        if re.search(r'(?:当店|この店舗|本店舗).{0,20}(?:閉店しました|営業を終了)',visible):raise AppError('店舗詳細に閉店の記載があります。')
+        point=_v256_point(s,c['name'])
+        if not point and chain=='いなげや':
+            nodes=s.select('[store_lat][store_lng]')
+            if len(nodes)==1:point=(float(nodes[0]['store_lat']),float(nodes[0]['store_lng']),'公式店舗ページの公開店舗座標')
+        if not point and chain=='東急ストア':
+            ids=set(re.findall(r'\bshopId\s*:\s*[\'\"]?(\d{1,9})',text))
+            if len(ids)!=1:raise AppError('東急ストア公式ページのチラシ掲載先が一意ではありません。')
+            source='https://www.shufoo.net/pntweb/shopDetail/'+next(iter(ids))+'/'
+            partner=BeautifulSoup(_v250_fetch_official(job,source),'html.parser')
+            _v256_confirm_address(partner,c,ward)
+            def store_key(value):return re.sub(r'東急ストア|[\s店]','',normal(value))
+            points=[]
+            for tag in partner.select('script[type="application/ld+json"]'):
+                try:doc=json.loads(tag.get_text())
+                except (TypeError,ValueError):continue
+                for node in json_nodes(doc):
+                    if isinstance(node,dict) and isinstance(node.get('geo'),dict) and store_key(node.get('name',''))==store_key(c['name']):
+                        try:points.append((float(node['geo']['latitude']),float(node['geo']['longitude'])))
+                        except (KeyError,TypeError,ValueError):pass
+            points=list(set(points))
+            if len(points)!=1:raise AppError('東急ストア公式掲載チラシの店名・店舗座標を確認できません。')
+            point=(*points[0],'公式ページのチラシID・店名・番地と掲載店舗座標を照合')
+        if not point:raise AppError('店舗座標を一意に確認できません。町の代表点は使用しません。')
+    lat,lng,_=point
+    if not (35.50<=lat<=35.95 and 139.50<=lng<=139.98):raise AppError('店舗座標が対象範囲外です。')
+    row=_v255_store_row(c,ward,point)
+    if re.search(r'BL[ΛA]NDE|キッチンコート|プレッセ',c['name'],re.I):
+        row['price_label']=_V246_PRICE_LABELS[5];row['color']=_V246_PRICE_COLORS[5]
+    if chain in ('三徳','そうてつローゼン'):
+        row['verification']='公式チラシ掲載店舗の店名・住所・店舗座標照合済み';row['position_basis']='チラシ掲載店舗の公開座標（店名・住所照合）'
+    if source!=c['url']:row['position_source_url']=source
+    return row
+
+
+_V250_OFFICIAL_CHAINS+=_V257_NEW_CHAINS
+_V250_OFFICIAL_HOSTS=frozenset(set(_V250_OFFICIAL_HOSTS)|{p[0] for p in _V257_PATTERNS.values()}|{'chirashi.kurashiru.com'})
+
+
 def _v250_supplement_supermarkets(job,ward,rows):
     official=[];coverage=[];unresolved=[]
     for chain in _V250_OFFICIAL_CHAINS:
@@ -15660,7 +15925,9 @@ def _v250_supplement_supermarkets(job,ward,rows):
             for candidate in candidates:
                 if job.stop.is_set():raise SearchCancelled()
                 try:
-                    if chain in _V256_NEW_CHAINS:
+                    if chain in _V257_NEW_CHAINS:
+                        row=_v257_resolve_store(job,candidate,ward)
+                    elif chain in _V256_NEW_CHAINS:
                         row=_v256_resolve_store(job,candidate,ward)
                     elif chain in _V255_NEW_CHAINS:
                         row=_v255_resolve_store(job,candidate,ward)
@@ -15687,7 +15954,7 @@ def _v250_supplement_supermarkets(job,ward,rows):
             job.log(ward,'official_directory_failed',chain=chain,url=url,error_type=type(exc).__name__,message=str(exc)[:400])
         coverage.append(report)
     merged,added,matched=_v250_merge_supermarkets(rows,official)
-    stats={'official_catalog_version':256,'official_complete':all(r['complete'] for r in coverage),
+    stats={'official_catalog_version':257,'official_complete':all(r['complete'] for r in coverage),
         'official_coverage':coverage,'official_added':added,'official_matched':matched,'official_unresolved':unresolved}
     job.log(ward,'official_supplement_completed',**stats)
     return merged,stats
@@ -15736,7 +16003,7 @@ class _V246EquipmentJob:
                     self.log(ward,'saved_data_loaded',found=bool(previous),count=len(previous['rows']) if previous else 0,scope='all_saved' if load_only else 'selected')
                     if previous:
                         with self.lock:self.data[ward]=previous
-                    if load_only or (previous and not force and previous.get('stats',{}).get('osm_query_version')==252 and previous.get('stats',{}).get('osm_complete') is True and previous.get('stats',{}).get('official_catalog_version')==256 and previous.get('stats',{}).get('official_complete') is True):
+                    if load_only or (previous and not force and previous.get('stats',{}).get('osm_query_version')==252 and previous.get('stats',{}).get('osm_complete') is True and previous.get('stats',{}).get('official_catalog_version')==257 and previous.get('stats',{}).get('official_complete') is True):
                         completed=bool(previous and (previous.get('stats') or {}).get('osm_complete') is True and (previous.get('stats') or {}).get('official_complete') is True)
                         with self.lock:self.progress[ward]={'状態':('完了' if completed else '補完一部未完了') if previous else '未取得','保存件数':len(previous['rows']) if previous else 0,'詳細':'保存結果を読み込みました' if previous else '保存結果はありません'}
                         continue
@@ -15816,7 +16083,7 @@ if(rows.length)map.fitBounds(rows.map(s=>[s.lat,s.lng]),{padding:[20,20],maxZoom
 def _v251_equipment_panel_body():
     st.subheader('スーパーの位置情報を取得')
     job=_v246_equipment_job();snap=job.snapshot()
-    st.caption('OSMに加え、19チェーンの公式店舗情報を照合・補完して保存します。全店舗の網羅は保証しません。住まいの地図では再検索しません。')
+    st.caption('OSMに加え、34チェーンの公式店舗情報・公式チラシ掲載情報を照合・補完して保存します。全店舗の網羅は保証しません。住まいの地図では再検索しません。')
     wards=st.multiselect('取得する区',list(TOKYO_WARDS.values()),default=['品川区','港区'],key='equipment_wards_v246',disabled=snap['running'])
     force=st.checkbox('完了した区も再取得する',key='equipment_force_v246',disabled=snap['running'])
     if st.button('選択した区のスーパーを取得・再開',key='equipment_start_v246',type='primary',disabled=snap['running'] or not wards,use_container_width=True):
