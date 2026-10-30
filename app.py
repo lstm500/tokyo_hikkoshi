@@ -52,7 +52,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v268"
+BUILD = "REBUILD-01-v269"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -15159,6 +15159,7 @@ def _v250_directory_candidates(text,url,chain,ward):
 
 
 def _v254_official_candidates(job,url,chain,ward):
+    if chain in _V269_CHAINS:return _v269_candidates(job,chain,ward)
     if chain in _V268_CHAINS:return _v268_candidates(job,chain,ward)
     if chain=='オーケー':return _v266_ok_candidates(job,ward)
     if chain in _V257_NEW_CHAINS:return _v257_candidates(job,chain,ward)
@@ -15557,7 +15558,7 @@ def _v256_address(text):
     return re.split(r'TEL[:：]?|FAX[:：]?|電話|営業時間',match.group(0),maxsplit=1)[0] if match else ''
 
 
-def _v256_parse_catalog(text,chain,url):
+def _v256_parse_catalog(text,chain,url,verify_total=True):
     soup=BeautifulSoup(text,'html.parser');out=[];expected=None
     def add(name,address,target,node=None,ward_hint='',branch=''):
         name=normal(name);address=_v256_address(address) if address else ''
@@ -15652,7 +15653,7 @@ def _v256_parse_catalog(text,chain,url):
             if not link or not address:raise AppError('イオン公式一覧の店舗区画を確認できません。')
             add(link.get_text(' ',strip=True),address.get_text(' ',strip=True),link['href'])
     else:raise AppError('未対応のチェーンです。')
-    if not out or (expected is not None and len(out)!=expected) or len({r['url']+'|'+r['name'] for r in out})!=len(out):
+    if not out or (verify_total and expected is not None and len(out)!=expected) or len({r['url']+'|'+r['name'] for r in out})!=len(out):
         raise AppError(chain+'公式一覧の取得件数・重複を確認できません。')
     for r in out:
         if r.get('directory_point')==(None,None):r['directory_point']=None
@@ -16023,6 +16024,91 @@ _V250_OFFICIAL_HOSTS=frozenset(set(_V250_OFFICIAL_HOSTS)|{p[0] for p in _V257_PA
 
 
 
+
+# v269: second map price band, with completeness and store identity checks.
+_V269_CHAINS=('ベイシア','ジャパンミート','生鮮市場TOP','ベルク','ベルクス','西友')
+
+
+def _v269_catalog_count(text,chain):
+    soup=BeautifulSoup(text,'html.parser')
+    if chain=='西友':
+        match=re.search(r'検索結果[:：]\s*([\d,]+)件',normal(soup.get_text(' ',strip=True)))
+        if not match:raise AppError('西友公式一覧の総件数を確認できません。')
+        return int(match.group(1).replace(',','')),'official_total'
+    if chain=='ベイシア':
+        heading=soup.select_one('#prefecture13');root=heading.find_next_sibling('table') if heading else None
+        nodes=[r for r in root.select('tr') if r.find('td')] if root else []
+    elif chain=='ジャパンミート':nodes=soup.select('table.shop_tbl tr')
+    elif chain=='生鮮市場TOP':nodes=soup.select('#tokyo tbody tr')
+    elif chain=='ベルクス':nodes=soup.select('#tab01 .stores__item')
+    else:
+        total=re.search(r'全\s*([\d,]+)\s*店舗',normal(soup.get_text(' ',strip=True)))
+        if not total or len(soup.select('.m-box-store__lstItm'))!=int(total.group(1).replace(',','')):
+            raise AppError('ベルク公式一覧の全店舗数が一致しません。')
+        heading=next((h for h in soup.select('h2') if normal(h.get_text())=='東京都'),None)
+        root=heading.find_parent(class_='m-box-type6') if heading else None
+        nodes=root.select('.m-box-store__lstItm') if root else []
+    if not nodes:raise AppError(chain+'公式東京都一覧の店舗区画を確認できません。')
+    return len(nodes),'official_tokyo_store_cards'
+
+
+def _v269_candidates(job,chain,ward):
+    cache=getattr(job,'_v255_catalog_cache',None)
+    if cache is None:cache={};job._v255_catalog_cache=cache
+    audits=getattr(job,'_v269_catalog_audits',None)
+    if audits is None:audits={};job._v269_catalog_audits=audits
+    if chain not in cache:
+        base=_V256_DIRECTORIES[chain];pending=[base];seen=set();entries=[];expected=None;basis=''
+        while pending:
+            url=pending.pop(0)
+            if url in seen:continue
+            if len(seen)>=20:raise AppError(chain+'公式一覧のページ数が上限を超えました。')
+            seen.add(url);text=_v250_fetch_official(job,url);count,basis=_v269_catalog_count(text,chain)
+            if basis=='official_total':
+                if expected is not None and count!=expected:raise AppError(chain+'公式一覧のページ間で総件数が一致しません。')
+                expected=count
+            else:expected=(expected or 0)+count
+            entries.extend(_v256_parse_catalog(text,chain,url,verify_total=False))
+            soup=BeautifulSoup(text,'html.parser')
+            for link in soup.select('a[rel~="next"],a.next,.pagination a[href],.pager a[href],a.page-numbers[href]'):
+                target=urljoin(url,html.unescape(link.get('href','')));u=urlparse(target);origin=urlparse(base)
+                if not link.get('href') or u.scheme!='https' or u.hostname!=origin.hostname or u.username or u.password or u.port not in (None,443):continue
+                if target not in pending and target not in seen:pending.append(target)
+        if expected!=len(entries) or len({r['url'] for r in entries})!=len(entries):
+            raise AppError(chain+'公式一覧の全ページ件数・重複を確認できません（'+str(len(entries))+'/'+str(expected)+'件）。')
+        audit={'chain':chain,'catalog_count':len(entries),'expected':expected,'count_basis':basis,'pages':len(seen),
+            'tokyo23_count':sum(bool(r['ward']) for r in entries),'checked_at':utc_now(),'complete':True}
+        audits[chain]=audit;cache[chain]=entries
+        job.log('','official_catalog_verified',endpoint=base,**audit)
+    rows=[dict(r) for r in cache[chain] if r['ward']==ward]
+    job.log(ward,'official_ward_candidates',chain=chain,count=len(rows),catalog_count=len(cache[chain]),
+        complete=True,zero_confirmed=not rows)
+    return rows
+
+
+def _v269_resolve_store(job,candidate,ward):
+    if candidate['ward']!=ward or _v255_ward(candidate['address'])!=ward:
+        raise AppError('公式一覧の店舗住所と対象区が一致しません。')
+    text=_v250_fetch_official(job,candidate['url']);soup=BeautifulSoup(text,'html.parser')
+    root=soup.select_one('main') or soup.select_one('article') or soup
+    address=_v256_confirm_address(root,candidate,ward)
+    compact=lambda v:re.sub(r'[\s・ー－-]+','',unicodedata.normalize('NFKC',str(v))).casefold()
+    branch=compact(candidate.get('branch') or candidate['name'])
+    headings=[compact(n.get_text(' ',strip=True)) for n in root.select('h1,h2,h3,.shop_title,.stores__name')]
+    if candidate['chain']=='ベルク':headings.extend(compact(n.get_text(' ',strip=True)) for n in soup.select('h1.l-mv__hdg'))
+    if not branch or not any(branch in heading for heading in headings):
+        raise AppError('公式店舗ページの店舗名が一覧と一致しません。')
+    if re.search(r'(?:当店|この店舗|本店舗).{0,20}(?:閉店しました|営業を終了)',normal(root.get_text(' ',strip=True))):
+        raise AppError('公式店舗ページに閉店の記載があります。')
+    point=_v256_point(root,candidate['name'])
+    if not point and candidate.get('directory_point'):
+        point=(*candidate['directory_point'],'公式一覧の店舗座標（店舗ページの店名・番地照合済み）')
+    if not point:raise AppError('公式店舗の座標を一意に確認できません。町の代表点は使用しません。')
+    row=_v255_store_row(candidate,ward,point);row['address']=address;row['official_catalog_version']=269
+    row['verification']='公式一覧全件・店舗ページの店名・番地・店舗位置照合済み'
+    return row
+
+
 # v268: verified catalogs for all six remaining highest-priority price chains.
 _V268_CHAINS=('ロピア','業務スーパー','トライアル','ビッグ・エー','エイビイ','フーコット')
 
@@ -16205,7 +16291,7 @@ def _v266_saved_official_coverage(job,ward,payload):
 
 def _v250_supplement_supermarkets(job,ward,rows):
     official=[];coverage=[];unresolved=[]
-    for chain in (*_V266_PRIORITY_CHAINS,*(c for c in _V250_OFFICIAL_CHAINS if c not in _V266_PRIORITY_CHAINS)):
+    for chain in (*_V266_PRIORITY_CHAINS,*_V269_CHAINS,*(c for c in _V250_OFFICIAL_CHAINS if c not in (*_V266_PRIORITY_CHAINS,*_V269_CHAINS))):
         if job.stop.is_set():raise SearchCancelled()
         with job.lock:job.status=ward+'：'+chain+'公式店舗を照合中'
         report={'chain':chain,'candidates':0,'verified':0,'unresolved':0,'complete':False}
@@ -16213,14 +16299,16 @@ def _v250_supplement_supermarkets(job,ward,rows):
         try:
             candidates=_v254_official_candidates(job,url,chain,ward)
             report['candidates']=len(candidates)
-            if chain in _V268_CHAINS:
-                audit=getattr(job,'_v268_catalog_audits',{}).get(chain,{})
+            if chain in (*_V268_CHAINS,*_V269_CHAINS):
+                audit=getattr(job,'_v269_catalog_audits' if chain in _V269_CHAINS else '_v268_catalog_audits',{}).get(chain,{})
                 report.update({k:audit[k] for k in ('catalog_count','expected','count_basis','pages','tokyo23_count','checked_at') if k in audit})
                 report['zero_confirmed']=not candidates and bool(audit.get('complete'))
             for candidate in candidates:
                 if job.stop.is_set():raise SearchCancelled()
                 try:
-                    if chain in _V268_CHAINS:
+                    if chain in _V269_CHAINS:
+                        row=_v269_resolve_store(job,candidate,ward)
+                    elif chain in _V268_CHAINS:
                         row=_v268_resolve_store(job,candidate,ward)
                     elif chain in _V257_NEW_CHAINS:
                         row=_v257_resolve_store(job,candidate,ward)
@@ -16251,7 +16339,7 @@ def _v250_supplement_supermarkets(job,ward,rows):
             job.log(ward,'official_directory_failed',chain=chain,url=url,error_type=type(exc).__name__,message=str(exc)[:400])
         coverage.append(report)
     merged,added,matched=_v250_merge_supermarkets(rows,official)
-    stats={'official_catalog_version':268,'priority_complete':all(r['complete'] for r in coverage if r['chain'] in _V266_PRIORITY_CHAINS),'official_complete':all(r['complete'] for r in coverage),
+    stats={'official_catalog_version':269,'tier2_complete':all(r['complete'] for r in coverage if r['chain'] in _V269_CHAINS),'priority_complete':all(r['complete'] for r in coverage if r['chain'] in _V266_PRIORITY_CHAINS),'official_complete':all(r['complete'] for r in coverage),
         'official_coverage':coverage,'official_added':added,'official_matched':matched,'official_unresolved':unresolved}
     job.log(ward,'official_supplement_completed',**stats)
     return merged,stats
@@ -16276,7 +16364,7 @@ class _V246EquipmentJob:
             self.running=True;self.stop.clear();self.wards=wards;self.status='保存結果を確認中'
             self.logs=[];self.dropped_logs=0;self.log_saved=False;self.log_error='';self.started_at=utc_now();self.run_id=hashlib.sha256(os.urandom(32)).hexdigest()[:24]
             self.progress={w:{'状態':'待機','保存件数':0,'詳細':''} for w in wards}
-            self._v252_osm_pause={};self._v252_official_pause={};self._v250_http_cache={};self._v250_host_starts={};self._v255_catalog_cache={};self._v255_catalog_errors={};self._v268_catalog_audits={}
+            self._v252_osm_pause={};self._v252_official_pause={};self._v250_http_cache={};self._v250_host_starts={};self._v255_catalog_cache={};self._v255_catalog_errors={};self._v268_catalog_audits={};self._v269_catalog_audits={}
         threading.Thread(target=self.run,args=(wards,force,load_only),daemon=True,name='equipment-manual-v246').start();return True
     def run(self,wards,force=False,load_only=False):
         try:
@@ -16300,7 +16388,7 @@ class _V246EquipmentJob:
                     self.log(ward,'saved_data_loaded',found=bool(previous),count=len(previous['rows']) if previous else 0,scope='all_saved' if load_only else 'selected')
                     if previous:
                         with self.lock:self.data[ward]=previous
-                    if load_only or (previous and not force and previous.get('stats',{}).get('osm_query_version')==252 and previous.get('stats',{}).get('osm_complete') is True and previous.get('stats',{}).get('official_catalog_version')==268 and previous.get('stats',{}).get('official_complete') is True):
+                    if load_only or (previous and not force and previous.get('stats',{}).get('osm_query_version')==252 and previous.get('stats',{}).get('osm_complete') is True and previous.get('stats',{}).get('official_catalog_version')==269 and previous.get('stats',{}).get('official_complete') is True):
                         if previous:_v266_saved_official_coverage(self,ward,previous)
                         completed=bool(previous and (previous.get('stats') or {}).get('osm_complete') is True and (previous.get('stats') or {}).get('official_complete') is True)
                         with self.lock:self.progress[ward]={'状態':('完了' if completed else '補完一部未完了') if previous else '未取得','保存件数':len(previous['rows']) if previous else 0,'詳細':'保存結果を読み込みました' if previous else '保存結果はありません'}
