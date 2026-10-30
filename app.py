@@ -52,7 +52,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v252"
+BUILD = "REBUILD-01-v254"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -14841,15 +14841,20 @@ def _v246_parse(doc,ward):
     return sorted(rows,key=lambda r:(r['name'],r['id'])),{'excluded':rejected,'duplicates':duplicates,'rejections':rejections,'rejections_truncated':truncated}
 
 
+def _v253_validate_saved(payload,ward):
+    if not isinstance(payload,dict):raise AppError('スーパーの保存結果を読み取れません。')
+    rows=payload.get('rows')
+    if payload.get('schema')!=246 or payload.get('ward')!=ward or not isinstance(rows,list) or payload.get('digest')!=_v246_digest(rows):
+        raise AppError('スーパーの保存データの整合性を確認できません。')
+    return payload
+
+
 def _v246_load(db,ward):
     records=db.call('GET',SEARCH_TABLE,{'namespace':'eq.'+db.namespace,'id':'eq.'+_v246_record_id(ward),
         'status':'eq.equipment_supermarket_v246','select':'summary','limit':1})
     if not isinstance(records,list):raise AppError('スーパーの保存結果を読み取れません。')
     if not records:return None
-    payload=records[0].get('summary') or {};rows=payload.get('rows')
-    if payload.get('schema')!=246 or payload.get('ward')!=ward or not isinstance(rows,list) or payload.get('digest')!=_v246_digest(rows):
-        raise AppError('スーパーの保存データの整合性を確認できません。')
-    return payload
+    return _v253_validate_saved(records[0].get('summary'),ward)
 
 
 def _v246_save(db,ward,rows,stats):
@@ -14927,7 +14932,7 @@ _V250_OFFICIAL_HOSTS=frozenset(('store.lifecorp.jp','www.mybasket.co.jp','www.ma
 
 def _v250_directory_url(chain,ward):
     if chain=='ライフ':return 'https://store.lifecorp.jp/'+quote('東京都')+'/'+quote(ward)+'/'
-    if chain=='まいばすけっと':return 'https://www.mybasket.co.jp/shop/'
+    if chain=='まいばすけっと':return 'https://www.mybasket.co.jp/shop/index.html?p_prefectures='+quote('東京都')+'&p_municipalities='+quote(ward)
     if chain=='マルエツ':return 'https://www.maruetsu.co.jp/store/shop_area/tokyo/'
     return 'https://ok-corporation.jp/shop/field/pref/eq/'+quote('東京都')+'/_and_/town/lk/'+quote(ward)+'/'
 
@@ -15002,9 +15007,9 @@ def _v250_directory_candidates(text,url,chain,ward):
                 if len(detail_urls)<=1:chosen=node;break
             node=node.parent
         if chosen is None:continue
-        name_node=chosen.select_one('h2,h3,h4,.__name,.rt_cf_s_tenpo_nm_kanji')
+        name_node=chosen.select_one('.c-list-store__head-link,h2,h3,h4,.__name,.rt_cf_s_tenpo_nm_kanji')
         name=normal(name_node.get_text(' ',strip=True) if name_node else anchor.get_text(' ',strip=True))
-        if not name or name in ('詳しく見る','店舗詳細','詳細はこちら'):continue
+        if not name or name in ('詳しく見る','店舗詳細','詳細はこちら','地図を見る','チラシを見る'):continue
         address_node=chosen.select_one('.rt_cf_s_tenpo_jusho,[itemprop="streetAddress"]')
         address=_v250_address(address_node.get_text(' ',strip=True) if address_node else normal(chosen.get_text(' ',strip=True)),ward)
         if address:out[target]={'url':target,'name':name,'address':address,'chain':chain}
@@ -15037,6 +15042,24 @@ def _v250_directory_candidates(text,url,chain,ward):
     return list(out.values())
 
 
+def _v254_official_candidates(job,url,chain,ward):
+    text=_v250_fetch_official(job,url)
+    if chain!='まいばすけっと':return _v250_directory_candidates(text,url,chain,ward)
+    visible=normal(BeautifulSoup(text,'html.parser').get_text(' ',strip=True))
+    match=re.search(r'検索した結果\s*([\d,]+)\s*件',visible)
+    if not match:raise AppError('まいばすけっと公式検索の総件数を確認できません。')
+    total=int(match.group(1).replace(',',''))
+    if total>600:raise AppError('まいばすけっとの区別検索が絞り込まれていません。')
+    out={};pages=max(1,(total+29)//30)
+    for page in range(pages):
+        page_url=url if page==0 else url+'&rt_bn_search_list_skip='+str(page*30)
+        page_text=text if page==0 else _v250_fetch_official(job,page_url)
+        for row in _v250_directory_candidates(page_text,page_url,chain,ward):out[row['url']]=row
+    if len(out)!=total:raise AppError('まいばすけっと公式検索の総件数と取得件数が一致しません（'+str(len(out))+'/'+str(total)+'件）。')
+    job.log(ward,'official_directory_pages_verified',chain=chain,pages=pages,count=len(out))
+    return list(out.values())
+
+
 def _v250_point_from_official(soup,text,name):
     points=[]
     def add(lat,lng,basis):
@@ -15044,6 +15067,14 @@ def _v250_point_from_official(soup,text,name):
             lat,lng=float(lat),float(lng)
             if 35.50<=lat<=35.95 and 139.50<=lng<=139.98:points.append((lat,lng,basis))
         except (TypeError,ValueError):pass
+    # MyBasket publishes these values for the map; pin coordinates take precedence.
+    if soup.select_one('.rt_cf_s_tenpo_nm_kanji,.js-map'):
+        for lat_key,lng_key in (('pin_hokui','pin_tokei'),('zahyo_hokui','zahyo_tokei')):
+            lat_node=soup.select_one('.rt_cf_s_tenpo_'+lat_key);lng_node=soup.select_one('.rt_cf_s_tenpo_'+lng_key)
+            if lat_node and lng_node:
+                before=len(points)
+                add(lat_node.get_text(strip=True),lng_node.get_text(strip=True),'公式店舗ページの公開店舗座標')
+                if len(points)>before:break
     for script in soup.select('script[type="application/ld+json"]'):
         try:document=json.loads(script.get_text())
         except (ValueError,TypeError):continue
@@ -15071,7 +15102,8 @@ def _v250_point_from_official(soup,text,name):
 
 def _v250_parse_official_detail(text,candidate,ward):
     soup=BeautifulSoup(text,'html.parser');root=soup.select_one('main') or soup
-    heading=root.select_one('h1') or root.select_one('h2')
+    headings=[n for n in root.select('h1,h2') if normal(n.get_text(' ',strip=True))]
+    heading=next((n for n in headings if any(t in n.get_text() for t in (candidate['chain'],'リンコス'))),headings[0] if headings else None)
     name=normal(heading.get_text(' ',strip=True)) if heading else candidate['name']
     if name in ('店舗情報','店舗詳細','店舗・チラシ','店舗・チラシ情報'):name=candidate['name']
     if not any(token in name for token in (candidate['chain'],'リンコス')):
@@ -15094,6 +15126,12 @@ def _v250_parse_official_detail(text,candidate,ward):
                 texts.append(sibling.get_text(' ',strip=True) if hasattr(sibling,'get_text') else str(sibling))
             address=_v250_address(normal(' '.join(texts)),ward)
         if address:break
+    if not address and candidate['chain']=='マルエツ':
+        for item in root.select('.c-block-detail-content__item'):
+            label=item.select_one('.c-block-detail-content__item-lead')
+            if label and re.sub(r'\s+','',label.get_text())=='住所':
+                address=_v250_address(item.get_text(' ',strip=True),ward)
+                if address:break
     if not address:
         node=root.select_one('.rt_cf_s_tenpo_jusho,[itemprop="streetAddress"]')
         if node:address=_v250_address(node.get_text(' ',strip=True),ward)
@@ -15142,7 +15180,7 @@ def _v250_supplement_supermarkets(job,ward,rows):
         report={'chain':chain,'candidates':0,'verified':0,'unresolved':0,'complete':False}
         url=_v250_directory_url(chain,ward)
         try:
-            candidates=_v250_directory_candidates(_v250_fetch_official(job,url),url,chain,ward)
+            candidates=_v254_official_candidates(job,url,chain,ward)
             report['candidates']=len(candidates)
             for candidate in candidates:
                 if job.stop.is_set():raise SearchCancelled()
@@ -15167,7 +15205,7 @@ def _v250_supplement_supermarkets(job,ward,rows):
             job.log(ward,'official_directory_failed',chain=chain,url=url,error_type=type(exc).__name__,message=str(exc)[:400])
         coverage.append(report)
     merged,added,matched=_v250_merge_supermarkets(rows,official)
-    stats={'official_catalog_version':250,'official_complete':all(r['complete'] for r in coverage),
+    stats={'official_catalog_version':254,'official_complete':all(r['complete'] for r in coverage),
         'official_coverage':coverage,'official_added':added,'official_matched':matched,'official_unresolved':unresolved}
     job.log(ward,'official_supplement_completed',**stats)
     return merged,stats
@@ -15179,13 +15217,13 @@ class _V246EquipmentJob:
         self.progress={};self.data={};self.logs=[];self.wards=[];self.run_id='';self.started_at='';self.log_saved=False;self.log_error='';self.dropped_logs=0
     def snapshot(self):
         with self.lock:return {'running':self.running,'status':self.status,'progress':{k:dict(v) for k,v in self.progress.items()},
-            'log_saved':self.log_saved,'log_error':self.log_error,'wards':list(self.wards),'count':sum(len(self.data.get(w,{}).get('rows',[])) for w in self.wards)}
+            'log_saved':self.log_saved,'log_error':self.log_error,'wards':list(self.wards),'count':sum(len(payload.get('rows',[])) for payload in self.data.values())}
     def log(self,ward,stage,**detail):
         with self.lock:
             self.logs.append(dict(time=utc_now(),ward=ward,stage=stage,**detail))
             if len(self.logs)>1000:self.dropped_logs+=1;self.logs=self.logs[-1000:]
     def start(self,wards,force=False,load_only=False):
-        wards=list(dict.fromkeys(w for w in wards if w in TOKYO_WARDS.values()))
+        wards=list(TOKYO_WARDS.values()) if load_only else list(dict.fromkeys(w for w in wards if w in TOKYO_WARDS.values()))
         if not wards:return False
         with self.lock:
             if self.running:return False
@@ -15197,15 +15235,28 @@ class _V246EquipmentJob:
     def run(self,wards,force=False,load_only=False):
         try:
             db=Database()
+            if load_only:
+                # One storage read for all wards; selection only limits new collection.
+                ids=','.join(_v246_record_id(w) for w in wards)
+                records=db.call('GET',SEARCH_TABLE,{'namespace':'eq.'+db.namespace,
+                    'status':'eq.equipment_supermarket_v246','id':'in.('+ids+')',
+                    'select':'id,summary','limit':len(TOKYO_WARDS)})
+                if not isinstance(records,list):raise AppError('スーパーの保存結果を読み取れません。')
+                saved={r.get('id'):r.get('summary') for r in records if isinstance(r,dict)}
             for ward in wards:
                 if self.stop.is_set():break
                 with self.lock:self.status=ward+'：保存結果を確認中';self.progress[ward]['状態']='確認中'
                 try:
-                    previous=_v246_load(db,ward)
+                    if load_only:
+                        previous=saved.get(_v246_record_id(ward))
+                        if previous is not None:_v253_validate_saved(previous,ward)
+                    else:previous=_v246_load(db,ward)
+                    self.log(ward,'saved_data_loaded',found=bool(previous),count=len(previous['rows']) if previous else 0,scope='all_saved' if load_only else 'selected')
                     if previous:
                         with self.lock:self.data[ward]=previous
-                    if load_only or (previous and not force and previous.get('stats',{}).get('osm_query_version')==252 and previous.get('stats',{}).get('osm_complete') is True and previous.get('stats',{}).get('official_catalog_version')==250 and previous.get('stats',{}).get('official_complete') is True):
-                        with self.lock:self.progress[ward]={'状態':'完了' if previous else '未取得','保存件数':len(previous['rows']) if previous else 0,'詳細':'保存結果を読み込みました' if previous else '保存結果はありません'}
+                    if load_only or (previous and not force and previous.get('stats',{}).get('osm_query_version')==252 and previous.get('stats',{}).get('osm_complete') is True and previous.get('stats',{}).get('official_catalog_version')==254 and previous.get('stats',{}).get('official_complete') is True):
+                        completed=bool(previous and (previous.get('stats') or {}).get('osm_complete') is True and (previous.get('stats') or {}).get('official_complete') is True)
+                        with self.lock:self.progress[ward]={'状態':('完了' if completed else '補完一部未完了') if previous else '未取得','保存件数':len(previous['rows']) if previous else 0,'詳細':'保存結果を読み込みました' if previous else '保存結果はありません'}
                         continue
                     if self.stop.is_set():break
                     with self.lock:self.status=ward+'：スーパーを取得中';self.progress[ward]['状態']='取得中'
@@ -15261,7 +15312,7 @@ class _V246EquipmentJob:
                     with self.lock:self.log_error=str(exc)[:300];self.log_saved=False
             with self.lock:self.running=False
     def rows(self):
-        with self.lock:return [dict(r) for w in self.wards for r in self.data.get(w,{}).get('rows',[])]
+        with self.lock:return [dict(r) for payload in self.data.values() for r in payload.get('rows',[])]
 
 
 def _v246_equipment_job():
@@ -15287,7 +15338,7 @@ def _v251_equipment_panel_body():
     wards=st.multiselect('取得する区',list(TOKYO_WARDS.values()),default=['品川区','港区'],key='equipment_wards_v246',disabled=snap['running'])
     force=st.checkbox('完了した区も再取得する',key='equipment_force_v246',disabled=snap['running'])
     if st.button('選択した区のスーパーを取得・再開',key='equipment_start_v246',type='primary',disabled=snap['running'] or not wards,use_container_width=True):
-        job.start(wards,force=force);st.rerun(scope='fragment')
+        job.start(wards,force=force);st.rerun()
     if st.button('取得を中止（保存済みデータを保持）',key='equipment_stop_v246',disabled=not snap['running']):
         job.stop.set();st.info('中止を受け付けました。通信中の区は通信終了後に保存・確認して停止します。')
     st.caption('通常は完了した区を読み込み、未完了の区から再開します。再取得に失敗しても以前の保存結果は削除しません。')
@@ -15298,8 +15349,8 @@ def _v251_equipment_panel_body():
     if progress:
         st.progress(done/len(progress));st.caption(f'完了 {done}/{len(progress)}区｜読み込んだ店舗 {snap["count"]}件')
         st.dataframe([dict(区=w,**r) for w,r in progress.items()],hide_index=True,use_container_width=True)
-    if st.button('保存したスーパーを読み込む',key='equipment_load_v246',disabled=snap['running'] or not wards):
-        job.start(wards,load_only=True);st.rerun(scope='fragment')
+    if st.button('保存したスーパーを読み込む',key='equipment_load_v246',disabled=snap['running']):
+        job.start(list(TOKYO_WARDS.values()),load_only=True);st.rerun()
     st.caption('取得ログは「設定 → ログ出力」にあります。情報：© OpenStreetMap contributors / ODbL。')
 
 
