@@ -52,7 +52,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v251"
+BUILD = "REBUILD-01-v252"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -14762,6 +14762,8 @@ def _v247_analyze_logs(events):
             if 'Timeout' in kind:add('通信：タイムアウト')
             elif kind!='HTTPError':add('取得・解析：'+kind)
         elif stage=='ward_failed':add('区の処理が未完了')
+        elif stage=='osm_unavailable_official_continues':add('OSM未完了・公式情報の補完継続')
+        elif stage=='osm_endpoint_paused':add('混雑・通信失敗による取得先の一時休止')
         elif stage=='official_directory_failed':add('公式一覧の取得・解析失敗')
         elif stage=='official_store_unresolved':
             add('公式店舗の照合未完了')
@@ -14788,7 +14790,7 @@ def _v246_query(ward):
     if ward not in TOKYO_WARDS.values():raise AppError('東京23区から選択してください。')
     # Resolve only the named ward in the Tokyo bbox; avoid the Tokyo-wide area join.
     return ('[out:json][timeout:60];'
-        'rel["boundary"="administrative"]["admin_level"="8"]["name"="'+ward+'"]'
+        'rel["boundary"="administrative"]["admin_level"="7"]["name"="'+ward+'"]'
         '(35.50,139.50,35.95,139.98)->.r;.r out tags;'
         '.r map_to_area->.w;('
         'nwr(area.w)["shop"="supermarket"];'
@@ -14867,7 +14869,13 @@ def _v248_fetch_supermarkets(job,ward):
     endpoints=('https://overpass-api.de/api/interpreter',
                'https://overpass.private.coffee/api/interpreter')
     failures=[]
+    if not hasattr(job,'_v252_osm_pause'):job._v252_osm_pause={}
     for number,endpoint in enumerate(endpoints,1):
+        remaining=job._v252_osm_pause.get(endpoint,0)-time.monotonic()
+        if remaining>0:
+            failures.append('取得先の一時休止')
+            job.log(ward,'osm_endpoint_paused',endpoint=endpoint,remaining_seconds=round(remaining),reason='前回の混雑・通信失敗')
+            continue
         if job.stop.is_set():return None,{}
         with job.lock:job.status=f'{ward}：スーパーを取得中（取得先{number}/{len(endpoints)}）'
         begin=time.monotonic();response=None
@@ -14901,7 +14909,11 @@ def _v248_fetch_supermarkets(job,ward):
                 error_type=type(exc).__name__,message=str(exc)[:400],
                 elapsed=round(time.monotonic()-begin,2))
             # Do not switch endpoints after an explicit denial or rate limit.
-            if status in (403,429):break
+            if status in (502,503,504) or isinstance(exc,(requests.Timeout,requests.ConnectionError)):
+                job._v252_osm_pause[endpoint]=time.monotonic()+300
+            if status in (403,429):
+                job._v252_osm_pause[endpoint]=time.monotonic()+300
+                break
             if number<len(endpoints) and job.stop.wait(2):return None,{}
     if job.stop.is_set():return None,{}
     raise AppError('位置情報を取得できませんでした。'+'／'.join(failures)+
@@ -14937,6 +14949,8 @@ def _v250_fetch_official(job,url):
     cache=getattr(job,'_v250_http_cache',None)
     if cache is None:cache={};job._v250_http_cache=cache
     if url in cache:return cache[url]
+    failures=getattr(job,'_v252_official_pause',{})
+    if url in failures and failures[url][0]>time.monotonic():raise AppError('公式取得先は前回の通信失敗により一時休止中です：'+failures[url][1])
     original=url
     for _ in range(4):
         u=urlparse(url)
@@ -14945,10 +14959,16 @@ def _v250_fetch_official(job,url):
         starts=getattr(job,'_v250_host_starts',{})
         if job.stop.wait(max(0,starts.get(u.hostname,0)+1-time.monotonic())):raise SearchCancelled()
         starts[u.hostname]=time.monotonic();job._v250_host_starts=starts
-        response=requests.get(url,headers={'User-Agent':'SumaiCompass/250 (manual official store directory verification)'},timeout=(6,20),allow_redirects=False)
+        try:
+            response=requests.get(url,headers={'User-Agent':'SumaiCompass/252 (manual official store directory verification)'},timeout=(6,20),allow_redirects=False)
+        except requests.RequestException as exc:
+            failures[original]=(time.monotonic()+300,type(exc).__name__);job._v252_official_pause=failures
+            raise
         job.log('','official_http_response',endpoint=url,status=response.status_code)
         if response.status_code in (301,302,303,307,308):
             url=urljoin(url,response.headers.get('Location',''));continue
+        if response.status_code in (403,429,502,503,504):
+            failures[original]=(time.monotonic()+300,'HTTP '+str(response.status_code));job._v252_official_pause=failures
         response.raise_for_status()
         if response.status_code!=200:raise AppError('公式店舗ページが正常な応答を返しません。')
         response.encoding=response_encoding(response)
@@ -15172,6 +15192,7 @@ class _V246EquipmentJob:
             self.running=True;self.stop.clear();self.wards=wards;self.status='保存結果を確認中'
             self.logs=[];self.dropped_logs=0;self.log_saved=False;self.log_error='';self.started_at=utc_now();self.run_id=hashlib.sha256(os.urandom(32)).hexdigest()[:24]
             self.progress={w:{'状態':'待機','保存件数':0,'詳細':''} for w in wards}
+            self._v252_osm_pause={};self._v252_official_pause={};self._v250_http_cache={};self._v250_host_starts={}
         threading.Thread(target=self.run,args=(wards,force,load_only),daemon=True,name='equipment-manual-v246').start();return True
     def run(self,wards,force=False,load_only=False):
         try:
@@ -15183,29 +15204,41 @@ class _V246EquipmentJob:
                     previous=_v246_load(db,ward)
                     if previous:
                         with self.lock:self.data[ward]=previous
-                    if load_only or (previous and not force and previous.get('stats',{}).get('official_catalog_version')==250 and previous.get('stats',{}).get('official_complete') is True):
+                    if load_only or (previous and not force and previous.get('stats',{}).get('osm_query_version')==252 and previous.get('stats',{}).get('osm_complete') is True and previous.get('stats',{}).get('official_catalog_version')==250 and previous.get('stats',{}).get('official_complete') is True):
                         with self.lock:self.progress[ward]={'状態':'完了' if previous else '未取得','保存件数':len(previous['rows']) if previous else 0,'詳細':'保存結果を読み込みました' if previous else '保存結果はありません'}
                         continue
                     if self.stop.is_set():break
                     with self.lock:self.status=ward+'：スーパーを取得中';self.progress[ward]['状態']='取得中'
-                    if previous and not force:
-                        rows=[dict(r) for r in previous['rows']];stats=dict(previous.get('stats') or {})
-                    else:
-                        rows,stats=_v248_fetch_supermarkets(self,ward)
-                        if rows is not None and previous:
-                            rows=list({r['id']:dict(r) for r in [*previous['rows'],*rows]}.values())
+                    rows=[dict(r) for r in previous['rows']] if previous else []
+                    stats=dict(previous.get('stats') or {}) if previous else {}
+                    stats['osm_query_version']=252
+                    osm_cached=bool(previous and not force and stats.get('osm_complete') is True and (previous.get('stats') or {}).get('osm_query_version')==252)
+                    if not osm_cached:
+                        try:
+                            acquired,osm_stats=_v248_fetch_supermarkets(self,ward)
+                            if acquired is None:
+                                with self.lock:self.progress[ward]['状態']='中止'
+                                break
+                            rows=list({r['id']:dict(r) for r in [*rows,*acquired]}.values())
+                            stats.update(osm_stats);stats['osm_complete']=True;stats.pop('osm_error',None)
+                        except SearchCancelled:raise
+                        except Exception as exc:
+                            stats['osm_complete']=False;stats['osm_error']=str(exc)[:400]
+                            self.log(ward,'osm_unavailable_official_continues',error_type=type(exc).__name__,message=str(exc)[:400])
                     if rows is None:
                         with self.lock:self.progress[ward]['状態']='中止'
                         break
                     rows,official_stats=_v250_supplement_supermarkets(self,ward,rows)
                     stats.update(official_stats)
+                    if not rows and stats.get('osm_complete') is not True:
+                        raise AppError('OSMと公式情報の両方で店舗を取得できません。以前の保存結果は保持しています。')
                     if self.stop.is_set():
                         with self.lock:self.progress[ward]['状態']='中止'
                         break
                     with self.lock:self.status=ward+'：保存・読み戻し確認中'
                     confirmed=_v246_save(db,ward,rows,stats)
                     with self.lock:
-                        self.data[ward]=confirmed;self.progress[ward]={'状態':'完了' if stats.get('official_complete') else '補完一部未完了','保存件数':len(rows),'詳細':f"公式追加 {stats.get('official_added',0)}件／照合 {stats.get('official_matched',0)}件／未確認 {sum(r.get('unresolved',0) for r in stats.get('official_coverage',[]))}件"}
+                        self.data[ward]=confirmed;self.progress[ward]={'状態':'完了' if stats.get('official_complete') and stats.get('osm_complete') else '補完一部未完了','保存件数':len(rows),'詳細':f"OSM {'確認済み' if stats.get('osm_complete') else '未完了'}／公式追加 {stats.get('official_added',0)}件／公式未完了 {sum(not r.get('complete') for r in stats.get('official_coverage',[]))}社"}
                     self.log(ward,'saved_and_verified',count=len(rows))
                 except SearchCancelled:
                     with self.lock:self.progress[ward]['状態']='中止'
