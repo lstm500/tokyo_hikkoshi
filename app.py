@@ -52,7 +52,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v265"
+BUILD = "REBUILD-01-v268"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -14500,6 +14500,7 @@ def town_choropleth_status():
     state=st.session_state
     supermarket_loader=state.get('_v249_supermarket_loader')
     equipment=state.get('_v246_equipment_job')
+    _v267_prefetch_supermarkets(state)
     if equipment and supermarket_loader and state.get('_v249_supermarket_visible'):
         with equipment.lock:stamp=tuple(sorted((ward,payload.get('updated_at','')) for ward,payload in equipment.data.items()))
         if stamp and stamp!=state.get('_v250_supermarket_saved_stamp') and not supermarket_loader.snapshot()['running']:
@@ -14785,7 +14786,10 @@ def _v251_prepare_log_export(payload,events,error='',warning=''):
     failures=[{'区':r.get('ward',''),'段階':r.get('operation') or r.get('stage',''),'HTTP':r.get('status',''),
         '失敗理由':r.get('message') or r.get('body_preview',''),'取得先':r.get('endpoint') or r.get('url','')}
         for r in events if r.get('stage') in ('fetch_failed','ward_failed','job_failed','official_directory_failed','official_store_unresolved')]
-    export={'run':payload,'events':events,'analysis':summary,'excluded_candidates':excluded,
+    saved_coverage=[r for r in events if r.get('stage')=='saved_official_coverage']
+    export={'run':payload,'events':events,'saved_official_coverage':saved_coverage,
+        'collection_performed':any(r.get('stage') in ('http_response','official_http_response','official_supplement_completed') for r in events),
+        'analysis':summary,'excluded_candidates':excluded,
         'log_persistence_error':error,'integrity_warning':warning}
     return {'summary':summary,'excluded':excluded,'failures':failures,'warning':warning,
         'json':json.dumps(export,ensure_ascii=False,indent=2,default=str).encode('utf-8'),
@@ -15155,6 +15159,8 @@ def _v250_directory_candidates(text,url,chain,ward):
 
 
 def _v254_official_candidates(job,url,chain,ward):
+    if chain in _V268_CHAINS:return _v268_candidates(job,chain,ward)
+    if chain=='オーケー':return _v266_ok_candidates(job,ward)
     if chain in _V257_NEW_CHAINS:return _v257_candidates(job,chain,ward)
     if chain in _V256_NEW_CHAINS:return _v256_candidates(job,chain,ward)
     if chain in _V255_NEW_CHAINS:return _v255_candidates(job,chain,ward)
@@ -15318,7 +15324,7 @@ def _v255_detail_url(url,chain):
             values=parse_qs(u.query)
             if set(values)=={'sh_id'} and len(values['sh_id'])==1 and values['sh_id'][0].isdigit():
                 return u._replace(fragment='').geturl()
-        patterns={'ロピア':(('lopia.jp',r'/shops/?'),('www.supervalue.jp',r'/shop/detail/\d+/?')),
+        patterns={'ロピア':(('lopia.jp',r'/shops(?:/[a-zA-Z0-9_-]+)?/?'),('www.supervalue.jp',r'/shop/detail/\d+/?')),
             'トライアル':(('www.trial-net.co.jp',r'/shops/\d+/?'),),
             'ビッグ・エー':(('www.biga.co.jp',r'/shop/[^/]+/?'),),
             'エイビイ':(('www.ave.gr.jp',r'/shop/?'),)}
@@ -15354,7 +15360,7 @@ def _v255_map_point(soup,name):
     return next(iter(found.values())) if len(found)==1 else None
 
 
-def _v255_parse_catalog(text,chain,url):
+def _v255_parse_catalog(text,chain,url,verify_total=True):
     soup=BeautifulSoup(text,'html.parser');entries=[];expected=None
     def add(node,name,address,target,point=None):
         name=normal(name);address=_v255_address(address);target=_v255_detail_url(target,chain)
@@ -15408,9 +15414,11 @@ def _v255_parse_catalog(text,chain,url):
         for node in group.find_all('li',recursive=False):
             title=node.select_one('dt');address=node.select_one('dd')
             if not title or not address or not node.get('id'):raise AppError('ロピア公式一覧の店舗区画を確認できません。')
-            add(node,title.get_text(' ',strip=True),address.get_text(' ',strip=True),url+'#'+node['id'],_v255_map_point(node,title.get_text()))
+            link=node.select_one('a[href]')
+            target=urljoin(url,link['href']) if link else url+'#'+node['id']
+            add(node,title.get_text(' ',strip=True),address.get_text(' ',strip=True),target,_v255_map_point(node,title.get_text()))
     else:raise AppError('未対応の公式店舗一覧です。')
-    if expected is None or expected!=len(entries) or len({e['url']+e['name'] for e in entries})!=len(entries):
+    if expected is None or (verify_total and expected!=len(entries)) or len({e['url']+e['name'] for e in entries})!=len(entries):
         raise AppError(chain+'公式一覧の件数と解析件数が一致しません。')
     return entries
 
@@ -16014,9 +16022,190 @@ _V250_OFFICIAL_CHAINS+=_V257_NEW_CHAINS
 _V250_OFFICIAL_HOSTS=frozenset(set(_V250_OFFICIAL_HOSTS)|{p[0] for p in _V257_PATTERNS.values()}|{'chirashi.kurashiru.com'})
 
 
+
+# v268: verified catalogs for all six remaining highest-priority price chains.
+_V268_CHAINS=('ロピア','業務スーパー','トライアル','ビッグ・エー','エイビイ','フーコット')
+
+
+def _v268_count(text,chain):
+    soup=BeautifulSoup(text,'html.parser');visible=normal(soup.get_text(' ',strip=True))
+    patterns={'業務スーパー':r'([\d,]+)件の店舗が見つかりました','ビッグ・エー':r'検索結果[:：]\s*([\d,]+)店舗',
+        'トライアル':r'東京都\s*[（(]\s*(\d+)店舗'}
+    if chain in patterns:
+        match=re.search(patterns[chain],visible)
+        if not match:raise AppError(chain+'公式一覧の総件数を確認できません。')
+        return int(match.group(1).replace(',','')),'official_total'
+    if chain=='ロピア':
+        nav=soup.select_one('a[href="#area-tokyo"]')
+        match=re.search(r'(\d+)\s*店舗',nav.get_text(' ',strip=True)) if nav else None
+        if not match:raise AppError('ロピア公式東京都一覧の総件数を確認できません。')
+        return int(match.group(1)),'official_total'
+    if chain=='エイビイ':
+        # One direct section per branch. Exclude support companies and factories.
+        sections=[h.find_parent('section') for h in soup.select('h2.tit02') if h.get_text(strip=True).startswith('エイビイ')]
+        if not sections or len({id(n) for n in sections})!=len(sections) or any(n is None for n in sections):
+            raise AppError('エイビイ公式一覧の店舗区画を確認できません。')
+        return len(sections),'official_store_sections'
+    root=soup.select_one('.entry-body')
+    if not root:raise AppError('フーコット公式店舗一覧の本文を確認できません。')
+    rows=root.select('table tbody tr')
+    if not rows:raise AppError('フーコット公式店舗一覧が空です。')
+    for row in rows:
+        cells=row.find_all('td',recursive=False)
+        if len(cells)!=5 or not cells[1].select_one('a[href]') or not _v256_address(cells[2].get_text(' ',strip=True)):
+            raise AppError('フーコット公式一覧の店舗名・地図リンク・住所を確認できません。')
+    return len(rows),'official_store_rows'
+
+
+def _v268_catalog(job,chain):
+    url=_V256_DIRECTORIES[chain] if chain=='フーコット' else _V255_DIRECTORIES[chain]
+    pending=[url];seen=set();entries=[];expected=None;basis=''
+    while pending:
+        current=pending.pop(0)
+        if current in seen:continue
+        if len(seen)>=30:raise AppError(chain+'公式一覧のページ数が上限を超えました。')
+        seen.add(current);text=_v250_fetch_official(job,current)
+        count,kind=_v268_count(text,chain)
+        if kind=='official_total':
+            if expected is not None and expected!=count:raise AppError(chain+'公式一覧のページ間で総件数が一致しません。')
+            expected=count
+        else:expected=(expected or 0)+count
+        basis=kind
+        parsed=_v256_parse_catalog(text,chain,current) if chain=='フーコット' else _v255_parse_catalog(text,chain,current,verify_total=False)
+        entries.extend(parsed)
+        soup=BeautifulSoup(text,'html.parser')
+        for link in soup.select('a[rel~="next"],a.next,.pagination a[href],.pager a[href],a.page-numbers[href]'):
+            target=urljoin(current,html.unescape(link.get('href','')));u=urlparse(target);base=urlparse(url)
+            if not link.get('href') or u.hostname!=base.hostname or u.scheme!='https' or u.username or u.password or u.port not in (None,443):continue
+            if target not in seen and target not in pending:pending.append(target)
+    keys=[(r['name']+'|'+_v256_postal_key(r['address'])) if r.get('catalog_entry') else r['url'] for r in entries]
+    if expected!=len(entries) or len(set(keys))!=len(entries):
+        raise AppError(chain+'公式一覧の全ページ件数・重複を確認できません（'+str(len(entries))+'/'+str(expected)+'件）。')
+    main_count=len(entries)
+    if chain=='ロピア':
+        # Include officially delegated Lopia counters within Super Value stores.
+        try:
+            extra_text=_v250_fetch_official(job,_V255_SV_LIST,post={'id':'2','page':'https://www.supervalue.jp/shop/tokyo'})
+            extra=_v255_sv_candidates(extra_text)
+            if len({r['url'] for r in extra})!=len(extra):raise AppError('ロピア併設店舗の重複を確認できません。')
+            entries.extend(extra)
+        except SearchCancelled:raise
+        except Exception as exc:
+            errors=getattr(job,'_v255_catalog_errors',{});errors[chain]=str(exc)[:240];job._v255_catalog_errors=errors
+    audit={'chain':chain,'catalog_count':len(entries),'main_count':main_count,'delegated_count':len(entries)-main_count,'expected':expected,
+        'count_basis':basis,'pages':len(seen),'tokyo23_count':sum(bool(r['ward']) and (chain!='ロピア' or 'ロピア' in r['name']) for r in entries),
+        'checked_at':utc_now(),'complete':not bool(getattr(job,'_v255_catalog_errors',{}).get(chain))}
+    audits=getattr(job,'_v268_catalog_audits',{});audits[chain]=audit;job._v268_catalog_audits=audits
+    job.log('','official_catalog_verified',endpoint=url,**audit)
+    return entries
+
+
+def _v268_candidates(job,chain,ward):
+    cache=getattr(job,'_v255_catalog_cache',None)
+    if cache is None:cache={};job._v255_catalog_cache=cache
+    if chain not in cache:cache[chain]=_v268_catalog(job,chain)
+    rows=[dict(r) for r in cache[chain] if r['ward']==ward and (chain!='ロピア' or 'ロピア' in r['name'])]
+    audit=getattr(job,'_v268_catalog_audits',{}).get(chain,{})
+    job.log(ward,'official_ward_candidates',chain=chain,count=len(rows),catalog_count=len(cache[chain]),
+        complete=bool(audit.get('complete')),zero_confirmed=not rows and bool(audit.get('complete')))
+    return rows
+
+
+def _v268_resolve_store(job,candidate,ward):
+    if candidate['ward']!=ward or _v255_ward(candidate['address'])!=ward:
+        raise AppError('公式一覧の店舗住所と対象区が一致しません。')
+    chain=candidate['chain']
+    if candidate.get('catalog_entry'):
+        # The address and map belong to the same exact store card on the full list.
+        return (_v256_resolve_store if chain=='フーコット' else _v255_resolve_store)(job,candidate,ward)
+    text=_v250_fetch_official(job,candidate['url']);soup=BeautifulSoup(text,'html.parser')
+    root=soup.select_one('main') or soup.select_one('.box02') or soup
+    _v256_confirm_address(root,candidate,ward)
+    compact=lambda v:re.sub(r'[\s・ー－-]+','',unicodedata.normalize('NFKC',str(v))).casefold()
+    branch=re.sub(r'^(?:スーパーバリュー\s*|業務スーパー\s*|TRIAL GO\s*|トライアル西友\s*|トライアル\s*)','',candidate['name'])
+    headings=[compact(n.get_text(' ',strip=True)) for n in root.select('h1,h2,h3,.shop_title')]
+    if not any(compact(branch) in h for h in headings):raise AppError('公式店舗ページの店舗名が一覧と一致しません。')
+    if re.search(r'(?:当店|この店舗|本店舗).{0,20}(?:閉店しました|営業を終了)',normal(root.get_text(' ',strip=True))):
+        raise AppError('公式店舗ページに閉店の記載があります。')
+    point=_v255_map_point(root,candidate['name'])
+    if not point and chain=='トライアル' and candidate.get('directory_point'):
+        point=(*candidate['directory_point'],'公式一覧・店舗ページの店名・番地照合済み店舗地図座標')
+    if point:row=_v255_store_row(candidate,ward,point)
+    elif chain=='ロピア':
+        # Existing facility coordinates are accepted only for an exact known tenant.
+        row=_v255_resolve_store(job,candidate,ward)
+    else:raise AppError('公式店舗の座標を一意に確認できません。町の代表点は使用しません。')
+    row['verification']='公式一覧全件・店舗ページの店名・番地・店舗位置照合済み'
+    row['official_catalog_version']=268
+    return row
+
+
+# v266: enumerate every official OK page once per manual job, checking totals.
+# Each card owns its map; never read coordinates from another store's card.
+_V266_PRIORITY_CHAINS=('オーケー','ロピア','業務スーパー','トライアル','ビッグ・エー','エイビイ','フーコット')
+_V266_OK_DIRECTORY='https://ok-corporation.jp/shop/field/pref/eq/'+quote('東京都')+'/_and_/town/lk/'+quote('区')+'/'
+
+
+def _v266_ok_page(text,url):
+    soup=BeautifulSoup(text,'html.parser')
+    amount=soup.select_one('.page-amount')
+    match=re.fullmatch(r'([\d,]+)件中([\d,]+)[〜～~−-]([\d,]+)件目を表示しています',normal(amount.get_text()) if amount else '')
+    if not match:raise AppError('オーケー公式一覧の総件数・表示範囲を確認できません。')
+    total,start,end=(int(v.replace(',','')) for v in match.groups())
+    cards=soup.select('.summary-shop-item')
+    if not (0<start<=end<=total<=500) or len(cards)!=end-start+1:
+        raise AppError('オーケー公式一覧の表示件数と店舗カード数が一致しません。')
+    entries=[]
+    for card in cards:
+        heading=card.select_one('h2.section-title')
+        name=normal(heading.get_text(' ',strip=True)) if heading else ''
+        targets={_v250_detail_url(urljoin(url,node['href']),'オーケー') for node in card.select('a[href]')}
+        targets.discard('')
+        address_node=next((node for node in card.select('li') if normal(node.get_text()).startswith('住所')),None)
+        address=_v255_address(address_node.get_text(' ',strip=True)) if address_node else ''
+        ward=_v255_ward(address)
+        if not name.startswith('オーケー') or len(targets)!=1 or not ward:
+            raise AppError('オーケー公式一覧の店舗名・住所・詳細URLを照合できません。')
+        visible=normal(card.get_text(' ',strip=True))
+        if re.search(r'(?:当店|この店舗|本店舗).{0,20}(?:閉店しました|営業を終了)',visible):
+            raise AppError('オーケー公式一覧に閉店店舗が含まれています。')
+        point=_v250_point_from_official(card,str(card),name)
+        entries.append({'url':next(iter(targets)),'name':name,'address':address,'ward':ward,'chain':'オーケー',
+            'directory_point':point[:2] if point else None})
+    return entries,total,start,end
+
+
+def _v266_ok_candidates(job,ward):
+    cache=getattr(job,'_v255_catalog_cache',None)
+    if cache is None:cache={};job._v255_catalog_cache=cache
+    if 'オーケー' not in cache:
+        first,total,start,end=_v266_ok_page(_v250_fetch_official(job,_V266_OK_DIRECTORY),_V266_OK_DIRECTORY)
+        if start!=1:raise AppError('オーケー公式一覧の先頭ページを確認できません。')
+        entries=list(first);size=end;pages=(total+size-1)//size
+        for page in range(2,pages+1):
+            url=_V266_OK_DIRECTORY+'page/'+str(page)+'/'
+            rows,count,begin,finish=_v266_ok_page(_v250_fetch_official(job,url),url)
+            if count!=total or begin!=len(entries)+1:raise AppError('オーケー公式一覧のページ間の件数が一致しません。')
+            entries.extend(rows)
+        if len(entries)!=total or len({r['url'] for r in entries})!=total:
+            raise AppError('オーケー公式一覧の総件数と全ページ取得件数が一致しません。')
+        cache['オーケー']=entries
+        job.log('','official_catalog_verified',chain='オーケー',count=total,expected=total,pages=pages,endpoint=_V266_OK_DIRECTORY)
+    rows=[dict(r) for r in cache['オーケー'] if r['ward']==ward]
+    job.log(ward,'official_ward_candidates',chain='オーケー',count=len(rows),catalog_count=len(cache['オーケー']),complete=True)
+    return rows
+
+
+def _v266_saved_official_coverage(job,ward,payload):
+    stats=payload.get('stats') or {}
+    job.log(ward,'saved_official_coverage',source='previous_collection',catalog_version=stats.get('official_catalog_version'),
+        official_complete=bool(stats.get('official_complete')),coverage=stats.get('official_coverage') or [],
+        unresolved=stats.get('official_unresolved') or [])
+
+
 def _v250_supplement_supermarkets(job,ward,rows):
     official=[];coverage=[];unresolved=[]
-    for chain in _V250_OFFICIAL_CHAINS:
+    for chain in (*_V266_PRIORITY_CHAINS,*(c for c in _V250_OFFICIAL_CHAINS if c not in _V266_PRIORITY_CHAINS)):
         if job.stop.is_set():raise SearchCancelled()
         with job.lock:job.status=ward+'：'+chain+'公式店舗を照合中'
         report={'chain':chain,'candidates':0,'verified':0,'unresolved':0,'complete':False}
@@ -16024,10 +16213,16 @@ def _v250_supplement_supermarkets(job,ward,rows):
         try:
             candidates=_v254_official_candidates(job,url,chain,ward)
             report['candidates']=len(candidates)
+            if chain in _V268_CHAINS:
+                audit=getattr(job,'_v268_catalog_audits',{}).get(chain,{})
+                report.update({k:audit[k] for k in ('catalog_count','expected','count_basis','pages','tokyo23_count','checked_at') if k in audit})
+                report['zero_confirmed']=not candidates and bool(audit.get('complete'))
             for candidate in candidates:
                 if job.stop.is_set():raise SearchCancelled()
                 try:
-                    if chain in _V257_NEW_CHAINS:
+                    if chain in _V268_CHAINS:
+                        row=_v268_resolve_store(job,candidate,ward)
+                    elif chain in _V257_NEW_CHAINS:
                         row=_v257_resolve_store(job,candidate,ward)
                     elif chain in _V256_NEW_CHAINS:
                         row=_v256_resolve_store(job,candidate,ward)
@@ -16056,7 +16251,7 @@ def _v250_supplement_supermarkets(job,ward,rows):
             job.log(ward,'official_directory_failed',chain=chain,url=url,error_type=type(exc).__name__,message=str(exc)[:400])
         coverage.append(report)
     merged,added,matched=_v250_merge_supermarkets(rows,official)
-    stats={'official_catalog_version':257,'official_complete':all(r['complete'] for r in coverage),
+    stats={'official_catalog_version':268,'priority_complete':all(r['complete'] for r in coverage if r['chain'] in _V266_PRIORITY_CHAINS),'official_complete':all(r['complete'] for r in coverage),
         'official_coverage':coverage,'official_added':added,'official_matched':matched,'official_unresolved':unresolved}
     job.log(ward,'official_supplement_completed',**stats)
     return merged,stats
@@ -16081,7 +16276,7 @@ class _V246EquipmentJob:
             self.running=True;self.stop.clear();self.wards=wards;self.status='保存結果を確認中'
             self.logs=[];self.dropped_logs=0;self.log_saved=False;self.log_error='';self.started_at=utc_now();self.run_id=hashlib.sha256(os.urandom(32)).hexdigest()[:24]
             self.progress={w:{'状態':'待機','保存件数':0,'詳細':''} for w in wards}
-            self._v252_osm_pause={};self._v252_official_pause={};self._v250_http_cache={};self._v250_host_starts={};self._v255_catalog_cache={};self._v255_catalog_errors={}
+            self._v252_osm_pause={};self._v252_official_pause={};self._v250_http_cache={};self._v250_host_starts={};self._v255_catalog_cache={};self._v255_catalog_errors={};self._v268_catalog_audits={}
         threading.Thread(target=self.run,args=(wards,force,load_only),daemon=True,name='equipment-manual-v246').start();return True
     def run(self,wards,force=False,load_only=False):
         try:
@@ -16105,7 +16300,8 @@ class _V246EquipmentJob:
                     self.log(ward,'saved_data_loaded',found=bool(previous),count=len(previous['rows']) if previous else 0,scope='all_saved' if load_only else 'selected')
                     if previous:
                         with self.lock:self.data[ward]=previous
-                    if load_only or (previous and not force and previous.get('stats',{}).get('osm_query_version')==252 and previous.get('stats',{}).get('osm_complete') is True and previous.get('stats',{}).get('official_catalog_version')==257 and previous.get('stats',{}).get('official_complete') is True):
+                    if load_only or (previous and not force and previous.get('stats',{}).get('osm_query_version')==252 and previous.get('stats',{}).get('osm_complete') is True and previous.get('stats',{}).get('official_catalog_version')==268 and previous.get('stats',{}).get('official_complete') is True):
+                        if previous:_v266_saved_official_coverage(self,ward,previous)
                         completed=bool(previous and (previous.get('stats') or {}).get('osm_complete') is True and (previous.get('stats') or {}).get('official_complete') is True)
                         with self.lock:self.progress[ward]={'状態':('完了' if completed else '補完一部未完了') if previous else '未取得','保存件数':len(previous['rows']) if previous else 0,'詳細':'保存結果を読み込みました' if previous else '保存結果はありません'}
                         continue
@@ -16372,9 +16568,35 @@ def _v249_saved_supermarket_rows(records):
     return list(result.values())
 
 
+def _v267_prefetch_supermarkets(state,now=None):
+    # Reuse the existing status fragment: no extra timer, rerun or browser storage.
+    loader=state.get('_v249_supermarket_loader')
+    deadline=state.get('_v267_supermarket_prefetch_after')
+    if not loader or deadline is None or (time.monotonic() if now is None else now)<deadline:return False
+    equipment=state.get('_v246_equipment_job')
+    if equipment and equipment.snapshot()['running']:return False
+    snapshot=loader.snapshot()
+    if snapshot['initialized'] or snapshot['running']:return False
+    return loader.start()
+
+
+def _v267_supermarket_payload(state,loader,visible):
+    # Publish prepared rows once on first ON, without waiting for a status tick.
+    if not visible:return None
+    with loader.lock:
+        stamp=(loader.asset_token,loader.revision,int(state.get('_v118_map_reset_count',0)))
+        ready=bool(loader.browser_json and loader.revision>0)
+    if ready and state.get('_v267_supermarket_payload_stamp')!=stamp:
+        state['_v267_supermarket_payload_stamp']=stamp
+        state['_v264_delivery_pending']=True
+    return _v264_requested_supermarkets(state,loader)
+
+
 def _v249_supermarket_loader():
     state=st.session_state
-    if '_v249_supermarket_loader' not in state:state['_v249_supermarket_loader']=_V249SupermarketMapLoader()
+    if '_v249_supermarket_loader' not in state:
+        state['_v249_supermarket_loader']=_V249SupermarketMapLoader()
+        state['_v267_supermarket_prefetch_after']=time.monotonic()+6
     return state['_v249_supermarket_loader']
 
 def _v240_map_source(value):
@@ -16622,7 +16844,7 @@ def interactive_town_choropleth(group):
                 signature=cached['layer_signature'],stations=stations,wards=wards,
                 supermarket_overlay_visible=supermarket_visible,
                 supermarket_manifest=_v261_supermarket_manifest(supermarket_loader),
-                supermarket_payload=_v264_requested_supermarkets(state,supermarket_loader),
+                supermarket_payload=_v267_supermarket_payload(state,supermarket_loader,supermarket_visible),
                 supermarket_revision=supermarket_snapshot['revision'],
                 supermarket_loading=supermarket_snapshot['running'],
                 supermarket_error=supermarket_snapshot['error'],
