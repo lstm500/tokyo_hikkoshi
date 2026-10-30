@@ -52,7 +52,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v263"
+BUILD = "REBUILD-01-v265"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -13672,7 +13672,7 @@ const fallback=PAYLOAD;document.getElementById('export').onclick=function(){try{
 
 
 # v261: stable map layout and revision-based, asynchronous supermarket delivery.
-_V261_SUPERMARKET_JS = "function v261SupermarketStatus(){\n var status=document.getElementById('v249-supermarket-status');if(!status)return;\n status.hidden=!state._v247SupermarketOverlayVisible;\n status.textContent=state._v261Loading?'保存済みスーパーを読み込み中…':state._v261Error?'スーパー読込失敗：'+state._v261Error:'保存済みスーパー '+(state._v249Rows||[]).length+'件'+((state._v249Rows||[]).length?'':'（周辺設備タブで取得してください）');\n}\nfunction v263RequestSupermarkets(){\n var manifest=state._v261Manifest;if(!manifest||!state._v247SupermarketOverlayVisible)return;\n var wanted=manifest.token+'|'+manifest.revision;\n if(state._v261Loaded===wanted||state._v263Requested===wanted)return;\n state._v263Requested=wanted;\n var message={type:'sumai:supermarket-ready-v263',token:manifest.token};\n window.parent.postMessage(message,location.origin);\n for(var i=0;i<window.parent.frames.length;i++){try{window.parent.frames[i].postMessage(message,location.origin)}catch(e){}}\n}\nfunction v261SupermarketManifest(manifest){\n if(!manifest||manifest.token!==state._v261Channel)return;\n if(state._v261Loaded&&state._v261Loaded.indexOf(manifest.token+'|')===0&&Number(manifest.revision)<Number(state._v249Revision))return;\n state._v261Manifest=manifest;state._v261Error=String(manifest.error||'');\n state._v261Loading=!!manifest.loading||(manifest.revision>0&&state._v261Loaded!==manifest.token+'|'+manifest.revision);\n v263RequestSupermarkets();v261SupermarketStatus();\n}\nwindow.addEventListener('message',function(event){\n if(event.origin!==location.origin||!event.data)return;\n var message=event.data;\n if(message.type!=='sumai:supermarket-update-v263')return;\n var manifest=message.manifest,packet=message.packet;\n if(!manifest||manifest.token!==state._v261Channel)return;\n v261SupermarketManifest(manifest);\n if(!packet||packet.schema!==261||packet.token!==state._v261Channel||!Array.isArray(packet.rows)||packet.revision<Number((state._v261Manifest||{}).revision||0))return;\n var key=packet.token+'|'+packet.revision;\n if(state._v261Loaded===key)return;\n state._v249Rows=packet.rows;state._v249Revision=String(packet.revision);state._v261Loaded=key;\n state._v261Loading=!!manifest.loading;state._v261Error=String(manifest.error||'');\n if(typeof v260Diag!=='undefined')v260Diag.record('supermarket_load_complete','transport=message rows='+packet.rows.length+' bytes='+manifest.bytes+' db_ms='+((manifest.metrics||{}).db_ms||0));\n v249DrawSupermarkets();v261SupermarketStatus();setHeight();\n});\n"
+_V261_SUPERMARKET_JS = "\nfunction v264WaitDelivery(){\n var m=state._v261Manifest;if(!m||!state._v247SupermarketOverlayVisible||state._v264DeliveryTimer)return;\n if(state._v261Loaded===m.token+'|'+m.revision&&!m.loading)return;\n state._v264DeliveryTimer=setTimeout(function(){\n  state._v264DeliveryTimer=null;var current=state._v261Manifest;if(!current||!state._v247SupermarketOverlayVisible)return;\n  if(state._v261Loaded===current.token+'|'+current.revision&&!current.loading)return;\n  var attempt=(state._v264DeliveryAttempts||0)+1;state._v264DeliveryAttempts=attempt;\n  if(attempt>5){state._v261Loading=false;state._v261Error='店舗データの受信待ちが続いています。スーパー再読込をお試しください。';v261SupermarketStatus();return;}\n  if(typeof v260Diag!=='undefined')v260Diag.record('supermarket_delivery_retry','attempt='+attempt);\n  hostMessage('streamlit:setComponentValue',{dataType:'json',value:{event:'supermarket_delivery_request_v264',token:current.token,ticket:'delivery_'+Date.now()+'_'+attempt,home_view_epoch:state._v202HomeEpoch}});\n },6000);\n}\nfunction v261SupermarketStatus(){\n var status=document.getElementById('v249-supermarket-status');if(!status)return;\n status.hidden=!state._v247SupermarketOverlayVisible;\n status.textContent=state._v261Loading?'保存済みスーパーを読み込み中…':state._v261Error?'スーパー読込失敗：'+state._v261Error:'保存済みスーパー '+(state._v249Rows||[]).length+'件'+((state._v249Rows||[]).length?'':'（周辺設備タブで取得してください）');\n}\nfunction v263RequestSupermarkets(){\n var manifest=state._v261Manifest;if(!manifest||!state._v247SupermarketOverlayVisible)return;\n var wanted=manifest.token+'|'+manifest.revision;\n if(state._v261Loaded===wanted||state._v263Requested===wanted)return;\n state._v263Requested=wanted;\n var message={type:'sumai:supermarket-ready-v263',token:manifest.token};\n window.parent.postMessage(message,location.origin);\n for(var i=0;i<window.parent.frames.length;i++){try{window.parent.frames[i].postMessage(message,location.origin)}catch(e){}}\n}\nfunction v261SupermarketManifest(manifest){\n if(!manifest||manifest.token!==state._v261Channel)return;\n if(state._v261Loaded&&state._v261Loaded.indexOf(manifest.token+'|')===0&&Number(manifest.revision)<Number(state._v249Revision))return;\n state._v261Manifest=manifest;state._v261Error=String(manifest.error||'');\n state._v261Loading=!!manifest.loading||(manifest.revision>0&&state._v261Loaded!==manifest.token+'|'+manifest.revision);\n v263RequestSupermarkets();v264WaitDelivery();v261SupermarketStatus();\n}\nfunction v264ReceiveSupermarkets(manifest,packet){\n if(!manifest||manifest.token!==state._v261Channel)return;\n v261SupermarketManifest(manifest);\n if(!packet||packet.schema!==261||packet.token!==state._v261Channel||!Array.isArray(packet.rows)||packet.revision<Number((state._v261Manifest||{}).revision||0))return;\n var key=packet.token+'|'+packet.revision;\n if(state._v261Loaded===key)return;\n if(state._v264DeliveryTimer)clearTimeout(state._v264DeliveryTimer);state._v264DeliveryTimer=null;state._v264DeliveryAttempts=0;\n state._v249Rows=packet.rows;state._v249Revision=String(packet.revision);state._v261Loaded=key;\n state._v261Loading=!!manifest.loading;state._v261Error=String(manifest.error||'');\n if(typeof v260Diag!=='undefined')v260Diag.record('supermarket_load_complete','transport=message rows='+packet.rows.length+' bytes='+manifest.bytes+' db_ms='+((manifest.metrics||{}).db_ms||0));\n v249DrawSupermarkets();v261SupermarketStatus();setHeight();\n}\nwindow.addEventListener('message',function(event){if(event.origin===location.origin&&event.data&&event.data.type==='sumai:supermarket-update-v263')v264ReceiveSupermarkets(event.data.manifest,event.data.packet)});\n"
 TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('function v249RenderSupermarkets(args){',_V261_SUPERMARKET_JS+'\nfunction v249RenderSupermarkets(args){',1)
 TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace("var legend=document.getElementById('v249-supermarket-legend');if(legend)legend.hidden=!visible;", "var legend=document.getElementById('v249-supermarket-legend');if(legend){legend.hidden=false;legend.style.visibility=visible?'visible':'hidden';legend.setAttribute('aria-hidden',String(!visible));}",1)
 TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace("v249ApplySupermarketMode(!state._v247SupermarketOverlayVisible);v249DrawSupermarkets();v249SupermarketCommand(false);", "v249ApplySupermarketMode(!state._v247SupermarketOverlayVisible);if(state._v261Manifest)v261SupermarketManifest(state._v261Manifest);v249DrawSupermarkets();v249SupermarketCommand(false);",1)
@@ -13694,6 +13694,9 @@ TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('</style></head>','#v2
 TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace("function setHeight(){hostMessage('streamlit:setFrameHeight',{height:Math.max(615,document.documentElement.scrollHeight)})}", "function setHeight(){var height=Math.max(615,document.documentElement.scrollHeight);if(state._v261FrameHeight===height)return;state._v261FrameHeight=height;hostMessage('streamlit:setFrameHeight',{height:height})}",1)
 
 
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(' if(args.supermarket_manifest)v261SupermarketStatus();', ' if(args.supermarket_manifest){if(args.supermarket_payload)v264ReceiveSupermarkets(args.supermarket_manifest,args.supermarket_payload);v261SupermarketStatus();}',1)
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('function v249SupermarketCommand(refresh){', 'function v249SupermarketCommand(refresh){if(refresh)state._v264DeliveryAttempts=0;',1)
+
 # v262: an empty supermarket Canvas must not intercept taps on rent polygons.
 TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(
     "var bounds=state.map.getBounds().pad(.1),visible=!!state._v247SupermarketOverlayVisible;",
@@ -13702,9 +13705,50 @@ TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(
     "state._v247SupermarketOverlayVisible=!!visible;",
     "state._v247SupermarketOverlayVisible=!!visible;var pane=state.map&&state.map.getPane('supermarketPane');if(pane)pane.style.pointerEvents=visible?'auto':'none';",1)
 
+
+# v264: delivery iframe is mounted above the map so browser lazy loading cannot defer it.
+_V264_MAP_SIZE_JS = "function v264WatchMapSize(){\n if(!state.map||state._v264SizeObserver||!window.ResizeObserver)return;\n var previous='',pending=false;\n state._v264SizeObserver=new ResizeObserver(function(entries){\n  var rect=entries[0]&&entries[0].contentRect;if(!rect)return;\n  var key=Math.round(rect.width)+'x'+Math.round(rect.height);if(key===previous)return;previous=key;\n  if(rect.width<2||rect.height<2||pending)return;pending=true;\n  requestAnimationFrame(function(){pending=false;if(!state.map)return;state.map.invalidateSize({pan:false});state._v261DrawView=null;v249DrawSupermarkets();if(typeof v260Diag!=='undefined')v260Diag.record('map_size_restored',key,1000);});\n });\n state._v264SizeObserver.observe(document.getElementById('map'));\n}\n"
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('function v249RenderSupermarkets(args){',_V264_MAP_SIZE_JS+'\nfunction v249RenderSupermarkets(args){',1)
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('if(!state.map)return;state._v249Rows=state._v249Rows||[];', 'if(!state.map)return;v264WatchMapSize();state._v249Rows=state._v249Rows||[];',1)
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace("shops='+((args&&args.supermarkets)||[]).length", "shops='+(state._v249Rows||[]).length",1).replace("build:'v260'","build:'v264'",1)
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('v249DrawSupermarkets();v261SupermarketStatus();setHeight();', "v249DrawSupermarkets();if(typeof v260Diag!=='undefined')v260Diag.record('supermarket_drawn','received='+(state._v249Rows||[]).length+' visible='+(state._v259Markers?state._v259Markers.size:0));v261SupermarketStatus();setHeight();",1)
+
+
+
+# v265: keep one quarter of a viewport pre-drawn beyond every map edge.
+# Match the Canvas bounds to the marker selection bounds so buffered markers
+# can become visible during a short pan, before the next moveend reconciliation.
+_v265_bounds_old="var bounds=state.map.getBounds().pad(.1),visible=!!state._v247SupermarketOverlayVisible;"
+_v265_bounds_new="var bounds=state.map.getBounds().pad(.25),visible=!!state._v247SupermarketOverlayVisible;"
+assert TOWN_COMPONENT_HTML_V121.count(_v265_bounds_old)==1
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(_v265_bounds_old,_v265_bounds_new,1)
+_v265_marker_old="marker=L.circleMarker([shop.lat,shop.lng],{pane:'supermarketPane',radius:7,"
+_v265_marker_new="if(!state._v265Renderer)state._v265Renderer=L.canvas({pane:'supermarketPane',padding:.25});\n   marker=L.circleMarker([shop.lat,shop.lng],{pane:'supermarketPane',renderer:state._v265Renderer,radius:7,"
+assert TOWN_COMPONENT_HTML_V121.count(_v265_marker_old)==1
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(_v265_marker_old,_v265_marker_new,1)
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace("build:'v264'","build:'v265'",1)
+
+
+def _v264_supermarket_diagnostics(state):
+    loader=state.get('_v249_supermarket_loader')
+    if not loader:return {'initialized':False}
+    with loader.lock:return {'initialized':loader.initialized,'running':loader.running,'revision':loader.revision,'rows':len(loader.rows),'bytes':loader.asset_bytes,'error':loader.error,'metrics':dict(loader.metrics),'transport':'message'}
+
+
+def _v264_accept_delivery_request(state,data,loader):
+    ticket=str(data.get('ticket') or '')[:100]
+    if not ticket or data.get('token')!=loader.asset_token or state.get('_v264_delivery_ticket')==ticket:return False
+    state['_v264_delivery_ticket']=ticket;state['_v264_delivery_pending']=True
+    return True
+
+
+def _v264_requested_supermarkets(state,loader):
+    if not state.pop('_v264_delivery_pending',False):return None
+    with loader.lock:return json.loads(loader.browser_json) if loader.browser_json else None
+
 @st.cache_resource(show_spinner=False)
 def town_component_v121():
-    _asset_revision='v263-supermarket-message'
+    _asset_revision='v265-supermarket-buffer'
     folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-'+_asset_revision)
     os.makedirs(folder,exist_ok=True)
     path=os.path.join(folder,'index.html')
@@ -13722,7 +13766,7 @@ def town_component_v121():
         with open(temp_path,'w',encoding='utf-8') as output:
             output.write(TOWN_COMPONENT_HTML_V121)
         os.replace(temp_path,path)
-    return st.components.v1.declare_component('sumai_town_map_v263',path=folder)
+    return st.components.v1.declare_component('sumai_town_map_v265',path=folder)
 
 @st.cache_resource(show_spinner=False)
 def _v216_api_budget():
@@ -16211,7 +16255,7 @@ def _v251_seed_verified_stores(db,records):
 
 
 # v261: store data is published once per successful load, outside the map render.
-_V261_COMPONENT_REVISION='v263-supermarket-message'
+_V261_COMPONENT_REVISION='v265-supermarket-buffer'
 _V261_MAP_FIELDS=('id','ward','name','address','lat','lng','color','price_label','website','source_url','verification')
 
 
@@ -16578,6 +16622,7 @@ def interactive_town_choropleth(group):
                 signature=cached['layer_signature'],stations=stations,wards=wards,
                 supermarket_overlay_visible=supermarket_visible,
                 supermarket_manifest=_v261_supermarket_manifest(supermarket_loader),
+                supermarket_payload=_v264_requested_supermarkets(state,supermarket_loader),
                 supermarket_revision=supermarket_snapshot['revision'],
                 supermarket_loading=supermarket_snapshot['running'],
                 supermarket_error=supermarket_snapshot['error'],
@@ -16596,6 +16641,8 @@ def interactive_town_choropleth(group):
                 jump=state.get('_v182_map_jump'),
                 key='town_map_v184_'+str(reset),default=None)
     if isinstance(data,dict) and data.get('home_view_epoch')==int(state.get('_v202_home_epoch',0)):
+        if data.get('event')=='supermarket_delivery_request_v264' and _v264_accept_delivery_request(state,data,supermarket_loader):
+            st.rerun(scope='fragment')
         if isinstance(data.get('map_diagnostics'),list):
             state['_v245_map_diagnostics']=[{k:str(row.get(k,''))[:160] for k in ('time','status','provider','detail')}
                 for row in data['map_diagnostics'][-40:] if isinstance(row,dict)]
@@ -17594,7 +17641,7 @@ def _v209_log_tools(state):
         rows=state.get('_v245_map_diagnostics',[])
         if rows:st.dataframe(rows,hide_index=True,use_container_width=True)
         else:st.caption('地図を表示すると、背景地図の取得結果が記録されます。')
-        diagnostic={'background_tiles':rows,'rent_overlay':state.get('_v245_rent_diagnostics',{}),'ui_diagnostics':state.get('_v260_map_ui_diagnostics',{})}
+        diagnostic={'background_tiles':rows,'rent_overlay':state.get('_v245_rent_diagnostics',{}),'ui_diagnostics':state.get('_v260_map_ui_diagnostics',{}),'supermarket_loader':_v264_supermarket_diagnostics(state)}
         st.json(diagnostic['rent_overlay'],expanded=False)
         st.download_button('背景地図の詳細ログ JSON',json.dumps(diagnostic,ensure_ascii=False,indent=2).encode('utf-8'),
             'sumai_basemap_log.json','application/json',key='basemap_log_v245',disabled=not rows)
@@ -17648,6 +17695,8 @@ def main():
         bounds=state.get('new_bounds')
         center=bounds_center(bounds) if bounds else state.get('new_view_center',DEFAULT_CENTER)
         radius=bounds_radius(bounds) if bounds else 1500
+        state['_v263_supermarket_slot']=st.empty()
+        state['_v263_supermarket_sent']=None
         interactive_town_choropleth(selected_group)
         town_location_search_panel_v184()
         # Only the map is a fragment; the search is an ordinary form.
@@ -17693,8 +17742,6 @@ def main():
                     for label in result['conditions']['regions']: st.write(label)
         st.caption('町丁目別の集計対象は保存済みの募集データです。件数と平均家賃は区・町丁目単位で集計します。')
         # Detailed 23-ward coverage and aggregation status are low-priority UI.
-        state['_v263_supermarket_slot']=st.empty()
-        state['_v263_supermarket_sent']=None
         town_choropleth_status()
     with tabs[1]:
         st.caption('物件と家賃の集計は共通のSupabaseに保存し、全利用者で同じデータを参照します。通勤設定は共有しません。')
