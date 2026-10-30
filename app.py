@@ -52,7 +52,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v261"
+BUILD = "REBUILD-01-v262"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -13693,9 +13693,18 @@ if _v261_legend:
 TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('</style></head>','#v249-supermarket-legend{height:38px;min-height:38px;max-height:38px;display:flex;flex-wrap:wrap;align-content:center;gap:0 8px;overflow:hidden}#v249-supermarket-legend span{margin-right:0}'+ '</style></head>',1)
 TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace("function setHeight(){hostMessage('streamlit:setFrameHeight',{height:Math.max(615,document.documentElement.scrollHeight)})}", "function setHeight(){var height=Math.max(615,document.documentElement.scrollHeight);if(state._v261FrameHeight===height)return;state._v261FrameHeight=height;hostMessage('streamlit:setFrameHeight',{height:height})}",1)
 
+
+# v262: an empty supermarket Canvas must not intercept taps on rent polygons.
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(
+    "var bounds=state.map.getBounds().pad(.1),visible=!!state._v247SupermarketOverlayVisible;",
+    "var bounds=state.map.getBounds().pad(.1),visible=!!state._v247SupermarketOverlayVisible;state.map.getPane('supermarketPane').style.pointerEvents=visible?'auto':'none';",1)
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(
+    "state._v247SupermarketOverlayVisible=!!visible;",
+    "state._v247SupermarketOverlayVisible=!!visible;var pane=state.map&&state.map.getPane('supermarketPane');if(pane)pane.style.pointerEvents=visible?'auto':'none';",1)
+
 @st.cache_resource(show_spinner=False)
 def town_component_v121():
-    _asset_revision='v261-supermarket-async'
+    _asset_revision='v262-supermarket-taps'
     folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-'+_asset_revision)
     os.makedirs(folder,exist_ok=True)
     path=os.path.join(folder,'index.html')
@@ -13713,7 +13722,7 @@ def town_component_v121():
         with open(temp_path,'w',encoding='utf-8') as output:
             output.write(TOWN_COMPONENT_HTML_V121)
         os.replace(temp_path,path)
-    return st.components.v1.declare_component('sumai_town_map_v261',path=folder)
+    return st.components.v1.declare_component('sumai_town_map_v262',path=folder)
 
 @st.cache_resource(show_spinner=False)
 def _v216_api_budget():
@@ -16202,7 +16211,7 @@ def _v251_seed_verified_stores(db,records):
 
 
 # v261: store data is published once per successful load, outside the map render.
-_V261_COMPONENT_REVISION='v261-supermarket-async'
+_V261_COMPONENT_REVISION='v262-supermarket-taps'
 _V261_MAP_FIELDS=('id','ward','name','address','lat','lng','color','price_label','website','source_url','verification')
 
 
