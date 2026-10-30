@@ -52,7 +52,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v260"
+BUILD = "REBUILD-01-v261"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -13670,9 +13670,32 @@ const fallback=PAYLOAD;document.getElementById('export').onclick=function(){try{
 </script>'''.replace('PAYLOAD',payload,1),height=74)
 
 
+
+# v261: stable map layout and revision-based, asynchronous supermarket delivery.
+_V261_SUPERMARKET_JS = "function v261SupermarketStatus(){\n var status=document.getElementById('v249-supermarket-status');if(!status)return;\n status.hidden=!state._v247SupermarketOverlayVisible;\n status.textContent=state._v261Loading?'保存済みスーパーを読み込み中…':state._v261Error?'スーパー読込失敗：'+state._v261Error:'保存済みスーパー '+(state._v249Rows||[]).length+'件'+((state._v249Rows||[]).length?'':'（周辺設備タブで取得してください）');\n}\nfunction v261SupermarketManifest(manifest){\n if(!manifest||manifest.token!==state._v261Channel)return;\n if(state._v261Loaded&&Number(manifest.revision)<Number(state._v249Revision))return;\n state._v261Manifest=manifest;state._v261Error=String(manifest.error||state._v261FetchError||'');state._v261Loading=!!manifest.loading||!!state._v261Fetching;\n var wanted=manifest.token+'|'+manifest.revision;\n if(state._v247SupermarketOverlayVisible&&manifest.file&&state._v261Loaded!==wanted&&state._v261Request!==wanted){\n  var file=String(manifest.file);\n  if(!/^supermarkets-[a-f0-9]{48}\\.json$/.test(file)){state._v261Error='保存店舗データの参照先が不正です。';v261SupermarketStatus();return;}\n  if(state._v261Controller)state._v261Controller.abort();\n  if(state._v261FailureRevision!==wanted){state._v261FailureRevision=wanted;state._v261Failures=0;}\n  var controller=new AbortController();state._v261Controller=controller;state._v261Request=wanted;state._v261Loading=true;state._v261Fetching=wanted;state._v261FetchError='';\n  var started=performance.now(),url=new URL(file,document.baseURI);url.searchParams.set('revision',String(manifest.revision));\n  if(typeof v260Diag!=='undefined')v260Diag.record('supermarket_load_start','revision='+manifest.revision+' bytes='+manifest.bytes);\n  fetch(url.href,{cache:'no-store',credentials:'same-origin',signal:controller.signal}).then(function(response){\n   if(!response.ok)throw new Error('HTTP '+response.status);return response.json();\n  }).then(function(body){\n   if(state._v261Request!==wanted)return;\n   if(body.schema!==261||body.token!==manifest.token||body.revision<manifest.revision||!Array.isArray(body.rows))throw new Error('保存店舗データの形式が不正です。');\n   state._v249Rows=body.rows;state._v249Revision=String(body.revision);state._v261Loaded=body.token+'|'+body.revision;state._v261Loading=false;state._v261Fetching='';state._v261FetchError='';state._v261Error='';state._v261Failures=0;\n   if(typeof v260Diag!=='undefined')v260Diag.record('supermarket_load_complete','duration_ms='+Math.round(performance.now()-started)+' rows='+body.rows.length+' bytes='+manifest.bytes+' db_ms='+((manifest.metrics||{}).db_ms||0));\n   v249DrawSupermarkets();v261SupermarketStatus();setHeight();\n  }).catch(function(error){\n   if(state._v261Request!==wanted||error.name==='AbortError')return;\n   state._v261Loading=false;state._v261Fetching='';state._v261Error=String(error.message||error);state._v261FetchError=state._v261Error;state._v261Failures=(state._v261Failures||0)+1;\n   // Retry transient asset failures on a later existing status update, at most three times.\n   if(state._v261Failures<3)state._v261Request='';\n   if(typeof v260Diag!=='undefined')v260Diag.record('supermarket_load_error',state._v261Error);\n   v261SupermarketStatus();setHeight();\n  });\n }\n v261SupermarketStatus();\n}\nwindow.addEventListener('message',function(event){\n if(event.origin!==location.origin||!event.data||event.data.type!=='sumai:supermarket-update-v261')return;\n v261SupermarketManifest(event.data.manifest);\n});\n"
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('function v249RenderSupermarkets(args){',_V261_SUPERMARKET_JS+'\nfunction v249RenderSupermarkets(args){',1)
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace("var legend=document.getElementById('v249-supermarket-legend');if(legend)legend.hidden=!visible;", "var legend=document.getElementById('v249-supermarket-legend');if(legend){legend.hidden=false;legend.style.visibility=visible?'visible':'hidden';legend.setAttribute('aria-hidden',String(!visible));}",1)
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace("v249ApplySupermarketMode(!state._v247SupermarketOverlayVisible);v249DrawSupermarkets();v249SupermarketCommand(false);", "v249ApplySupermarketMode(!state._v247SupermarketOverlayVisible);if(state._v261Manifest)v261SupermarketManifest(state._v261Manifest);v249DrawSupermarkets();v249SupermarketCommand(false);",1)
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace("state._v249Rows=Array.isArray(args.supermarkets)?args.supermarkets:[];\n state._v249Revision=String(args.supermarket_revision||0);", "if(args.supermarket_manifest){state._v261Channel=args.supermarket_manifest.token;v261SupermarketManifest(args.supermarket_manifest)}else{state._v249Rows=Array.isArray(args.supermarkets)?args.supermarkets:[];state._v249Revision=String(args.supermarket_revision||0);}",1)
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(" setHeight();\n}\n\nfunction render(args){", " setHeight();\n}\n\nfunction render(args){",1)
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace("var fingerprint=JSON.stringify([shop.name,shop.price_label,shop.address,shop.verification,shop.website,shop.source_url,shop.color,shop.lat,shop.lng]);", "var fingerprint=shop;",1)
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('function v249RenderSupermarkets(args){\n if(!state.map)return;', 'function v249RenderSupermarkets(args){\n if(!state.map)return;state._v249Rows=state._v249Rows||[];',1)
+# Bounds changes still cull pins; unchanged data/view does no per-store work.
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(" var wanted=new Set();", " var viewKey=[visible,state._v249Revision,state.map.getZoom(),bounds.toBBoxString(),(state._v249Rows||[]).length].join('|');if(state._v261DrawRows===state._v249Rows&&state._v261DrawView===viewKey)return;state._v261DrawRows=state._v249Rows;state._v261DrawView=viewKey;\n var wanted=new Set();",1)
+# Popup closure can release an offscreen retained pin on the next draw.
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace("marker.addTo(state._v249Layer);markers.set(key,marker);", "marker.on('popupclose',function(){state._v261DrawView=null});marker.addTo(state._v249Layer);markers.set(key,marker);",1)
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(" setHeight();\n}\n\nfunction render(args){", " if(args.supermarket_manifest)v261SupermarketStatus();\n setHeight();\n}\n\nfunction render(args){",1)
+# Move the complete legend below the map, and reserve its height in both modes.
+_v261_legend=re.search(r'<div id="v249-supermarket-legend"[^>]*>.*?</div>',TOWN_COMPONENT_HTML_V121)
+if _v261_legend:
+    _v261_markup=_v261_legend.group(0).replace(' hidden',' style="visibility:hidden" aria-hidden="true"')
+    TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(_v261_legend.group(0),'',1).replace('<div id="map"></div>','<div id="map"></div>'+_v261_markup,1)
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('</style></head>','#v249-supermarket-legend{height:38px;min-height:38px;max-height:38px;display:flex;flex-wrap:wrap;align-content:center;gap:0 8px;overflow:hidden}#v249-supermarket-legend span{margin-right:0}'+ '</style></head>',1)
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace("function setHeight(){hostMessage('streamlit:setFrameHeight',{height:Math.max(615,document.documentElement.scrollHeight)})}", "function setHeight(){var height=Math.max(615,document.documentElement.scrollHeight);if(state._v261FrameHeight===height)return;state._v261FrameHeight=height;hostMessage('streamlit:setFrameHeight',{height:height})}",1)
+
 @st.cache_resource(show_spinner=False)
 def town_component_v121():
-    _asset_revision='v249-supermarket-overlay'
+    _asset_revision='v261-supermarket-async'
     folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-'+_asset_revision)
     os.makedirs(folder,exist_ok=True)
     path=os.path.join(folder,'index.html')
@@ -13690,7 +13713,7 @@ def town_component_v121():
         with open(temp_path,'w',encoding='utf-8') as output:
             output.write(TOWN_COMPONENT_HTML_V121)
         os.replace(temp_path,path)
-    return st.components.v1.declare_component('sumai_town_map_v249',path=folder)
+    return st.components.v1.declare_component('sumai_town_map_v261',path=folder)
 
 @st.cache_resource(show_spinner=False)
 def _v216_api_budget():
@@ -14431,7 +14454,7 @@ def town_choropleth_status():
                 state['_v250_supermarket_saved_stamp']=stamp;state['_v249_supermarket_wait']=True
     if state.get('_v249_supermarket_wait') and supermarket_loader and not supermarket_loader.snapshot()['running']:
         state['_v249_supermarket_wait']=False
-        st.rerun()
+    _v261_supermarket_bridge(state)
     store=current_town_summary_worker()
     snap=store.snapshot()
     if state.get('_v183_manual_refresh_wait') and not snap['running']:
@@ -16178,11 +16201,55 @@ def _v251_seed_verified_stores(db,records):
     return [r for r in records if not isinstance(r,dict) or r.get('id')!=identity]+[{'id':identity,'summary':confirmed}]
 
 
+# v261: store data is published once per successful load, outside the map render.
+_V261_COMPONENT_REVISION='v261-supermarket-async'
+_V261_MAP_FIELDS=('id','ward','name','address','lat','lng','color','price_label','website','source_url','verification')
+
+
+def _v261_component_folder():
+    return os.path.join(tempfile.gettempdir(),'sumai-town-map-component-'+_V261_COMPONENT_REVISION)
+
+
+def _v261_publish_supermarkets(rows,token,revision):
+    compact=[{key:r.get(key,'') for key in _V261_MAP_FIELDS} for r in rows]
+    body=json.dumps({'schema':261,'token':token,'revision':revision,'rows':compact},ensure_ascii=False,separators=(',',':')).encode('utf-8')
+    folder=_v261_component_folder();os.makedirs(folder,exist_ok=True)
+    name='supermarkets-'+token+'.json';target=os.path.join(folder,name)
+    temp=target+'.tmp-'+str(threading.get_ident())
+    try:
+        with open(temp,'wb') as output:output.write(body)
+        os.replace(temp,target)
+    finally:
+        if os.path.exists(temp):os.unlink(temp)
+    return name,len(body)
+
+
+def _v261_supermarket_manifest(loader):
+    with loader.lock:
+        return {'token':loader.asset_token,'revision':loader.revision,
+            'file':loader.asset_file,'bytes':loader.asset_bytes,
+            'loading':loader.running,'initialized':loader.initialized,'error':loader.error,
+            'metrics':dict(loader.metrics)}
+
+
+def _v261_supermarket_bridge(state):
+    loader=state.get('_v249_supermarket_loader')
+    if not loader or not state.get('_v249_supermarket_visible'):return
+    packet=_v261_supermarket_manifest(loader)
+    payload=json.dumps(packet,ensure_ascii=False,separators=(',',':')).replace('<',chr(92)+'u003c')
+    st.components.v1.html('''<script>
+const packet=PACKET,targetOrigin=new URL(document.baseURI).origin;
+function deliver(){const message={type:'sumai:supermarket-update-v261',manifest:packet};window.parent.postMessage(message,targetOrigin);for(let i=0;i<window.parent.frames.length;i++){try{window.parent.frames[i].postMessage(message,targetOrigin)}catch(e){}}}
+deliver();setTimeout(deliver,350);
+</script>'''.replace('PACKET',payload,1),height=0)
+
+
 class _V249SupermarketMapLoader:
     """Load only saved POIs, once on demand; never query Overpass from the map."""
     def __init__(self):
         self.lock=threading.RLock();self.running=False;self.initialized=False
         self.rows=[];self.revision=0;self.error=''
+        self.asset_token=os.urandom(24).hex();self.asset_file='';self.asset_bytes=0;self.metrics={}
     def snapshot(self):
         with self.lock:return dict(running=self.running,initialized=self.initialized,
             rows=self.rows,revision=self.revision,error=self.error)
@@ -16196,9 +16263,12 @@ class _V249SupermarketMapLoader:
         try:
             db=Database()
             ids=','.join(_v246_record_id(w) for w in TOKYO_WARDS.values())
+            load_started=time.perf_counter()
             records=db.call('GET',SEARCH_TABLE,{'namespace':'eq.'+db.namespace,
                 'status':'eq.equipment_supermarket_v246','id':'in.('+ids+')',
                 'select':'id,summary','limit':len(TOKYO_WARDS)})
+            db_ms=round((time.perf_counter()-load_started)*1000,1)
+            validate_started=time.perf_counter()
             warnings=[]
             try:records=_v251_seed_verified_stores(db,records)
             except Exception as exc:warnings.append('公式補完の保存未確認：'+str(exc))
@@ -16211,8 +16281,12 @@ class _V249SupermarketMapLoader:
                     code=str(record.get('id','')).rsplit('.',1)[-1]
                     ward=TOKYO_WARDS.get(code)
                     with self.lock:rows.extend(r for r in self.rows if r.get('ward')==ward)
+            validate_ms=round((time.perf_counter()-validate_started)*1000,1)
+            next_revision=self.revision+1
+            asset_file,asset_bytes=_v261_publish_supermarkets(rows,self.asset_token,next_revision)
             with self.lock:
-                self.rows=rows;self.revision+=1
+                self.asset_file=asset_file;self.asset_bytes=asset_bytes;self.metrics={'db_ms':db_ms,'validate_ms':validate_ms,'rows':len(rows)}
+                self.rows=rows;self.revision=next_revision
                 self.error='一部の保存データが未確認です：'+'／'.join(warnings) if warnings else ''
         except Exception as exc:
             with self.lock:self.error=str(exc)[:300]
@@ -16496,7 +16570,7 @@ def interactive_town_choropleth(group):
                 home_view_epoch=int(state.get('_v202_home_epoch',0)),home_center=list(_V202_HOME_CENTER),
                 signature=cached['layer_signature'],stations=stations,wards=wards,
                 supermarket_overlay_visible=supermarket_visible,
-                supermarkets=[r for r in supermarket_snapshot['rows'] if not supermarket_window or in_rectangle((r['lat'],r['lng']),supermarket_window)] if supermarket_visible else [],
+                supermarket_manifest=_v261_supermarket_manifest(supermarket_loader),
                 supermarket_revision=supermarket_snapshot['revision'],
                 supermarket_loading=supermarket_snapshot['running'],
                 supermarket_error=supermarket_snapshot['error'],
