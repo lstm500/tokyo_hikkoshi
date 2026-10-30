@@ -52,7 +52,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v254"
+BUILD = "REBUILD-01-v255"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -14926,11 +14926,12 @@ def _v248_fetch_supermarkets(job,ward):
 
 
 # v250: official store directories supplement OSM; unknown coordinates remain unresolved.
-_V250_OFFICIAL_CHAINS=('ライフ','まいばすけっと','マルエツ','オーケー')
-_V250_OFFICIAL_HOSTS=frozenset(('store.lifecorp.jp','www.mybasket.co.jp','www.maruetsu.co.jp','ok-corporation.jp'))
+_V250_OFFICIAL_CHAINS=('ライフ','まいばすけっと','マルエツ','オーケー','ロピア','業務スーパー','トライアル','ビッグ・エー','エイビイ')
+_V250_OFFICIAL_HOSTS=frozenset(('store.lifecorp.jp','www.mybasket.co.jp','www.maruetsu.co.jp','ok-corporation.jp','lopia.jp','www.gyomusuper.jp','www.trial-net.co.jp','www.biga.co.jp','www.ave.gr.jp','www.supervalue.jp'))
 
 
 def _v250_directory_url(chain,ward):
+    if chain in _V255_NEW_CHAINS:return _V255_DIRECTORIES[chain]
     if chain=='ライフ':return 'https://store.lifecorp.jp/'+quote('東京都')+'/'+quote(ward)+'/'
     if chain=='まいばすけっと':return 'https://www.mybasket.co.jp/shop/index.html?p_prefectures='+quote('東京都')+'&p_municipalities='+quote(ward)
     if chain=='マルエツ':return 'https://www.maruetsu.co.jp/store/shop_area/tokyo/'
@@ -14938,6 +14939,7 @@ def _v250_directory_url(chain,ward):
 
 
 def _v250_detail_url(url,chain):
+    if chain in _V255_NEW_CHAINS:return _v255_detail_url(url,chain)
     try:
         u=urlparse(url)
         if u.scheme!='https' or u.hostname not in _V250_OFFICIAL_HOSTS or u.username or u.password or u.port not in (None,443):return ''
@@ -14950,10 +14952,11 @@ def _v250_detail_url(url,chain):
     except (ValueError,KeyError):return ''
 
 
-def _v250_fetch_official(job,url):
+def _v250_fetch_official(job,url,post=None):
     cache=getattr(job,'_v250_http_cache',None)
     if cache is None:cache={};job._v250_http_cache=cache
-    if url in cache:return cache[url]
+    cache_key=url if post is None else url+'|'+json.dumps(post,sort_keys=True,ensure_ascii=False)
+    if cache_key in cache:return cache[cache_key]
     failures=getattr(job,'_v252_official_pause',{})
     if url in failures and failures[url][0]>time.monotonic():raise AppError('公式取得先は前回の通信失敗により一時休止中です：'+failures[url][1])
     original=url
@@ -14965,7 +14968,10 @@ def _v250_fetch_official(job,url):
         if job.stop.wait(max(0,starts.get(u.hostname,0)+1-time.monotonic())):raise SearchCancelled()
         starts[u.hostname]=time.monotonic();job._v250_host_starts=starts
         try:
-            response=requests.get(url,headers={'User-Agent':'SumaiCompass/252 (manual official store directory verification)'},timeout=(6,20),allow_redirects=False)
+            if post is not None and url!=_V255_SV_LIST:raise AppError('公式検索の送信先が不正です。')
+            request=requests.post if post is not None else requests.get
+            options={'data':post} if post is not None else {}
+            response=request(url,headers={'User-Agent':'SumaiCompass/255 (manual official store directory verification)'},timeout=(6,20),allow_redirects=False,**options)
         except requests.RequestException as exc:
             failures[original]=(time.monotonic()+300,type(exc).__name__);job._v252_official_pause=failures
             raise
@@ -14978,7 +14984,7 @@ def _v250_fetch_official(job,url):
         if response.status_code!=200:raise AppError('公式店舗ページが正常な応答を返しません。')
         response.encoding=response_encoding(response)
         text=response.text
-        cache[original]=text
+        cache[cache_key]=text
         return text
     raise AppError('公式店舗ページの転送回数が上限を超えました。')
 
@@ -15043,6 +15049,7 @@ def _v250_directory_candidates(text,url,chain,ward):
 
 
 def _v254_official_candidates(job,url,chain,ward):
+    if chain in _V255_NEW_CHAINS:return _v255_candidates(job,chain,ward)
     text=_v250_fetch_official(job,url)
     if chain!='まいばすけっと':return _v250_directory_candidates(text,url,chain,ward)
     visible=normal(BeautifulSoup(text,'html.parser').get_text(' ',strip=True))
@@ -15161,7 +15168,7 @@ def _v250_merge_supermarkets(existing,official):
     for new in official:
         found=None
         for index,old in enumerate(rows):
-            same_url=bool(new.get('website')) and (old.get('website')==new['website'] or old.get('source_url')==new['source_url'])
+            same_url=not (new.get('catalog_entry') or old.get('catalog_entry')) and bool(new.get('website')) and (old.get('website')==new['website'] or old.get('source_url')==new['source_url'])
             same_name=token(old.get('name'))==token(new['name'])
             near=meters((old['lat'],old['lng']),(new['lat'],new['lng']))<150
             generic_near=any(token(old.get('name'))==token(chain) and token(new['name']).startswith(token(chain)) for chain in _V250_OFFICIAL_CHAINS) and meters((old['lat'],old['lng']),(new['lat'],new['lng']))<40
@@ -15170,6 +15177,206 @@ def _v250_merge_supermarkets(existing,official):
         else:
             rows[found]={**rows[found],**new,'id':rows[found]['id']};matched+=1
     return sorted(rows,key=lambda r:(r['name'],r['id'])),added,matched
+
+
+# v255: official adapters for the next five price-tier chains. No map-time network.
+_V255_NEW_CHAINS=('ロピア','業務スーパー','トライアル','ビッグ・エー','エイビイ')
+_V255_DIRECTORIES={
+    'ロピア':'https://lopia.jp/shops/',
+    '業務スーパー':'https://www.gyomusuper.jp/shop/list.php?pref_id=13',
+    'トライアル':'https://www.trial-net.co.jp/shops/search-result/prefecture/'+quote('東京都'),
+    'ビッグ・エー':'https://www.biga.co.jp/?'+urlencode({'csp':'search_add','fe_form_no':'0','feadvns_max_line_0':'3','s_keyword_2':'','search_element_0[]':'東京都','searchbutton':'検　索'}),
+    'エイビイ':'https://www.ave.gr.jp/shop/'}
+_V255_SV_LIST='https://www.supervalue.jp/shop/shop_list'
+
+
+def _v255_address(text):
+    source=unicodedata.normalize('NFKC',str(text))
+    source=re.split(r'TEL[:：]?|FAX[:：]?|(?<!\d)0\d{1,3}[-－]\d{1,4}[-－]\d{3,4}',source,maxsplit=1)[0]
+    compact=re.sub(r'\s+','',source)
+    match=re.search(r'(東京都|神奈川県|埼玉県|千葉県)[^〒]{2,240}',compact)
+    return re.split(r'TEL[:：]?|FAX[:：]?|電話|通常営業時間|営業時間',match.group(0),maxsplit=1)[0] if match else ''
+
+
+def _v255_ward(address):
+    return next((w for w in TOKYO_WARDS.values() if address.startswith('東京都'+w)),'')
+
+
+def _v255_detail_url(url,chain):
+    try:
+        u=urlparse(url)
+        if u.scheme!='https' or u.username or u.password or u.port not in (None,443):return ''
+        if chain=='業務スーパー' and u.hostname=='www.gyomusuper.jp' and u.path=='/shop/detail.php':
+            values=parse_qs(u.query)
+            if set(values)=={'sh_id'} and len(values['sh_id'])==1 and values['sh_id'][0].isdigit():
+                return u._replace(fragment='').geturl()
+        patterns={'ロピア':(('lopia.jp',r'/shops/?'),('www.supervalue.jp',r'/shop/detail/\d+/?')),
+            'トライアル':(('www.trial-net.co.jp',r'/shops/\d+/?'),),
+            'ビッグ・エー':(('www.biga.co.jp',r'/shop/[^/]+/?'),),
+            'エイビイ':(('www.ave.gr.jp',r'/shop/?'),)}
+        if not u.query and any(u.hostname==host and re.fullmatch(pattern,u.path) for host,pattern in patterns.get(chain,())):
+            return u.geturl()
+    except ValueError:pass
+    return ''
+
+
+def _v255_map_point(soup,name):
+    point=_v250_point_from_official(soup,str(soup),name)
+    if point:return point
+    found={}
+    for node in soup.select('iframe[src],a[href]'):
+        value=html.unescape(str(node.get('src') or node.get('href') or '')).replace('¢er=','&center=')
+        u=urlparse(value)
+        if not u.hostname or not (u.hostname=='maps.google.com' or u.hostname.startswith('www.google.') or u.hostname=='maps.google.co.jp'):continue
+        if '/maps' not in u.path:continue
+        pairs=[]
+        place=re.findall(r'!3d(-?\d+\.\d+)!4d(-?\d+\.\d+)',value)
+        if place:pairs=place
+        else:
+            for key,items in parse_qs(u.query).items():
+                if key in ('center','q','query','ll'):
+                    for item in items:
+                        match=re.fullmatch(r'\s*(-?\d+\.\d+)\s*,\s*(-?\d+\.\d+)\s*',item)
+                        if match:pairs.append(match.groups())
+            # Store-specific links on Trial's official results use this map URL.
+            if not pairs:pairs=re.findall(r'/@(-?\d+\.\d+),(-?\d+\.\d+),',value)
+        for lat,lng in pairs:
+            lat,lng=float(lat),float(lng)
+            if 35.50<=lat<=35.95 and 139.50<=lng<=139.98:found[(round(lat,5),round(lng,5))]=(lat,lng,'公式店舗ページの店舗地図座標')
+    return next(iter(found.values())) if len(found)==1 else None
+
+
+def _v255_parse_catalog(text,chain,url):
+    soup=BeautifulSoup(text,'html.parser');entries=[];expected=None
+    def add(node,name,address,target,point=None):
+        name=normal(name);address=_v255_address(address);target=_v255_detail_url(target,chain)
+        if not name or not address or not target:raise AppError(chain+'公式一覧の店舗名・住所・URLを確認できません。')
+        entries.append({'url':target,'name':name,'address':address,'ward':_v255_ward(address),'chain':chain,
+            'catalog_entry':chain in ('ロピア','エイビイ') and urlparse(target).path.rstrip('/') in ('/shops','/shop'),
+            'directory_point':point[:2] if point else None})
+    if chain=='業務スーパー':
+        nodes=soup.select('.shop_info > a[href]')
+        match=re.search(r'([\d,]+)件の店舗が見つかりました',normal(soup.get_text(' ',strip=True)))
+        expected=int(match.group(1).replace(',','')) if match else None
+        for node in nodes:
+            title=node.select_one('b');address_node=node.select_one('.shop_info_left')
+            if not title or not address_node:raise AppError('業務スーパー公式一覧の形式が変わっています。')
+            # Phonetic ruby annotations are not part of the postal address.
+            for rt in address_node.select('rt,rp'):rt.decompose()
+            add(node,'業務スーパー '+title.get_text(strip=True),address_node.get_text(' ',strip=True),urljoin(url,node['href']))
+    elif chain=='ビッグ・エー':
+        match=re.search(r'検索結果[:：]\s*([\d,]+)店舗',normal(soup.get_text(' ',strip=True)))
+        expected=int(match.group(1).replace(',','')) if match else None
+        for node in soup.select('td a[href]'):
+            target=_v255_detail_url(urljoin(url,node['href']),chain)
+            if not target:continue
+            cell=node.find_parent('td');address_cell=cell.find_next_sibling('td') if cell else None
+            if not address_cell:raise AppError('ビッグ・エー公式一覧の住所列を確認できません。')
+            add(node,node.get_text(' ',strip=True),address_cell.get_text(' ',strip=True),target)
+    elif chain=='トライアル':
+        match=re.search(r'東京都\s*[（(]\s*(\d+)店舗',normal(soup.get_text(' ',strip=True)))
+        expected=int(match.group(1)) if match else None
+        for node in soup.select('.store-info'):
+            title=node.select_one('.store-name');category=node.select_one('.store-category');link=node.select_one('a[href^="/shops/"]')
+            map_link=next((a for a in node.select('a[href]') if '/maps/search/' in a['href']),None)
+            if not title or not category or not link or not map_link:raise AppError('トライアル公式一覧の店舗カードを確認できません。')
+            from urllib.parse import unquote
+            address=_v255_address(unquote(map_link['href']).split('/@',1)[0])
+            add(node,category.get_text(' ',strip=True)+' '+title.get_text(' ',strip=True),address,urljoin(url,link['href']),_v255_map_point(node,title.get_text()))
+    elif chain=='エイビイ':
+        nodes=[h for h in soup.select('h2.tit02') if h.get_text(strip=True).startswith('エイビイ')]
+        if not nodes:raise AppError('エイビイ公式一覧の店舗見出しを確認できません。')
+        for h in nodes:
+            node=h.find_parent('section')
+            if not node:raise AppError('エイビイ公式一覧の店舗区画を確認できません。')
+            add(node,h.get_text(' ',strip=True),node.get_text(' ',strip=True),url,_v255_map_point(node,h.get_text()))
+        expected=len(nodes)
+    elif chain=='ロピア':
+        heading=soup.select_one('#area-tokyo');nav=soup.select_one('a[href="#area-tokyo"]')
+        match=re.search(r'(\d+)\s*店舗',nav.get_text(' ',strip=True)) if nav else None
+        expected=int(match.group(1)) if match else None
+        group=heading.find_next_sibling('ul') if heading else None
+        if not group:raise AppError('ロピア公式一覧の東京都区画を確認できません。')
+        for node in group.find_all('li',recursive=False):
+            title=node.select_one('dt');address=node.select_one('dd')
+            if not title or not address or not node.get('id'):raise AppError('ロピア公式一覧の店舗区画を確認できません。')
+            add(node,title.get_text(' ',strip=True),address.get_text(' ',strip=True),url+'#'+node['id'],_v255_map_point(node,title.get_text()))
+    else:raise AppError('未対応の公式店舗一覧です。')
+    if expected is None or expected!=len(entries) or len({e['url']+e['name'] for e in entries})!=len(entries):
+        raise AppError(chain+'公式一覧の件数と解析件数が一致しません。')
+    return entries
+
+
+def _v255_sv_candidates(text):
+    soup=BeautifulSoup(text,'html.parser');out=[];links=soup.select('a[href^="/shop/detail/"]')
+    if not links:raise AppError('スーパーバリュー公式一覧の店舗を確認できません。')
+    for link in links:
+        heading=link.select_one('h2,h3,h4,.shop-name')
+        name=normal(heading.get_text(' ',strip=True)) if heading else normal(link.get_text(' ',strip=True)).split('〒',1)[0].strip()
+        address=_v255_address(link.get_text(' ',strip=True))
+        if not name or not address:raise AppError('スーパーバリュー公式一覧の店舗情報を確認できません。')
+        if 'ロピア' not in name:continue
+        out.append({'url':urljoin('https://www.supervalue.jp/',link['href']),'name':'スーパーバリュー '+name,
+            'address':address,'ward':_v255_ward(address),'chain':'ロピア','catalog_entry':False,'directory_point':None})
+    if not out:raise AppError('スーパーバリュー公式一覧のロピア店舗を確認できません。')
+    return out
+
+
+def _v255_candidates(job,chain,ward):
+    cache=getattr(job,'_v255_catalog_cache',None)
+    if cache is None:cache={};job._v255_catalog_cache=cache
+    if chain not in cache:
+        url=_V255_DIRECTORIES[chain];entries=_v255_parse_catalog(_v250_fetch_official(job,url),chain,url)
+        if chain=='ロピア':
+            # The parent list explicitly delegates in-store Lopia counters here.
+            try:entries+=_v255_sv_candidates(_v250_fetch_official(job,_V255_SV_LIST,post={'id':'2','page':'https://www.supervalue.jp/shop/tokyo'}))
+            except SearchCancelled:raise
+            except Exception as exc:
+                errors=getattr(job,'_v255_catalog_errors',{});errors[chain]=str(exc)[:240];job._v255_catalog_errors=errors
+        cache[chain]=entries
+        job.log('','official_catalog_verified',chain=chain,count=len(entries),endpoint=url)
+    out=[dict(r) for r in cache[chain] if r['ward']==ward and (chain!='ロピア' or 'ロピア' in r['name'])]
+    job.log(ward,'official_ward_candidates',chain=chain,count=len(out),catalog_count=len(cache[chain]),
+        complete=not bool(getattr(job,'_v255_catalog_errors',{}).get(chain)))
+    return out
+
+
+def _v255_parse_detail(text,candidate,ward):
+    soup=BeautifulSoup(text,'html.parser');chain=candidate['chain'];name=candidate['name']
+    compact=re.sub(r'\s+','',unicodedata.normalize('NFKC',soup.get_text(' ',strip=True)))
+    address=candidate['address']
+    # Match the complete store address, not just the ward or branch name.
+    core=re.match(r'東京都'+re.escape(ward)+r'.*?\d+(?:[-ー−－]\d+){1,2}',address)
+    if not core or core.group(0) not in compact:raise AppError('公式店舗ページの番地を確認できません。')
+    titles=[normal(n.get_text(' ',strip=True)) for n in soup.select('h1,h2,h3,.shop_title') if normal(n.get_text(' ',strip=True))]
+    branch=normal(re.sub(r'^スーパーバリュー\s*|^業務スーパー\s*|^TRIAL GO\s*|^トライアル西友\s*|^トライアル\s*','',name))
+    if not any(branch in t or normal(name) in t for t in titles):raise AppError('公式店舗ページの店名が一致しません。')
+    if re.search(r'(?:当店|この店舗|本店舗).{0,20}(?:閉店しました|営業を終了)',compact):raise AppError('公式店舗ページに閉店の記載があります。')
+    point=_v255_map_point(soup,name)
+    if not point:raise AppError('公式店舗の座標を一意に確認できません。町の代表点は使用しません。')
+    return _v255_store_row(candidate,ward,point)
+
+
+def _v255_store_row(candidate,ward,point):
+    row=_v251_official_store_row(candidate,ward,candidate['name'],candidate['address'],point)
+    if candidate.get('catalog_entry'):
+        row['id']='official:'+hashlib.sha256((candidate['chain']+'|'+candidate['name']+'|'+candidate['address']).encode()).hexdigest()[:24]
+        row['catalog_entry']=True
+    return row
+
+
+def _v255_resolve_store(job,candidate,ward):
+    if candidate.get('directory_point'):
+        lat,lng=candidate['directory_point'];return _v255_store_row(candidate,ward,(lat,lng,'公式店舗一覧の店舗地図座標'))
+    # Official facility page lists Lopia as a tenant at this exact same address.
+    # Pin is the facility's place coordinate, not the Google map's viewport center.
+    if candidate['chain']=='ロピア' and candidate['name']=='ロピア 平井島忠ホームズ店' and candidate['address']=='東京都江戸川区平井6-1-38島忠ホームズ平井店':
+        row=_v255_store_row(candidate,ward,(35.7038985,139.8361132,'入居施設の公式地図・同一住所確認（2026-10-30）'))
+        row['position_source_url']='https://www.shimachu.co.jp/shop/tokyo/308.html'
+        job.log(ward,'official_facility_position',chain=candidate['chain'],name=candidate['name'],url=row['position_source_url'])
+        return row
+    return _v255_parse_detail(_v250_fetch_official(job,candidate['url']),candidate,ward)
+
 
 
 def _v250_supplement_supermarkets(job,ward,rows):
@@ -15185,7 +15392,9 @@ def _v250_supplement_supermarkets(job,ward,rows):
             for candidate in candidates:
                 if job.stop.is_set():raise SearchCancelled()
                 try:
-                    if candidate.get('directory_point'):
+                    if chain in _V255_NEW_CHAINS:
+                        row=_v255_resolve_store(job,candidate,ward)
+                    elif candidate.get('directory_point'):
                         lat,lng=candidate['directory_point']
                         row=_v251_official_store_row(candidate,ward,candidate['name'],candidate['address'],
                             (lat,lng,'公式店舗一覧の公開店舗座標'))
@@ -15198,14 +15407,17 @@ def _v250_supplement_supermarkets(job,ward,rows):
                     report['unresolved']+=1
                     item={'chain':chain,'name':candidate['name'],'url':candidate['url'],'reason':str(exc)[:240]}
                     unresolved.append(item);job.log(ward,'official_store_unresolved',**item)
-            report['complete']=report['unresolved']==0
+            catalog_error=getattr(job,'_v255_catalog_errors',{}).get(chain)
+            if catalog_error:
+                report['error']=catalog_error;job.log(ward,'official_directory_failed',chain=chain,url=url,message=catalog_error,error_type='PartialCatalog')
+            report['complete']=report['unresolved']==0 and not catalog_error
         except SearchCancelled:raise
         except Exception as exc:
             report['error']=str(exc)[:240]
             job.log(ward,'official_directory_failed',chain=chain,url=url,error_type=type(exc).__name__,message=str(exc)[:400])
         coverage.append(report)
     merged,added,matched=_v250_merge_supermarkets(rows,official)
-    stats={'official_catalog_version':254,'official_complete':all(r['complete'] for r in coverage),
+    stats={'official_catalog_version':255,'official_complete':all(r['complete'] for r in coverage),
         'official_coverage':coverage,'official_added':added,'official_matched':matched,'official_unresolved':unresolved}
     job.log(ward,'official_supplement_completed',**stats)
     return merged,stats
@@ -15230,7 +15442,7 @@ class _V246EquipmentJob:
             self.running=True;self.stop.clear();self.wards=wards;self.status='保存結果を確認中'
             self.logs=[];self.dropped_logs=0;self.log_saved=False;self.log_error='';self.started_at=utc_now();self.run_id=hashlib.sha256(os.urandom(32)).hexdigest()[:24]
             self.progress={w:{'状態':'待機','保存件数':0,'詳細':''} for w in wards}
-            self._v252_osm_pause={};self._v252_official_pause={};self._v250_http_cache={};self._v250_host_starts={}
+            self._v252_osm_pause={};self._v252_official_pause={};self._v250_http_cache={};self._v250_host_starts={};self._v255_catalog_cache={};self._v255_catalog_errors={}
         threading.Thread(target=self.run,args=(wards,force,load_only),daemon=True,name='equipment-manual-v246').start();return True
     def run(self,wards,force=False,load_only=False):
         try:
@@ -15254,7 +15466,7 @@ class _V246EquipmentJob:
                     self.log(ward,'saved_data_loaded',found=bool(previous),count=len(previous['rows']) if previous else 0,scope='all_saved' if load_only else 'selected')
                     if previous:
                         with self.lock:self.data[ward]=previous
-                    if load_only or (previous and not force and previous.get('stats',{}).get('osm_query_version')==252 and previous.get('stats',{}).get('osm_complete') is True and previous.get('stats',{}).get('official_catalog_version')==254 and previous.get('stats',{}).get('official_complete') is True):
+                    if load_only or (previous and not force and previous.get('stats',{}).get('osm_query_version')==252 and previous.get('stats',{}).get('osm_complete') is True and previous.get('stats',{}).get('official_catalog_version')==255 and previous.get('stats',{}).get('official_complete') is True):
                         completed=bool(previous and (previous.get('stats') or {}).get('osm_complete') is True and (previous.get('stats') or {}).get('official_complete') is True)
                         with self.lock:self.progress[ward]={'状態':('完了' if completed else '補完一部未完了') if previous else '未取得','保存件数':len(previous['rows']) if previous else 0,'詳細':'保存結果を読み込みました' if previous else '保存結果はありません'}
                         continue
@@ -15334,7 +15546,7 @@ if(rows.length)map.fitBounds(rows.map(s=>[s.lat,s.lng]),{padding:[20,20],maxZoom
 def _v251_equipment_panel_body():
     st.subheader('スーパーの位置情報を取得')
     job=_v246_equipment_job();snap=job.snapshot()
-    st.caption('OSMに加え、ライフ・まいばすけっと・マルエツ・オーケーの公式店舗情報を照合・補完して保存します。全店舗の網羅は保証しません。住まいの地図では再検索しません。')
+    st.caption('OSMに加え、ライフ・まいばすけっと・マルエツ・オーケー・ロピア・業務スーパー・トライアル・ビッグ・エー・エイビイの公式店舗情報を照合・補完して保存します。全店舗の網羅は保証しません。住まいの地図では再検索しません。')
     wards=st.multiselect('取得する区',list(TOKYO_WARDS.values()),default=['品川区','港区'],key='equipment_wards_v246',disabled=snap['running'])
     force=st.checkbox('完了した区も再取得する',key='equipment_force_v246',disabled=snap['running'])
     if st.button('選択した区のスーパーを取得・再開',key='equipment_start_v246',type='primary',disabled=snap['running'] or not wards,use_container_width=True):
