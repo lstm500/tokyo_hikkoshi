@@ -52,7 +52,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v259"
+BUILD = "REBUILD-01-v260"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -13644,6 +13644,32 @@ TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('<div id="map"></div>'
 TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('</style></head>','#v249-supermarket-toggle,#v249-supermarket-refresh{min-height:40px;border:1px solid #9eb4bd;border-radius:7px;background:#fff;color:#173a5e;padding:8px 10px;font:13px system-ui;cursor:pointer}#v249-supermarket-toggle[aria-pressed="true"]{background:#d9eaf3;border-color:#174d6b}#v249-supermarket-legend{font:11px system-ui;color:#173a5e;background:#f5f3ed;padding:4px 10px;line-height:1.7;box-sizing:border-box}#v249-supermarket-legend span{display:inline-block;margin-right:10px;white-space:nowrap}#v249-supermarket-legend i{display:inline-block;width:8px;height:8px;border:1px solid #fff;border-radius:50%;margin-right:3px}.v249-supermarket-popup{font:13px system-ui;color:#173a5e;line-height:1.6;overflow-wrap:anywhere}.v249-supermarket-popup a{display:block;color:#175e96}#v249-supermarket-status{flex-basis:100%;font:12px system-ui;color:#173a5e;overflow-wrap:anywhere}[hidden]{display:none!important}'+'</style></head>',1)
 TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(' redrawStations();\n setHeight();',' redrawStations();\n v249RenderSupermarkets(args);\n setHeight();',1)
 
+
+# v260: bounded client diagnostics, piggybacked on existing map messages only.
+_V260_DIAGNOSTIC_JS = '// Bounded diagnostics: no frame loop, screenshots, network calls or diagnostic-only reruns.\nvar v260Diag=(function(){\n var key=\'sumai-map-ui-v260\',events=[],timer=null,seq=0,dirty=false,last={},lastWrite=0;\n var instance=Date.now().toString(36)+\'-\'+Math.random().toString(36).slice(2,8),boot=performance.now();\n try{var saved=JSON.parse(localStorage.getItem(key)||\'{}\');if(Array.isArray(saved.events))events=saved.events.slice(-119)}catch(e){}\n function safe(v){return String(v||\'\').replace(/https?:\\/\\/[^\\s"<>]+/g,function(u){return u.split(/[?#]/)[0]}).slice(0,240)}\n function record(type,detail,limit){\n  var now=Date.now();if(limit&&now-(last[type]||0)<limit)return;last[type]=now;\n  events.push({time:new Date(now).toISOString(),instance:instance,seq:++seq,event:type,detail:safe(detail)});\n  if(events.length>120)events.splice(0,events.length-120);dirty=true;\n  if(!timer)timer=setTimeout(flush,5000);\n }\n function snapshot(){return {schema:260,build:\'v260\',instance:instance,uptime_ms:Math.round(performance.now()-boot),events:events.slice(-120),limits:{max_events:120,persist_interval_ms:5000,watch_interval_ms:2000,slow_render_ms:100,long_task_ms:150},environment:{width:innerWidth,height:innerHeight,pixel_ratio:devicePixelRatio,visibility:document.visibilityState,user_agent:navigator.userAgent.slice(0,180)}}}\n function flush(force){if(timer)clearTimeout(timer);timer=null;if(!dirty)return;var wait=5000-(Date.now()-lastWrite);if(!force&&wait>0){timer=setTimeout(flush,wait);return}try{localStorage.setItem(key,JSON.stringify(snapshot()));dirty=false;lastWrite=Date.now()}catch(e){}}\n window.addEventListener(\'error\',function(e){record(e.message?\'js_error\':\'resource_error\',e.message?(safe(e.message)+\' \'+safe(e.filename)+\':\'+e.lineno):safe(e.target&&(e.target.src||e.target.href)),1000)},true);\n window.addEventListener(\'unhandledrejection\',function(e){record(\'unhandled_rejection\',e.reason&&e.reason.message||e.reason,1000)});\n document.addEventListener(\'visibilitychange\',function(){record(\'visibility\',document.visibilityState);if(document.visibilityState!==\'visible\')flush(true)});\n window.addEventListener(\'pagehide\',function(e){record(\'pagehide\',\'persisted=\'+!!e.persisted);flush(true)});\n window.addEventListener(\'pageshow\',function(e){record(\'pageshow\',\'persisted=\'+!!e.persisted)});\n try{if(window.PerformanceObserver&&PerformanceObserver.supportedEntryTypes.includes(\'longtask\')){\n  new PerformanceObserver(function(list){var entries=list.getEntries().filter(function(e){return e.duration>=150});if(entries.length)record(\'long_task\',\'count=\'+entries.length+\' max_ms=\'+Math.round(Math.max.apply(null,entries.map(function(e){return e.duration}))),2000)}).observe({type:\'longtask\',buffered:false});\n }}catch(e){}\n var previous=performance.now(),previousVisible=document.visibilityState===\'visible\',blankSince=0,blankReported=false;\n setInterval(function(){\n  var now=performance.now(),visible=document.visibilityState===\'visible\';\n  if(visible&&previousVisible&&now-previous>3000)record(\'event_loop_delay\',\'delay_ms=\'+Math.round(now-previous-2000),2000);\n  previous=now;previousVisible=visible;if(!visible)return;\n  var el=document.getElementById(\'map\'),rect=el&&el.getBoundingClientRect(),missing=!el||!el.isConnected||!rect||rect.width<2||rect.height<2||getComputedStyle(el).visibility===\'hidden\'||getComputedStyle(el).display===\'none\';\n  if(missing!==!!last._missing){record(missing?\'map_container_missing\':\'map_container_restored\',rect?\'size=\'+Math.round(rect.width)+\'x\'+Math.round(rect.height):\'no element\');last._missing=missing;}\n  if(state.map&&!missing){\n   var loaded=el.querySelector(\'.leaflet-tile-loaded\');\n   if(!loaded){if(!blankSince)blankSince=now;if(!blankReported&&now-blankSince>=8000){blankReported=true;record(\'no_loaded_tiles\',\'no loaded background tiles for >=8000ms\')}}\n   else{if(blankReported)record(\'tiles_restored\',\'duration_ms=\'+Math.round(now-blankSince));blankSince=0;blankReported=false;}\n  }\n },2000);\n function attach(){\n  if(!state.map||state.map._v260Attached)return;state.map._v260Attached=true;\n  record(\'map_created\',\'leaflet=\'+String(window.L&&L.version));\n  state.map.on(\'unload\',function(){record(\'map_unload\',\'Leaflet map removed\');flush(true)});\n  state.map.on(\'movestart zoomstart moveend zoomend\',function(e){record(e.type,\'zoom=\'+state.map.getZoom(),e.type===\'moveend\'?300:0)});\n  state.map.on(\'popupopen popupclose\',function(e){var source=e.popup&&e.popup._source;record(e.type,source&&source._v259Shop?\'supermarket id=\'+source._v259Shop.id:\'other\')});\n  var base=state._v245Base,started=0;\n  if(base){base.on(\'loading\',function(){started=performance.now()});base.on(\'load\',function(){record(\'tiles_load_complete\',\'duration_ms=\'+(started?Math.round(performance.now()-started):\'unknown\'),1000)});}\n }\n record(\'component_boot\',\'previous_events=\'+events.length);flush(true);\n return {record:record,snapshot:snapshot,flush:flush,attach:attach};\n})();\n'
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('function hostMessage(type,extra){',_V260_DIAGNOSTIC_JS+'\nfunction hostMessage(type,extra){',1)
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace("window.parent.postMessage(Object.assign({isStreamlitMessage:true,type:type},extra||{}),'*')", "if(type==='streamlit:setComponentValue'&&extra&&extra.value&&typeof extra.value==='object'){extra.value.ui_diagnostics=v260Diag.snapshot();v260Diag.flush()}window.parent.postMessage(Object.assign({isStreamlitMessage:true,type:type},extra||{}),'*')",1)
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace("window.addEventListener('message',function(e){if(e.data&&e.data.type==='streamlit:render')render(e.data.args)});", "var v260OriginalRender=render;render=function(args){var start=performance.now();try{return v260OriginalRender(args)}catch(e){v260Diag.record('render_error',e&&e.message);throw e}finally{v260Diag.attach();var elapsed=performance.now()-start;v260Diag.record(elapsed>=100?'slow_render':'render','duration_ms='+Math.round(elapsed)+' leaflet='+!!window.L+' map='+!!state.map+' shops='+((args&&args.supermarkets)||[]).length,elapsed>=100?0:2000)}};\nwindow.addEventListener('message',function(e){if(e.data&&e.data.type==='streamlit:render')render(e.data.args)});",1)
+
+
+def _v260_clean_diagnostics(value):
+    if not isinstance(value,dict) or value.get('schema')!=260:return {}
+    events=[]
+    for row in value.get('events',[])[-120:] if isinstance(value.get('events'),list) else []:
+        if isinstance(row,dict):events.append({key:str(row.get(key,''))[:240] for key in ('time','instance','seq','event','detail')})
+    return {'schema':260,'build':str(value.get('build',''))[:30],'instance':str(value.get('instance',''))[:60],
+        'events':events,'environment':{str(k)[:40]:str(v)[:180] for k,v in list(value.get('environment',{}).items())[:8]} if isinstance(value.get('environment'),dict) else {},
+        'limits':{'max_events':120,'persist_interval_ms':5000,'watch_interval_ms':2000}}
+
+
+def _v260_browser_log_download(diagnostic):
+    # Read bounded browser storage only when requested; no server polling.
+    payload=json.dumps(diagnostic,ensure_ascii=False).replace('<',chr(92)+'u003c')
+    st.components.v1.html('''<style>body{margin:0;font:14px system-ui}button{background:#fff;border:1px solid #9eb4bd;border-radius:8px;padding:12px;color:#173a5e;cursor:pointer}span{font-size:12px}</style><button id="export">端末の地図操作ログ JSON</button><span id="result"></span><script>
+const fallback=PAYLOAD;document.getElementById('export').onclick=function(){try{const stored=JSON.parse(localStorage.getItem('sumai-map-ui-v260')||'null');const data={...fallback,ui_diagnostics:stored||fallback.ui_diagnostics||{},exported_at:new Date().toISOString(),client_log_available:!!stored};const blob=new Blob([JSON.stringify(data,null,2)],{type:'application/json'});const url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download='sumai_map_ui_log.json';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);document.getElementById('result').textContent=stored?'':' 端末ログなし：受信済みログを出力';}catch(e){document.getElementById('result').textContent=' 端末ログを取得できません。上のJSONを保存してください。'}};
+</script>'''.replace('PAYLOAD',payload,1),height=74)
+
+
 @st.cache_resource(show_spinner=False)
 def town_component_v121():
     _asset_revision='v249-supermarket-overlay'
@@ -16492,6 +16518,8 @@ def interactive_town_choropleth(group):
         if isinstance(data.get('map_diagnostics'),list):
             state['_v245_map_diagnostics']=[{k:str(row.get(k,''))[:160] for k in ('time','status','provider','detail')}
                 for row in data['map_diagnostics'][-40:] if isinstance(row,dict)]
+        if isinstance(data.get('ui_diagnostics'),dict):
+            state['_v260_map_ui_diagnostics']=_v260_clean_diagnostics(data['ui_diagnostics'])
         current=viewport_bounds(data)
         if data.get('event')=='supermarket_v249':
             ticket=str(data.get('ticket') or '')[:100]
@@ -17485,10 +17513,12 @@ def _v209_log_tools(state):
         rows=state.get('_v245_map_diagnostics',[])
         if rows:st.dataframe(rows,hide_index=True,use_container_width=True)
         else:st.caption('地図を表示すると、背景地図の取得結果が記録されます。')
-        diagnostic={'background_tiles':rows,'rent_overlay':state.get('_v245_rent_diagnostics',{})}
+        diagnostic={'background_tiles':rows,'rent_overlay':state.get('_v245_rent_diagnostics',{}),'ui_diagnostics':state.get('_v260_map_ui_diagnostics',{})}
         st.json(diagnostic['rent_overlay'],expanded=False)
         st.download_button('背景地図の詳細ログ JSON',json.dumps(diagnostic,ensure_ascii=False,indent=2).encode('utf-8'),
             'sumai_basemap_log.json','application/json',key='basemap_log_v245',disabled=not rows)
+        _v260_browser_log_download(diagnostic)
+        st.caption('白画面・地図消失の調査には「端末の地図操作ログ JSON」を出力してください。直近120件を記録します。')
     _v247_equipment_log_tools(state)
     _v208_landmark_log_panel(state)
     if state.get('_v217_suumo_audit'):
