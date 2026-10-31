@@ -53,7 +53,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v279"
+BUILD = "REBUILD-01-v280"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -13791,7 +13791,7 @@ def _v264_requested_supermarkets(state,loader):
 
 @st.cache_resource(show_spinner=False)
 def town_component_v121():
-    _asset_revision='v279-fixed-station-name-anchor'
+    _asset_revision='v280-incremental-map'
     folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-'+_asset_revision)
     os.makedirs(folder,exist_ok=True)
     path=os.path.join(folder,'index.html')
@@ -13809,7 +13809,7 @@ def town_component_v121():
         with open(temp_path,'w',encoding='utf-8') as output:
             output.write(TOWN_COMPONENT_HTML_V121)
         os.replace(temp_path,path)
-    return st.components.v1.declare_component('sumai_town_map_v279',path=folder)
+    return st.components.v1.declare_component('sumai_town_map_v280',path=folder)
 
 @st.cache_resource(show_spinner=False)
 def _v216_api_budget():
@@ -14579,6 +14579,31 @@ _v279_redraw=_v279_redraw.replace(_v279_old,_v279_new,1)
 TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121[:_v279_start]+_v279_redraw+TOWN_COMPONENT_HTML_V121[_v279_end:]
 TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('</style></head>',
  '.station-chip{transform:none;text-align:left;align-items:flex-start;line-height:18px}.station-chip.dual{align-items:flex-start;line-height:18px}.station-chip::before,.station-chip.dual::before{margin-top:5px}.station-chip.v226-shifted::before{display:inline-block}.station-chip.dual .commute-grid{align-items:start}.station-chip.v225-name-only{font-size:14px;line-height:18px}.station-chip.minor.v225-name-only{font-size:12px}.station-chip.compact.v225-name-only{font-size:12px;line-height:16px}.station-chip.minor.compact.v225-name-only{font-size:11px;line-height:15px}\n</style></head>',1)
+
+
+# v280: bounded viewport painting and lazy popup content. No new data source,
+# no changed rent classification, no persistent browser store data.
+_v280_start=TOWN_COMPONENT_HTML_V121.index('function updateOverlay(')
+_v280_end=TOWN_COMPONENT_HTML_V121.index('\nfunction ',_v280_start+10)
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121[:_v280_start]+"\n// v280: render only the buffered viewport; keep existing layers/popups stable.\nfunction v280GeometryBounds(geometry){\n var box=[Infinity,Infinity,-Infinity,-Infinity];\n function visit(a){if(!Array.isArray(a))return;if(typeof a[0]==='number'&&typeof a[1]==='number'){box[0]=Math.min(box[0],a[1]);box[1]=Math.min(box[1],a[0]);box[2]=Math.max(box[2],a[1]);box[3]=Math.max(box[3],a[0]);}else a.forEach(visit)}\n if(geometry)visit(geometry.coordinates);return Number.isFinite(box[0])?box:null;\n}\nfunction v280Intersects(box,b){return box&&box[0]<=b.getNorth()&&box[2]>=b.getSouth()&&box[1]<=b.getEast()&&box[3]>=b.getWest()}\nfunction v280RentStyle(feature){var p=feature.properties||{};return p.has_data===true?{color:'#606b72',weight:.7,fillColor:p.color||'#bbb',fillOpacity:state._v247SupermarketOverlayVisible?.32:.81}:{color:'transparent',weight:0,fillOpacity:0}}\nfunction v280RentPopup(layer){\n if(layer._v280Popup)return layer._v280Popup;\n var props=layer.feature.properties||{},el=document.createElement('div');\n el.appendChild(document.createTextNode(String(props.name||'')+'｜平均 '+String(props.price_label||'')+'｜'+String(props.count_label||'')));\n var actions=document.createElement('div');actions.className='v204-popup-actions';el.appendChild(actions);\n layer._v280PopupEntry=v217AttachSuumo(layer,actions,el,props);\n var route=document.createElement('a');route.className='v167-suumo-link v204-route-link';route.textContent='経路案内 ↗';route.target='_blank';route.rel='noopener noreferrer';route.title='現在地からタップした場所までGoogleマップで案内';route.setAttribute('aria-label',route.title);route.setAttribute('aria-disabled','true');\n route.addEventListener('click',function(e){if(!route.hasAttribute('href'))e.preventDefault()});actions.appendChild(route);\n layer._v280Popup=el;return el;\n}\nfunction v280PreparePopup(layer,event){\n var el=v280RentPopup(layer),route=el.querySelector('.v204-route-link'),url=v204DirectionsUrl(event&&event.latlng);\n if(url){route.href=url;route.removeAttribute('aria-disabled')}else{route.removeAttribute('href');route.setAttribute('aria-disabled','true')}\n var entry=layer._v280PopupEntry;if(entry){state._v217Active=entry;v217UpdatePopup(entry);if(!entry.link.hasAttribute('href'))v217RequestPopup(entry)}\n}\nfunction v280QueueRent(task){\n state._v280RentWork=task;state._v280RentTimer=true;\n if(!state._v280RentChannel){var channel=new MessageChannel();channel.port1.onmessage=function(){var next=state._v280RentWork;state._v280RentWork=null;state._v280RentTimer=null;if(next)next()};state._v280RentChannel=channel;}\n state._v280RentChannel.port2.postMessage(0);\n}\nfunction v280DrawRent(){\n if(!state.map||!state._v280RentRecords)return;\n state._v280RentWork=null;state._v280RentTimer=null;\n var epoch=(state._v280RentEpoch||0)+1;state._v280RentEpoch=epoch;\n var started=performance.now(),bounds=state.map.getBounds(),buffer=bounds.pad(.25),wanted=new Set(),todo=[],layers=state._v280RentLayers;\n state._v280RentRecords.forEach(function(row){if(v280Intersects(row.box,buffer)){wanted.add(row.key);var old=layers.get(row.key);if(!old||old.feature!==row.feature||!state.overlay.hasLayer(old))todo.push(row)}});\n todo.sort(function(a,b){return Number(v280Intersects(b.box,bounds))-Number(v280Intersects(a.box,bounds))});\n var index=0,created=0,reused=0,maxSlice=0,attach=[],attachIndex=0,visibleRemaining=todo.filter(function(row){return v280Intersects(row.box,bounds)}).length,visibleMs=0;\n function slice(){\n  if(epoch!==state._v280RentEpoch)return;state._v280RentTimer=null;\n  var begin=performance.now(),done=0;\n  while(index<todo.length&&done<80&&(done===0||performance.now()-begin<12)){\n   var row=todo[index++],layer=layers.get(row.key),feature=row.feature;\n   if(!layer){\n    var item=L.geoJSON(feature,{smoothFactor:.25,style:v280RentStyle,onEachFeature:function(f,path){\n     if((f.properties||{}).has_data!==true){path.options.interactive=false;return}\n     path.on('click',function(e){v280PreparePopup(path,e)});path.bindPopup(function(){return v280RentPopup(path)});\n    }});\n    layer=item.getLayers()[0];if(layer){layer._v280Geometry=JSON.stringify(feature.geometry);layers.set(row.key,layer);created++;}\n   }else{\n    var geometry=JSON.stringify(feature.geometry);\n    if(layer._v280Geometry!==geometry){var updated=L.GeoJSON.geometryToLayer(feature);if(updated&&updated.getLatLngs&&layer.setLatLngs)layer.setLatLngs(updated.getLatLngs());layer._v280Geometry=geometry}\n    layer.feature=feature;layer.setStyle(v280RentStyle(feature));\n    var entry=layer._v280PopupEntry;if(entry){entry.props=feature.properties||{};entry.place=v217Place(entry.props);v217UpdatePopup(entry);if(layer._v280Popup.firstChild)layer._v280Popup.firstChild.nodeValue=String(entry.props.name||'')+'｜平均 '+String(entry.props.price_label||'')+'｜'+String(entry.props.count_label||'')}\n    reused++;\n   }\n   if(layer&&!state.overlay.hasLayer(layer))attach.push({layer:layer,box:row.box});\n   else if(v280Intersects(row.box,bounds)&&--visibleRemaining===0)visibleMs=Math.round(performance.now()-started);\n   done++;\n  }\n  maxSlice=Math.max(maxSlice,performance.now()-begin);\n  if(index<todo.length){v280QueueRent(slice);return}\n  attachSlice();\n }\n function attachSlice(){\n  if(epoch!==state._v280RentEpoch)return;state._v280RentTimer=null;\n  var begin=performance.now(),done=0;\n  while(attachIndex<attach.length&&done<500&&(done===0||performance.now()-begin<32)){var row=attach[attachIndex++];row.layer.addTo(state.overlay);if(v280Intersects(row.box,bounds)&&--visibleRemaining===0)visibleMs=Math.round(performance.now()-started);done++}\n  maxSlice=Math.max(maxSlice,performance.now()-begin);\n  if(attachIndex<attach.length){v280QueueRent(attachSlice);return}\n  layers.forEach(function(layer,key){if(!wanted.has(key)&&!(state._v280RentRecordKeys.has(key)&&layer.isPopupOpen&&layer.isPopupOpen())){state.overlay.removeLayer(layer);layers.delete(key)}});\n  state._v280RentStats={available:state._v280RentRecords.length,drawn:layers.size,created:created,reused:reused,max_slice_ms:Math.round(maxSlice*10)/10,visible_ms:visibleMs,total_ms:Math.round(performance.now()-started)};\n  if(todo.length&&typeof v260Diag!=='undefined')v260Diag.record('rent_draw_complete','available='+state._v280RentRecords.length+' drawn='+layers.size+' created='+created+' reused='+reused+' max_slice_ms='+Math.round(maxSlice)+' visible_ms='+visibleMs+' total_ms='+Math.round(performance.now()-started));\n }\n slice();\n}\nfunction updateOverlay(geo,signature){\n if(!state.map||signature===state.groupSignature)return;\n try{\n  var records=[],keys=new Set();\n  ((geo&&geo.features)||[]).forEach(function(feature,index){var p=feature.properties||{};if(p.has_data!==true)return;var box=v280GeometryBounds(feature.geometry);if(!box)return;var key=String(p.suumo_ward||'')+'|'+String(p.name||index);if(keys.has(key))key+='|'+index;keys.add(key);records.push({key:key,feature:feature,box:box})});\n  if(!state.overlay){state.overlay=L.featureGroup().addTo(state.map);state._v280RentLayers=new Map();state.map.on('moveend zoomend',v280DrawRent)}\n  state._v280RentRecords=records;state._v280RentRecordKeys=keys;state.groupSignature=signature;state.townAnchors=[];v280DrawRent();\n }catch(error){note('地図の塗り分けを表示できません: '+(error&&error.message||'エラー'));if(typeof v260Diag!=='undefined')v260Diag.record('rent_draw_error',error&&error.message)}\n}\n"+TOWN_COMPONENT_HTML_V121[_v280_end:]
+_v280_attach=" layer.on('click',function(){state._v217Active=entry;v217UpdatePopup(entry);if(!link.hasAttribute('href'))v217RequestPopup(entry);});\n}"
+assert TOWN_COMPONENT_HTML_V121.count(_v280_attach)==1
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(_v280_attach,_v280_attach[:-1]+' return entry;\n}',1)
+# Repeated server renders and duplicate zoomend/moveend must not clear/recreate
+# station DOM when destinations, rows, viewport and dimensions are unchanged.
+_v280_station_wrapper="""function redrawStations(){
+ if(!state.map)return;
+ var size=state.map.getSize(),key=[state._v280StationInput,state.map.getZoom(),state.map.getBounds().toBBoxString(),size.x,size.y].join('|');
+ if(state._v280StationView===key)return;
+ v280RedrawStationsBody();state._v280StationView=key;state._v280StationBuilds=(state._v280StationBuilds||0)+1;
+}
+function v280RedrawStationsBody(){"""
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('function redrawStations(){',_v280_station_wrapper,1)
+_v280_rows=' state.stations=Array.isArray(args.stations)?args.stations:state.stations;'
+assert TOWN_COMPONENT_HTML_V121.count(_v280_rows)==1
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(_v280_rows,_v280_rows+'\n state._v280StationInput=JSON.stringify([state.commuteDestination,state.commuteDestination2,state.commuteDestination3,state.stations]);',1)
+# Correct the stale build identifier in exported logs.
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace("build:'v265'","build:'v280'")
 
 
 def _v228_station_line_matches(query,lines):
@@ -16805,7 +16830,7 @@ def _v251_seed_verified_stores(db,records):
 
 
 # v261: store data is published once per successful load, outside the map render.
-_V261_COMPONENT_REVISION='v279-fixed-station-name-anchor'
+_V261_COMPONENT_REVISION='v280-incremental-map'
 _V261_MAP_FIELDS=('id','ward','name','address','lat','lng','color','price_label','website','source_url','verification')
 
 
