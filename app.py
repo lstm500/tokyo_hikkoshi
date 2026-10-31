@@ -52,7 +52,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v269"
+BUILD = "REBUILD-01-v272"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -10795,10 +10795,10 @@ def attach_town_summary_worker(worker):
 
 
 class TownSummaryWorker:
-    """One namespace snapshot, recomputed only after a manual button click.
+    """One namespace snapshot, preferring the persisted summary on startup.
 
-    The worker reads the persisted summary on start-up, without scanning
-    listings. Manual aggregation runs on a background thread.
+    If no snapshot exists, the first aggregation runs once in the background.
+    Later listing changes remain pending until manual aggregation.
     """
     def __init__(self,db):
         self.db=db;self.build=BUILD;self.lock=threading.RLock();self.running=False;self.progress=0;self.total_pages=None;self.total_records=None;self.scanned_records=0;self.page_size=160
@@ -10830,8 +10830,11 @@ class TownSummaryWorker:
         # Kept for compatibility; never schedule background polling.
         return False
     def refresh_on_startup(self):
-        # Read existing persisted summary only; do not scan rental listings.
-        return False
+        # A persisted summary is always preferred. Scan once only if absent.
+        with self.lock:
+            if self.ready or self.running or not self.initialized or getattr(self,'_v271_initializing',False) or self.error or self._startup_scan_requested:return False
+            self._startup_scan_requested=True
+            return self.start()
     def _schedule_refresh_locked(self,urgent=False):
         # No timers or automatic retries. A manual click is always required.
         return False
@@ -10849,7 +10852,7 @@ class TownSummaryWorker:
     def initialize(self):
         with self.lock:
             if self.initialized:return
-            self.initialized=True
+            self.initialized=True;self._v271_initializing=True
         try:
             records=self.db.call('GET',SEARCH_TABLE,{'namespace':'eq.'+self.db.namespace,
                 'id':'eq.'+TOWN_SUMMARY_ID,'select':'summary','limit':1})
@@ -10858,6 +10861,8 @@ class TownSummaryWorker:
                 with self.lock:self.summary=summary;self.ready=True;self.revision+=1
         except Exception as exc:
             with self.lock:self.error='町丁目集計の保存データを確認できません: '+str(exc)
+        finally:
+            with self.lock:self._v271_initializing=False
     def start(self):
         with self.lock:
             if self.running:return False
@@ -10990,10 +10995,11 @@ def current_town_summary_worker():
     with lock:
         job=jobs.get(key)
         if job is None or (getattr(job,'build',None)!=BUILD and not job.snapshot()['running']):
-            # A hot-deployed version must rebuild summaries with its new layout groups.
+            # A new worker first reads the persisted summary for its layout groups.
             # Keep an older, actively running worker until its scan has finished.
             job=TownSummaryWorker(db);jobs[key]=job
     job.initialize()
+    job.refresh_on_startup()
     attach_town_summary_worker(job)
     return job
 
@@ -13729,6 +13735,42 @@ TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(_v265_marker_old,_v265
 TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace("build:'v264'","build:'v265'",1)
 
 
+# v271: readiness probes rerun only the existing map fragment, never the page.
+_V271_RENT_STARTUP_JS = r"""
+function v271RentStartup(args){
+ state._v271RentWaiting=!!args.rent_map_waiting&&!args.rent_map_ready;
+ if(!state._v271RentWaiting){if(state._v271RentTimer)clearTimeout(state._v271RentTimer);state._v271RentTimer=null;return;}
+ if(state._v271RentTimer||(state._v271RentAttempts||0)>=24)return;
+ state._v271RentTimer=setTimeout(function(){
+  state._v271RentTimer=null;if(!state._v271RentWaiting)return;
+  if(document.hidden){v271RentStartup({rent_map_waiting:true});return;}
+  state._v271RentAttempts=(state._v271RentAttempts||0)+1;
+  hostMessage('streamlit:setComponentValue',{dataType:'json',value:{event:'rent_ready_probe_v271',
+   ticket:'rent_ready_'+Date.now()+'_'+state._v271RentAttempts,home_view_epoch:state._v202HomeEpoch}});
+  v271RentStartup({rent_map_waiting:state._v271RentWaiting});
+ },state._v271RentAttempts?5000:1500);
+}
+"""
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('function v249RenderSupermarkets(args){',_V271_RENT_STARTUP_JS+'\nfunction v249RenderSupermarkets(args){\n v271RentStartup(args||{});',1)
+
+
+# v272: supermarket directions reuse the existing exact-coordinate walking URL.
+_V272_SUPERMARKET_ROUTE_JS = r"""
+ var actions=document.createElement('div');actions.className='v204-popup-actions';
+ var route=document.createElement('a');route.className='v167-suumo-link v204-route-link';
+ route.textContent='経路案内 ↗';route.target='_blank';route.rel='noopener noreferrer';
+ route.title='現在地からこのスーパーまでGoogleマップで案内';
+ route.setAttribute('aria-label','現在地から'+String(shop.name||'このスーパー')+'までGoogleマップで経路案内');
+ var destination=v204DirectionsUrl({lat:shop.lat,lng:shop.lng});
+ if(destination)route.href=destination;else route.setAttribute('aria-disabled','true');
+ route.addEventListener('click',function(event){if(!route.hasAttribute('href'))event.preventDefault();});
+ actions.appendChild(route);box.appendChild(actions);
+"""
+_v272_route_anchor=" [['公式ページ',shop.website],['地図情報の出典',shop.source_url]].forEach(function(pair){"
+assert TOWN_COMPONENT_HTML_V121.count(_v272_route_anchor)==1
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(_v272_route_anchor,_V272_SUPERMARKET_ROUTE_JS+'\n'+_v272_route_anchor,1)
+
+
 def _v264_supermarket_diagnostics(state):
     loader=state.get('_v249_supermarket_loader')
     if not loader:return {'initialized':False}
@@ -13748,7 +13790,7 @@ def _v264_requested_supermarkets(state,loader):
 
 @st.cache_resource(show_spinner=False)
 def town_component_v121():
-    _asset_revision='v265-supermarket-buffer'
+    _asset_revision='v272-supermarket-directions'
     folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-'+_asset_revision)
     os.makedirs(folder,exist_ok=True)
     path=os.path.join(folder,'index.html')
@@ -13766,7 +13808,7 @@ def town_component_v121():
         with open(temp_path,'w',encoding='utf-8') as output:
             output.write(TOWN_COMPONENT_HTML_V121)
         os.replace(temp_path,path)
-    return st.components.v1.declare_component('sumai_town_map_v265',path=folder)
+    return st.components.v1.declare_component('sumai_town_map_v272',path=folder)
 
 @st.cache_resource(show_spinner=False)
 def _v216_api_budget():
@@ -16348,6 +16390,7 @@ def _v250_supplement_supermarkets(job,ward,rows):
 class _V246EquipmentJob:
     def __init__(self):
         self.lock=threading.RLock();self.stop=threading.Event();self.running=False;self.status='待機中'
+        self._v270_commit_lock=threading.RLock()
         self.progress={};self.data={};self.logs=[];self.wards=[];self.run_id='';self.started_at='';self.log_saved=False;self.log_error='';self.dropped_logs=0
     def snapshot(self):
         with self.lock:return {'running':self.running,'status':self.status,'progress':{k:dict(v) for k,v in self.progress.items()},
@@ -16384,7 +16427,11 @@ class _V246EquipmentJob:
                     if load_only:
                         previous=saved.get(_v246_record_id(ward))
                         if previous is not None:_v253_validate_saved(previous,ward)
-                    else:previous=_v246_load(db,ward)
+                    else:
+                        with self._v270_commit_lock:
+                            if self.stop.is_set():raise SearchCancelled()
+                        previous=_v246_load(db,ward)
+                    if self.stop.is_set():raise SearchCancelled()
                     self.log(ward,'saved_data_loaded',found=bool(previous),count=len(previous['rows']) if previous else 0,scope='all_saved' if load_only else 'selected')
                     if previous:
                         with self.lock:self.data[ward]=previous
@@ -16422,7 +16469,9 @@ class _V246EquipmentJob:
                         with self.lock:self.progress[ward]['状態']='中止'
                         break
                     with self.lock:self.status=ward+'：保存・読み戻し確認中'
-                    confirmed=_v246_save(db,ward,rows,stats)
+                    with self._v270_commit_lock:
+                        if self.stop.is_set():raise SearchCancelled()
+                        confirmed=_v246_save(db,ward,rows,stats)
                     with self.lock:
                         self.data[ward]=confirmed;self.progress[ward]={'状態':'完了' if stats.get('official_complete') and stats.get('osm_complete') else '補完一部未完了','保存件数':len(rows),'詳細':f"OSM {'確認済み' if stats.get('osm_complete') else '未完了'}／公式追加 {stats.get('official_added',0)}件／公式未完了 {sum(not r.get('complete') for r in stats.get('official_coverage',[]))}社"}
                     self.log(ward,'saved_and_verified',count=len(rows))
@@ -16450,6 +16499,34 @@ class _V246EquipmentJob:
         with self.lock:return [dict(r) for payload in self.data.values() for r in payload.get('rows',[])]
 
 
+def _v270_cancel_equipment(state):
+    """Detach a cancelled run without ever clearing its stop Event.
+
+    The old worker may still be awaiting an HTTP response. Its data/log objects
+    and run ID remain private to that worker. New collection gets a fresh Event,
+    so a late response cannot revive the old run or alter the current UI.
+    A shared commit lock orders any already-started saved-data write before
+    the new run's read/write; cancellation is checked inside that lock.
+    """
+    previous=state.get('_v246_equipment_job')
+    if not previous:return None
+    with previous.lock:
+        if not previous.running:return previous
+        previous.stop.set()
+        previous.log('','collection_cancel_requested',message='新しい取得処理とは分離して停止します。')
+        replacement=_V246EquipmentJob()
+        replacement._v270_commit_lock=getattr(previous,'_v270_commit_lock',threading.RLock())
+        replacement.data=dict(previous.data)
+        replacement.progress={w:{**p,'状態':p.get('状態') if p.get('状態') in ('完了','補完一部未完了','未取得') else '中止'} for w,p in previous.progress.items()}
+        replacement.logs=[dict(r) for r in previous.logs]
+        replacement.wards=list(previous.wards);replacement.run_id=previous.run_id
+        replacement.started_at=previous.started_at;replacement.dropped_logs=previous.dropped_logs
+        replacement.log_error=previous.log_error
+        replacement.status='中止しました。保存済みデータは保持しています。取得を再開できます。'
+    state['_v246_equipment_job']=replacement
+    return replacement
+
+
 def _v246_equipment_job():
     state=st.session_state
     if '_v246_equipment_job' not in state:state['_v246_equipment_job']=_V246EquipmentJob()
@@ -16475,7 +16552,7 @@ def _v251_equipment_panel_body():
     if st.button('選択した区のスーパーを取得・再開',key='equipment_start_v246',type='primary',disabled=snap['running'] or not wards,use_container_width=True):
         job.start(wards,force=force);st.rerun()
     if st.button('取得を中止（保存済みデータを保持）',key='equipment_stop_v246',disabled=not snap['running']):
-        job.stop.set();st.info('中止を受け付けました。通信中の区は通信終了後に保存・確認して停止します。')
+        _v270_cancel_equipment(st.session_state);st.rerun()
     st.caption('通常は完了した区を読み込み、未完了の区から再開します。再取得に失敗しても以前の保存結果は削除しません。')
     st.write(snap['status'])
     if snap.get('log_error'):st.warning('取得ログの保存は未確認です：'+snap['log_error'])
@@ -16539,7 +16616,7 @@ def _v251_seed_verified_stores(db,records):
 
 
 # v261: store data is published once per successful load, outside the map render.
-_V261_COMPONENT_REVISION='v265-supermarket-buffer'
+_V261_COMPONENT_REVISION='v272-supermarket-directions'
 _V261_MAP_FIELDS=('id','ward','name','address','lat','lng','color','price_label','website','source_url','verification')
 
 
@@ -16917,7 +16994,7 @@ def interactive_town_choropleth(group):
         if not cached['colored_count']:
             st.caption('現在の表示範囲・間取り・データソースに一致する保存家賃は表示されていません。取得済み物件を反映するには「保存物件を再集計」を押してください。背景地図の通信とは別の状態です。')
     else:
-        st.caption('取得元別の集計を作成中です。完了後に選択したデータソースの家賃を表示します。' if source!='ALL' and snap['running'] else '保存物件の再集計を押すと、家賃の色分けをバックグラウンドで作成します')
+        st.caption('家賃の色分けを準備しています。完了すると自動で反映します。' if snap['running'] or busy else '保存物件の再集計を押すと、家賃の色分けをバックグラウンドで作成します')
     search_catalog=[];search_ward_bounds=[]
     if ready and isinstance(shapes,TownBoundaryStore):
         try:
@@ -16930,6 +17007,7 @@ def interactive_town_choropleth(group):
     data=widget(chintai_town_urls=(_v243_chintai_urls(cached['geo'],group) if source=='CHINTAI' else {}),map_source=source,map_layout_group=group,center=list(center),zoom=_v202_view_zoom(state.get('new_view_zoom')),geo=cached['geo'],
                 home_view_epoch=int(state.get('_v202_home_epoch',0)),home_center=list(_V202_HOME_CENTER),
                 signature=cached['layer_signature'],stations=stations,wards=wards,
+                rent_map_ready=bool(cached['ready']),rent_map_waiting=bool(snap['running'] or busy),
                 supermarket_overlay_visible=supermarket_visible,
                 supermarket_manifest=_v261_supermarket_manifest(supermarket_loader),
                 supermarket_payload=_v267_supermarket_payload(state,supermarket_loader,supermarket_visible),
