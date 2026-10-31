@@ -29,6 +29,7 @@ import threading
 import time
 import unicodedata
 import urllib.robotparser
+from collections import deque
 from datetime import datetime, timezone, timedelta
 from email.utils import parsedate_to_datetime
 from urllib.parse import urlencode, urljoin, urlparse, parse_qs, quote
@@ -52,7 +53,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v272"
+BUILD = "REBUILD-01-v274"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -13790,7 +13791,7 @@ def _v264_requested_supermarkets(state,loader):
 
 @st.cache_resource(show_spinner=False)
 def town_component_v121():
-    _asset_revision='v272-supermarket-directions'
+    _asset_revision='v274-rail-connections'
     folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-'+_asset_revision)
     os.makedirs(folder,exist_ok=True)
     path=os.path.join(folder,'index.html')
@@ -13808,7 +13809,7 @@ def town_component_v121():
         with open(temp_path,'w',encoding='utf-8') as output:
             output.write(TOWN_COMPONENT_HTML_V121)
         os.replace(temp_path,path)
-    return st.components.v1.declare_component('sumai_town_map_v272',path=folder)
+    return st.components.v1.declare_component('sumai_town_map_v274',path=folder)
 
 @st.cache_resource(show_spinner=False)
 def _v216_api_budget():
@@ -14397,6 +14398,110 @@ def town_station_refs_v164(destinations):
     return stations,wards
 
 
+
+# v274: schematic station-to-station connections. Never reuse the legacy
+# express graph or concatenate branch lists, which would invent rail links.
+# Display-only station positions; existing commute calculations stay intact.
+# Coordinates: existing MIT station_locations.csv and ekidata/ODPT station groups:
+# https://github.com/piuccio/open-data-jp-railway-stations
+# Haneda names follow the official 2020 terminal/station renaming.
+_V274_RAIL_EXTRA_POINTS={'西船橋': [35.70718, 139.95877], '和光市': [35.78835, 139.612865], '浦安': [35.665905, 139.893235], '行徳': [35.68262, 139.914185], '東船橋': [35.69983, 140.00407], '原木中山': [35.7033, 139.941915], '本八幡': [35.72085, 139.927405], '妙典': [35.69101, 139.92429], '南行徳': [35.67273, 139.902275], '下総中山': [35.714285, 139.94307], '大森町': [35.572431, 139.732027], '登戸': [35.620889, 139.570028], '大森海岸': [35.587576, 139.73544], '沼部': [35.582526, 139.67326], '雪が谷大塚': [35.592038, 139.681083], '平間': [35.560565, 139.671039], '緑が丘': [35.60638, 139.679482], '矢口渡': [35.562462, 139.700389], '若林': [35.645933, 139.659911], '向河原': [35.572891, 139.66725], '梅島': [35.772437, 139.797916], '千鳥町': [35.572983, 139.69142], '世田谷': [35.643564, 139.650945], 'とうきょうスカイツリー': [35.71043, 139.809332], '京急川崎': [35.53285, 139.700893], '東向島': [35.724324, 139.819306], '松原': [35.660048, 139.642], '鐘ヶ淵': [35.733712, 139.820344], '亀戸水神': [35.699976, 139.833422], '武蔵新城': [35.587369, 139.629419], '北千束': [35.606311, 139.693303], '豪徳寺': [35.653807, 139.647381], '青物横丁': [35.609351, 139.742958], '京急蒲田': [35.560796, 139.723681], '九品仏': [35.60538, 139.660992], '四ツ木': [35.731962, 139.834918], '世田谷代田': [35.65834, 139.661557], '武蔵中原': [35.581498, 139.640613], '流通センター': [35.58186, 139.748964], '石川台': [35.596888, 139.685063], '北品川': [35.622458, 139.739191], '整備場': [35.555125, 139.753366], '小菅': [35.759039, 139.812935], '天空橋': [35.548908, 139.75423], '蓮沼': [35.564173, 139.708544], '仙川': [35.662257, 139.584908], '長原': [35.60219, 139.697881], '江古田': [35.737557, 139.672814], '上野毛': [35.611957, 139.638917], '平和島': [35.57868, 139.73491], '牛田': [35.744555, 139.811816], '立会川': [35.598489, 139.738886], '尾山台': [35.606971, 139.653862], '祖師ヶ谷大蔵': [35.643236, 139.609659], '八幡山': [35.669982, 139.614927], '昭和島': [35.570656, 139.749918], '池上': [35.572025, 139.702822], '久が原': [35.579499, 139.685678], '大岡山': [35.607456, 139.685909], '田園調布': [35.596815, 139.667356], '新三河島': [35.73714, 139.773834], '東あずま': [35.707067, 139.831883], '鵜の木': [35.575452, 139.680554], '新馬場': [35.61762, 139.741366], '御嶽山': [35.585236, 139.682473], '梅屋敷': [35.566873, 139.728266], '京成高砂': [35.750932, 139.866875], '大鳥居': [35.552531, 139.739356], '鮫洲': [35.604977, 139.742227], '洗足池': [35.599648, 139.690896], '山下': [35.653844, 139.646509], '穴守稲荷': [35.550326, 139.746669], '洗足': [35.61043, 139.694367], '宮の坂': [35.647508, 139.64494], '鹿島田': [35.551459, 139.674964], '上町': [35.643656, 139.646276], '多摩川': [35.589591, 139.668723], '南新宿': [35.683483, 139.69867], '八広': [35.727687, 139.828738], '矢向': [35.539408, 139.68055], '等々力': [35.608369, 139.647938], '五反野': [35.765852, 139.809643], '梅ヶ丘': [35.656024, 139.653628], '新丸子': [35.58049, 139.661964], '曳舟': [35.718418, 139.816634], '堀切': [35.742977, 139.817727], '京成関屋': [35.744008, 139.81183], '尻手': [35.530939, 139.684233], '羽田空港第1ターミナル': [35.549163, 139.784653], '羽田空港第2ターミナル': [35.550734, 139.787979], '羽田空港第1・第2ターミナル': [35.549809, 139.785962], '羽田空港第3ターミナル': [35.544676, 139.768968]}
+
+
+def _v274_rail_network():
+    segments={}
+    palette=('#d17826','#238b70','#8c70ac','#248cb1','#bd596f','#637db5','#878126','#b46733')
+    colors={'山手線':'#639b2f','中央総武線':'#bd9426','京浜東北線':'#348db8',
+        '銀座線':'#d38422','丸ノ内線':'#be454f','丸ノ内線支線':'#be454f',
+        '日比谷線':'#73848b','東西線':'#238ea7','千代田線':'#279265','有楽町線':'#9f8d4b',
+        '副都心線':'#946544','半蔵門線':'#886aa4','南北線':'#28988d','浅草線':'#b96680',
+        '三田線':'#3a73b9','新宿線':'#74a038','大江戸線':'#9f3274','大江戸線都庁前連絡':'#9f3274',
+        '西武池袋線':'#cb7b21','西武有楽町線':'#cb7b21'}
+    sources=(_COMMUTE_PUBLISHED_LINES,_COMMUTE_APPROX_LINES,_COMMUTE_V162_TIMED_LINES,_COMMUTE_V162_APPROX_LINES)
+    for source in sources:
+        for row in source.splitlines():
+            if not row.strip():continue
+            raw,words=row.split('|',1);line=raw.replace('（概算）','').replace('（各停概算）','')
+            if line=='大江戸線都庁前連絡':line='大江戸線'
+            label=_commute_v160_line_label(line)
+            if line=='丸ノ内線支線':label='東京メトロ 丸ノ内線（支線）'
+            color=colors.get(raw,colors.get(line,palette[int(hashlib.sha256(line.encode()).hexdigest()[:6],16)%len(palette)]))
+            names=[_commute_key(w.split(':',1)[0]) for w in words.split()]
+            # Skip edges with unknown endpoints; do not join over missing stops.
+            for a,b in zip(names,names[1:]):
+                pa=STATION_MAP_POINTS.get(a) or STATIONS.get(a) or _V274_RAIL_EXTRA_POINTS.get(a);pb=STATION_MAP_POINTS.get(b) or STATIONS.get(b) or _V274_RAIL_EXTRA_POINTS.get(b)
+                if not pa or not pb or a==b:continue
+                if not all(math.isfinite(float(v)) for v in (*pa,*pb)):continue
+                key='|'.join(sorted((a,b)))
+                if key not in segments:segments[key]={'id':key,'a':a,'b':b,'points':[list(pa),list(pb)],'lines':[],'color':color}
+                if label not in segments[key]['lines']:segments[key]['lines'].append(label)
+    return list(segments.values())
+
+
+_V274_RAIL_NETWORK=_v274_rail_network()
+_V274_RAIL_JS=r"""
+var v274RailNetwork=NETWORK;
+var v274ExtraStations=EXTRAPOINTS;
+function v274Railways(){
+ if(!state.map||!window.L)return;
+ var map=state.map;
+ if(!state._v274RailLayer){
+  map.createPane('v274RailPane');map.getPane('v274RailPane').style.zIndex='450';map.getPane('v274RailPane').style.pointerEvents='none';
+  map.createPane('v274RailLabelPane');map.getPane('v274RailLabelPane').style.zIndex='620';map.getPane('v274RailLabelPane').style.pointerEvents='none';
+  state._v274RailRenderer=L.svg({pane:'v274RailPane',padding:.25});
+  state._v274RailLayer=L.layerGroup().addTo(map);state._v274RailLabels=L.layerGroup().addTo(map);state._v274RailSegments=new Map();
+  state._v274RailNodes=L.layerGroup().addTo(map);
+  map.attributionControl.addAttribution('路線：駅間接続の概略図｜駅位置：駅データ.jp・ODPT');
+  map.on('moveend zoomend',v274Railways);
+ }
+ var bounds=map.getBounds().pad(.25),zoom=map.getZoom(),size=map.getSize();
+ var view=[zoom,bounds.toBBoxString(),size.x,size.y].join('|');if(state._v274RailView===view)return;state._v274RailView=view;
+ var wanted=new Set(),visible=[];
+ v274RailNetwork.forEach(function(row){
+  if(!bounds.intersects(L.latLngBounds(row.points)))return;
+  wanted.add(row.id);
+  if(!state._v274RailSegments.has(row.id)){
+   var halo=L.polyline(row.points,{renderer:state._v274RailRenderer,pane:'v274RailPane',weight:4.5,color:'#fff',opacity:.82,interactive:false});
+   var line=L.polyline(row.points,{renderer:state._v274RailRenderer,pane:'v274RailPane',weight:2,color:row.color,opacity:.85,interactive:false});
+   halo.addTo(state._v274RailLayer);line.addTo(state._v274RailLayer);state._v274RailSegments.set(row.id,[halo,line]);
+  }
+  if(zoom>=12){
+   var a=map.latLngToContainerPoint(row.points[0]),b=map.latLngToContainerPoint(row.points[1]),p=L.point((a.x+b.x)/2,(a.y+b.y)/2),length=a.distanceTo(b);
+   if(length>=60&&p.x>85&&p.x<size.x-85&&p.y>22&&p.y<size.y-22)visible.push({row:row,p:p,length:length});
+  }
+ });
+ state._v274RailSegments.forEach(function(layers,key){if(!wanted.has(key)){layers.forEach(function(layer){state._v274RailLayer.removeLayer(layer)});state._v274RailSegments.delete(key)}});
+ state._v274RailLabels.clearLayers();state._v274RailNodes.clearLayers();var named=new Set(),boxes=[],count=0;
+ var nodes=new Map();v274RailNetwork.forEach(function(row){row.points.forEach(function(point,index){var name=index===0?row.a:row.b;if(bounds.contains(point))nodes.set(name,point)})});
+ if(zoom>=12)nodes.forEach(function(point,name){L.circleMarker(point,{renderer:state._v274RailRenderer,pane:'v274RailPane',radius:2.8,color:'#fff',weight:1.3,fillColor:'#47717d',fillOpacity:1,interactive:false}).addTo(state._v274RailNodes)});
+
+ visible.sort(function(a,b){return b.length-a.length});
+ visible.forEach(function(item){
+  if(count>=8)return;var row=item.row,label=row.lines.join(' / ');if(named.has(label))return;
+  var width=Math.min(190,Math.max(90,Array.from(label).length*10)),height=label.length>18?32:18;
+  var box={x:item.p.x-width/2,y:item.p.y-height/2,w:width,h:height};
+  if(boxes.some(function(b){return box.x<b.x+b.w+8&&box.x+box.w>b.x-8&&box.y<b.y+b.h+8&&box.y+box.h>b.y-8}))return;
+  var el=document.createElement('span');el.className='v274-rail-label';el.textContent=label;el.style.borderLeftColor=row.color;
+  el.title=row.a+' ↔ '+row.b+'：駅間の接続を示す概略線（実際の線路形状とは異なります）';
+  L.marker(map.containerPointToLatLng(item.p),{pane:'v274RailLabelPane',interactive:false,keyboard:false,icon:L.divIcon({className:'v274-rail-icon',html:el.outerHTML,iconSize:[0,0],iconAnchor:[0,0]})}).addTo(state._v274RailLabels);
+  boxes.push(box);named.add(label);count++;
+ });
+ var stationCount=0;
+ if(zoom>=14)Object.keys(v274ExtraStations).forEach(function(name){
+  if(stationCount>=20)return;var point=v274ExtraStations[name],p=map.latLngToContainerPoint(point);if(p.x<15||p.x>size.x-15||p.y<15||p.y>size.y-15)return;
+  var el=document.createElement('span');el.className='v274-extra-station';el.textContent=name;
+  L.marker(point,{pane:'v274RailLabelPane',interactive:false,keyboard:false,icon:L.divIcon({className:'v274-rail-icon',html:el.outerHTML,iconSize:[0,0],iconAnchor:[0,0]})}).addTo(state._v274RailLabels);stationCount++;
+ });
+}
+""".replace('NETWORK',json.dumps(_V274_RAIL_NETWORK,ensure_ascii=False,separators=(',',':')),1).replace('EXTRAPOINTS',json.dumps(_V274_RAIL_EXTRA_POINTS,ensure_ascii=False,separators=(',',':')),1)
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('function render(args){',_V274_RAIL_JS+'\nfunction render(args){',1)
+_v274_rail_anchor=' redrawStations();\n v249RenderSupermarkets(args);'
+assert TOWN_COMPONENT_HTML_V121.count(_v274_rail_anchor)==1
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(_v274_rail_anchor,' redrawStations();\n v274Railways();\n v249RenderSupermarkets(args);',1)
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('</style></head>',
+ '.v274-extra-station{display:block;white-space:nowrap;transform:translate(5px,-16px);font:11px/14px system-ui;color:#164a5c;text-shadow:1px 1px #fff,-1px -1px #fff,1px -1px #fff,-1px 1px #fff;pointer-events:none}.v274-rail-icon,.v274-rail-label{pointer-events:none!important}.v274-rail-label{display:block;width:max-content;max-width:190px;transform:translate(-50%,-50%);font:11px/14px system-ui;color:#25414b;background:rgba(255,255,255,.9);border-left:3px solid;padding:1px 4px;border-radius:2px;box-shadow:0 0 2px #fff;white-space:normal}'+ '</style></head>',1)
+
+
 def _v228_station_line_matches(query,lines):
     def key(value):
         value=re.sub(r'\s+','',unicodedata.normalize('NFKC',str(value or ''))).casefold()
@@ -14765,6 +14870,7 @@ def _v246_public_url(value):
 
 
 # Equipment collection is manual and independent of the rent-map render path.
+_V273_EQUIPMENT_LOG_LIMIT=100_000
 def _v251_log_digest(payload):
     # JSONB may round-trip integral JSON numbers as either int or float.
     def canonical(value):
@@ -14779,7 +14885,8 @@ def _v247_collect_log(job,db):
     with job.lock:
         payload={'schema':247,'checksum_schema':2,'run_id':job.run_id,'started_at':job.started_at,'finished_at':utc_now(),
             'wards':list(job.wards),'progress':{k:dict(v) for k,v in job.progress.items()},
-            'events':[dict(r) for r in job.logs],'dropped_events':job.dropped_logs,'status':job.status}
+            'events':[dict(r) for r in job.logs],'dropped_events':job.dropped_logs,'status':job.status,
+            'limits':{'max_events':_V273_EQUIPMENT_LOG_LIMIT}}
     payload['digest']=_v251_log_digest(payload)
     identity='equipment.supermarket.log.v247.'+job.run_id
     db.save_search({'id':identity,'source':'OpenStreetMap','status':'equipment_supermarket_log_v247',
@@ -14829,7 +14936,10 @@ def _v251_prepare_log_export(payload,events,error='',warning=''):
         '失敗理由':r.get('message') or r.get('body_preview',''),'取得先':r.get('endpoint') or r.get('url','')}
         for r in events if r.get('stage') in ('fetch_failed','ward_failed','job_failed','official_directory_failed','official_store_unresolved')]
     saved_coverage=[r for r in events if r.get('stage')=='saved_official_coverage']
-    export={'run':payload,'events':events,'saved_official_coverage':saved_coverage,
+    run=dict(payload)
+    # Preserve malformed original values, but serialize valid events just once.
+    if isinstance(run.get('events'),list):run.pop('events')
+    export={'run':run,'events':events,'saved_official_coverage':saved_coverage,
         'collection_performed':any(r.get('stage') in ('http_response','official_http_response','official_supplement_completed') for r in events),
         'analysis':summary,'excluded_candidates':excluded,
         'log_persistence_error':error,'integrity_warning':warning}
@@ -16391,21 +16501,21 @@ class _V246EquipmentJob:
     def __init__(self):
         self.lock=threading.RLock();self.stop=threading.Event();self.running=False;self.status='待機中'
         self._v270_commit_lock=threading.RLock()
-        self.progress={};self.data={};self.logs=[];self.wards=[];self.run_id='';self.started_at='';self.log_saved=False;self.log_error='';self.dropped_logs=0
+        self.progress={};self.data={};self.logs=deque(maxlen=_V273_EQUIPMENT_LOG_LIMIT);self.wards=[];self.run_id='';self.started_at='';self.log_saved=False;self.log_error='';self.dropped_logs=0
     def snapshot(self):
         with self.lock:return {'running':self.running,'status':self.status,'progress':{k:dict(v) for k,v in self.progress.items()},
             'log_saved':self.log_saved,'log_error':self.log_error,'wards':list(self.wards),'count':sum(len(payload.get('rows',[])) for payload in self.data.values())}
     def log(self,ward,stage,**detail):
         with self.lock:
+            if len(self.logs)==_V273_EQUIPMENT_LOG_LIMIT:self.dropped_logs+=1
             self.logs.append(dict(time=utc_now(),ward=ward,stage=stage,**detail))
-            if len(self.logs)>1000:self.dropped_logs+=1;self.logs=self.logs[-1000:]
     def start(self,wards,force=False,load_only=False):
         wards=list(TOKYO_WARDS.values()) if load_only else list(dict.fromkeys(w for w in wards if w in TOKYO_WARDS.values()))
         if not wards:return False
         with self.lock:
             if self.running:return False
             self.running=True;self.stop.clear();self.wards=wards;self.status='保存結果を確認中'
-            self.logs=[];self.dropped_logs=0;self.log_saved=False;self.log_error='';self.started_at=utc_now();self.run_id=hashlib.sha256(os.urandom(32)).hexdigest()[:24]
+            self.logs=deque(maxlen=_V273_EQUIPMENT_LOG_LIMIT);self.dropped_logs=0;self.log_saved=False;self.log_error='';self.started_at=utc_now();self.run_id=hashlib.sha256(os.urandom(32)).hexdigest()[:24]
             self.progress={w:{'状態':'待機','保存件数':0,'詳細':''} for w in wards}
             self._v252_osm_pause={};self._v252_official_pause={};self._v250_http_cache={};self._v250_host_starts={};self._v255_catalog_cache={};self._v255_catalog_errors={};self._v268_catalog_audits={};self._v269_catalog_audits={}
         threading.Thread(target=self.run,args=(wards,force,load_only),daemon=True,name='equipment-manual-v246').start();return True
@@ -16518,7 +16628,7 @@ def _v270_cancel_equipment(state):
         replacement._v270_commit_lock=getattr(previous,'_v270_commit_lock',threading.RLock())
         replacement.data=dict(previous.data)
         replacement.progress={w:{**p,'状態':p.get('状態') if p.get('状態') in ('完了','補完一部未完了','未取得') else '中止'} for w,p in previous.progress.items()}
-        replacement.logs=[dict(r) for r in previous.logs]
+        replacement.logs=deque((dict(r) for r in previous.logs),maxlen=_V273_EQUIPMENT_LOG_LIMIT)
         replacement.wards=list(previous.wards);replacement.run_id=previous.run_id
         replacement.started_at=previous.started_at;replacement.dropped_logs=previous.dropped_logs
         replacement.log_error=previous.log_error
@@ -16616,7 +16726,7 @@ def _v251_seed_verified_stores(db,records):
 
 
 # v261: store data is published once per successful load, outside the map render.
-_V261_COMPONENT_REVISION='v272-supermarket-directions'
+_V261_COMPONENT_REVISION='v274-rail-connections'
 _V261_MAP_FIELDS=('id','ward','name','address','lat','lng','color','price_label','website','source_url','verification')
 
 
