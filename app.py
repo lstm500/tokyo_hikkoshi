@@ -53,7 +53,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v275"
+BUILD = "REBUILD-01-v276"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -13791,7 +13791,7 @@ def _v264_requested_supermarkets(state,loader):
 
 @st.cache_resource(show_spinner=False)
 def town_component_v121():
-    _asset_revision='v275-subtle-rail-connections'
+    _asset_revision='v276-colored-dashed-rail-connections'
     folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-'+_asset_revision)
     os.makedirs(folder,exist_ok=True)
     path=os.path.join(folder,'index.html')
@@ -13809,7 +13809,7 @@ def town_component_v121():
         with open(temp_path,'w',encoding='utf-8') as output:
             output.write(TOWN_COMPONENT_HTML_V121)
         os.replace(temp_path,path)
-    return st.components.v1.declare_component('sumai_town_map_v275',path=folder)
+    return st.components.v1.declare_component('sumai_town_map_v276',path=folder)
 
 @st.cache_resource(show_spinner=False)
 def _v216_api_budget():
@@ -14461,8 +14461,8 @@ function v274Railways(){
   if(!bounds.intersects(L.latLngBounds(row.points)))return;
   wanted.add(row.id);
   if(!state._v274RailSegments.has(row.id)){
-   var halo=L.polyline(row.points,{renderer:state._v274RailRenderer,pane:'v274RailPane',weight:3,color:'#fff',opacity:.3,dashArray:'2 6',lineCap:'round',interactive:false});
-   var line=L.polyline(row.points,{renderer:state._v274RailRenderer,pane:'v274RailPane',weight:1.3,color:row.color,opacity:.45,dashArray:'2 6',lineCap:'round',interactive:false});
+   var halo=L.polyline(row.points,{renderer:state._v274RailRenderer,pane:'v274RailPane',weight:4,color:'#fff',opacity:.65,dashArray:'4 4',lineCap:'round',interactive:false});
+   var line=L.polyline(row.points,{renderer:state._v274RailRenderer,pane:'v274RailPane',weight:1.8,color:row.color,opacity:.75,dashArray:'4 4',lineCap:'round',interactive:false});
    halo.addTo(state._v274RailLayer);line.addTo(state._v274RailLayer);state._v274RailSegments.set(row.id,[halo,line]);
   }
   if(zoom>=12){
@@ -16726,7 +16726,7 @@ def _v251_seed_verified_stores(db,records):
 
 
 # v261: store data is published once per successful load, outside the map render.
-_V261_COMPONENT_REVISION='v275-subtle-rail-connections'
+_V261_COMPONENT_REVISION='v276-colored-dashed-rail-connections'
 _V261_MAP_FIELDS=('id','ward','name','address','lat','lng','color','price_label','website','source_url','verification')
 
 
