@@ -53,7 +53,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v278"
+BUILD = "REBUILD-01-v279"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -13791,7 +13791,7 @@ def _v264_requested_supermarkets(state,loader):
 
 @st.cache_resource(show_spinner=False)
 def town_component_v121():
-    _asset_revision='v278-commercial-station-badge'
+    _asset_revision='v279-fixed-station-name-anchor'
     folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-'+_asset_revision)
     os.makedirs(folder,exist_ok=True)
     path=os.path.join(folder,'index.html')
@@ -13809,7 +13809,7 @@ def town_component_v121():
         with open(temp_path,'w',encoding='utf-8') as output:
             output.write(TOWN_COMPONENT_HTML_V121)
         os.replace(temp_path,path)
-    return st.components.v1.declare_component('sumai_town_map_v278',path=folder)
+    return st.components.v1.declare_component('sumai_town_map_v279',path=folder)
 
 @st.cache_resource(show_spinner=False)
 def _v216_api_budget():
@@ -14536,6 +14536,49 @@ assert TOWN_COMPONENT_HTML_V121.count(_v278_width)==1
 TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(_v278_width,"var nameWidth=Array.from(stationName).length*12+19+(v277CommercialStations.has(stationName)?6:0);",1)
 TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('reserveLabel(labelPoint,nameWidth,20,boxes,size)','reserveLabel(labelPoint,nameWidth,22,boxes,size)',1)
 TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('var width=Math.min(460,nameWidth+timeWidth+19);','var width=Math.min(466,nameWidth+timeWidth+19+(v277CommercialStations.has(name)?6:0));',1)
+
+
+# v279: anchor the first station-name row, never the full commute-label box.
+# Collision rectangles expand right/down from that fixed origin. Clamp using
+# the name alone so adding/removing commute columns never changes its position.
+_v279_start=TOWN_COMPONENT_HTML_V121.index('function redrawStations(){')
+_v279_end=TOWN_COMPONENT_HTML_V121.index('\nfunction ',_v279_start+10)
+_v279_redraw=TOWN_COMPONENT_HTML_V121[_v279_start:_v279_end]
+_v279_old="""   var nameWidth=Array.from(stationName).length*12+19+(v277CommercialStations.has(stationName)?6:0);
+   var labelPoint={x:Math.max(nameWidth/2+4,Math.min(size.x-nameWidth/2-4,stationPoint.x)),
+                   y:Math.max(14,Math.min(size.y-14,stationPoint.y))};"""
+_v279_new="""   var stationFont=visible[k].priority===0?14:12;
+   var nameWidth=Array.from(stationName).length*stationFont+19+(v277CommercialStations.has(stationName)?6:0);
+   var labelLeft=Math.max(4,Math.min(size.x-nameWidth-4,stationPoint.x));
+   var labelTop=Math.max(4,Math.min(size.y-26,stationPoint.y-9));
+   var labelPoint={x:labelLeft+nameWidth/2,y:labelTop+11};"""
+assert _v279_redraw.count(_v279_old)==1
+_v279_redraw=_v279_redraw.replace(_v279_old,_v279_new,1)
+_v279_old="""    if(reserveLabel(namePositions[j],width,height,others,size))boxes=others;
+    else nameOnly=true;
+   }else if(!reserveLabel(p,width,height,boxes,size))continue;"""
+_v279_new="""    var fullPoint={x:own[0]+width/2,y:own[1]+height/2};
+    if(reserveLabel(fullPoint,width,height,others,size))boxes=others;
+    else nameOnly=true;
+   }else if(!reserveLabel({x:p.x+width/2,y:p.y-9+height/2},width,height,boxes,size))continue;"""
+# reserveLabel stores [left, top, right, bottom] rectangles.
+assert _v279_redraw.count(_v279_old)==1
+_v279_redraw=_v279_redraw.replace(_v279_old,_v279_new,1)
+_v279_redraw=_v279_redraw.replace("classes='station-chip v225-name-only';", "classes+=' v225-name-only';",1)
+_v279_old="""   var offsetX=detail&&namePositions[j]?namePositions[j].x-p.x:0;
+   var offsetY=detail&&namePositions[j]?namePositions[j].y-p.y:0;
+   var shifted=Math.abs(offsetX)>.5||Math.abs(offsetY)>.5;
+   var style=shifted?' style="left:'+offsetX.toFixed(2)+'px;top:'+offsetY.toFixed(2)+'px"':'';"""
+_v279_new="""   var labelLeft=detail&&namePlacements[j]?namePlacements[j][0]:p.x;
+   var labelTop=detail&&namePlacements[j]?namePlacements[j][1]:p.y-9;
+   var offsetX=labelLeft-p.x,offsetY=labelTop-p.y;
+   var shifted=Math.abs(offsetX)>.5||Math.abs(offsetY+9)>.5;
+   var style=' style="left:'+offsetX.toFixed(2)+'px;top:'+offsetY.toFixed(2)+'px"';"""
+assert _v279_redraw.count(_v279_old)==1
+_v279_redraw=_v279_redraw.replace(_v279_old,_v279_new,1)
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121[:_v279_start]+_v279_redraw+TOWN_COMPONENT_HTML_V121[_v279_end:]
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('</style></head>',
+ '.station-chip{transform:none;text-align:left;align-items:flex-start;line-height:18px}.station-chip.dual{align-items:flex-start;line-height:18px}.station-chip::before,.station-chip.dual::before{margin-top:5px}.station-chip.v226-shifted::before{display:inline-block}.station-chip.dual .commute-grid{align-items:start}.station-chip.v225-name-only{font-size:14px;line-height:18px}.station-chip.minor.v225-name-only{font-size:12px}.station-chip.compact.v225-name-only{font-size:12px;line-height:16px}.station-chip.minor.compact.v225-name-only{font-size:11px;line-height:15px}\n</style></head>',1)
 
 
 def _v228_station_line_matches(query,lines):
@@ -16762,7 +16805,7 @@ def _v251_seed_verified_stores(db,records):
 
 
 # v261: store data is published once per successful load, outside the map render.
-_V261_COMPONENT_REVISION='v278-commercial-station-badge'
+_V261_COMPONENT_REVISION='v279-fixed-station-name-anchor'
 _V261_MAP_FIELDS=('id','ward','name','address','lat','lng','color','price_label','website','source_url','verification')
 
 
