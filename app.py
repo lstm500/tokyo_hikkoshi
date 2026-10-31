@@ -53,7 +53,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v277"
+BUILD = "REBUILD-01-v278"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -13791,7 +13791,7 @@ def _v264_requested_supermarkets(state,loader):
 
 @st.cache_resource(show_spinner=False)
 def town_component_v121():
-    _asset_revision='v277-commercial-station-weight'
+    _asset_revision='v278-commercial-station-badge'
     folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-'+_asset_revision)
     os.makedirs(folder,exist_ok=True)
     path=os.path.join(folder,'index.html')
@@ -13809,7 +13809,7 @@ def town_component_v121():
         with open(temp_path,'w',encoding='utf-8') as output:
             output.write(TOWN_COMPONENT_HTML_V121)
         os.replace(temp_path,path)
-    return st.components.v1.declare_component('sumai_town_map_v277',path=folder)
+    return st.components.v1.declare_component('sumai_town_map_v278',path=folder)
 
 @st.cache_resource(show_spinner=False)
 def _v216_api_budget():
@@ -14525,7 +14525,17 @@ _v277_extra="el.className='v274-extra-station';el.textContent=name;"
 assert TOWN_COMPONENT_HTML_V121.count(_v277_extra)==1
 TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(_v277_extra,"el.className='v274-extra-station'+(v277CommercialStations.has(name)?' v277-commercial':' v277-unreviewed');el.textContent=name;",1)
 TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('</style></head>',
- '.station-chip .station-name{font-weight:500}.station-chip.v277-commercial .station-name{font-weight:900}.v274-extra-station.v277-commercial{font-weight:900}.v274-extra-station.v277-unreviewed{font-weight:500}\n</style></head>',1)
+ '.station-chip .station-name{font-weight:500}.station-chip.v277-commercial .station-name{font-weight:900;color:#fff;background:#174a6a;border-radius:3px;padding:1px 3px;text-shadow:none;box-shadow:0 0 0 1px rgba(255,255,255,.95)}.v274-extra-station.v277-commercial{font-weight:900;color:#fff;background:#174a6a;border-radius:3px;padding:1px 3px;text-shadow:none;box-shadow:0 0 0 1px rgba(255,255,255,.95)}.v274-extra-station.v277-unreviewed{font-weight:500}\n</style></head>',1)
+
+
+# v278: distinguish confirmed facilities by a high-contrast station-name badge.
+# Reserve the additional six horizontal / two vertical CSS pixels so badges
+# keep the same collision / edge protection as unadorned station names.
+_v278_width="var nameWidth=Array.from(stationName).length*12+19;"
+assert TOWN_COMPONENT_HTML_V121.count(_v278_width)==1
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(_v278_width,"var nameWidth=Array.from(stationName).length*12+19+(v277CommercialStations.has(stationName)?6:0);",1)
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('reserveLabel(labelPoint,nameWidth,20,boxes,size)','reserveLabel(labelPoint,nameWidth,22,boxes,size)',1)
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('var width=Math.min(460,nameWidth+timeWidth+19);','var width=Math.min(466,nameWidth+timeWidth+19+(v277CommercialStations.has(name)?6:0));',1)
 
 
 def _v228_station_line_matches(query,lines):
@@ -16752,7 +16762,7 @@ def _v251_seed_verified_stores(db,records):
 
 
 # v261: store data is published once per successful load, outside the map render.
-_V261_COMPONENT_REVISION='v277-commercial-station-weight'
+_V261_COMPONENT_REVISION='v278-commercial-station-badge'
 _V261_MAP_FIELDS=('id','ward','name','address','lat','lng','color','price_label','website','source_url','verification')
 
 
