@@ -55,7 +55,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v283"
+BUILD = "REBUILD-01-v284"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -18766,48 +18766,51 @@ def main():
         # Detailed 23-ward coverage and aggregation status are low-priority UI.
         town_choropleth_status()
     with tabs[1]:
-        _v282_reference_panel()
-        st.caption('物件と家賃の集計は共通のSupabaseに保存し、全利用者で同じデータを参照します。通勤設定は共有しません。')
-        if state.get('saved_map_restore_message'):st.caption(state.saved_map_restore_message)
-        automatic_collection_panel()
-        st.subheader('保存した物件')
-        st.caption('地図は自動集計した町丁目の平均家賃を表示します。ここは個々の物件の確認・CSV出力用です。')
-        if st.button('保存物件の一覧を読み込む',key='new_load',use_container_width=True,
-                     disabled=bool(active_job() and not active_job().snapshot()['finished'])):
-            try:start_saved_load(bounds,state.get('address_point_cache'))
-            except AppError as exc:st.error(str(exc))
-        saved_load_progress()
-        if state.get('new_notice'):st.caption(state.new_notice)
-        count=len(state.get('new_units') or [])
-        if count:
-            st.caption(f'一覧に読み込んだ物件：{count:,}件')
-            if st.button('一覧をCSVにする',key='mobile_prepare_units_csv'):
-                state['_mobile_units_export']={'key':(id(state.new_units),len(state.new_units)),
-                    'bytes':csv_bytes(state.new_units)}
-            ready=state.get('_mobile_units_export')
-            if ready and ready.get('key')==(id(state.new_units),len(state.new_units)):
-                st.download_button('CSVをダウンロード',ready['bytes'],'sumai_rebuild_units.csv',
-                                   'text/csv',use_container_width=True,on_click='ignore')
-        if st.toggle('その他の操作を表示（CSV取込・再読込）',
-                     key='show_saved_advanced_v122',value=False):
-            st.caption('通常は操作不要です。保存データの修復・CSV取込に使用します。ログは「設定」→「ログ出力」で確認できます。')
-            if st.button('保存物件を全件読み直す',key='new_load_full',use_container_width=False,
-                         disabled=bool(active_saved_load() and not active_saved_load().snapshot()['finished'])):
-                try:start_saved_load(bounds,state.get('address_point_cache'),force_full=True)
+        listing_tab,contract_tab=st.tabs(['掲載データを取得','成約データを取得'])
+        with listing_tab:
+            st.caption('物件と家賃の集計は共通のSupabaseに保存し、全利用者で同じデータを参照します。通勤設定は共有しません。')
+            if state.get('saved_map_restore_message'):st.caption(state.saved_map_restore_message)
+            automatic_collection_panel()
+            st.subheader('保存した物件')
+            st.caption('地図は自動集計した町丁目の平均家賃を表示します。ここは個々の物件の確認・CSV出力用です。')
+            if st.button('保存物件の一覧を読み込む',key='new_load',use_container_width=True,
+                         disabled=bool(active_job() and not active_job().snapshot()['finished'])):
+                try:start_saved_load(bounds,state.get('address_point_cache'))
                 except AppError as exc:st.error(str(exc))
-            st.caption('地図の集計は「住まいを探す」タブの「保存物件を再集計」で開始します。')
-            upload=st.file_uploader('このアプリのCSVを追加する',type=['csv'])
-            if st.button('CSVの物件をSupabaseへ保存',disabled=upload is None or bool(active_job() and not active_job().snapshot()['finished']),key='new_import'):
-                try:
-                    rows=read_csv(upload.getvalue());saved=Database().save_units(rows)
-                    state.new_map_loaded=False;state.new_units=[];state.new_saved_keys=[]
-                    state.new_notice=f'CSVから{len(saved)}件を保存しました。地図反映には「保存物件を再集計」を押してください。';st.rerun()
-                except AppError as exc: st.error(str(exc))
-            if st.button('画面上の未保存物件を再保存',key='new_retry_save',disabled=not state.new_units or bool(active_job() and not active_job().snapshot()['finished'])):
-                try:
-                    saved=Database().save_units(state.new_units);state.new_saved_keys=list(set(state.new_saved_keys)|saved)
-                    state.new_notice=f'{len(saved)}件の保存を確認しました。';st.rerun()
-                except AppError as exc: st.error(str(exc))
+            saved_load_progress()
+            if state.get('new_notice'):st.caption(state.new_notice)
+            count=len(state.get('new_units') or [])
+            if count:
+                st.caption(f'一覧に読み込んだ物件：{count:,}件')
+                if st.button('一覧をCSVにする',key='mobile_prepare_units_csv'):
+                    state['_mobile_units_export']={'key':(id(state.new_units),len(state.new_units)),
+                        'bytes':csv_bytes(state.new_units)}
+                ready=state.get('_mobile_units_export')
+                if ready and ready.get('key')==(id(state.new_units),len(state.new_units)):
+                    st.download_button('CSVをダウンロード',ready['bytes'],'sumai_rebuild_units.csv',
+                                       'text/csv',use_container_width=True,on_click='ignore')
+            if st.toggle('その他の操作を表示（CSV取込・再読込）',
+                         key='show_saved_advanced_v122',value=False):
+                st.caption('通常は操作不要です。保存データの修復・CSV取込に使用します。ログは「設定」→「ログ出力」で確認できます。')
+                if st.button('保存物件を全件読み直す',key='new_load_full',use_container_width=False,
+                             disabled=bool(active_saved_load() and not active_saved_load().snapshot()['finished'])):
+                    try:start_saved_load(bounds,state.get('address_point_cache'),force_full=True)
+                    except AppError as exc:st.error(str(exc))
+                st.caption('地図の集計は「住まいを探す」タブの「保存物件を再集計」で開始します。')
+                upload=st.file_uploader('このアプリのCSVを追加する',type=['csv'])
+                if st.button('CSVの物件をSupabaseへ保存',disabled=upload is None or bool(active_job() and not active_job().snapshot()['finished']),key='new_import'):
+                    try:
+                        rows=read_csv(upload.getvalue());saved=Database().save_units(rows)
+                        state.new_map_loaded=False;state.new_units=[];state.new_saved_keys=[]
+                        state.new_notice=f'CSVから{len(saved)}件を保存しました。地図反映には「保存物件を再集計」を押してください。';st.rerun()
+                    except AppError as exc: st.error(str(exc))
+                if st.button('画面上の未保存物件を再保存',key='new_retry_save',disabled=not state.new_units or bool(active_job() and not active_job().snapshot()['finished'])):
+                    try:
+                        saved=Database().save_units(state.new_units);state.new_saved_keys=list(set(state.new_saved_keys)|saved)
+                        state.new_notice=f'{len(saved)}件の保存を確認しました。';st.rerun()
+                    except AppError as exc: st.error(str(exc))
+        with contract_tab:
+            _v282_reference_panel()
     with tabs[2]:
         _v246_equipment_panel()
         _v246_equipment_results()
