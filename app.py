@@ -55,7 +55,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v284"
+BUILD = "REBUILD-01-v285"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -10296,13 +10296,14 @@ def automatic_collection_ward_filter_ui(ward_codes, filters, busy=False):
 
 @st.fragment(run_every='16s')
 def automatic_collection_panel():
-    st.subheader('アプリ内の自動収集（SUUMO・CHINTAI）')
-    memory=cloud_memory_pressure()
-    if memory:
-        st.caption(f"処理と非回収キャッシュの目安 {memory['effective_mib']}/{memory['limit_mib']} MiB" 
-                   f"（{memory['effective_ratio']:.0%}）｜コンテナ計上 {memory['used_mib']} MiB" 
-                   f"｜Python RSS {memory['rss_mib']} MiB｜非アクティブなファイルページ {memory['inactive_mib']} MiB。"
-                   '保護停止は実効80%以上またはコンテナ全体96%以上。')
+    st.subheader('掲載データを取得')
+    with st.expander('メモリ使用状況',expanded=False):
+        memory=cloud_memory_pressure()
+        if memory:
+            st.caption(f"処理と非回収キャッシュの目安 {memory['effective_mib']}/{memory['limit_mib']} MiB" 
+                       f"（{memory['effective_ratio']:.0%}）｜コンテナ計上 {memory['used_mib']} MiB" 
+                       f"｜Python RSS {memory['rss_mib']} MiB｜非アクティブなファイルページ {memory['inactive_mib']} MiB。"
+                       '保護停止は実効80%以上またはコンテナ全体96%以上。')
     st.caption('収集中は画面を閉じても継続します。サーバーの再起動後は自動再開しません。進捗は保存され、開始・再開ボタンで再開できます。')
     controller=get_automatic_collection();snap=controller.snapshot() if controller else None
     # Legacy per-error persistence bridge intentionally disabled. Historical
@@ -10329,6 +10330,7 @@ def automatic_collection_panel():
         st.warning(f'現在の収集設定は{len(default_wards)}/23区です。中止後、23区を選択して開始すると対象を拡大できます。')
     st.session_state.setdefault('automatic_area_categories',[])
     st.session_state.setdefault('automatic_applied_area_categories',[])
+    st.markdown('**1. 取得する地域**')
     st.multiselect('区のカテゴリー（一括追加）',list(TOKYO_WARD_CATEGORIES),
                    key='automatic_area_categories',disabled=busy,
                    on_change=automatic_add_area_categories)
@@ -10338,7 +10340,7 @@ def automatic_collection_panel():
     if st.button('東京23区をすべて選択',key='automatic_select_all_23_v171',disabled=busy):
         st.session_state['automatic_wards']=list(TOKYO_WARDS)
         st.rerun(scope='fragment')
-    ward_codes=st.multiselect('自動収集する区（複数選択）',list(TOKYO_WARDS),
+    ward_codes=st.multiselect('取得する区（複数選択）',list(TOKYO_WARDS),
                               format_func=lambda code:TOKYO_WARDS[code],
                               key='automatic_wards',disabled=busy)
     missing_codes=[code for code in TOKYO_WARDS if code not in ward_codes]
@@ -10357,34 +10359,40 @@ def automatic_collection_panel():
     filters=st.session_state['automatic_town_filters']
     collection_wards,chosen_filters=automatic_collection_ward_filter_ui(ward_codes,filters,busy)
     st.caption('取得順：'+(' → '.join(TOKYO_WARDS[code] for code in collection_wards) if collection_wards else '区を選択してください'))
-    st.multiselect('自動収集の取得元',list(PROVIDER_OPTIONS),default=_v232_enabled_providers(saved.get('providers') or AUTOMATIC_REGION_PROVIDERS),key='automatic_providers_v232',disabled=busy)
+    st.markdown('**2. 取得条件**')
+    st.multiselect('取得元',list(PROVIDER_OPTIONS),default=_v232_enabled_providers(saved.get('providers') or AUTOMATIC_REGION_PROVIDERS),key='automatic_providers_v232',disabled=busy)
     st.caption('選択した取得元で町ごとに最後のページまで検索します。マンションは築15年以内、ワンルーム/1K/1DK・1LDK/2K/2DK・2LDK/3K/3DK、一戸建て・その他は築40年以内・50㎡以上を対象とします。')
     manual=active_job();manual_busy=bool(manual and not manual.snapshot()['finished'])
     cannot_start=busy or manual_busy or not collection_wards
-    if st.button('選択した区で自動収集を開始・再開',key='automatic_start',disabled=cannot_start):
+    st.markdown('**3. 取得操作**')
+    if st.button('取得を開始・再開',key='automatic_start',type='primary',use_container_width=True,disabled=cannot_start):
         try:
             controller=start_automatic_collection(collection_wards,town_codes=chosen_filters)
             snap=controller.snapshot();busy=True
             st.session_state.automatic_saved_settings=dict(snap['settings'])
-        except AppError as exc:st.error(str(exc))
-    if st.button('選択した区で自動収集を開始・再開（最初からすべて）',
-                 key='automatic_start_all',disabled=cannot_start or busy):
-        try:
-            controller=start_automatic_collection(collection_wards,town_codes={},restart_all=True)
-            snap=controller.snapshot();busy=True
-            st.session_state.automatic_saved_settings=dict(snap['settings'])
-            st.session_state.automatic_saved_summary=dict(snap['summary'])
-            st.session_state['automatic_town_filters']={}
-            st.session_state['_automatic_reset_town_selection']=list(collection_wards)
             st.rerun()
         except AppError as exc:st.error(str(exc))
-    st.caption('通常は選択した区・町の進捗を復元します。「最初からすべて」は選択した全区の進捗と町名の絞り込みだけを初期化します。保存済み物件・履歴は削除しません。')
-    if st.button('自動収集を中止（取得済みデータを保存）',key='automatic_stop',disabled=not busy or bool(snap and snap['stopping'])):
+    if st.button('取得を中止（保存済みデータを保持）',key='automatic_stop',use_container_width=True,disabled=not busy or bool(snap and snap['stopping'])):
         try:
             controller.request_stop();snap=controller.snapshot()
             st.session_state.automatic_saved_settings=snap['settings'];st.session_state.automatic_saved_summary=snap['summary']
             st.success('停止を要求しました。保存済みデータは保持します。')
+            st.rerun()
         except AppError as exc:st.error('実行の停止は要求しましたが、停止設定の保存に失敗しました：'+str(exc))
+    with st.expander('再取得の詳細設定',expanded=False):
+        if st.button('選択した区を最初から再取得',
+                     key='automatic_start_all',disabled=cannot_start or busy):
+            try:
+                controller=start_automatic_collection(collection_wards,town_codes={},restart_all=True)
+                snap=controller.snapshot();busy=True
+                st.session_state.automatic_saved_settings=dict(snap['settings'])
+                st.session_state.automatic_saved_summary=dict(snap['summary'])
+                st.session_state['automatic_town_filters']={}
+                st.session_state['_automatic_reset_town_selection']=list(collection_wards)
+                st.rerun()
+            except AppError as exc:st.error(str(exc))
+        st.caption('通常は選択した区・町の進捗を復元します。「最初からすべて」は選択した全区の進捗と町名の絞り込みだけを初期化します。保存済み物件・履歴は削除しません。')
+    st.markdown('**4. 取得状況**')
     if snap:
         summary=snap['summary'];st.write(snap['message']);st.progress(min(1.,max(0.,snap['progress'])))
         current=snap.get('current') or {};live=snapshot_count_metrics(current)
@@ -10431,6 +10439,9 @@ def automatic_collection_panel():
         for notice in summary.get('last_summary',{}).get('warnings',[])[:2]:st.caption(notice)
         for issue in summary.get('last_summary',{}).get('issues',[])[:4]:st.error(issue)
         if snap['error']:st.error(snap['error'])
+    if not snap:
+        st.progress(0.0)
+        st.caption('取得する区と条件を選び、開始してください。')
     if st.session_state.get('automatic_settings_error'):st.error(st.session_state.automatic_settings_error)
 
     st.caption('保存物件の読み込みやCSV出力は、この下の『保存した物件』で操作できます。')
@@ -13793,7 +13804,7 @@ def _v264_requested_supermarkets(state,loader):
 
 @st.cache_resource(show_spinner=False)
 def town_component_v121():
-    _asset_revision='v283-reference-layouts'
+    _asset_revision='v285-acquisition-ui'
     folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-'+_asset_revision)
     os.makedirs(folder,exist_ok=True)
     path=os.path.join(folder,'index.html')
@@ -13811,7 +13822,7 @@ def town_component_v121():
         with open(temp_path,'w',encoding='utf-8') as output:
             output.write(TOWN_COMPONENT_HTML_V121)
         os.replace(temp_path,path)
-    return st.components.v1.declare_component('sumai_town_map_v283',path=folder)
+    return st.components.v1.declare_component('sumai_town_map_v285',path=folder)
 
 @st.cache_resource(show_spinner=False)
 def _v216_api_budget():
@@ -18603,21 +18614,30 @@ def _v282_map_args():
 
 @st.fragment(run_every='3s')
 def _v282_reference_panel():
-    with st.expander('参考・成約家賃の取得／保存',expanded=False):
-        st.caption('青山地所の公開集計値を取得し、既存のSupabase保存領域へ保存します。募集物件とは別に管理します。')
+    with st.container():
+        st.subheader('成約データを取得')
+        st.caption('青山地所の間取り別・築年帯別の参考家賃を取得して保存します。')
         st.caption('間取り別・築年帯別の中央値です。推定値の注記があるため、サイト公表の参考値として扱います。')
         try:store=_v282_store()
         except AppError as exc:st.error(str(exc));return
         snap=store.snapshot()
-        wards=st.multiselect('参考家賃を取得する区',list(TOKYO_WARDS.values()),default=['品川区'],key='reference_wards_v282',disabled=snap['running'])
+        st.markdown('**1. 取得する地域**')
+        if st.button('東京23区をすべて選択',key='reference_select_all_v285',disabled=snap['running']):
+            st.session_state['reference_wards_v282']=list(TOKYO_WARDS.values());st.rerun()
+        wards=st.multiselect('取得する区（複数選択）',list(TOKYO_WARDS.values()),default=['品川区'],key='reference_wards_v282',disabled=snap['running'])
+        st.caption(f'選択した区：{len(wards)}/23区')
+        st.markdown('**2. 取得条件**')
+        st.caption('取得元：青山地所')
         force=st.checkbox('30日以内に取得したページも更新する',key='reference_force_v282',disabled=snap['running'])
         st.caption('東京の区別未分類の駅も必要に応じて確認します。公開されていない間取り・地域は補完しません。')
-        if st.button('参考家賃を取得・保存',key='reference_start_v282',disabled=snap['running'] or not wards):
+        st.markdown('**3. 取得操作**')
+        if st.button('取得を開始・再開',key='reference_start_v282',type='primary',use_container_width=True,disabled=snap['running'] or not wards):
             store.start('collect',wards,force);st.rerun()
-        if st.button('参考家賃の取得を中止',key='reference_stop_v282',disabled=not snap['running']):
+        if st.button('取得を中止（保存済みデータを保持）',key='reference_stop_v282',use_container_width=True,disabled=not snap['running']):
             store.stop();st.rerun()
-        if st.button('保存した参考家賃を読み込む',key='reference_load_v282',disabled=snap['running']):
-            store.start('load');st.rerun()
+        st.caption('通常は取得済みのページを読み込み、未取得・更新対象のページから取得します。保存済みデータは保持します。')
+        st.markdown('**4. 取得状況**')
+        st.progress(min(1.0,max(0.0,snap['completed']/snap['total'])) if snap['total'] else 0.0)
         st.caption(f"保存済み {snap['pages']}ページ｜処理 {snap['completed']}/{snap['total']}ページ")
         if snap['running']:st.caption('バックグラウンドで取得・保存中です。地図は引き続き操作できます。')
         if snap['message']:st.caption(snap['message'])
@@ -18629,6 +18649,9 @@ def _v282_reference_panel():
         # Only completed changes need a full render; acquisition polling stays local.
         if not snap['running'] and seen is not None and (seen!=snap['revision'] or was_running):
             st.rerun()
+        st.subheader('保存した参考データ')
+        if st.button('保存した参考家賃を読み込む',key='reference_load_v282',disabled=snap['running']):
+            store.start('load');st.rerun()
         if st.button('保存した参考家賃のログを読み込む',key='reference_logs_load_v282'):
             try:
                 records=store.db.call('GET',SEARCH_TABLE,{'namespace':'eq.'+store.db.namespace,'status':'eq.reference_aoyama_log',
@@ -18644,7 +18667,7 @@ def _v282_reference_panel():
 _V282_REFERENCE_JS=r"""
 function v282ReferenceBlock(layer,point){
  var el=document.createElement('div');el.className='v282-reference';
- var title=document.createElement('strong');title.textContent='参考・成約家賃（サイト公表中央値）';el.appendChild(title);
+ var title=document.createElement('div');el.appendChild(title);
  var props=layer.feature&&layer.feature.properties||{},place=v217Place(props),pages=state._v282Pages||[];
  // v283: show the requested representative layout; never combine medians.
  var group=state._v240Group||'group1',layouts=group==='group0'?['1R','1DK']:group==='group1'?['1LDK']:group==='house'?['3LDK']:['2LDK'];
@@ -18653,9 +18676,14 @@ function v282ReferenceBlock(layer,point){
  candidates.sort(function(a,b){return a._distance-b._distance||String(a.name).localeCompare(String(b.name))});
  var page=candidates.length&&candidates[0]._distance<=1500?candidates[0]:pages.find(function(p){return p.kind==='ward'&&p.ward===place.ward});
  function line(text){var d=document.createElement('div');d.textContent=text;el.appendChild(d)}
+ function mainLine(text){var d=document.createElement('strong');d.textContent=text;title.appendChild(d)}
  if(!page){line(state._v282Loading?'保存した参考データを読み込み中です。':state._v282Error?'参考データの読み込みに失敗しました。':'参考データなし（「保存データ」から取得できます）');return el}
- line(page.kind==='station'?page.name+'駅周辺｜タップ地点から直線'+Math.round(page._distance)+'m':page.ward+'全体の参考値');
- layouts.forEach(function(layout){var row=(page.rows||[]).find(function(r){return r.layout===layout});line((layout==='1R'?'ワンルーム':layout)+'：'+(row?(Number(row.median_yen)/10000).toFixed(1)+'万円（'+Number(row.count).toLocaleString()+'件）':'公表データなし'))});
+ layouts.forEach(function(layout){
+  var row=(page.rows||[]).find(function(r){return r.layout===layout}),layoutName=layout==='1R'?'ワンルーム':layout;
+  var name=page.kind==='station'?page.name+'駅周辺':page.ward+'全体',label=layouts.length>1?'成約（'+layoutName+'）':'成約';
+  mainLine(name+'｜'+label+'：'+(row?(Number(row.median_yen)/10000).toFixed(1)+'万円｜'+Number(row.count).toLocaleString()+'件':'参考データなし'));
+ });
+ line('参考：'+(page.kind==='station'?page.name+'駅周辺（タップ地点から直線'+Math.round(page._distance)+'m）':page.ward+'全体')+'｜'+layouts.map(function(v){return v==='1R'?'ワンルーム':v}).join('・')+'｜中央値');
  if(group==='house')line('一戸建ての成約データがないため、3LDKの参考値です。一戸建ての成約家賃ではありません。');
  line('築年数・建物種別は混在。掲載平均とは対象条件が異なります。');
  var link=document.createElement('a');link.textContent='出典：青山地所（'+page.published_month+'時点） ↗';
@@ -18684,8 +18712,29 @@ assert TOWN_COMPONENT_HTML_V121.count(' v249RenderSupermarkets(args);')==1
 TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(' v249RenderSupermarkets(args);',' v249RenderSupermarkets(args);\n v282ReferenceRender(args);',1)
 TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('</style></head>',
     '.v282-reference{margin:6px 0;padding:6px 0;border-top:1px solid #d8e0df;font-size:12px;line-height:1.5}.v282-reference strong{display:block}.v282-reference a{display:block}\n</style></head>',1)
-TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace("build:'v281'","build:'v283'")
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace("build:'v281'","build:'v285'")
 
+
+
+
+# v285: concise listing/reference rent headlines; source caveats stay below.
+_v285_popup_old="el.appendChild(document.createTextNode(String(props.name||'')+'｜平均 '+String(props.price_label||'')+'｜'+String(props.count_label||'')));"
+assert TOWN_COMPONENT_HTML_V121.count(_v285_popup_old)==1
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(_v285_popup_old,"el.className='v285-rent-popup';"+_v285_popup_old.replace('｜平均 ','｜平均：'),1)
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace("+'｜平均 '+String(entry.props.price_label||'')","+'｜平均：'+String(entry.props.price_label||'')",1)
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('</style></head>',
+    '.v285-rent-popup{font-weight:700}.v285-rent-popup>div{font-weight:400}.v285-rent-popup .v282-reference{border-top:0;margin:3px 0 6px;padding:0}.v285-rent-popup .v282-reference strong{display:block;font-weight:700}\n</style></head>',1)
+
+# v285: visible acquisition tabs, scoped to Saved Data only.
+_V285_SAVED_TABS_CSS="""<style>
+.st-key-saved_data_tabs_v285 [role="tablist"]{display:flex;gap:8px;padding:6px;margin:4px 0 16px;border:1px solid #c4d3cf;border-radius:12px;background:#e9eeeb!important}
+.st-key-saved_data_tabs_v285 [role="tab"]{flex:1;justify-content:center;min-height:52px;padding:10px 12px;border:1px solid #afc4be;border-radius:8px;background:#fff!important;color:#203f39!important;font-weight:800}
+.st-key-saved_data_tabs_v285 [role="tab"] p{font-size:16px;font-weight:800;color:inherit!important;white-space:nowrap}
+.st-key-saved_data_tabs_v285 [role="tab"][aria-selected="true"]{background:#174a6a!important;color:#fff!important;border-color:#174a6a;box-shadow:0 2px 5px #173a5e22}
+.st-key-saved_data_tabs_v285 [role="tab"]:focus-visible{outline:3px solid #b35636;outline-offset:2px}
+.st-key-saved_data_tabs_v285 [data-baseweb="tab-highlight"],.st-key-saved_data_tabs_v285 [data-baseweb="tab-border"],.st-key-saved_data_tabs_v285 .react-aria-SelectionIndicator{display:none}
+@media(max-width:420px){.st-key-saved_data_tabs_v285 [role="tab"]{padding:10px 6px}.st-key-saved_data_tabs_v285 [role="tab"] p{font-size:15px}}
+</style>"""
 
 def main():
     st.set_page_config(page_title='住まいコンパス｜新しい住まいを探す',page_icon='🏡',layout='wide',initial_sidebar_state='collapsed')
@@ -18766,51 +18815,53 @@ def main():
         # Detailed 23-ward coverage and aggregation status are low-priority UI.
         town_choropleth_status()
     with tabs[1]:
-        listing_tab,contract_tab=st.tabs(['掲載データを取得','成約データを取得'])
-        with listing_tab:
-            st.caption('物件と家賃の集計は共通のSupabaseに保存し、全利用者で同じデータを参照します。通勤設定は共有しません。')
-            if state.get('saved_map_restore_message'):st.caption(state.saved_map_restore_message)
-            automatic_collection_panel()
-            st.subheader('保存した物件')
-            st.caption('地図は自動集計した町丁目の平均家賃を表示します。ここは個々の物件の確認・CSV出力用です。')
-            if st.button('保存物件の一覧を読み込む',key='new_load',use_container_width=True,
-                         disabled=bool(active_job() and not active_job().snapshot()['finished'])):
-                try:start_saved_load(bounds,state.get('address_point_cache'))
-                except AppError as exc:st.error(str(exc))
-            saved_load_progress()
-            if state.get('new_notice'):st.caption(state.new_notice)
-            count=len(state.get('new_units') or [])
-            if count:
-                st.caption(f'一覧に読み込んだ物件：{count:,}件')
-                if st.button('一覧をCSVにする',key='mobile_prepare_units_csv'):
-                    state['_mobile_units_export']={'key':(id(state.new_units),len(state.new_units)),
-                        'bytes':csv_bytes(state.new_units)}
-                ready=state.get('_mobile_units_export')
-                if ready and ready.get('key')==(id(state.new_units),len(state.new_units)):
-                    st.download_button('CSVをダウンロード',ready['bytes'],'sumai_rebuild_units.csv',
-                                       'text/csv',use_container_width=True,on_click='ignore')
-            if st.toggle('その他の操作を表示（CSV取込・再読込）',
-                         key='show_saved_advanced_v122',value=False):
-                st.caption('通常は操作不要です。保存データの修復・CSV取込に使用します。ログは「設定」→「ログ出力」で確認できます。')
-                if st.button('保存物件を全件読み直す',key='new_load_full',use_container_width=False,
-                             disabled=bool(active_saved_load() and not active_saved_load().snapshot()['finished'])):
-                    try:start_saved_load(bounds,state.get('address_point_cache'),force_full=True)
+        with st.container(key='saved_data_tabs_v285'):
+            st.markdown(_V285_SAVED_TABS_CSS,unsafe_allow_html=True)
+            listing_tab,contract_tab=st.tabs(['掲載データを取得','成約データを取得'])
+            with listing_tab:
+                if state.get('saved_map_restore_message'):st.caption(state.saved_map_restore_message)
+                automatic_collection_panel()
+                st.subheader('保存した物件')
+                st.caption('物件と家賃の集計は共通のSupabaseに保存し、全利用者で同じデータを参照します。通勤設定は共有しません。')
+                st.caption('地図は自動集計した町丁目の平均家賃を表示します。ここは個々の物件の確認・CSV出力用です。')
+                if st.button('保存物件の一覧を読み込む',key='new_load',use_container_width=True,
+                             disabled=bool(active_job() and not active_job().snapshot()['finished'])):
+                    try:start_saved_load(bounds,state.get('address_point_cache'))
                     except AppError as exc:st.error(str(exc))
-                st.caption('地図の集計は「住まいを探す」タブの「保存物件を再集計」で開始します。')
-                upload=st.file_uploader('このアプリのCSVを追加する',type=['csv'])
-                if st.button('CSVの物件をSupabaseへ保存',disabled=upload is None or bool(active_job() and not active_job().snapshot()['finished']),key='new_import'):
-                    try:
-                        rows=read_csv(upload.getvalue());saved=Database().save_units(rows)
-                        state.new_map_loaded=False;state.new_units=[];state.new_saved_keys=[]
-                        state.new_notice=f'CSVから{len(saved)}件を保存しました。地図反映には「保存物件を再集計」を押してください。';st.rerun()
-                    except AppError as exc: st.error(str(exc))
-                if st.button('画面上の未保存物件を再保存',key='new_retry_save',disabled=not state.new_units or bool(active_job() and not active_job().snapshot()['finished'])):
-                    try:
-                        saved=Database().save_units(state.new_units);state.new_saved_keys=list(set(state.new_saved_keys)|saved)
-                        state.new_notice=f'{len(saved)}件の保存を確認しました。';st.rerun()
-                    except AppError as exc: st.error(str(exc))
-        with contract_tab:
-            _v282_reference_panel()
+                saved_load_progress()
+                if state.get('new_notice'):st.caption(state.new_notice)
+                count=len(state.get('new_units') or [])
+                if count:
+                    st.caption(f'一覧に読み込んだ物件：{count:,}件')
+                    if st.button('一覧をCSVにする',key='mobile_prepare_units_csv'):
+                        state['_mobile_units_export']={'key':(id(state.new_units),len(state.new_units)),
+                            'bytes':csv_bytes(state.new_units)}
+                    ready=state.get('_mobile_units_export')
+                    if ready and ready.get('key')==(id(state.new_units),len(state.new_units)):
+                        st.download_button('CSVをダウンロード',ready['bytes'],'sumai_rebuild_units.csv',
+                                           'text/csv',use_container_width=True,on_click='ignore')
+                if st.toggle('その他の操作を表示（CSV取込・再読込）',
+                             key='show_saved_advanced_v122',value=False):
+                    st.caption('通常は操作不要です。保存データの修復・CSV取込に使用します。ログは「設定」→「ログ出力」で確認できます。')
+                    if st.button('保存物件を全件読み直す',key='new_load_full',use_container_width=False,
+                                 disabled=bool(active_saved_load() and not active_saved_load().snapshot()['finished'])):
+                        try:start_saved_load(bounds,state.get('address_point_cache'),force_full=True)
+                        except AppError as exc:st.error(str(exc))
+                    st.caption('地図の集計は「住まいを探す」タブの「保存物件を再集計」で開始します。')
+                    upload=st.file_uploader('このアプリのCSVを追加する',type=['csv'])
+                    if st.button('CSVの物件をSupabaseへ保存',disabled=upload is None or bool(active_job() and not active_job().snapshot()['finished']),key='new_import'):
+                        try:
+                            rows=read_csv(upload.getvalue());saved=Database().save_units(rows)
+                            state.new_map_loaded=False;state.new_units=[];state.new_saved_keys=[]
+                            state.new_notice=f'CSVから{len(saved)}件を保存しました。地図反映には「保存物件を再集計」を押してください。';st.rerun()
+                        except AppError as exc: st.error(str(exc))
+                    if st.button('画面上の未保存物件を再保存',key='new_retry_save',disabled=not state.new_units or bool(active_job() and not active_job().snapshot()['finished'])):
+                        try:
+                            saved=Database().save_units(state.new_units);state.new_saved_keys=list(set(state.new_saved_keys)|saved)
+                            state.new_notice=f'{len(saved)}件の保存を確認しました。';st.rerun()
+                        except AppError as exc: st.error(str(exc))
+            with contract_tab:
+                _v282_reference_panel()
     with tabs[2]:
         _v246_equipment_panel()
         _v246_equipment_results()
