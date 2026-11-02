@@ -55,7 +55,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v286"
+BUILD = "REBUILD-01-v287"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -18752,7 +18752,7 @@ def main():
     except Exception:state.current_storage_key=None
     # Choropleth display does not auto-restore thousands of old per-listing points.
     # The Saved Data tab can still load them explicitly for detailed export.
-    tabs=st.tabs(['住まいを探す','保存データ','周辺設備','通勤','設定'])
+    tabs=st.tabs(['住まいを探す','データ取得','周辺設備','通勤','設定'])
     with tabs[0]:
         st.subheader('地図を動かして、探す地域を表示してください')
         selected_group=state.get('layout_display_group','group1')
