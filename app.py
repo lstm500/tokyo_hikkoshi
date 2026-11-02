@@ -55,7 +55,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v285"
+BUILD = "REBUILD-01-v286"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -13804,7 +13804,7 @@ def _v264_requested_supermarkets(state,loader):
 
 @st.cache_resource(show_spinner=False)
 def town_component_v121():
-    _asset_revision='v285-acquisition-ui'
+    _asset_revision='v286-simple-popup'
     folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-'+_asset_revision)
     os.makedirs(folder,exist_ok=True)
     path=os.path.join(folder,'index.html')
@@ -13822,7 +13822,7 @@ def town_component_v121():
         with open(temp_path,'w',encoding='utf-8') as output:
             output.write(TOWN_COMPONENT_HTML_V121)
         os.replace(temp_path,path)
-    return st.components.v1.declare_component('sumai_town_map_v285',path=folder)
+    return st.components.v1.declare_component('sumai_town_map_v286',path=folder)
 
 @st.cache_resource(show_spinner=False)
 def _v216_api_budget():
@@ -18677,19 +18677,12 @@ function v282ReferenceBlock(layer,point){
  var page=candidates.length&&candidates[0]._distance<=1500?candidates[0]:pages.find(function(p){return p.kind==='ward'&&p.ward===place.ward});
  function line(text){var d=document.createElement('div');d.textContent=text;el.appendChild(d)}
  function mainLine(text){var d=document.createElement('strong');d.textContent=text;title.appendChild(d)}
- if(!page){line(state._v282Loading?'保存した参考データを読み込み中です。':state._v282Error?'参考データの読み込みに失敗しました。':'参考データなし（「保存データ」から取得できます）');return el}
+ if(!page){line(state._v282Loading?'成約：読み込み中':state._v282Error?'成約：読み込み失敗':'成約：データなし');return el}
  layouts.forEach(function(layout){
   var row=(page.rows||[]).find(function(r){return r.layout===layout}),layoutName=layout==='1R'?'ワンルーム':layout;
-  var name=page.kind==='station'?page.name+'駅周辺':page.ward+'全体',label=layouts.length>1?'成約（'+layoutName+'）':'成約';
-  mainLine(name+'｜'+label+'：'+(row?(Number(row.median_yen)/10000).toFixed(1)+'万円｜'+Number(row.count).toLocaleString()+'件':'参考データなし'));
+  var name=page.kind==='station'?page.name+'駅周辺':page.ward+'全体',label=group==='house'?'成約（3LDK参考）':layouts.length>1?'成約（'+layoutName+'）':'成約';
+  mainLine(name+'｜'+label+'：'+(row?(Number(row.median_yen)/10000).toFixed(1)+'万円｜'+Number(row.count).toLocaleString()+'件':'データなし'));
  });
- line('参考：'+(page.kind==='station'?page.name+'駅周辺（タップ地点から直線'+Math.round(page._distance)+'m）':page.ward+'全体')+'｜'+layouts.map(function(v){return v==='1R'?'ワンルーム':v}).join('・')+'｜中央値');
- if(group==='house')line('一戸建ての成約データがないため、3LDKの参考値です。一戸建ての成約家賃ではありません。');
- line('築年数・建物種別は混在。掲載平均とは対象条件が異なります。');
- var link=document.createElement('a');link.textContent='出典：青山地所（'+page.published_month+'時点） ↗';
- try{var u=new URL(page.url);if(u.origin==='https://aoyama-e.com'&&/^\/chintai\/(st|area\/tokyo)\/[a-z0-9-]+\/$/.test(u.pathname))link.href=u.href}catch(e){}
- link.target='_blank';link.rel='noopener noreferrer';el.appendChild(link);
- line('取得：'+String(page.fetched_at||'').slice(0,10)+'｜推定値の注記あり');
  return el;
 }
 function v282UpdatePopup(layer,point){
@@ -18712,7 +18705,7 @@ assert TOWN_COMPONENT_HTML_V121.count(' v249RenderSupermarkets(args);')==1
 TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(' v249RenderSupermarkets(args);',' v249RenderSupermarkets(args);\n v282ReferenceRender(args);',1)
 TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('</style></head>',
     '.v282-reference{margin:6px 0;padding:6px 0;border-top:1px solid #d8e0df;font-size:12px;line-height:1.5}.v282-reference strong{display:block}.v282-reference a{display:block}\n</style></head>',1)
-TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace("build:'v281'","build:'v285'")
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace("build:'v281'","build:'v286'")
 
 
 
@@ -18723,7 +18716,7 @@ assert TOWN_COMPONENT_HTML_V121.count(_v285_popup_old)==1
 TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(_v285_popup_old,"el.className='v285-rent-popup';"+_v285_popup_old.replace('｜平均 ','｜平均：'),1)
 TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace("+'｜平均 '+String(entry.props.price_label||'')","+'｜平均：'+String(entry.props.price_label||'')",1)
 TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('</style></head>',
-    '.v285-rent-popup{font-weight:700}.v285-rent-popup>div{font-weight:400}.v285-rent-popup .v282-reference{border-top:0;margin:3px 0 6px;padding:0}.v285-rent-popup .v282-reference strong{display:block;font-weight:700}\n</style></head>',1)
+    '.v285-rent-popup{font-weight:700}.v285-rent-popup>div{font-weight:400}.v285-rent-popup .v282-reference{border-top:0;margin:3px 0 6px;padding:0}.v285-rent-popup .v282-reference strong{display:block;font-weight:700}.v285-rent-popup .v167-suumo-note{display:none}\n</style></head>',1)
 
 # v285: visible acquisition tabs, scoped to Saved Data only.
 _V285_SAVED_TABS_CSS="""<style>
