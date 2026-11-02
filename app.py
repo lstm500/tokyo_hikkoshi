@@ -29,6 +29,8 @@ import threading
 import time
 import unicodedata
 import urllib.robotparser
+import urllib.request
+import urllib.error
 from collections import deque
 from datetime import datetime, timezone, timedelta
 from email.utils import parsedate_to_datetime
@@ -53,7 +55,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v281"
+BUILD = "REBUILD-01-v282"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -13791,7 +13793,7 @@ def _v264_requested_supermarkets(state,loader):
 
 @st.cache_resource(show_spinner=False)
 def town_component_v121():
-    _asset_revision='v281-large-commercial-stations'
+    _asset_revision='v282-reference-rent'
     folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-'+_asset_revision)
     os.makedirs(folder,exist_ok=True)
     path=os.path.join(folder,'index.html')
@@ -13809,7 +13811,7 @@ def town_component_v121():
         with open(temp_path,'w',encoding='utf-8') as output:
             output.write(TOWN_COMPONENT_HTML_V121)
         os.replace(temp_path,path)
-    return st.components.v1.declare_component('sumai_town_map_v281',path=folder)
+    return st.components.v1.declare_component('sumai_town_map_v282',path=folder)
 
 @st.cache_resource(show_spinner=False)
 def _v216_api_budget():
@@ -17237,7 +17239,7 @@ def interactive_town_choropleth(group):
     stations,wards=town_station_refs_v164(destinations)
     supermarket_window=_v156_town_render_window(bounds,center) if bounds else None
     widget=town_component_v121()
-    data=widget(chintai_town_urls=(_v243_chintai_urls(cached['geo'],group) if source=='CHINTAI' else {}),map_source=source,map_layout_group=group,center=list(center),zoom=_v202_view_zoom(state.get('new_view_zoom')),geo=cached['geo'],
+    data=widget(**_v282_map_args(),chintai_town_urls=(_v243_chintai_urls(cached['geo'],group) if source=='CHINTAI' else {}),map_source=source,map_layout_group=group,center=list(center),zoom=_v202_view_zoom(state.get('new_view_zoom')),geo=cached['geo'],
                 home_view_epoch=int(state.get('_v202_home_epoch',0)),home_center=list(_V202_HOME_CENTER),
                 signature=cached['layer_signature'],stations=stations,wards=wards,
                 rent_map_ready=bool(cached['ready']),rent_map_waiting=bool(snap['running'] or busy),
@@ -17262,6 +17264,9 @@ def interactive_town_choropleth(group):
                 jump=state.get('_v182_map_jump'),
                 key='town_map_v184_'+str(reset),default=None)
     if isinstance(data,dict) and data.get('home_view_epoch')==int(state.get('_v202_home_epoch',0)):
+        if data.get('event')=='reference_poll_v282' and data.get('ticket')!=state.get('_v282_poll_ticket'):
+            state['_v282_poll_ticket']=data.get('ticket')
+            st.rerun(scope='fragment')
         if data.get('event')=='supermarket_delivery_request_v264' and _v264_accept_delivery_request(state,data,supermarket_loader):
             st.rerun(scope='fragment')
         if isinstance(data.get('map_diagnostics'),list):
@@ -18286,6 +18291,402 @@ def _v209_log_tools(state):
             v147_replay_status()
 
 
+# v282: collect public reference aggregates through an explicit background job.
+# Data stays in the existing search-record store, isolated from rental listings.
+_V282_ROOT='https://aoyama-e.com/chintai/'
+_V282_AGENT='SumaiCompassReference/1.0'
+_V282_LAYOUTS=('1R','1K','1DK','1LDK','2K','2DK','2LDK','3K','3DK','3LDK','4LDK')
+_V282_HTTP_LOCK=threading.Lock()
+_V282_HTTP_NEXT=0.0
+
+
+def _v282_source_url(value):
+    try:
+        u=urlparse(value)
+        return bool(u.scheme=='https' and u.hostname=='aoyama-e.com' and not u.username and not u.password
+                    and u.port in (None,443) and not u.query and not u.fragment
+                    and (u.path=='/robots.txt' or u.path=='/chintai/'
+                         or re.fullmatch(r'/chintai/(?:st/[a-z0-9-]+|area/tokyo/[a-z0-9-]+)/',u.path)))
+    except (TypeError,ValueError):return False
+
+
+def _v282_number(value,pattern):
+    match=re.search(pattern,unicodedata.normalize('NFKC',str(value)).replace(',',''))
+    return float(match.group(1)) if match else None
+
+
+def _v282_layout(value):
+    value=unicodedata.normalize('NFKC',str(value)).replace(' ','').upper()
+    return '1R' if value in ('ワンルーム','1R','ワンルーム(1R)') else value
+
+
+def _v282_parse_page(raw,url):
+    if not _v282_source_url(url):raise AppError('参考家賃の取得先URLが不正です。')
+    soup=BeautifulSoup(raw,'html.parser');heading=soup.find('h1')
+    title=heading.get_text(' ',strip=True) if heading else ''
+    is_station='/st/' in url
+    match=re.fullmatch(r'(.+?)(駅)?の家賃相場',title)
+    if not match:raise AppError('参考家賃の地域見出しを確認できません。')
+    label=match.group(1);text=soup.get_text(' ',strip=True)
+    ward=label if not is_station else ''
+    if is_station:
+        # Ward identity comes from breadcrumb links, never a station-name guess.
+        for a in soup.select('a[href]'):
+            if re.fullmatch(r'/chintai/area/tokyo/[a-z0-9-]+/',urlparse(a.get('href','')).path):
+                name=a.get_text(' ',strip=True)
+                if name in TOKYO_WARDS.values():ward=name;break
+    if ward not in TOKYO_WARDS.values():raise AppError('東京23区の参考データではありません。')
+    published=re.search(r'(20\d{2})[年-](\d{1,2})(?:月)?時点',text)
+    month=f'{published.group(1)}-{int(published.group(2)):02d}' if published else ''
+    if not month:raise AppError('参考家賃の集計時点を確認できません。')
+    rows=[]
+    for table in soup.find_all('table'):
+        header=table.find('tr')
+        heads=[c.get_text(' ',strip=True) for c in header.find_all(['th','td'])] if header else []
+        if not heads or heads[0]!='間取り':continue
+        layout_table=any('家賃' in h and '中央値' in h for h in heads)
+        age_table=len(heads)>1 and all('築' in h for h in heads[1:])
+        if not (layout_table or age_table):continue
+        for tr in table.select('tbody tr'):
+            cells=[c.get_text(' ',strip=True) for c in tr.find_all(['th','td'],recursive=False)]
+            if len(cells)!=len(heads):continue
+            layout=_v282_layout(cells[0])
+            if layout not in _V282_LAYOUTS:continue
+            if layout_table:
+                ri=next(i for i,h in enumerate(heads) if '家賃' in h and '中央値' in h)
+                ci=next((i for i,h in enumerate(heads) if '成約件数' in h),None)
+                count=_v282_number(cells[ci],r'(\d+)') if ci is not None else None
+                values=[('全年代',cells[ri],count)]
+            else:values=[(heads[i],cells[i],_v282_number(cells[i],r'(\d+)件')) for i in range(1,len(heads))]
+            for age,cell,count in values:
+                rent=_v282_number(cell,r'([0-9]+(?:\.[0-9]+)?)\s*万円')
+                if rent is None or count is None or count<10 or not 0<rent<=1000:continue
+                rows.append({'layout':layout,'age':age,'median_yen':int(round(rent*10000)),'count':int(count)})
+    if not rows or not any(r['age']=='全年代' for r in rows):raise AppError('間取り別の家賃中央値を取得できません。以前の保存結果を保持します。')
+    # Town map values have no layout breakdown. Never label them as 1LDK etc.
+    towns=[]
+    if not is_station:
+        for el in soup.select('svg title'):
+            m=re.fullmatch(r'(.+?):\s*家賃([0-9.]+)万円\s*\(㎡単価([0-9,]+)円\)',el.get_text(strip=True))
+            if m:
+                key=town_chome_key(ward+m.group(1))
+                if key:towns.append({'key':key,'median_yen':int(round(float(m.group(2))*10000)),
+                                     'sqm_yen':int(m.group(3).replace(',',''))})
+    return {'schema':1,'provider':'aoyama','kind':'station' if is_station else 'ward','name':label,
+            'ward':ward,'url':url,'published_month':month,'fetched_at':utc_now(),'statistic':'median',
+            'basis':'サイト公表成約家賃・推定値の注記あり','rows':rows,'towns':towns}
+
+
+def _v282_discover(raw,wards):
+    soup=BeautifulSoup(raw,'html.parser');wanted=set(wards);pages={};mapped=set()
+    for a in soup.select('a[href]'):
+        name=a.get_text(' ',strip=True);url=urljoin(_V282_ROOT,a.get('href',''))
+        if name in wanted and '/area/tokyo/' in url and _v282_source_url(url):pages[url]=name
+    # The site's Tokyo station directory nests ward groups inside a Tokyo group.
+    for d in soup.select('details'):
+        summary=d.find('summary',recursive=False)
+        if not summary:continue
+        title=summary.get_text(' ',strip=True)
+        ward=next((w for w in wanted if re.match('^'+re.escape(w)+r'(?:\s|\d|$)',title)),None)
+        other='東京のその他' in title
+        if not ward and not other:continue
+        if ward:mapped.add(ward)
+        # Other-Tokyo is handled below only for wards without their own directory.
+    for d in soup.select('details'):
+        summary=d.find('summary',recursive=False)
+        if not summary:continue
+        title=summary.get_text(' ',strip=True)
+        ward=next((w for w in wanted if re.match('^'+re.escape(w)+r'(?:\s|\d|$)',title)),None)
+        if not ward and not ('東京のその他' in title and wanted-mapped):continue
+        for a in d.select('a[href]'):
+            url=urljoin(_V282_ROOT,a.get('href',''))
+            if '/st/' in url and _v282_source_url(url):pages.setdefault(url,ward or '')
+    if not pages:raise AppError('選択した区の公開ページが見つかりません。以前の保存結果を保持します。')
+    return list(pages.items())
+
+
+def _v282_record_id(url):return 'reference.aoyama.page.'+hashlib.sha256(url.encode()).hexdigest()
+
+
+def _v282_save_page(db,page):
+    key=_v282_record_id(page['url']);stamp=utc_now()
+    db.save_search({'id':key,'status':'reference_aoyama_page','started_at':stamp,'finished_at':stamp,
+                    'conditions':{'provider':'aoyama','ward':page['ward'],'url':page['url']},'summary':page})
+    rows=db.call('GET',SEARCH_TABLE,{'namespace':'eq.'+db.namespace,'id':'eq.'+key,
+                 'status':'eq.reference_aoyama_page','select':'id,summary','limit':1})
+    if not isinstance(rows,list) or len(rows)!=1 or rows[0].get('summary')!=page:
+        raise AppError('参考家賃の保存後の読み戻しが一致しません。')
+
+
+def _v282_load_pages(db,cancel=None):
+    pages={};offset=0
+    while True:
+        if cancel and cancel.is_set():raise SearchCancelled()
+        rows=db.call('GET',SEARCH_TABLE,{'namespace':'eq.'+db.namespace,'status':'eq.reference_aoyama_page',
+            'select':'id,summary','order':'id.asc','limit':50,'offset':offset})
+        if not isinstance(rows,list):raise AppError('参考家賃の保存形式が不正です。')
+        for row in rows:
+            page=row.get('summary')
+            if (isinstance(page,dict) and page.get('schema')==1 and page.get('provider')=='aoyama'
+                    and _v282_source_url(page.get('url')) and page.get('ward') in TOKYO_WARDS.values()
+                    and isinstance(page.get('rows'),list) and page.get('statistic')=='median'):
+                pages[page['url']]=page
+        if len(rows)<50:break
+        offset+=len(rows)
+    return pages
+
+
+class _V282ReferenceHTTP:
+    def __init__(self,cancel,log):
+        self.cancel=cancel;self.log=log;self.robot=None
+        class NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self,req,fp,code,msg,headers,newurl):return None
+        self.opener=urllib.request.build_opener(NoRedirect())
+    def get(self,url):
+        global _V282_HTTP_NEXT
+        if not _v282_source_url(url):raise AppError('参考家賃の取得先URLが不正です。')
+        if self.cancel.is_set():raise SearchCancelled()
+        if self.robot is not None and not self.robot.can_fetch(_V282_AGENT,url):raise AppError('取得先のrobots.txtにより取得対象外です。')
+        # Process-wide start pacing; cancelled old workers cannot bypass it.
+        while True:
+            with _V282_HTTP_LOCK:
+                delay=max(0,_V282_HTTP_NEXT-time.monotonic())
+                if delay==0:_V282_HTTP_NEXT=time.monotonic()+getattr(self,'delay',2.0);break
+            if self.cancel.wait(min(delay,.25)):raise SearchCancelled()
+        begin=time.monotonic()
+        try:
+            req=urllib.request.Request(url,headers={'User-Agent':_V282_AGENT})
+            try:response=self.opener.open(req,timeout=20)
+            except urllib.error.HTTPError as exc:response=exc
+            with response:
+                status=response.code
+                self.log('http',url,status=status,ms=round((time.monotonic()-begin)*1000))
+                if status in (429,503):raise AppError('取得先が混雑しています。今回の取得を停止し、保存済みデータを保持します。')
+                if url.endswith('/robots.txt') and status==404:return ''
+                if status!=200:raise AppError('参考家賃の取得失敗：HTTP '+str(status))
+                data=response.read(2_000_001)
+            if len(data)>2_000_000:raise AppError('参考ページの容量が想定を超えました。')
+            if self.cancel.is_set():raise SearchCancelled()
+            return data.decode('utf-8')
+        except (urllib.error.URLError,OSError,UnicodeError) as exc:
+            self.log('http_error',url,error=type(exc).__name__)
+            raise AppError('参考家賃の通信失敗：'+type(exc).__name__) from None
+    def prepare(self):
+        global _V282_HTTP_NEXT
+        raw=self.get('https://aoyama-e.com/robots.txt')
+        self.robot=urllib.robotparser.RobotFileParser();self.robot.parse(raw.splitlines())
+        delay=self.robot.crawl_delay(_V282_AGENT)
+        if delay and delay>2:
+            # Honor larger declared delays in addition to the global minimum.
+            self.delay=float(delay)
+        else:self.delay=2.0
+        with _V282_HTTP_LOCK:_V282_HTTP_NEXT=max(_V282_HTTP_NEXT,time.monotonic()+self.delay)
+
+
+class _V282ReferenceStore:
+    def __init__(self,db):
+        self.db=db;self.lock=threading.RLock();self.write_lock=threading.Lock();self.pages={};self.revision=0
+        self.running=False;self.loaded=False;self.error='';self.message='';self.logs=[];self.cancel=threading.Event()
+        self.generation=0;self.completed=0;self.total=0;self.saved=0;self.skipped=0;self.mode='';self.last_log_id=''
+        self._payload_revision=-1;self._payload=[]
+    def snapshot(self):
+        with self.lock:return {'running':self.running,'loaded':self.loaded,'error':self.error,'message':self.message,
+            'revision':self.revision,'pages':len(self.pages),'completed':self.completed,'total':self.total,
+            'saved':self.saved,'skipped':self.skipped,'logs':list(self.logs),'mode':self.mode}
+    def stop(self):
+        with self.lock:
+            self.cancel.set();self.generation+=1;self.running=False;self.message='中止しました。保存済みデータを保持しています。'
+    def start(self,mode='load',wards=(),force=False):
+        with self.lock:
+            if self.running:return False
+            self.running=True;self.cancel=threading.Event();self.generation+=1;gen=self.generation;cancel=self.cancel
+            self.error='';self.message='';self.logs=[];self.completed=0;self.total=0;self.saved=0;self.skipped=0;self.mode=mode
+        threading.Thread(target=self.run,args=(gen,cancel,mode,tuple(wards),force),daemon=True,name='reference-rent-aoyama').start()
+        return True
+    def run(self,gen,cancel,mode,wards,force):
+        events=[];started=utc_now();run_id='reference.aoyama.run.'+hashlib.sha256((started+str(gen)).encode()).hexdigest()
+        def current():return not cancel.is_set() and gen==self.generation
+        def log(event,url='',**extra):
+            row=dict(time=utc_now(),event=event,url=url,**extra);events.append(row)
+            with self.lock:
+                if gen==self.generation:self.logs=list(events)
+        status='completed'
+        try:
+            pages=_v282_load_pages(self.db,cancel)
+            with self.lock:
+                if not current():raise SearchCancelled()
+                # Merge: never lose a page saved by another finished acquisition.
+                self.pages.update(pages);self.loaded=True;self.revision+=1
+            if mode=='load':return
+            http=_V282ReferenceHTTP(cancel,log);http.prepare()
+            plan=_v282_discover(http.get(_V282_ROOT),wards)
+            with self.lock:
+                if current():self.total=len(plan)
+            for url,expected in plan:
+                if not current():raise SearchCancelled()
+                old=self.pages.get(url)
+                fresh=False
+                try:fresh=old is not None and (datetime.now(timezone.utc)-datetime.fromisoformat(old['fetched_at'].replace('Z','+00:00'))).total_seconds()<30*86400
+                except (KeyError,ValueError,TypeError):pass
+                if fresh and not force:
+                    log('skip_fresh',url)
+                    with self.lock:
+                        if current():self.skipped+=1;self.completed+=1
+                    continue
+                try:
+                    page=_v282_parse_page(http.get(url),url)
+                    if expected and page['ward']!=expected:raise AppError('索引の区名と取得ページの区名が一致しません。')
+                    # Other-Tokyo directory has mixed wards; retain valid Tokyo rows.
+                    with self.write_lock:
+                        if not current():raise SearchCancelled()
+                        _v282_save_page(self.db,page)
+                        with self.lock:
+                            if current():self.pages[url]=page;self.saved+=1;self.revision+=1
+                    log('saved_verified',url,ward=page['ward'],name=page['name'],records=len(page['rows']))
+                except AppError as exc:
+                    log('page_error',url,error=str(exc),retained=bool(old))
+                    if re.search(r'HTTP (?:401|403|429|503)',str(exc)) or '混雑' in str(exc) or 'robots.txt' in str(exc):raise
+                with self.lock:
+                    if current():self.completed+=1
+            failed=sum(e['event']=='page_error' for e in events)
+            status='partial' if failed else 'completed'
+            with self.lock:
+                if current():self.message=f'取得終了：保存 {self.saved}ページ／更新不要 {self.skipped}ページ／失敗 {failed}ページ'
+        except SearchCancelled:status='cancelled';log('cancelled')
+        except Exception as exc:
+            status='failed';log('error',error=str(exc) if isinstance(exc,AppError) else type(exc).__name__)
+            with self.lock:
+                if current():self.error=str(exc) if isinstance(exc,AppError) else type(exc).__name__
+        finally:
+            if mode=='collect':
+                try:
+                    self.db.save_search({'id':run_id,'status':'reference_aoyama_log','started_at':started,'finished_at':utc_now(),
+                        'conditions':{'provider':'aoyama','wards':list(wards)},'summary':{'schema':1,'status':status,'events':events}})
+                    with self.lock:
+                        if gen==self.generation:self.last_log_id=run_id
+                except Exception as exc:log('log_save_error',error=str(exc)[:300])
+            with self.lock:
+                if gen==self.generation:self.running=False
+    def map_payload(self):
+        with self.lock:
+            if self._payload_revision==self.revision:return self._payload
+            out=[]
+            for page in self.pages.values():
+                row={k:page.get(k) for k in ('kind','name','ward','url','published_month','fetched_at')}
+                row['rows']=[r for r in page.get('rows',[]) if r.get('age')=='全年代']
+                point=(STATION_MAP_POINTS.get(page['name']) or STATIONS.get(page['name']) or _V274_RAIL_EXTRA_POINTS.get(page['name'])) if page['kind']=='station' else None
+                if point:row['lat'],row['lng']=float(point[0]),float(point[1])
+                out.append(row)
+            self._payload=out;self._payload_revision=self.revision;return out
+
+
+@st.cache_resource(show_spinner=False)
+def _v282_registry():return {},threading.RLock()
+
+
+def _v282_store():
+    db=Database();items,lock=_v282_registry();key=manual_registry_key(db)
+    with lock:
+        if key not in items:items[key]=_V282ReferenceStore(db)
+        return items[key]
+
+
+def _v282_map_args():
+    try:
+        store=_v282_store();snap=store.snapshot()
+        if not snap['loaded'] and not snap['running'] and not snap['error']:store.start('load')
+        snap=store.snapshot()
+        return {'reference_pages':store.map_payload(),'reference_revision':snap['revision'],
+                'reference_loading':snap['running'] and not snap['loaded'],'reference_error':snap['error']}
+    except AppError as exc:return {'reference_pages':[],'reference_error':str(exc),'reference_loading':False}
+
+
+@st.fragment(run_every='3s')
+def _v282_reference_panel():
+    with st.expander('参考・成約家賃の取得／保存',expanded=False):
+        st.caption('青山地所の公開集計値を取得し、既存のSupabase保存領域へ保存します。募集物件とは別に管理します。')
+        st.caption('間取り別・築年帯別の中央値です。推定値の注記があるため、サイト公表の参考値として扱います。')
+        try:store=_v282_store()
+        except AppError as exc:st.error(str(exc));return
+        snap=store.snapshot()
+        wards=st.multiselect('参考家賃を取得する区',list(TOKYO_WARDS.values()),default=['品川区'],key='reference_wards_v282',disabled=snap['running'])
+        force=st.checkbox('30日以内に取得したページも更新する',key='reference_force_v282',disabled=snap['running'])
+        st.caption('東京の区別未分類の駅も必要に応じて確認します。公開されていない間取り・地域は補完しません。')
+        if st.button('参考家賃を取得・保存',key='reference_start_v282',disabled=snap['running'] or not wards):
+            store.start('collect',wards,force);st.rerun()
+        if st.button('参考家賃の取得を中止',key='reference_stop_v282',disabled=not snap['running']):
+            store.stop();st.rerun()
+        if st.button('保存した参考家賃を読み込む',key='reference_load_v282',disabled=snap['running']):
+            store.start('load');st.rerun()
+        st.caption(f"保存済み {snap['pages']}ページ｜処理 {snap['completed']}/{snap['total']}ページ")
+        if snap['running']:st.caption('バックグラウンドで取得・保存中です。地図は引き続き操作できます。')
+        if snap['message']:st.caption(snap['message'])
+        if snap['error']:st.error(snap['error'])
+        seen=st.session_state.get('_v282_panel_seen_revision')
+        was_running=st.session_state.get('_v282_panel_was_running',False)
+        st.session_state['_v282_panel_was_running']=snap['running']
+        st.session_state['_v282_panel_seen_revision']=snap['revision']
+        # Only completed changes need a full render; acquisition polling stays local.
+        if not snap['running'] and seen is not None and (seen!=snap['revision'] or was_running):
+            st.rerun()
+        if st.button('保存した参考家賃のログを読み込む',key='reference_logs_load_v282'):
+            try:
+                records=store.db.call('GET',SEARCH_TABLE,{'namespace':'eq.'+store.db.namespace,'status':'eq.reference_aoyama_log',
+                    'select':'id,started_at,summary','order':'started_at.desc','limit':20})
+                if not isinstance(records,list):raise AppError('参考家賃ログの応答形式が不正です。')
+                st.session_state['_v282_saved_logs']=records
+            except AppError as exc:st.error(str(exc))
+        logs={'current':snap['logs'],'saved':st.session_state.get('_v282_saved_logs',[])}
+        st.download_button('参考家賃の取得ログ JSON',json.dumps(logs,ensure_ascii=False,indent=2).encode(),
+            'sumai_reference_rent_log.json','application/json',key='reference_logs_v282',on_click='ignore',disabled=not any(logs.values()))
+
+
+_V282_REFERENCE_JS=r"""
+function v282ReferenceBlock(layer,point){
+ var el=document.createElement('div');el.className='v282-reference';
+ var title=document.createElement('strong');title.textContent='参考・成約家賃（サイト公表中央値）';el.appendChild(title);
+ if(state._v240Group==='house'){var d=document.createElement('div');d.textContent='一戸建ての同条件データはありません。';el.appendChild(d);return el}
+ var props=layer.feature&&layer.feature.properties||{},place=v217Place(props),pages=state._v282Pages||[];
+ var group=state._v240Group||'group1',layouts=group==='group0'?['1R','1K','1DK']:group==='group1'?['1LDK','2K','2DK']:['2LDK','3K','3DK'];
+ var candidates=pages.filter(function(p){return p.kind==='station'&&Number.isFinite(p.lat)&&Number.isFinite(p.lng)});
+ candidates.forEach(function(p){p._distance=point?state.map.distance(point,L.latLng(p.lat,p.lng)):Infinity});
+ candidates.sort(function(a,b){return a._distance-b._distance||String(a.name).localeCompare(String(b.name))});
+ var page=candidates.length&&candidates[0]._distance<=1500?candidates[0]:pages.find(function(p){return p.kind==='ward'&&p.ward===place.ward});
+ function line(text){var d=document.createElement('div');d.textContent=text;el.appendChild(d)}
+ if(!page){line(state._v282Loading?'保存した参考データを読み込み中です。':state._v282Error?'参考データの読み込みに失敗しました。':'参考データなし（「保存データ」から取得できます）');return el}
+ line(page.kind==='station'?page.name+'駅周辺｜タップ地点から直線'+Math.round(page._distance)+'m':page.ward+'全体の参考値');
+ layouts.forEach(function(layout){var row=(page.rows||[]).find(function(r){return r.layout===layout});line((layout==='1R'?'ワンルーム':layout)+'：'+(row?(Number(row.median_yen)/10000).toFixed(1)+'万円（'+Number(row.count).toLocaleString()+'件）':'公表データなし'))});
+ if(group==='group2'){var extra=(page.rows||[]).find(function(r){return r.layout==='3LDK'});if(extra)line('別間取り参考・3LDK：'+(Number(extra.median_yen)/10000).toFixed(1)+'万円（'+Number(extra.count).toLocaleString()+'件）')}
+ line('築年数・建物種別は混在。掲載平均とは対象条件が異なります。');
+ var link=document.createElement('a');link.textContent='出典：青山地所（'+page.published_month+'時点） ↗';
+ try{var u=new URL(page.url);if(u.origin==='https://aoyama-e.com'&&/^\/chintai\/(st|area\/tokyo)\/[a-z0-9-]+\/$/.test(u.pathname))link.href=u.href}catch(e){}
+ link.target='_blank';link.rel='noopener noreferrer';el.appendChild(link);
+ line('取得：'+String(page.fetched_at||'').slice(0,10)+'｜推定値の注記あり');
+ return el;
+}
+function v282UpdatePopup(layer,point){
+ if(!layer||!layer._v280Popup)return;
+ var old=layer._v280Popup.querySelector('.v282-reference'),block=v282ReferenceBlock(layer,point);
+ if(old)old.replaceWith(block);else layer._v280Popup.insertBefore(block,layer._v280Popup.childNodes[1]||null);
+}
+function v282ReferenceRender(args){
+ var refKey=JSON.stringify([args.reference_revision,state._v240Group,!!args.reference_loading,args.reference_error||'']),changed=state._v282RefKey!==refKey;state._v282RefKey=refKey;
+ if(Array.isArray(args.reference_pages))state._v282Pages=args.reference_pages;
+ state._v282Loading=!!args.reference_loading;state._v282Error=args.reference_error||'';
+ if(state.map&&!state._v282Hook){state._v282Hook=true;state.map.on('popupopen',function(e){var layer=e.popup&&e.popup._source;if(layer&&layer._v280Popup){state._v282ActiveLayer=layer;state._v282ActivePoint=e.popup.getLatLng();v282UpdatePopup(layer,state._v282ActivePoint);e.popup.update()}})}
+ if(changed&&state._v282ActiveLayer&&state._v282ActiveLayer.isPopupOpen()){v282UpdatePopup(state._v282ActiveLayer,state._v282ActivePoint);state._v282ActiveLayer.getPopup().update()}
+ if(state._v282Loading&&!state._v282Poll&& (state._v282Polls||0)<20){state._v282Poll=setTimeout(function(){state._v282Poll=null;state._v282Polls=(state._v282Polls||0)+1;hostMessage('streamlit:setComponentValue',{dataType:'json',value:{event:'reference_poll_v282',ticket:String(Date.now()),home_view_epoch:state._v202HomeEpoch}})},2000)}
+}
+"""
+# Preserve the existing map instance, polygon layers, route actions and selection.
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('function render(args){',_V282_REFERENCE_JS+'\nfunction render(args){',1)
+assert TOWN_COMPONENT_HTML_V121.count(' v249RenderSupermarkets(args);')==1
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(' v249RenderSupermarkets(args);',' v249RenderSupermarkets(args);\n v282ReferenceRender(args);',1)
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('</style></head>',
+    '.v282-reference{margin:6px 0;padding:6px 0;border-top:1px solid #d8e0df;font-size:12px;line-height:1.5}.v282-reference strong{display:block}.v282-reference a{display:block}\n</style></head>',1)
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace("build:'v281'","build:'v282'")
+
+
 def main():
     st.set_page_config(page_title='住まいコンパス｜新しい住まいを探す',page_icon='🏡',layout='wide',initial_sidebar_state='collapsed')
     st.markdown(CSS,unsafe_allow_html=True)
@@ -18365,6 +18766,7 @@ def main():
         # Detailed 23-ward coverage and aggregation status are low-priority UI.
         town_choropleth_status()
     with tabs[1]:
+        _v282_reference_panel()
         st.caption('物件と家賃の集計は共通のSupabaseに保存し、全利用者で同じデータを参照します。通勤設定は共有しません。')
         if state.get('saved_map_restore_message'):st.caption(state.saved_map_restore_message)
         automatic_collection_panel()
