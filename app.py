@@ -55,7 +55,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v282"
+BUILD = "REBUILD-01-v283"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -13793,7 +13793,7 @@ def _v264_requested_supermarkets(state,loader):
 
 @st.cache_resource(show_spinner=False)
 def town_component_v121():
-    _asset_revision='v282-reference-rent'
+    _asset_revision='v283-reference-layouts'
     folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-'+_asset_revision)
     os.makedirs(folder,exist_ok=True)
     path=os.path.join(folder,'index.html')
@@ -13811,7 +13811,7 @@ def town_component_v121():
         with open(temp_path,'w',encoding='utf-8') as output:
             output.write(TOWN_COMPONENT_HTML_V121)
         os.replace(temp_path,path)
-    return st.components.v1.declare_component('sumai_town_map_v282',path=folder)
+    return st.components.v1.declare_component('sumai_town_map_v283',path=folder)
 
 @st.cache_resource(show_spinner=False)
 def _v216_api_budget():
@@ -18645,9 +18645,9 @@ _V282_REFERENCE_JS=r"""
 function v282ReferenceBlock(layer,point){
  var el=document.createElement('div');el.className='v282-reference';
  var title=document.createElement('strong');title.textContent='参考・成約家賃（サイト公表中央値）';el.appendChild(title);
- if(state._v240Group==='house'){var d=document.createElement('div');d.textContent='一戸建ての同条件データはありません。';el.appendChild(d);return el}
  var props=layer.feature&&layer.feature.properties||{},place=v217Place(props),pages=state._v282Pages||[];
- var group=state._v240Group||'group1',layouts=group==='group0'?['1R','1K','1DK']:group==='group1'?['1LDK','2K','2DK']:['2LDK','3K','3DK'];
+ // v283: show the requested representative layout; never combine medians.
+ var group=state._v240Group||'group1',layouts=group==='group0'?['1R','1DK']:group==='group1'?['1LDK']:group==='house'?['3LDK']:['2LDK'];
  var candidates=pages.filter(function(p){return p.kind==='station'&&Number.isFinite(p.lat)&&Number.isFinite(p.lng)});
  candidates.forEach(function(p){p._distance=point?state.map.distance(point,L.latLng(p.lat,p.lng)):Infinity});
  candidates.sort(function(a,b){return a._distance-b._distance||String(a.name).localeCompare(String(b.name))});
@@ -18656,7 +18656,7 @@ function v282ReferenceBlock(layer,point){
  if(!page){line(state._v282Loading?'保存した参考データを読み込み中です。':state._v282Error?'参考データの読み込みに失敗しました。':'参考データなし（「保存データ」から取得できます）');return el}
  line(page.kind==='station'?page.name+'駅周辺｜タップ地点から直線'+Math.round(page._distance)+'m':page.ward+'全体の参考値');
  layouts.forEach(function(layout){var row=(page.rows||[]).find(function(r){return r.layout===layout});line((layout==='1R'?'ワンルーム':layout)+'：'+(row?(Number(row.median_yen)/10000).toFixed(1)+'万円（'+Number(row.count).toLocaleString()+'件）':'公表データなし'))});
- if(group==='group2'){var extra=(page.rows||[]).find(function(r){return r.layout==='3LDK'});if(extra)line('別間取り参考・3LDK：'+(Number(extra.median_yen)/10000).toFixed(1)+'万円（'+Number(extra.count).toLocaleString()+'件）')}
+ if(group==='house')line('一戸建ての成約データがないため、3LDKの参考値です。一戸建ての成約家賃ではありません。');
  line('築年数・建物種別は混在。掲載平均とは対象条件が異なります。');
  var link=document.createElement('a');link.textContent='出典：青山地所（'+page.published_month+'時点） ↗';
  try{var u=new URL(page.url);if(u.origin==='https://aoyama-e.com'&&/^\/chintai\/(st|area\/tokyo)\/[a-z0-9-]+\/$/.test(u.pathname))link.href=u.href}catch(e){}
@@ -18684,7 +18684,7 @@ assert TOWN_COMPONENT_HTML_V121.count(' v249RenderSupermarkets(args);')==1
 TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(' v249RenderSupermarkets(args);',' v249RenderSupermarkets(args);\n v282ReferenceRender(args);',1)
 TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('</style></head>',
     '.v282-reference{margin:6px 0;padding:6px 0;border-top:1px solid #d8e0df;font-size:12px;line-height:1.5}.v282-reference strong{display:block}.v282-reference a{display:block}\n</style></head>',1)
-TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace("build:'v281'","build:'v282'")
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace("build:'v281'","build:'v283'")
 
 
 def main():
