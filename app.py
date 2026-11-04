@@ -56,7 +56,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v292"
+BUILD = "REBUILD-01-v293"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -13425,6 +13425,8 @@ def _v207_search_landmarks(data,audit=None):
                 score,match_kind=max((_v288_name_match(query,n) for n in aliases),key=lambda pair:pair[0])
                 if not score and tags.get('web_name_verified') is True and _v231_name_key(tags.get('web_query_alias'))==_v231_name_key(query):
                     score,match_kind=.9,'similar'
+                if not score and tags.get('web_location_match') is True and _v231_name_key(tags.get('web_query_alias'))==_v231_name_key(query):
+                    score,match_kind=.9,'name_and_location'
                 if not score:
                     trace(web,'landmark_candidate_rejected',{'query':query,'name':name,'reason':'name_not_similar'},stage='landmark.result');continue
                 address=normal(tags.get('addr:full'))
@@ -19107,23 +19109,36 @@ def _v291_address_token(value):
     return re.sub(r'\s+','',value).rstrip('-')
 
 
+def _v293_context_match(query,name,addresses,context):
+    if _v231_name_matches(query,name):return 'name'
+    tokens=[t for t in re.split(r'\s+',unicodedata.normalize('NFKC',query).strip()) if t]
+    # The first token identifies the facility; subsequent tokens can identify
+    # its neighbourhood, building or nearest station in this result's context.
+    if len(tokens)<2 or not _v231_name_matches(tokens[0],name):return ''
+    evidence=_v231_name_key(name+' '+' '.join(addresses)+' '+context)
+    if all(len(_v231_name_key(t))>=2 and _v231_name_key(t) in evidence for t in tokens[1:]):return 'name_and_location_context'
+    return ''
+
+
 def _v292_snippet_identity(row,query):
     title=normal(row.get('title'));text=normal(row.get('snippet'))
     if re.search(r'周辺の|近くの|一覧|ランキング',title):return '',[]
+    compact=re.sub(r'\s+','',unicodedata.normalize('NFKC',text))
+    addresses=_extract_detailed_addresses(compact)
+    addresses+=re.findall(r'東京都[^\s,、。|<>]{1,12}区[^\s,、。|<>]{1,20}?\d+-\d+(?:-\d+)?',compact)
+    unique={_v291_address_token(a):a for a in addresses}
+    # Never attach a mixed list's address to a facility or infer an address.
+    if len(unique)!=1:return '',[]
+    addresses=list(unique.values())
     parts=re.split(r'[｜|]|\s[-—–]\s',title)
-    name=next((p.strip() for p in parts if _v231_name_matches(query,p)), '')
+    name=next((p.strip() for p in parts if _v293_context_match(query,p,addresses,text)), '')
     if not name:return '',[]
     tokens=[t for t in re.split(r'\s+',query) if len(t)>=2]
     positions=[name.casefold().find(t.casefold()) for t in tokens if name.casefold().find(t.casefold())>=0]
     if positions:name=name[min(positions):]
     name=re.sub(r'(?<=[^\x00-\x7f])\s+(?=[^\x00-\x7f])','',name)
-    if not _v231_name_matches(query,name):return '',[]
-    compact=re.sub(r'\s+','',unicodedata.normalize('NFKC',text))
-    addresses=_extract_detailed_addresses(compact)
-    addresses+=re.findall(r'東京都[^\s,、。|<>]{1,12}区[^\s,、。|<>]{1,20}?\d+-\d+(?:-\d+)?',compact)
-    unique={_v291_address_token(a):a for a in addresses}
-    # A result mentioning several store addresses does not identify one branch.
-    return (name,list(unique.values())) if len(unique)==1 else ('',[])
+    if not _v293_context_match(query,name,addresses,text):return '',[]
+    return name,addresses
 
 
 def _v292_geocode_web(web,query,name,addresses,url,alias,snippet=False):
@@ -19144,7 +19159,8 @@ def _v292_geocode_web(web,query,name,addresses,url,alias,snippet=False):
             label=address+('（'+'・'.join(notes)+'）' if notes else '')
             elements.append({'lat':lat,'lon':lng,'tags':{'name':name,'addr:full':label,'source':url,
                 'provider':('Web検索の住所候補' if snippet else 'Webページの所在地')+'／国土地理院',
-                'web_query_alias':query,'web_name_verified':not snippet}})
+                'web_query_alias':query,'web_name_verified':not snippet,
+                'web_location_match':alias=='name_and_location_context'}})
             trace(web,'landmark_web_identity_verified' if not snippet else 'landmark_web_snippet_candidate',
                 {'query':query,'name':name,'address':address,'source_url':url,'alias_basis':alias,
                  'geocode_address':matched,'position_precision':'address' if a==b else 'block',
@@ -19164,6 +19180,7 @@ def _v291_public_web_document(web,query):
             try:
                 page,url=_v291_fetch(web,row['url']);name,addresses,text,title=_v291_page_identity(page)
                 alias=_v291_web_alias(query,name,text)
+                if not alias and len(addresses)==1:alias=_v293_context_match(query,name,addresses,row['snippet'])
                 if name and addresses and alias:page_elements=_v292_geocode_web(web,query,name,addresses,url,alias)
                 else:trace(web,'landmark_web_identity_rejected',{'query':query,'url':url,'name':name,
                     'missing':[k for k,v in [('name',name),('address',addresses),('alias',alias)] if not v]},stage='landmark.web')
@@ -19173,7 +19190,7 @@ def _v291_public_web_document(web,query):
             try:
                 name,addresses=_v292_snippet_identity(row,query)
                 if name and addresses:
-                    elements=_v292_geocode_web(web,query,name,addresses,row['url'],'query_tokens',snippet=True)
+                    elements=_v292_geocode_web(web,query,name,addresses,row['url'],_v293_context_match(query,name,addresses,row['snippet']),snippet=True)
                     if elements:return {'elements':elements},{'provider':'Web検索の住所候補＋国土地理院'}
             except Exception as exc:
                 trace(web,'landmark_web_snippet_failed',{'url':row['url'],'reason':str(exc)},'WARNING','landmark.web')
