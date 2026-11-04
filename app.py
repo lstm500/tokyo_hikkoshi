@@ -56,7 +56,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v293"
+BUILD = "REBUILD-01-v294"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -72,7 +72,7 @@ _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inven
 # 5) Keep old rental_listing and acquisition records unchanged. Version-150
 #    observations use isolated IDs; old/new records share read-time map keys
 #    and deduplicate by SUUMO property ID in the town rent aggregator.
-# 6) Continue searching age<=15-year target-layout mansions and age<=40-year,
+# 6) Continue searching age<=25-year target-layout mansions and age<=40-year,
 #    >=50sqm rental houses. Actual save means Supabase POST+GET field readback.
 SUUMO_TEXT_ADDRESS_FORBIDDEN = False
 SUUMO_MAP_ONLY_ADDRESS_POLICY = 'published_town_first_unique_property_map_fallback_v150'
@@ -3105,22 +3105,22 @@ def homes_prepare_region(web,region):
             except AppError:pass
     missing=[x for x in HOMES_LAYOUTS if x not in layout_filters]
     if missing:raise AppError('HOMESの間取り選択値を確認できません：'+','.join(missing))
-    age15=_form_control_by_label(soup,'15年以内') or _form_control_by_label(city_soup,'15年以内')
-    if not age15 and '15年以内' in page_text:age15=('cond[houseageh]','15')
-    if not age15:raise AppError('HOMESの「築年数：15年以内」の公開条件を確認できません。')
+    age25=_form_control_by_label(soup,'25年以内') or _form_control_by_label(city_soup,'25年以内')
+    if not age25 and '25年以内' in page_text:age25=('cond[houseageh]','25')
+    if not age25:raise AppError('HOMESの「築年数：25年以内」の公開条件を確認できません。')
     mansion=None
     if '/chintai/mansion/' not in urlparse(base_url).path:
         mansion=_form_control_by_label(soup,'マンション') or _form_control_by_label(city_soup,'マンション')
         if not mansion:raise AppError('HOMESの「建物の種類：マンション」を町域ページで確認できません。')
-    result={'url':base_url,'base_params':base_params,'layout_filters':layout_filters,'age15':age15,'mansion':mansion,'town':wanted,'city':city,
+    result={'url':base_url,'base_params':base_params,'layout_filters':layout_filters,'age25':age25,'mansion':mansion,'town':wanted,'city':city,
             'building_type':'マンション'}
     cache[key]=result
-    trace(web,'homes_filters_ready',{'city':city,'town':wanted,'building_type':'マンション','age15':age15,'layout_filters':layout_filters},stage='search_conditions')
+    trace(web,'homes_filters_ready',{'city':city,'town':wanted,'building_type':'マンション','age25':age25,'layout_filters':layout_filters},stage='search_conditions')
     return result
 
 
 def homes_group_params(prepared,layouts):
-    params=dict(prepared['base_params']);age_name,age_value=prepared['age15'];params[age_name]=age_value
+    params=dict(prepared['base_params']);age_name,age_value=prepared['age25'];params[age_name]=age_value
     if prepared.get('mansion'):
         mansion_name,mansion_value=prepared['mansion'];params[mansion_name]=mansion_value
     grouped={}
@@ -3322,7 +3322,7 @@ def homes_detail(web,url,region,bounds,munis,layouts):
     heading=normal(soup.select_one('h1').get_text(' ',strip=True)) if soup.select_one('h1') else ''
     if 'マンション' not in normal(kind+' '+heading+' '+page_text[:600]):return reject_listing(web,'HOME’S',url,'detail.building_type','condition' if kind else 'missing_data','マンションであることを確認できない',{'raw':kind,'heading':heading,'page_excerpt':page_text[:600]},'マンション')
     raw_age=labeled(soup,('築年数','築年月','築年'));age,_=age_info(raw_age)
-    if age is not None and age>15:return reject_listing(web,'HOME’S',url,'detail.age','condition','築年数が15年を超える',{'raw':raw_age,'years':age},'15年以内')
+    if age is not None and age>25:return reject_listing(web,'HOME’S',url,'detail.age','condition','築年数が25年を超える',{'raw':raw_age,'years':age},'25年以内')
     rent=optional_amount(labeled(soup,('賃料','家賃')))
     if not rent:return reject_listing(web,'HOME’S',url,'detail.rent','missing_data','家賃を正の数値として読み取れない',{'raw':labeled(soup,('賃料','家賃')),'parsed':rent},'家賃（円）>0')
     raw_area=labeled(soup,('専有面積','面積'))
@@ -3343,7 +3343,7 @@ def homes_collect(web,region,bounds,munis,emit):
     prepared=homes_prepare_region(web,region);seen_urls=set();visible_towns=region.get('visible_towns') or [region.get('town','')]
     scope=dict(getattr(DIAG_CONTEXT,'scope',{}))
     for group_number,layouts in enumerate(HOMES_LAYOUT_GROUPS,1):
-        emit('message',f'HOMES条件{group_number}｜マンション｜築15年以内｜'+ '・'.join(layouts))
+        emit('message',f'HOMES条件{group_number}｜マンション｜築25年以内｜'+ '・'.join(layouts))
         params=homes_group_params(prepared,layouts);current_url=prepared['url'];current_params=params;seen_pages=set();found=0
         while current_url:
             reply=web.fetch(current_url,params=current_params or None);current_params=None;soup=BeautifulSoup(reply.text,'html.parser')
@@ -3724,7 +3724,7 @@ def suumo_ward_regions(web,code,include_municipalities=True):
             name=re.sub(r'\s*[（(][\d,]+(?:件)?[）)]\s*$','',name)
             if not name:continue
             prepared={'url':url,'base_params':{**params,'oz':oz},'town':name,'selection_method':'区の公開町名選択フォーム',
-                      'mansion':('ts',SUUMO_BUILDING_TYPE_CODES['マンション']),'age15':('cn','15'),'layout_filters':{layout:('md',value) for layout,value in SUUMO_LAYOUT_CODES.items()}}
+                      'mansion':('ts',SUUMO_BUILDING_TYPE_CODES['マンション']),'age25':('cn','25'),'layout_filters':{layout:('md',value) for layout,value in SUUMO_LAYOUT_CODES.items()}}
             regions[oz]={'code':code,'pref':'13','town':name,'suumo_town':name,'city_name':TOKYO_WARDS[code],
                          'label':'東京都'+TOKYO_WARDS[code]+name,'suumo_prepared':prepared}
     if not regions:raise AppError('選択した区のSUUMO町名リストを取得できません。')
@@ -3841,7 +3841,7 @@ def suumo_prepare_region(web,region):
         'town':wanted,
         'selection_method':method,
         'mansion':('ts',SUUMO_BUILDING_TYPE_CODES['マンション']),
-        'age15':('cn','15'),
+        'age25':('cn','25'),
         'layout_filters':{layout:('md',
                observed_layout_inputs[layout][1] if layout in observed_layout_inputs
                and observed_layout_inputs[layout][0]=='md' else code)
@@ -3849,14 +3849,14 @@ def suumo_prepare_region(web,region):
     }
     cache[key]=result
     trace(web,'suumo_filters_ready',{'city':region.get('city_name',''),'town':wanted,'selection_method':method,
-          'mansion':result['mansion'],'age15':result['age15'],'layout_filters':result['layout_filters']},stage='search_conditions')
+          'mansion':result['mansion'],'age25':result['age25'],'layout_filters':result['layout_filters']},stage='search_conditions')
     return result
 
 
 def suumo_group_params(prepared,layouts,page=1):
     params=dict(prepared['base_params'])
     params['ts']=SUUMO_BUILDING_TYPE_CODES['マンション']  # 建物の種類：マンション（アパートは除外）
-    params['cn']='15'                # 築年数：15年以内
+    params['cn']='25'                # 築年数：25年以内
     # Prefer the site's currently observed public form values when available.
     # Never omit the 1R/1K/1DK codes added to the same verified layout set.
     fields=prepared.get('layout_filters') or {}
@@ -5760,7 +5760,7 @@ def suumo_collect(web,region,bounds,munis,emit):
     for group_number,layouts in enumerate(SUUMO_LAYOUT_GROUPS,1):
         filter_params=suumo_group_params(prepared,layouts,1)
         current_url=prepared['url'];current_params=filter_params;seen_pages=set();group_candidates=0;page_number=1
-        emit('message',f'SUUMO条件{group_number}｜マンション｜築15年以内｜'+ '・'.join(layouts))
+        emit('message',f'SUUMO条件{group_number}｜マンション｜築25年以内｜'+ '・'.join(layouts))
         while current_url:
             reply=web.fetch(current_url,params=current_params if current_params else None);soup=BeautifulSoup(reply.text,'html.parser')
             buildings=suumo_result_buildings(soup)
@@ -5836,8 +5836,8 @@ def suumo_collect(web,region,bounds,munis,emit):
                     if 'マンション' not in fields['building_type']:
                         reject_listing(web,'SUUMO',url,'detail.building_type','condition' if fields['building_type'] else 'missing_data','建物種別がマンションと確認できない',fields['building_type'],'マンション');emit('rejected',1);trace(web,'structure',{'url':url,'building_type':fields['building_type'],'reason':'not_mansion'},'WARNING');return
                     age,ym=age_info(fields['raw_age'])
-                    if age is None or age>15:
-                        reject_listing(web,'SUUMO',url,'detail.age','missing_data' if age is None else 'condition','築年数が15年以内と確認できない',{'raw':fields['raw_age'],'years':age},'15年以内');emit('rejected',1);trace(web,'age',{'url':url,'raw_age':fields['raw_age'],'age':age,'reason':'detail_age_not_confirmed_within_15'},'WARNING');return
+                    if age is None or age>25:
+                        reject_listing(web,'SUUMO',url,'detail.age','missing_data' if age is None else 'condition','築年数が25年以内と確認できない',{'raw':fields['raw_age'],'years':age},'25年以内');emit('rejected',1);trace(web,'age',{'url':url,'raw_age':fields['raw_age'],'age':age,'reason':'detail_age_not_confirmed_within_25'},'WARNING');return
                     rent=optional_amount(fields['raw_rent'])
                     if not rent:
                         reject_listing(web,'SUUMO',url,'detail.rent','missing_data','家賃を読み取れない',{'raw':fields['raw_rent'],'parsed':rent},'家賃（円）>0');emit('rejected',1);trace(web,'parse',{'url':url,'missing':'detail_rent','visible_head':fields['visible'][:400]},'WARNING');return
@@ -6582,7 +6582,7 @@ def _v232_chintai_detail(web,url,region,bounds,munis,layouts=None):
     house=any(token in kind for token in ('戸建','貸家','テラス','タウンハウス'))
     if not house and 'マンション' not in kind:return reject('detail.building_type','マンション・一戸建てではありません',kind)
     age,ym=age_info(field('築年','築年月','築年数'))
-    if age is None or age>(40 if house else 15):return reject('detail.age','築年数が未確認、または対象外です',field('築年','築年月','築年数'))
+    if age is None or age>(40 if house else 25):return reject('detail.age','築年数が未確認、または対象外です',field('築年','築年月','築年数'))
     raw_area=field('専有面積','面積');m=re.search(r'\d+(?:\.\d+)?',raw_area);area=float(m[0]) if m else None
     if house and (area is None or area<50):return reject('detail.area','一戸建ては50㎡以上が対象です',raw_area)
     allowed=set(x for group in SUUMO_LAYOUT_GROUPS for x in group)
@@ -6667,9 +6667,9 @@ def _v237_chintai_next_page(soup,current,scope_url,params):
 def chintai_collect(web,region,bounds,munis,emit):
     base_url=provider_region_request(web,'CHINTAI',region,munis,None)['url']
     # Verified against CHINTAI's public search controls: b=2 mansion, b=3
-    # house/terrace, h=5 <=15 years, sf=50 >=50 m2. No <=40-year option
+    # house/terrace, h=7 <=25 years, sf=50 >=50 m2. No <=40-year option
     # exists, so houses retain their existing detail-level <=40-year check.
-    searches=(('mansion','マンション・築15年以内',{'b':'2','h':'5','sf':'0'}),
+    searches=(('mansion','マンション・築25年以内',{'b':'2','h':'7','sf':'0'}),
               ('house','一戸建て・50㎡以上',{'b':'3','h':'99','sf':'50'}))
     seen_ids=set()
     for kind,label,params in searches:
@@ -6878,11 +6878,11 @@ def search_all(db,conditions,screen,state=None):
                 issues.append(provider+'｜未対応の取得元です。');audit.add('search_conditions','provider_unavailable','ERROR',{'provider':provider,'message':'collector not registered'});continue
             if provider=='SUUMO':
                 available[provider]=['GROUPED']
-                audit.add('search_conditions','provider_enabled','INFO',{'provider':'SUUMO','mansion':{'max_age':15,'layout_groups':[list(x) for x in SUUMO_LAYOUT_GROUPS]},'house':{'max_age':40,'min_area_sqm':50},'filter_mode':'city -> town -> mansion groups + detached house -> detail -> kankyo map'})
+                audit.add('search_conditions','provider_enabled','INFO',{'provider':'SUUMO','mansion':{'max_age':25,'layout_groups':[list(x) for x in SUUMO_LAYOUT_GROUPS]},'house':{'max_age':40,'min_area_sqm':50},'filter_mode':'city -> town -> mansion groups + detached house -> detail -> kankyo map'})
                 continue
             if provider=='HOME’S':
                 available[provider]=['GROUPED']
-                audit.add('search_conditions','provider_enabled','INFO',{'provider':'HOME’S','mansion':{'max_age':15,'layout_groups':[list(x) for x in HOMES_LAYOUT_GROUPS]},'house':{'max_age':40,'min_area_sqm':50},'filter_mode':'city -> 町域 -> mansion groups + kodate -> detail -> 地図を見る'})
+                audit.add('search_conditions','provider_enabled','INFO',{'provider':'HOME’S','mansion':{'max_age':25,'layout_groups':[list(x) for x in HOMES_LAYOUT_GROUPS]},'house':{'max_age':40,'min_area_sqm':50},'filter_mode':'city -> 町域 -> mansion groups + kodate -> detail -> 地図を見る'})
                 continue
             available[provider]=['ALL'];generic_providers.append(provider)
             audit.add('search_conditions','provider_enabled','INFO',{'provider':provider,'layouts':list(ALL_TARGET_LAYOUTS),'filter_mode':('separate mansion <=15y and house >=50sqm public searches + detail validation' if provider=='CHINTAI' else 'one public town-list crawl + explicit detail layout verification')})
@@ -7272,7 +7272,7 @@ class AuditLog:
         self._persisted_fault_samples=0
         self._persisted_db_fault_samples=0
         self._persisted_start=False
-        self.add('search','start','INFO',{'build':BUILD,'bounds':conditions.get('bounds'),'providers':conditions.get('providers'),'filters':{'structure':None,'max_age':None,'layouts':list(LAYOUTS),'suumo':{'mansion':{'max_age':15,'layout_groups':[list(x) for x in SUUMO_LAYOUT_GROUPS]},'house':{'max_age':40,'min_area_sqm':50}}},'property_limit':None})
+        self.add('search','start','INFO',{'build':BUILD,'bounds':conditions.get('bounds'),'providers':conditions.get('providers'),'filters':{'structure':None,'max_age':None,'layouts':list(LAYOUTS),'suumo':{'mansion':{'max_age':25,'layout_groups':[list(x) for x in SUUMO_LAYOUT_GROUPS]},'house':{'max_age':40,'min_area_sqm':50}}},'property_limit':None})
     def clean(self,value):
         if isinstance(value,dict):return {str(k):('[REDACTED]' if re.search(r'^(?:key|apikey|api_key|token|access_token|authorization|cookie|password|secret|SUPABASE_.*KEY)$',str(k),re.I) else self.clean(v)) for k,v in value.items()}
         if isinstance(value,(list,tuple)):return [self.clean(x) for x in value]
@@ -10362,7 +10362,7 @@ def automatic_collection_panel():
     st.caption('取得順：'+(' → '.join(TOKYO_WARDS[code] for code in collection_wards) if collection_wards else '区を選択してください'))
     st.markdown('**2. 取得条件**')
     st.multiselect('取得元',list(PROVIDER_OPTIONS),default=_v232_enabled_providers(saved.get('providers') or AUTOMATIC_REGION_PROVIDERS),key='automatic_providers_v232',disabled=busy)
-    st.caption('選択した取得元で町ごとに最後のページまで検索します。マンションは築15年以内、ワンルーム/1K/1DK・1LDK/2K/2DK・2LDK/3K/3DK、一戸建て・その他は築40年以内・50㎡以上を対象とします。')
+    st.caption('選択した取得元で町ごとに最後のページまで検索します。マンションは築25年以内、ワンルーム/1K/1DK・1LDK/2K/2DK・2LDK/3K/3DK、一戸建て・その他は築40年以内・50㎡以上を対象とします。')
     manual=active_job();manual_busy=bool(manual and not manual.snapshot()['finished'])
     cannot_start=busy or manual_busy or not collection_wards
     st.markdown('**3. 取得操作**')
@@ -11290,9 +11290,9 @@ def town_boundary_registry(v171_geometry_revision="v171"):
 # by this external link.  The website owns the final search semantics.
 _V167_WARD_TO_CODE = {name:code for code,name in TOKYO_WARDS.items()}
 _V167_SUUMO_CONDITION_LABELS = {
-    'group0':'ワンルーム・1K・1DK｜マンション・築15年以内',
-    'group1':'1LDK・2K・2DK｜マンション・築15年以内',
-    'group2':'2LDK・3K・3DK｜マンション・築15年以内',
+    'group0':'ワンルーム・1K・1DK｜マンション・築25年以内',
+    'group1':'1LDK・2K・2DK｜マンション・築25年以内',
+    'group2':'2LDK・3K・3DK｜マンション・築25年以内',
     'house':'一戸建て・その他｜50㎡以上（築40年以内は掲載先で確認）',
 }
 # Verified against SUUMO public town-selection links on 2026-10-23.
@@ -11347,7 +11347,7 @@ def _v189_suumo_search_url(city,group,code=None):
     if code is not None:params.append(('oz',code))
     if group in DISPLAY_LAYOUT_GROUPS:
         params.extend(('md',SUUMO_LAYOUT_CODES[layout]) for layout in DISPLAY_LAYOUT_GROUPS[group])
-        params.extend([('ts',SUUMO_BUILDING_TYPE_CODES['\u30de\u30f3\u30b7\u30e7\u30f3']),('cn','15')])
+        params.extend([('ts',SUUMO_BUILDING_TYPE_CODES['\u30de\u30f3\u30b7\u30e7\u30f3']),('cn','25')])
     else:
         # Single-family homes: do not fabricate a provider-side 40-year value.
         params.extend([('ts',SUUMO_BUILDING_TYPE_CODES['\u4e00\u6238\u5efa\u3066\u30fb\u305d\u306e\u4ed6'])])
@@ -13665,7 +13665,7 @@ TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('</style></head>',
 
 
 # v240: source selector stays inside the map iframe, beside geolocation.
-_V240_SOURCE_JS="function v240Source(value){return value==='SUUMO'||value==='CHINTAI'?value:'ALL';}\nfunction v240Provider(){return state._v240Source==='CHINTAI'?'CHINTAI':'SUUMO';}\nfunction v240PopupKey(place){return v240Provider()+'|'+(state._v240Group||'group1')+'|'+v189SelectionKey(place);}\nfunction v240ChintaiUrl(place,value){\n try{var u=new URL(value),city=(state._v189WardCodes||{})[place.ward];\n  if(!city||u.protocol!=='https:'||u.hostname!=='www.chintai.net'||u.username||u.password||u.port)return '';\n  if(!new RegExp('^/tokyo/area/'+city+'[0-9]{3}/list/$').test(u.pathname))return '';\n  var house=state._v240Group==='house';\n  if(u.searchParams.get('b')!==(house?'3':'2')||u.searchParams.get('h')!==(house?'99':'5'))return '';\n  return u.href;\n }catch(e){return '';}\n}\nfunction v240UpdatePopup(entry){\n if(!entry)return;\n var provider=v240Provider(),key=v240PopupKey(entry.place),reply=state._v217Reply,request=state._v217Pending,url='',error='';\n if(provider==='SUUMO')url=v217Url(entry.place,entry.props.suumo_url);\n if(reply&&reply.key===key){\n  if(!url)url=provider==='CHINTAI'?v240ChintaiUrl(entry.place,reply.url):v217Url(entry.place,reply.url);\n  error=reply.error||'';\n }\n if(url){entry.link.href=url;entry.link.removeAttribute('aria-disabled');entry.link.textContent=provider+'で検索 ↗';\n  entry.help.textContent=provider==='CHINTAI'?'CHINTAI町名：'+entry.place.name+'｜'+(state._v240Group==='house'?'一戸建て・50㎡以上（築40年以内は掲載先で確認）':'マンション・築15年以内')+'｜丁目を含む町全体':\n   'SUUMO町名：'+String(entry.props.suumo_town||entry.place.name)+'｜'+String(entry.props.suumo_conditions||'')+'｜駅徒歩15分以内・住所順・50件（丁目を含む町全体）';\n }else{entry.link.removeAttribute('href');entry.link.setAttribute('aria-disabled','true');\n  entry.link.textContent=request&&request.key===key?provider+' 確認中…':error?provider+' 再試行':provider+'で検索';\n  entry.help.textContent=error||(request&&request.key===key?provider+'の町名を確認しています。':provider+'ボタンでこの町名を確認します。');\n }\n if(entry.layer.getPopup){var popup=entry.layer.getPopup();if(popup&&popup.isOpen&&popup.isOpen()&&popup.update)popup.update();}\n}\nfunction v240RequestPopup(entry){\n if(!entry||!entry.place.ward||!entry.place.name)return;\n var key=v240PopupKey(entry.place);if(state._v217Pending&&state._v217Pending.key===key)return;\n var ticket='source_popup_'+Date.now()+'_'+Math.random().toString(36).slice(2,10);\n state._v217Reply=null;state._v217Pending={ticket:ticket,key:key};v240UpdatePopup(entry);\n hostMessage('streamlit:setComponentValue',{dataType:'json',value:{event:'polygon_suumo_v217',ticket:ticket,\n  search_source:state._v240Source||'ALL',ward:entry.place.ward,name:entry.place.name,kind:entry.place.kind,\n  home_view_epoch:state._v202HomeEpoch}});\n}\nfunction v240RenderSource(args){\n var source=v240Source(args.map_source),group=args.map_layout_group||'group1';\n if(state._v240Source!==source||state._v240Group!==group){state._v217Pending=null;state._v217Reply=null;}\n state._v240Source=source;state._v240Group=group;\n var select=document.getElementById('v240-source');if(!select)return;\n select.value=source;select.dataset.selected=source==='ALL'?'false':'true';\n if(!select.dataset.ready){select.dataset.ready='1';select.addEventListener('change',function(){\n  var chosen=v240Source(select.value);if(chosen===state._v240Source)return;\n  state._v240Source=chosen;state._v217Pending=null;state._v217Reply=null;\n  select.dataset.selected=chosen==='ALL'?'false':'true';v240UpdatePopup(state._v217Active);\n  var value={event:'map_source_v240',source:chosen,home_view_epoch:state._v202HomeEpoch};\n  if(state.map){var b=state.map.getBounds();value.bounds={_southWest:{lat:b.getSouth(),lng:b.getWest()},_northEast:{lat:b.getNorth(),lng:b.getEast()}};value.zoom=state.map.getZoom();}\n  hostMessage('streamlit:setComponentValue',{dataType:'json',value:value});\n });}\n v240UpdatePopup(state._v217Active);\n}\nv217UpdatePopup=v240UpdatePopup;\nv217RequestPopup=v240RequestPopup;\n"
+_V240_SOURCE_JS="function v240Source(value){return value==='SUUMO'||value==='CHINTAI'?value:'ALL';}\nfunction v240Provider(){return state._v240Source==='CHINTAI'?'CHINTAI':'SUUMO';}\nfunction v240PopupKey(place){return v240Provider()+'|'+(state._v240Group||'group1')+'|'+v189SelectionKey(place);}\nfunction v240ChintaiUrl(place,value){\n try{var u=new URL(value),city=(state._v189WardCodes||{})[place.ward];\n  if(!city||u.protocol!=='https:'||u.hostname!=='www.chintai.net'||u.username||u.password||u.port)return '';\n  if(!new RegExp('^/tokyo/area/'+city+'[0-9]{3}/list/$').test(u.pathname))return '';\n  var house=state._v240Group==='house';\n  if(u.searchParams.get('b')!==(house?'3':'2')||u.searchParams.get('h')!==(house?'99':'7'))return '';\n  return u.href;\n }catch(e){return '';}\n}\nfunction v240UpdatePopup(entry){\n if(!entry)return;\n var provider=v240Provider(),key=v240PopupKey(entry.place),reply=state._v217Reply,request=state._v217Pending,url='',error='';\n if(provider==='SUUMO')url=v217Url(entry.place,entry.props.suumo_url);\n if(reply&&reply.key===key){\n  if(!url)url=provider==='CHINTAI'?v240ChintaiUrl(entry.place,reply.url):v217Url(entry.place,reply.url);\n  error=reply.error||'';\n }\n if(url){entry.link.href=url;entry.link.removeAttribute('aria-disabled');entry.link.textContent=provider+'で検索 ↗';\n  entry.help.textContent=provider==='CHINTAI'?'CHINTAI町名：'+entry.place.name+'｜'+(state._v240Group==='house'?'一戸建て・50㎡以上（築40年以内は掲載先で確認）':'マンション・築25年以内')+'｜丁目を含む町全体':\n   'SUUMO町名：'+String(entry.props.suumo_town||entry.place.name)+'｜'+String(entry.props.suumo_conditions||'')+'｜駅徒歩15分以内・住所順・50件（丁目を含む町全体）';\n }else{entry.link.removeAttribute('href');entry.link.setAttribute('aria-disabled','true');\n  entry.link.textContent=request&&request.key===key?provider+' 確認中…':error?provider+' 再試行':provider+'で検索';\n  entry.help.textContent=error||(request&&request.key===key?provider+'の町名を確認しています。':provider+'ボタンでこの町名を確認します。');\n }\n if(entry.layer.getPopup){var popup=entry.layer.getPopup();if(popup&&popup.isOpen&&popup.isOpen()&&popup.update)popup.update();}\n}\nfunction v240RequestPopup(entry){\n if(!entry||!entry.place.ward||!entry.place.name)return;\n var key=v240PopupKey(entry.place);if(state._v217Pending&&state._v217Pending.key===key)return;\n var ticket='source_popup_'+Date.now()+'_'+Math.random().toString(36).slice(2,10);\n state._v217Reply=null;state._v217Pending={ticket:ticket,key:key};v240UpdatePopup(entry);\n hostMessage('streamlit:setComponentValue',{dataType:'json',value:{event:'polygon_suumo_v217',ticket:ticket,\n  search_source:state._v240Source||'ALL',ward:entry.place.ward,name:entry.place.name,kind:entry.place.kind,\n  home_view_epoch:state._v202HomeEpoch}});\n}\nfunction v240RenderSource(args){\n var source=v240Source(args.map_source),group=args.map_layout_group||'group1';\n if(state._v240Source!==source||state._v240Group!==group){state._v217Pending=null;state._v217Reply=null;}\n state._v240Source=source;state._v240Group=group;\n var select=document.getElementById('v240-source');if(!select)return;\n select.value=source;select.dataset.selected=source==='ALL'?'false':'true';\n if(!select.dataset.ready){select.dataset.ready='1';select.addEventListener('change',function(){\n  var chosen=v240Source(select.value);if(chosen===state._v240Source)return;\n  state._v240Source=chosen;state._v217Pending=null;state._v217Reply=null;\n  select.dataset.selected=chosen==='ALL'?'false':'true';v240UpdatePopup(state._v217Active);\n  var value={event:'map_source_v240',source:chosen,home_view_epoch:state._v202HomeEpoch};\n  if(state.map){var b=state.map.getBounds();value.bounds={_southWest:{lat:b.getSouth(),lng:b.getWest()},_northEast:{lat:b.getNorth(),lng:b.getEast()}};value.zoom=state.map.getZoom();}\n  hostMessage('streamlit:setComponentValue',{dataType:'json',value:value});\n });}\n v240UpdatePopup(state._v217Active);\n}\nv217UpdatePopup=v240UpdatePopup;\nv217RequestPopup=v240RequestPopup;\n"
 TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('<span id="v223-location-status"', '<select id="v240-source" aria-label="データソースを選択"><option value="ALL">データソース：全部</option><option value="SUUMO">データソース：SUUMO</option><option value="CHINTAI">データソース：CHINTAI</option></select><span id="v223-location-status"',1)
 TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('</style></head>','#v240-source{flex:1 1 0;min-width:0;min-height:40px;max-width:270px;padding:8px 10px;border:1px solid #9eb4bd;border-radius:7px;background:#fff;color:#173a5e;font:14px system-ui;cursor:pointer}#v240-source:focus{outline:3px solid #aacbdc}#v240-source[data-selected="true"]{background:#e9f1f5;border-color:#174d6b}#v223-location-status{flex-basis:100%}'+'</style></head>',1)
 TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('function render(args){',_V240_SOURCE_JS+'\nfunction render(args){',1)
@@ -13850,7 +13850,7 @@ def _v264_requested_supermarkets(state,loader):
 
 @st.cache_resource(show_spinner=False)
 def town_component_v121():
-    _asset_revision='v290-search-button'
+    _asset_revision='v294-age25'
     folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-'+_asset_revision)
     os.makedirs(folder,exist_ok=True)
     path=os.path.join(folder,'index.html')
@@ -13868,7 +13868,7 @@ def town_component_v121():
         with open(temp_path,'w',encoding='utf-8') as output:
             output.write(TOWN_COMPONENT_HTML_V121)
         os.replace(temp_path,path)
-    return st.components.v1.declare_component('sumai_town_map_v290',path=folder)
+    return st.components.v1.declare_component('sumai_town_map_v294',path=folder)
 
 @st.cache_resource(show_spinner=False)
 def _v216_api_budget():
@@ -17135,7 +17135,7 @@ def _v243_chintai_urls(geo,group):
 
 def _v243_chintai_search_url(base,group):
     house=group=='house'
-    params={'b':'3' if house else '2','h':'99' if house else '5','sf':'50' if house else '0','j':'6'}
+    params={'b':'3' if house else '2','h':'99' if house else '7','sf':'50' if house else '0','j':'6'}
     if not house:params['m']={'group0':['0','1','2'],'group1':['3','4','5'],'group2':['6','7','8']}[group]
     return urlparse(base)._replace(query=urlencode(params,doseq=True),fragment='').geturl()
 
@@ -17168,7 +17168,7 @@ def _v240_resolve_property_search(state,data,group):
                 if len(cache)>=128:cache.pop(next(iter(cache)))
                 cache[cache_key]=base
         house=group=='house'
-        params={'b':'3' if house else '2','h':'99' if house else '5','sf':'50' if house else '0','j':'6'}
+        params={'b':'3' if house else '2','h':'99' if house else '7','sf':'50' if house else '0','j':'6'}
         if not house:params['m']={'group0':['0','1','2'],'group1':['3','4','5'],'group2':['6','7','8']}[group]
         target=urlparse(base)
         allowed=r'^/tokyo/area/'+city+(r'/list/$' if kind=='ward' else r'\d{3}/list/$')
@@ -17213,16 +17213,16 @@ def interactive_town_choropleth(group):
     if group not in ('group0','group1','group2','house'):group='group1';state.layout_display_group='group1'
     if st.button('ワンルーム・1K・1DK',key='layout_group0_v174',type='primary' if group=='group0' else 'secondary',use_container_width=True):
         if _v202_choose_layout(state,'group0'):_v288_rerun_map()
-    if group=='group0':st.caption('マンション・築15年以内')
+    if group=='group0':st.caption('マンション・築25年以内')
     g1,g2,g3=st.columns(3)
     with g1:
         if st.button('1LDK・2K・2DK',key='layout_group1',type='primary' if group=='group1' else 'secondary',use_container_width=True):
             if _v202_choose_layout(state,'group1'):_v288_rerun_map()
-        if group=='group1':st.caption('マンション・築15年以内')
+        if group=='group1':st.caption('マンション・築25年以内')
     with g2:
         if st.button('2LDK・3K・3DK',key='layout_group2',type='primary' if group=='group2' else 'secondary',use_container_width=True):
             if _v202_choose_layout(state,'group2'):_v288_rerun_map()
-        if group=='group2':st.caption('マンション・築15年以内')
+        if group=='group2':st.caption('マンション・築25年以内')
     with g3:
         if st.button('一戸建て',key='layout_group_house',type='primary' if group=='house' else 'secondary',use_container_width=True):
             if _v202_choose_layout(state,'house'):_v288_rerun_map()
@@ -17515,7 +17515,7 @@ class V147RealUrlReplay:
                     if is_mansion:
                         if parsed_layout(f['raw_layout']) not in set().union(*map(set,SUUMO_LAYOUT_GROUPS)):
                             raise AppError('mansion layout out of scope')
-                        if age is None or age>15:raise AppError('mansion age out of scope')
+                        if age is None or age>25:raise AppError('mansion age out of scope')
                     else:
                         if age is None or age>HOUSE_MAX_AGE or area is None or area<HOUSE_MIN_AREA:
                             raise AppError('house age or floor area out of scope')
@@ -18306,7 +18306,7 @@ def _v209_initial_settings(state):
             st.caption('旧アプリの物件や検索状態を使用しません。旧テーブルのデータは削除しません。')
             st.caption(f'実行中の版：{BUILD}')
             with st.expander('取得・集計の範囲'):
-                st.write('SUUMO・CHINTAIで検索します。マンションは築15年以内、ワンルーム/1K/1DK・1LDK/2K/2DK・2LDK/3K/3DK。一戸建て・その他は築40年以内・50㎡以上。地図の色分けに必要な町丁目はSUUMO掲載所在地を優先し、不足時のみ物件固有地図から照合します。')
+                st.write('SUUMO・CHINTAIで検索します。マンションは築25年以内、ワンルーム/1K/1DK・1LDK/2K/2DK・2LDK/3K/3DK。一戸建て・その他は築40年以内・50㎡以上。地図の色分けに必要な町丁目はSUUMO掲載所在地を優先し、不足時のみ物件固有地図から照合します。')
                 st.caption('住所照合：SUUMOの所在地を市区・町丁目に正規化。町丁目を特定できない場合だけ物件固有のマーカーから国土地理院の逆ジオコーディングを利用します。番地を作りません。')
                 st.write('データベースへ保存する募集項目は家賃・間取り・種別・町丁目（既存の詳細住所は保持）・取得日時です。UTCで保存し画面はJST表示します。管理費・面積・築年数・画像・緯度経度は募集データに保存しません。')
                 st.write('募集情報は既存SupabaseのJSON領域を利用し、追加SQLは不要です。過去のschema 3〜7は書き換えず、集計時に町丁目へ正規化。新規schema 8のデータと同じ区域で表示します。')
