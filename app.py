@@ -56,7 +56,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v289"
+BUILD = "REBUILD-01-v292"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -12532,12 +12532,13 @@ TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('</style></head>',_V20
 
 
 # v205: personal named landmarks, independent of rental observations.
-_V205_PIN_DOM = """<section id="v205-pins-panel" aria-label="目印ピン"><div class="v223-pin-columns"><div><label for="v205-pin-address">施設名・目印の名前で検索</label><input id="v205-pin-address" maxlength="180" placeholder="例：ヨドバシAKIBA" autocomplete="off"/></div><div id="v205-pin-saved"><label for="v205-pin-list">保存した目印</label><select id="v205-pin-list"></select><button type="button" id="v205-pin-jump">選んだピンへ移動</button></div></div><div id="v223-pin-editor" hidden><label for="v205-pin-name">ピンの名前（検索結果から自動入力・変更可）</label><input id="v205-pin-name" maxlength="60" placeholder="検索後に施設名が入ります"/><div class="v205-actions"><button type="button" id="v205-pin-search">名前で検索</button><button type="button" id="v205-pin-pick">地図をタップして指定</button><button type="button" id="v205-pin-cancel" hidden>仮ピンを取り消す</button></div></div><div id="v205-pin-candidates" hidden><label id="v206-result-label" for="v205-pin-candidate">検索結果</label><select id="v205-pin-candidate"></select><div id="v206-result-detail" role="status"></div><button type="button" id="v205-pin-add">確認して確定</button></div><div id="v205-pin-status" role="status" aria-live="polite"></div><p class="v205-help">施設名から住所と位置を検索し、仮ピンを確認してから確定します。保存先はこのブラウザーです。情報：国土地理院・<a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener noreferrer">© OpenStreetMap contributors</a>。</p></section>"""
+_V205_PIN_DOM = """<section id="v205-pins-panel" aria-label="目印ピン"><div class="v223-pin-columns"><div><label for="v205-pin-address">施設名・目印の名前で検索</label><input id="v205-pin-address" maxlength="180" placeholder="例：ヨドバシAKIBA" autocomplete="off"/><button type="button" id="v205-pin-search">名前で検索</button></div><div id="v205-pin-saved"><label for="v205-pin-list">保存した目印</label><select id="v205-pin-list"></select><button type="button" id="v205-pin-jump">選んだピンへ移動</button></div></div><div id="v223-pin-editor" hidden><label for="v205-pin-name">ピンの名前（検索結果から自動入力・変更可）</label><input id="v205-pin-name" maxlength="60" placeholder="検索後に施設名が入ります"/><div class="v205-actions"><button type="button" id="v205-pin-pick">地図をタップして指定</button><button type="button" id="v205-pin-cancel" hidden>仮ピンを取り消す</button></div></div><div id="v205-pin-candidates" hidden><label id="v206-result-label" for="v205-pin-candidate">検索結果</label><select id="v205-pin-candidate"></select><div id="v206-result-detail" role="status"></div><button type="button" id="v205-pin-add">確認して確定</button></div><div id="v205-pin-status" role="status" aria-live="polite"></div><p class="v205-help">施設名から住所と位置を検索し、仮ピンを確認してから確定します。保存先はこのブラウザーです。情報：国土地理院・<a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener noreferrer">© OpenStreetMap contributors</a>。</p></section>"""
 
 _V205_PIN_CSS = """
 #v205-pins-panel{padding:12px 13px;background:#fff;border-top:1px solid #d5dfdc;color:#173a5e;font:14px system-ui}
 .v223-pin-columns{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:12px;align-items:start}
 .v223-pin-columns>div{min-width:0}
+#v205-pins-panel #v205-pin-search{width:100%}
 .v223-pin-columns label{min-height:2.7em;display:flex!important;align-items:end}
 #v223-pin-editor[hidden]{display:none!important}
 #v205-pins-panel label{display:block;font-size:13px;font-weight:650;margin:10px 0 5px}
@@ -13093,6 +13094,8 @@ def _v288_name_match(query,name):
     if named=='慶応幼稚舎':named='慶応義塾幼稚舎'
     if min(len(wanted),len(named))<2:return 0.0,'none'
     if wanted==named:return 1.0,'exact'
+    tokens=[_v231_name_key(t) for t in re.split(r'\s+',unicodedata.normalize('NFKC',str(query)).strip()) if t]
+    if len(tokens)>1 and all(len(t)>=2 and t in named for t in tokens):return .95,'partial'
     if wanted in named:return .96,'partial'
     if len(named)>=4 and named in wanted and len(named)/len(wanted)>=.5:return .88,'similar'
     score=difflib.SequenceMatcher(None,wanted,named,autojunk=False).ratio()
@@ -13207,7 +13210,7 @@ def _v216_setting(name,default=''):
     return value
 
 
-def _v216_web_document(web,query):
+def _v291_legacy_web_document(web,query):
     key=str(_v216_setting('LANDMARK_BRAVE_API_KEY')).strip()
     if not key or str(_v216_setting('LANDMARK_BRAVE_API_APPROVED')).upper()!='YES':
         trace(web,'landmark_web_api_disabled',{'reason':'API key and separate opt-in required'},stage='landmark.name_search')
@@ -13283,6 +13286,9 @@ def _v216_web_document(web,query):
 
 
 def _v212_name_document(web,query,pattern):
+    if re.fullmatch(r'[A-Za-z＆& ._-]{3,20}',query) or len(query.split())>=2:
+        result=_v216_web_document(web,query)
+        if result and result[0].get('elements'):return result
     variants=_v231_query_variants(query)
     # GSI has an independent Japanese facility index. OSM has complementary
     # coverage for shops and companies. A provider outage does not stop others.
@@ -13417,6 +13423,8 @@ def _v207_search_landmarks(data,audit=None):
                 if not name or not (math.isfinite(lat) and math.isfinite(lng) and 35.45<=lat<=35.95 and 139.4<=lng<=140.05):continue
                 aliases=[name]+[normal(tags.get(k)) for k in ('name:ja','name','alt_name','short_name') if tags.get(k)]
                 score,match_kind=max((_v288_name_match(query,n) for n in aliases),key=lambda pair:pair[0])
+                if not score and tags.get('web_name_verified') is True and _v231_name_key(tags.get('web_query_alias'))==_v231_name_key(query):
+                    score,match_kind=.9,'similar'
                 if not score:
                     trace(web,'landmark_candidate_rejected',{'query':query,'name':name,'reason':'name_not_similar'},stage='landmark.result');continue
                 address=normal(tags.get('addr:full'))
@@ -13840,7 +13848,7 @@ def _v264_requested_supermarkets(state,loader):
 
 @st.cache_resource(show_spinner=False)
 def town_component_v121():
-    _asset_revision='v288-landmark-search'
+    _asset_revision='v290-search-button'
     folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-'+_asset_revision)
     os.makedirs(folder,exist_ok=True)
     path=os.path.join(folder,'index.html')
@@ -13858,7 +13866,7 @@ def town_component_v121():
         with open(temp_path,'w',encoding='utf-8') as output:
             output.write(TOWN_COMPONENT_HTML_V121)
         os.replace(temp_path,path)
-    return st.components.v1.declare_component('sumai_town_map_v288',path=folder)
+    return st.components.v1.declare_component('sumai_town_map_v290',path=folder)
 
 @st.cache_resource(show_spinner=False)
 def _v216_api_budget():
@@ -18824,7 +18832,7 @@ TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(_v288_host,_v288_host+
 """,1)
 TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace("function v205PinReply(reply){\n if(!reply)return;", "function v205PinReply(reply){\n if(!reply)return;\n if(state._v288LandmarkRequest&&reply.ticket===state._v288LandmarkRequest.ticket)state._v288LandmarkRequest=null;",1)
 TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace("opt.textContent=String(p.name)+(p.address?", "opt.textContent=(p.match_kind==='similar'?'類似候補：':'')+String(p.name)+(p.address?",1)
-TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace("build:'v286'","build:'v288'")
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace("build:'v286'","build:'v290'")
 
 # v289: persist every facility lookup independently, including all INFO events.
 @st.cache_resource(show_spinner=False)
@@ -18968,6 +18976,221 @@ def _v208_landmark_log_panel(state):
             for failed,meta in unsaved:_v289_persist_current(state,failed,meta)
             st.rerun()
         st.caption('成功・失敗を問わず検索ごとに保存します。履歴は20件ずつ読み込み、過去の記録は削除しません。')
+
+
+# v291: resolve abbreviations through Web results and the linked page's own identity/address.
+# Search/source text is fetched, never a Google Maps coordinate or inferred street number.
+def _v291_url(value):
+    import ipaddress,socket
+    u=urlparse(str(value))
+    if u.scheme!='https' or not u.hostname or u.username or u.password or u.port not in (None,443):raise AppError('Web検索のURLが不正です。')
+    host=u.hostname.lower()
+    if '.' not in host or host.endswith(('.local','.localhost','.internal','.lan')) or host=='localhost':raise AppError('公開Webページではありません。')
+    try:
+        literal=ipaddress.ip_address(host)
+        if not literal.is_global:raise AppError('公開Webページではありません。')
+    except ValueError:pass
+    try:addresses=socket.getaddrinfo(host,443,type=socket.SOCK_STREAM)
+    except socket.gaierror:
+        # Managed/corporate HTTP proxies resolve public hostnames themselves.
+        if not any(os.environ.get(k) for k in ('HTTPS_PROXY','https_proxy','ALL_PROXY','all_proxy')):raise
+        return u._replace(fragment='').geturl()
+    if not addresses or any(not ipaddress.ip_address(item[4][0]).is_global for item in addresses):raise AppError('公開Webページではありません。')
+    return u._replace(fragment='').geturl()
+
+
+def _v291_fetch(web,url):
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self,*args,**kwargs):return None
+    opener=urllib.request.build_opener(NoRedirect())
+    for hop in range(3):
+        target=_v291_url(url);start=time.monotonic()
+        trace(web,'landmark_web_request',{'url':target,'method':'GET'},stage='landmark.web')
+        try:
+            try:r=opener.open(urllib.request.Request(target,headers={'User-Agent':'SumaiCompass/291'}),timeout=12)
+            except urllib.error.HTTPError as exc:r=exc
+            with r:
+                status=int(r.code)
+                trace(web,'landmark_web_response',{'url':target,'status':status,'elapsed_ms':round((time.monotonic()-start)*1000)},stage='landmark.web')
+                if status in (301,302,303,307,308):
+                    url=urljoin(target,r.headers.get('Location',''));continue
+                if status!=200:raise AppError('Web検索 HTTP '+str(status))
+                content=r.read(1_500_001)
+                if len(content)>1_500_000:raise AppError('Webページの容量が想定を超えました。')
+                charset=r.headers.get_content_charset() or 'utf-8'
+                text=content.decode(charset,errors='replace')
+                if any(word in text.lower() for word in ('anomaly.js','g-recaptcha','verify you are human','captcha challenge')):
+                    raise AppError('Web検索の確認画面が表示されました。')
+                return text,target
+        except Exception as exc:
+            trace(web,'landmark_web_fetch_failed',{'url':target,'reason':str(exc),'exception_type':type(exc).__name__},'WARNING','landmark.web');raise
+    raise AppError('Webページの転送回数が上限を超えました。')
+
+
+def _v291_search_rows(raw,base):
+    soup=BeautifulSoup(raw,'html.parser');rows=[];seen=set()
+    # Both the normal and basic Yahoo result pages contain linked result headings.
+    links=soup.select('#web li a[href], .sw-CardBase a[href], h3 a[href], h2 a[href]')
+    for a in links:
+        target=urljoin(base,a.get('href',''));u=urlparse(target)
+        if (u.hostname or '').endswith('yahoo.co.jp') or u.scheme!='https' or target in seen:continue
+        title=a.get_text(' ',strip=True)
+        if len(title)<3:continue
+        parent=a.find_parent('li') or a.parent
+        rows.append({'url':target,'title':title,'snippet':parent.get_text(' ',strip=True)[:1800]})
+        seen.add(target)
+        if len(rows)>=6:break
+    return rows
+
+
+def _v291_page_identity(raw):
+    soup=BeautifulSoup(raw,'html.parser');name='';address_texts=[]
+    # Label/value pairs prevent the group parent or a named client from becoming the company.
+    for label in soup.find_all(['dt','th']):
+        key=re.sub(r'\s+','',label.get_text(' ',strip=True))
+        if key in ('会社名','商号','法人名','施設名','店舗名','名称') and not name:
+            value=label.find_next_sibling(['dd','td'])
+            if value:name=value.get_text(' ',strip=True)[:100]
+        if key in ('所在地','本社所在地','本店所在地','住所'):
+            value=label.find_next_sibling(['dd','td'])
+            if value:address_texts.append(value.get_text(' ',strip=True))
+    for script in soup.select('script[type="application/ld+json"]'):
+        try:
+            root=json.loads(script.string or script.get_text());stack=root if isinstance(root,list) else [root]
+            while stack:
+                item=stack.pop()
+                if not isinstance(item,dict):continue
+                stack.extend(item.get('@graph',[]) if isinstance(item.get('@graph'),list) else [])
+                kind=item.get('@type','');kinds=kind if isinstance(kind,list) else [kind]
+                if not any(k in ('Organization','LocalBusiness','Corporation','School','Store','Place') or str(k).endswith('Store') for k in kinds):continue
+                if not name:name=normal(item.get('name'))[:100]
+                address=item.get('address')
+                if isinstance(address,dict):address_texts.append(''.join(str(address.get(k) or '') for k in ('addressRegion','addressLocality','streetAddress')))
+        except (ValueError,TypeError):pass
+    title=soup.title.get_text(' ',strip=True) if soup.title else ''
+    if not name:
+        parts=re.split(r'[｜|]',title)
+        name=next((p.strip() for p in reversed(parts) if re.search(r'株式会社|学校|ストア|センター|ホテル',p)), '')[:100]
+    if not name:
+        heading=soup.find('h1')
+        if heading:
+            candidate=heading.get_text(' ',strip=True)
+            if candidate not in ('店舗検索','店舗情報','会社概要','施設情報','アクセス','お問い合わせ') and len(candidate)<=100:name=candidate
+    for node in soup.find_all('address'):address_texts.append(node.get_text(' ',strip=True))
+    addresses=[]
+    for text in address_texts:
+        text=re.sub(r'\s+','',unicodedata.normalize('NFKC',text))
+        addresses.extend(_extract_detailed_addresses(text))
+        addresses.extend(re.findall(r'東京都[^\s,、。|<>]{1,12}区[^\s,、。|<>]{1,20}?\d+-\d+(?:-\d+)?',unicodedata.normalize('NFKC',text)))
+    return name,list(dict.fromkeys(addresses)),soup.get_text(' ',strip=True),title
+
+
+def _v291_web_alias(query,name,text):
+    if _v231_name_matches(query,name):return 'name'
+    wanted=_v231_name_key(query)
+    if not re.fullmatch(r'[a-z]{3,12}',wanted):return ''
+    # English copyright/company names provide a general abbreviation, e.g. T&D Asset Management -> TDAM.
+    for english in re.findall(r'COPYRIGHT\s*(?:©|\(C\))?\s*(?:\d{4}\s*)?([A-Za-z&., -]{5,120})',text,re.I):
+        words=re.findall(r'[A-Za-z]+',english)
+        stop={'co','company','ltd','limited','inc','incorporated','corp','corporation','all','rights','reserved'}
+        initials=''
+        for word in words:
+            if word.lower() in stop:break
+            initials+=word[0].lower()
+        if wanted==initials:return 'english_initials'
+    return ''
+
+
+def _v291_address_token(value):
+    value=address_key(_normalize_japanese_address(value)).replace('東京都','')
+    value=value.replace('丁目','-').replace('番地','-').replace('番','-').replace('号','')
+    return re.sub(r'\s+','',value).rstrip('-')
+
+
+def _v292_snippet_identity(row,query):
+    title=normal(row.get('title'));text=normal(row.get('snippet'))
+    if re.search(r'周辺の|近くの|一覧|ランキング',title):return '',[]
+    parts=re.split(r'[｜|]|\s[-—–]\s',title)
+    name=next((p.strip() for p in parts if _v231_name_matches(query,p)), '')
+    if not name:return '',[]
+    tokens=[t for t in re.split(r'\s+',query) if len(t)>=2]
+    positions=[name.casefold().find(t.casefold()) for t in tokens if name.casefold().find(t.casefold())>=0]
+    if positions:name=name[min(positions):]
+    name=re.sub(r'(?<=[^\x00-\x7f])\s+(?=[^\x00-\x7f])','',name)
+    if not _v231_name_matches(query,name):return '',[]
+    compact=re.sub(r'\s+','',unicodedata.normalize('NFKC',text))
+    addresses=_extract_detailed_addresses(compact)
+    addresses+=re.findall(r'東京都[^\s,、。|<>]{1,12}区[^\s,、。|<>]{1,20}?\d+-\d+(?:-\d+)?',compact)
+    unique={_v291_address_token(a):a for a in addresses}
+    # A result mentioning several store addresses does not identify one branch.
+    return (name,list(unique.values())) if len(unique)==1 else ('',[])
+
+
+def _v292_geocode_web(web,query,name,addresses,url,alias,snippet=False):
+    elements=[]
+    for address in addresses[:2]:
+        doc,info=_v208_landmark_json(web,'https://msearch.gsi.go.jp/address-search/AddressSearch',{'q':address},'web_address_lookup')
+        if not isinstance(doc,list):continue
+        for point in doc:
+            geometry=point.get('geometry') or {};props=point.get('properties') or {}
+            if geometry.get('type')!='Point':continue
+            lng,lat=map(float,geometry.get('coordinates',[])[:2]);matched=normal(props.get('title'))
+            a,b=_v291_address_token(address),_v291_address_token(matched)
+            if not b or not (a==b or (re.search(r'\d$',b) and a.startswith(b+'-'))):continue
+            if not (35.45<=lat<=35.95 and 139.4<=lng<=140.05):continue
+            notes=[]
+            if snippet:notes.append('Web検索の住所候補')
+            if a!=b:notes.append('位置は街区の概略')
+            label=address+('（'+'・'.join(notes)+'）' if notes else '')
+            elements.append({'lat':lat,'lon':lng,'tags':{'name':name,'addr:full':label,'source':url,
+                'provider':('Web検索の住所候補' if snippet else 'Webページの所在地')+'／国土地理院',
+                'web_query_alias':query,'web_name_verified':not snippet}})
+            trace(web,'landmark_web_identity_verified' if not snippet else 'landmark_web_snippet_candidate',
+                {'query':query,'name':name,'address':address,'source_url':url,'alias_basis':alias,
+                 'geocode_address':matched,'position_precision':'address' if a==b else 'block',
+                 'verification':'requires_user_confirmation' if snippet else 'page_identity'},stage='landmark.web')
+            break
+    return elements
+
+
+def _v291_public_web_document(web,query):
+    try:
+        suffix=' 会社概要 所在地' if re.fullmatch(r'[A-Za-z＆& ._-]{3,20}',query) else ' 所在地 住所'
+        raw,base=_v291_fetch(web,'https://search.yahoo.co.jp/search?'+urlencode({'p':query+suffix}))
+        rows=_v291_search_rows(raw,base)
+        trace(web,'landmark_web_results',{'query':query,'results':rows},stage='landmark.web')
+        for row in rows[:3]:
+            page_elements=[]
+            try:
+                page,url=_v291_fetch(web,row['url']);name,addresses,text,title=_v291_page_identity(page)
+                alias=_v291_web_alias(query,name,text)
+                if name and addresses and alias:page_elements=_v292_geocode_web(web,query,name,addresses,url,alias)
+                else:trace(web,'landmark_web_identity_rejected',{'query':query,'url':url,'name':name,
+                    'missing':[k for k,v in [('name',name),('address',addresses),('alias',alias)] if not v]},stage='landmark.web')
+            except Exception as exc:
+                trace(web,'landmark_web_profile_failed',{'url':row['url'],'reason':str(exc),'exception_type':type(exc).__name__},'WARNING','landmark.web')
+            if page_elements:return {'elements':page_elements},{'provider':'Web検索＋所在地ページ＋国土地理院'}
+            try:
+                name,addresses=_v292_snippet_identity(row,query)
+                if name and addresses:
+                    elements=_v292_geocode_web(web,query,name,addresses,row['url'],'query_tokens',snippet=True)
+                    if elements:return {'elements':elements},{'provider':'Web検索の住所候補＋国土地理院'}
+            except Exception as exc:
+                trace(web,'landmark_web_snippet_failed',{'url':row['url'],'reason':str(exc)},'WARNING','landmark.web')
+        return None
+    except Exception as exc:
+        trace(web,'landmark_public_web_failed',{'query':query,'reason':str(exc),'exception_type':type(exc).__name__},'WARNING','landmark.web')
+        return None
+
+
+def _v216_web_document(web,query):
+    cache=getattr(web,'_v291_web_cache',None)
+    if cache is None:cache={};web._v291_web_cache=cache
+    if query in cache:return cache[query]
+    result=_v291_legacy_web_document(web,query)
+    if not result or not result[0].get('elements'):result=_v291_public_web_document(web,query)
+    cache[query]=result
+    return result
 
 
 def main():
