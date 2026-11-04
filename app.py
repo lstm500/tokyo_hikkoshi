@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 import concurrent.futures as futures
 import csv
+import difflib
 import hashlib
 import heapq
 import html
@@ -55,7 +56,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v287"
+BUILD = "REBUILD-01-v289"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -7338,7 +7339,7 @@ class AuditLog:
                         line=file.readline()
                         if not line:break
                         event=json.loads(line)
-                        keep=(diagnostic_failure_event(event)
+                        keep=(self.search_mode=='landmark' or diagnostic_failure_event(event)
                               or (event.get('stage')=='search' and event.get('code') in ('start','finish')))
                         if keep:
                             length=len(line.encode('utf-8'))
@@ -12993,13 +12994,20 @@ def _v209_log_secrets():
 
 def _v208_run_landmark_lookup(state,data):
     """Reuse AuditLog, its redaction, and the existing diagnostic_log storage."""
-    audit=state.get('_v208_landmark_audit')
+    audit=_v288_landmark_audit(state)
     if audit is None:
         audit=AuditLog({'mode':'landmark','providers':['国土地理院 施設名検索','Photon / OpenStreetMap','Overpass']},
                        _v209_log_secrets())
         state['_v208_landmark_audit']=audit
     before_seq=audit.count
-    reply=_v207_search_landmarks(data,audit=audit)
+    audit.add('landmark.request','landmark_request_received','INFO',{'query':str(data.get('query') or '')[:180],'ticket':str(data.get('ticket') or '')[:100],'stage':data.get('stage') or 'places','build':BUILD})
+    try:
+        reply=_v207_search_landmarks(data,audit=audit)
+    except Exception as exc:
+        audit.add('landmark.request','landmark_unexpected_error','ERROR',{'exception_type':type(exc).__name__,'reason':str(exc),'traceback':traceback.format_exc()})
+        reply={'ticket':str(data.get('ticket') or ''),'stage':data.get('stage') or 'places','candidates':[],'error':'施設名検索でエラーが発生しました。設定の施設名検索ログを確認してください。'}
+    finally:
+        state['_v288_landmark_events']=audit.records()
     audit.add('search','finish','INFO',{'operation':'landmark','ticket':reply['ticket'],
               'error':reply.get('error') or '', 'candidates':len(reply.get('candidates') or [])})
     request_failures=any(diagnostic_failure_event(event) for event in audit.records() if event.get('seq',0)>before_seq)
@@ -13024,15 +13032,21 @@ def _v208_run_landmark_lookup(state,data):
             state['_v208_landmark_saved']=False
     if reply.get('error'):
         reply['error']+=' 詳細は「設定」→「ログ出力」で「ログ表示を更新」を押すとダウンロードできます。'
+    state['_v288_landmark_events']=audit.records()
     return reply
 
 
 def _v208_landmark_log_panel(state):
-    audit=state.get('_v208_landmark_audit')
+    audit=_v288_landmark_audit(state,create=False)
     with st.expander('施設名検索のログ',expanded=True):
         if audit is None:
-            st.caption('施設名を検索後、「ログ表示を更新」を押してください。')
-            st.download_button('詳細ログ JSON',b'','sumai_landmark_log.json','application/json',key='landmark_json_pending_v209',disabled=True)
+            events=state.get('_v288_landmark_events') or [{'seq':1,'time':utc_now(),'search_id':'landmark-no-request-'+str(state.get('_v288_log_refresh',0)),
+                'stage':'landmark.request','code':'landmark_request_not_received','level':'WARNING',
+                'details':{'build':BUILD,'message':'施設名検索要求がサーバーに届いた記録がありません。',
+                    'map_ui':state.get('_v260_map_ui_diagnostics',{}),'last_ticket':state.get('_v205_last_pin_ticket')},
+                'observed':'検索要求の未受信','improvement':'検索欄から再検索し、診断JSONを確認する。'}]
+            st.caption('検索処理の記録がない場合も、診断ログをダウンロードできます。')
+            diagnostic_downloads(events,'landmark_v208')
             return
         if state.get('_v208_landmark_storage_error'):
             st.caption('保存先への記録を確認できません。下のボタンから現在のログを保存してください。')
@@ -13067,14 +13081,27 @@ def _v231_query_variants(query):
     elif '慶応' in query or '慶應' in query:
         values+=[query.replace('慶応','慶應'),query.replace('慶應','慶応')]
     values+=[unicodedata.normalize('NFKC',query),re.sub(r'\s+','',query).upper()]
-    return list(dict.fromkeys(values))
+    values.append(_v231_name_key(query))
+    for suffix in ('マネジメント','ホールディングス'):
+        if query.endswith(suffix) and len(_v231_name_key(query[:-len(suffix)]))>=4:values.append(query[:-len(suffix)])
+    return list(dict.fromkeys(v for v in values if v))[:6]
 
 
-def _v231_name_matches(query,name):
+def _v288_name_match(query,name):
     wanted=_v231_name_key(query);named=_v231_name_key(name)
     if wanted=='慶応幼稚舎':wanted='慶応義塾幼稚舎'
     if named=='慶応幼稚舎':named='慶応義塾幼稚舎'
-    return len(wanted)>=2 and wanted in named
+    if min(len(wanted),len(named))<2:return 0.0,'none'
+    if wanted==named:return 1.0,'exact'
+    if wanted in named:return .96,'partial'
+    if len(named)>=4 and named in wanted and len(named)/len(wanted)>=.5:return .88,'similar'
+    score=difflib.SequenceMatcher(None,wanted,named,autojunk=False).ratio()
+    if min(len(wanted),len(named))>=5 and score>=.8:return round(score,4),'similar'
+    return 0.0,'none'
+
+
+def _v231_name_matches(query,name):
+    return _v288_name_match(query,name)[0]>0
 
 
 def _v231_gsi_document(web,query):
@@ -13156,7 +13183,7 @@ def _v212_photon_document(web,query):
                 elements.append({'type':props.get('osm_type'),'id':props.get('osm_id'),'lat':lat,'lon':lng,'tags':tags})
                 decisions.append({'name':name,'address':address,'lat':lat,'lng':lng,'osm_id':props.get('osm_id'),'decision':'candidate'})
             except (KeyError,TypeError,ValueError,AttributeError,IndexError) as exc:
-                decisions.append({'decision':'rejected','reason':str(exc)})
+                decisions.append({'name':str((feature.get('properties') or {}).get('name') or '')[:180] if isinstance(feature,dict) else '', 'decision':'rejected','reason':str(exc)})
         trace(web,'landmark_geocoder_results',{'query':query,'provider':'Photon','features':len(doc['features']),
               'accepted':len(elements),'decisions':decisions},stage='landmark.result')
         result={'elements':elements}
@@ -13218,7 +13245,7 @@ def _v216_web_document(web,query):
             url=str(row.get('url') or '');parsed=urlparse(url)
             if parsed.scheme!='https' or not parsed.hostname or parsed.username or parsed.password:continue
             # A page mentioning another facility must not inherit the user's name.
-            if wanted not in token(title):
+            if not any(_v231_name_matches(query,part) for part in re.split(r'[|｜:：]',title)):
                 trace(web,'landmark_web_candidate_rejected',{'url':url,'reason':'query_name_not_in_title'},stage='landmark.result');continue
             text=html.unescape(re.sub('<[^>]*>','',str(row.get('description') or '')))
             addresses=_extract_detailed_addresses(text)
@@ -13309,12 +13336,15 @@ def _v211_name_document(web,query,pattern):
     web.local.landmark_lookup=True
     bbox='(35.45,139.4,35.95,140.05)'
     endpoints=('https://overpass-api.de/api/interpreter','https://overpass.private.coffee/api/interpreter')
-    for mode in ('exact','partial'):
-        literal=json.dumps(query if mode=='exact' else pattern,ensure_ascii=False)
+    modes=['exact','partial']+(['similar'] if len(_v231_name_key(query))>=5 else [])
+    for mode in modes:
+        prefix=_v231_name_key(query)[:min(7,max(4,len(_v231_name_key(query))-3))]
+        fuzzy_pattern=r'[ &＆・._-]*'.join(re.escape(c) for c in prefix)
+        literal=json.dumps(query if mode=='exact' else fuzzy_pattern if mode=='similar' else pattern,ensure_ascii=False)
         operator='=' if mode=='exact' else '~'
         suffix='' if mode=='exact' else ',i'
         keys=('name','name:ja','alt_name','short_name')
-        q='[out:json][timeout:8];('+''.join('nwr["'+key+'"'+operator+literal+suffix+']'+bbox+';' for key in keys)+');out center tags;'
+        q='[out:json][timeout:8];('+''.join('nwr["'+key+'"'+operator+literal+suffix+']'+bbox+';' for key in keys)+');out center tags 40;'
         for index,url in enumerate(endpoints):
             info={'url':url,'parameters':{'data':q},'match_mode':mode,'failed_stage':'name_search.request'}
             try:
@@ -13336,7 +13366,7 @@ def _v211_name_document(web,query,pattern):
                 if status in (401,403,429) or not transient or index==len(endpoints)-1:raise
                 trace(web,'landmark_endpoint_fallback',{**detail,'url':url,'next_url':endpoints[index+1],
                       'match_mode':mode,'reason':str(exc),'exception_type':type(exc).__name__},'WARNING','landmark.name_search')
-        if doc['elements'] or mode=='partial':return doc,info
+        if doc['elements'] or mode==modes[-1]:return doc,info
 
 
 def _v207_search_landmarks(data,audit=None):
@@ -13385,15 +13415,21 @@ def _v207_search_landmarks(data,audit=None):
                 name=normal(tags.get('name:ja') or tags.get('name'))[:60]
                 lat,lng=float(point['lat']),float(point['lon'])
                 if not name or not (math.isfinite(lat) and math.isfinite(lng) and 35.45<=lat<=35.95 and 139.4<=lng<=140.05):continue
+                aliases=[name]+[normal(tags.get(k)) for k in ('name:ja','name','alt_name','short_name') if tags.get(k)]
+                score,match_kind=max((_v288_name_match(query,n) for n in aliases),key=lambda pair:pair[0])
+                if not score:
+                    trace(web,'landmark_candidate_rejected',{'query':query,'name':name,'reason':'name_not_similar'},stage='landmark.result');continue
                 address=normal(tags.get('addr:full'))
                 if not address:
                     address=''.join(normal(tags.get(k)) for k in ('addr:province','addr:city','addr:suburb','addr:quarter','addr:neighbourhood','addr:street','addr:block_number','addr:housenumber'))
                 key=(name,round(lat,5),round(lng,5))
                 if key in seen:continue
                 seen.add(key);reply['candidates'].append({'name':name,'title':name,'address':address[:180],
-                    'lat':lat,'lng':lng,'source':tags.get('provider') or info.get('source') or info.get('provider','Overpass')+' / OpenStreetMap','source_url':str(tags.get('source') or ''),'address_checked':bool(address)})
+                    'lat':lat,'lng':lng,'match_score':score,'match_kind':match_kind,'source':tags.get('provider') or info.get('source') or info.get('provider','Overpass')+' / OpenStreetMap','source_url':str(tags.get('source') or ''),'address_checked':bool(address)})
             except (KeyError,TypeError,ValueError,AttributeError):continue
-        reply['candidates'].sort(key=lambda p:(re.sub(r'\s+','',p['name']).casefold()!=compact.casefold(),p['name'],p['lat'],p['lng']))
+        reply['candidates'].sort(key=lambda p:(-p['match_score'],p['name'],p['lat'],p['lng']))
+        reply['candidates']=reply['candidates'][:20]
+        trace(web,'landmark_ranked_candidates',{'query':query,'candidates':[{'name':p['name'],'score':p['match_score'],'match':p['match_kind']} for p in reply['candidates']]},stage='landmark.result')
         trace(web,'landmark_result',{'query':query,'ticket':ticket,'elements':len(doc['elements']),'candidates':len(reply['candidates'])},stage='landmark.result')
         if not reply['candidates']:
             reply['error']='施設名データに一致する候補がありません。正式名称・表記を変えて検索するか、「設定」→「初期設定」の施設名検索APIを設定してください。'
@@ -13804,7 +13840,7 @@ def _v264_requested_supermarkets(state,loader):
 
 @st.cache_resource(show_spinner=False)
 def town_component_v121():
-    _asset_revision='v286-simple-popup'
+    _asset_revision='v288-landmark-search'
     folder=os.path.join(tempfile.gettempdir(),'sumai-town-map-component-'+_asset_revision)
     os.makedirs(folder,exist_ok=True)
     path=os.path.join(folder,'index.html')
@@ -13822,7 +13858,7 @@ def town_component_v121():
         with open(temp_path,'w',encoding='utf-8') as output:
             output.write(TOWN_COMPONENT_HTML_V121)
         os.replace(temp_path,path)
-    return st.components.v1.declare_component('sumai_town_map_v286',path=folder)
+    return st.components.v1.declare_component('sumai_town_map_v288',path=folder)
 
 @st.cache_resource(show_spinner=False)
 def _v216_api_budget():
@@ -17159,27 +17195,27 @@ def interactive_town_choropleth(group):
             if job.start():
                 state['_v183_manual_refresh_wait']=True
                 state['_v183_manual_start_revision']=previous['revision']
-        st.rerun(scope='fragment')
+        _v288_rerun_map()
     if st.button('表示範囲を更新（地図移動後のみ）',key='refresh_v118_town_map'):
         state['_v118_map_revision']=int(state.get('_v118_map_revision',0))+1
-        st.rerun(scope='fragment')
+        _v288_rerun_map()
     # Layout controls live next to the map instead of above map diagnostics.
     if group not in ('group0','group1','group2','house'):group='group1';state.layout_display_group='group1'
     if st.button('ワンルーム・1K・1DK',key='layout_group0_v174',type='primary' if group=='group0' else 'secondary',use_container_width=True):
-        if _v202_choose_layout(state,'group0'):st.rerun(scope='fragment')
+        if _v202_choose_layout(state,'group0'):_v288_rerun_map()
     if group=='group0':st.caption('マンション・築15年以内')
     g1,g2,g3=st.columns(3)
     with g1:
         if st.button('1LDK・2K・2DK',key='layout_group1',type='primary' if group=='group1' else 'secondary',use_container_width=True):
-            if _v202_choose_layout(state,'group1'):st.rerun(scope='fragment')
+            if _v202_choose_layout(state,'group1'):_v288_rerun_map()
         if group=='group1':st.caption('マンション・築15年以内')
     with g2:
         if st.button('2LDK・3K・3DK',key='layout_group2',type='primary' if group=='group2' else 'secondary',use_container_width=True):
-            if _v202_choose_layout(state,'group2'):st.rerun(scope='fragment')
+            if _v202_choose_layout(state,'group2'):_v288_rerun_map()
         if group=='group2':st.caption('マンション・築15年以内')
     with g3:
         if st.button('一戸建て',key='layout_group_house',type='primary' if group=='house' else 'secondary',use_container_width=True):
-            if _v202_choose_layout(state,'house'):st.rerun(scope='fragment')
+            if _v202_choose_layout(state,'house'):_v288_rerun_map()
         if group=='house':st.caption('築40年以内・50㎡以上')
     reset=int(state.get('_v118_map_reset_count',0))
     revision=int(state.get('_v118_map_revision',0))
@@ -17277,9 +17313,9 @@ def interactive_town_choropleth(group):
     if isinstance(data,dict) and data.get('home_view_epoch')==int(state.get('_v202_home_epoch',0)):
         if data.get('event')=='reference_poll_v282' and data.get('ticket')!=state.get('_v282_poll_ticket'):
             state['_v282_poll_ticket']=data.get('ticket')
-            st.rerun(scope='fragment')
+            _v288_rerun_map()
         if data.get('event')=='supermarket_delivery_request_v264' and _v264_accept_delivery_request(state,data,supermarket_loader):
-            st.rerun(scope='fragment')
+            _v288_rerun_map()
         if isinstance(data.get('map_diagnostics'),list):
             state['_v245_map_diagnostics']=[{k:str(row.get(k,''))[:160] for k in ('time','status','provider','detail')}
                 for row in data['map_diagnostics'][-40:] if isinstance(row,dict)]
@@ -17296,7 +17332,7 @@ def interactive_town_choropleth(group):
                 if current:
                     state['new_bounds']=current;state['new_view_center']=bounds_center(current)
                     state['new_view_zoom']=_v202_view_zoom(data.get('zoom'),state.get('new_view_zoom',11))
-                st.rerun(scope='fragment')
+                _v288_rerun_map()
         if data.get('event')=='map_source_v240':
             selected=_v240_map_source(data.get('source'))
             if selected!=source:
@@ -17309,25 +17345,26 @@ def interactive_town_choropleth(group):
                     if snap['running'] or store.start():
                         state['_v183_manual_refresh_wait']=True
                         state['_v183_manual_start_revision']=snap['revision']
-                st.rerun(scope='fragment')
-        if data.get('event')=='custom_pin_search_v205':
-            ticket=str(data.get('ticket') or '')[:100]
+                _v288_rerun_map()
+        landmark_data=_v288_pending_landmark(data)
+        if landmark_data is not None:
+            ticket=str(landmark_data.get('ticket') or '')[:100]
             if ticket and ticket!=state.get('_v205_last_pin_ticket'):
                 state['_v205_last_pin_ticket']=ticket
-                state['_v205_pin_reply']=_v208_run_landmark_lookup(state,data)
-                st.rerun(scope='fragment')
+                state['_v205_pin_reply']=_v208_run_landmark_lookup(state,landmark_data)
+                _v288_rerun_map()
         if data.get('event')=='polygon_suumo_v217':
             ticket=str(data.get('ticket') or '')[:100]
             if ticket and ticket!=state.get('_v217_last_suumo_ticket'):
                 state['_v217_last_suumo_ticket']=ticket
                 state['_v217_suumo_reply']=_v240_resolve_property_search(state,data,group)
-                st.rerun(scope='fragment')
+                _v288_rerun_map()
         if data.get('event')=='town_suumo_v189':
             ticket=str(data.get('ticket') or '')[:100]
             if ticket and ticket!=state.get('_v189_last_suumo_ticket'):
                 state['_v189_last_suumo_ticket']=ticket
                 state['_v189_suumo_reply']=_v189_resolve_suumo_selection(state,data,group)
-                st.rerun(scope='fragment')
+                _v288_rerun_map()
         if data.get('event')=='town_search_v184':
             ticket=str(data.get('ticket') or '')[:100]
             if ticket and ticket!=state.get('_v184_last_search_ticket'):
@@ -17350,7 +17387,7 @@ def interactive_town_choropleth(group):
                 if current:
                     state['new_bounds']=current;state['new_view_center']=bounds_center(current)
                     state['new_view_zoom']=_v202_view_zoom(data.get('zoom'),state.get('new_view_zoom',11))
-                st.rerun(scope='fragment')
+                _v288_rerun_map()
         command=state.get('_v182_map_jump')
         confirmed=not command or data.get('jump_applied')==command.get('id')
         if command and confirmed:
@@ -18273,7 +18310,9 @@ def _v209_initial_settings(state):
 
 def _v209_log_tools(state):
     st.subheader('ログ出力')
-    st.button('ログ表示を更新',key='settings_refresh_logs_v209')
+    if st.button('ログ表示を更新',key='settings_refresh_logs_v209'):
+        state['_v288_log_refresh']=int(state.get('_v288_log_refresh',0))+1
+        state.pop('landmark_v208_log_export',None)
     with st.expander('背景地図の読み込みログ'):
         rows=state.get('_v245_map_diagnostics',[])
         if rows:st.dataframe(rows,hide_index=True,use_container_width=True)
@@ -18728,6 +18767,208 @@ _V285_SAVED_TABS_CSS="""<style>
 .st-key-saved_data_tabs_v285 [data-baseweb="tab-highlight"],.st-key-saved_data_tabs_v285 [data-baseweb="tab-border"],.st-key-saved_data_tabs_v285 .react-aria-SelectionIndicator{display:none}
 @media(max-width:420px){.st-key-saved_data_tabs_v285 [role="tab"]{padding:10px 6px}.st-key-saved_data_tabs_v285 [role="tab"] p{font-size:15px}}
 </style>"""
+
+
+# v288: session-scoped diagnostics survive map fragment refresh failures.
+@st.cache_resource(show_spinner=False)
+def _v288_landmark_registry():return {},threading.RLock()
+
+
+def _v288_landmark_audit(state,create=True):
+    audit=state.get('_v208_landmark_audit')
+    if audit is not None:return audit
+    items,lock=_v288_landmark_registry();key=state.get('_v288_landmark_session')
+    with lock:
+        if key and key in items:
+            audit=items[key]
+        elif create:
+            key=hashlib.sha256(os.urandom(32)).hexdigest();state['_v288_landmark_session']=key
+            audit=AuditLog({'mode':'landmark','providers':['国土地理院','Photon','Overpass']},_v209_log_secrets())
+            # Do not retain unbounded sessions; active sessions also own their audit.
+            if len(items)>=128:items.pop(next(iter(items)))
+            items[key]=audit
+        else:return None
+    state['_v208_landmark_audit']=audit
+    return audit
+
+
+def _v288_pending_landmark(data):
+    pending=data if data.get('event')=='custom_pin_search_v205' else data.get('landmark_request')
+    if not isinstance(pending,dict) or not isinstance(pending.get('ticket'),str) or not pending['ticket']:return None
+    if pending.get('home_view_epoch')!=data.get('home_view_epoch'):return None
+    return pending
+
+
+def _v288_rerun_map():
+    try:st.rerun(scope='fragment')
+    except Exception as exc:
+        message=str(exc).lower()
+        if 'fragment' not in message or not any(word in message for word in ('scope','rerun','fragment-scoped')):raise
+        audit=_v288_landmark_audit(st.session_state,create=False)
+        if audit:
+            audit.add('landmark.ui','landmark_full_rerun_fallback','WARNING',{'exception_type':type(exc).__name__,'reason':str(exc)})
+            st.session_state['_v288_landmark_events']=audit.records()
+            meta=st.session_state.get('_v289_current_meta')
+            if meta:_v289_persist_current(st.session_state,audit,meta)
+        st.rerun()
+
+
+# Retain the pending facility request in all map callbacks until its reply arrives.
+_v288_host="function hostMessage(type,extra){"
+assert TOWN_COMPONENT_HTML_V121.count(_v288_host)==1
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace(_v288_host,_v288_host+"""
+ if(type==='streamlit:setComponentValue'&&extra&&extra.value&&typeof extra.value==='object'){
+  if(extra.value.event==='custom_pin_search_v205')state._v288LandmarkRequest=Object.assign({},extra.value);
+  if(state._v288LandmarkRequest){extra.value.landmark_request=Object.assign({},state._v288LandmarkRequest);if(extra.value.home_view_epoch===undefined)extra.value.home_view_epoch=state._v288LandmarkRequest.home_view_epoch;}
+ }
+""",1)
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace("function v205PinReply(reply){\n if(!reply)return;", "function v205PinReply(reply){\n if(!reply)return;\n if(state._v288LandmarkRequest&&reply.ticket===state._v288LandmarkRequest.ticket)state._v288LandmarkRequest=null;",1)
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace("opt.textContent=String(p.name)+(p.address?", "opt.textContent=(p.match_kind==='similar'?'類似候補：':'')+String(p.name)+(p.address?",1)
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace("build:'v286'","build:'v288'")
+
+# v289: persist every facility lookup independently, including all INFO events.
+@st.cache_resource(show_spinner=False)
+def _v289_pending_logs():return {},threading.RLock()
+
+
+def _v289_persist_current(state,audit,meta):
+    pending,lock=_v289_pending_logs()
+    try:
+        db=Database();audit.persist(db,force=True)
+        if audit.storage_error:raise AppError(audit.storage_error)
+        record={'id':audit.search_id,'status':'landmark_search','started_at':meta['started_at'],
+                'finished_at':meta.get('finished_at'),'conditions':{'mode':'landmark','query':meta['query'],
+                'ticket':meta['ticket'],'stage':meta['stage'],'build':BUILD},
+                'summary':{'status':meta['status'],'candidates':meta.get('candidates',0),
+                           'error':meta.get('error',''),'event_count':audit.count,'persisted_events':audit.persisted_events}}
+        db.save_search(record)
+        rows=db.call('GET',SEARCH_TABLE,{'namespace':'eq.'+db.namespace,'id':'eq.'+audit.search_id,'select':'id,summary','limit':1})
+        if not isinstance(rows,list) or len(rows)!=1 or rows[0].get('summary')!=record['summary']:
+            raise AppError('施設名検索ログの保存確認が一致しません。')
+        state['_v208_landmark_storage_error']='';state['_v208_landmark_saved']=True
+        with lock:pending.pop(audit.search_id,None)
+        state['_v289_unsaved_ids']=[k for k in state.get('_v289_unsaved_ids',[]) if k!=audit.search_id]
+        return True
+    except Exception as exc:
+        message=audit.clean(str(exc) if isinstance(exc,AppError) else type(exc).__name__)
+        audit.add('landmark.log','landmark_log_save_failed','ERROR',{'reason':message})
+        state['_v208_landmark_storage_error']=message;state['_v208_landmark_saved']=False
+        with lock:pending[audit.search_id]=(audit,dict(meta))
+        state['_v289_unsaved_ids']=list(dict.fromkeys([*state.get('_v289_unsaved_ids',[]),audit.search_id]))
+        return False
+
+
+def _v208_run_landmark_lookup(state,data):
+    # One ID per lookup. An accepted request is saved before external HTTP work.
+    audit=AuditLog({'mode':'landmark','providers':['国土地理院','Photon','Overpass']},_v209_log_secrets())
+    state['_v208_landmark_audit']=audit
+    items,lock=_v288_landmark_registry()
+    with lock:
+        key=state.get('_v288_landmark_session') or hashlib.sha256(os.urandom(32)).hexdigest()
+        state['_v288_landmark_session']=key;items[key]=audit
+    meta={'query':str(data.get('query') or data.get('name') or '')[:180],
+          'ticket':str(data.get('ticket') or '')[:100],'stage':str(data.get('stage') or 'places'),
+          'started_at':utc_now(),'status':'started'}
+    state['_v289_current_meta']=meta
+    audit.add('landmark.request','landmark_request_received','INFO',dict(meta,build=BUILD))
+    _v289_persist_current(state,audit,meta)
+    try:
+        reply=_v207_search_landmarks(data,audit=audit)
+    except Exception as exc:
+        audit.add('landmark.request','landmark_unexpected_error','ERROR',{'exception_type':type(exc).__name__,'reason':str(exc),'traceback':traceback.format_exc()})
+        reply={'ticket':meta['ticket'],'stage':meta['stage'],'candidates':[],'error':'施設名検索でエラーが発生しました。施設名検索ログを確認してください。'}
+    finally:
+        state['_v288_landmark_events']=audit.records()
+    meta.update(finished_at=utc_now(),status='failed' if reply.get('error') else 'completed',
+                candidates=len(reply.get('candidates') or []),error=str(reply.get('error') or ''))
+    audit.add('search','finish','INFO',{'operation':'landmark',**meta})
+    _v289_persist_current(state,audit,meta)
+    state['_v288_landmark_events']=audit.records()
+    return reply
+
+
+def _v289_load_history(db,offset=0):
+    rows=db.call('GET',SEARCH_TABLE,{'namespace':'eq.'+db.namespace,'conditions->>mode':'eq.landmark',
+        'status':'in.(landmark_search,failed,completed,started)',
+        'select':'id,started_at,conditions,summary','order':'started_at.desc,id.desc','limit':20,'offset':offset})
+    if not isinstance(rows,list):raise AppError('施設名検索の保存履歴を読み取れません。')
+    return rows
+
+
+class _V289HistoryLoader:
+    def __init__(self):
+        self.lock=threading.RLock();self.running=False;self.loaded=False;self.rows=[];self.events=[]
+        self.error='';self.offset=0;self.selected='';self.revision=0
+    def snapshot(self):
+        with self.lock:return dict(running=self.running,loaded=self.loaded,rows=list(self.rows),events=list(self.events),
+            error=self.error,offset=self.offset,selected=self.selected,revision=self.revision)
+    def start(self,offset=None,selected=None):
+        with self.lock:
+            if self.running:return False
+            self.running=True;self.error=''
+        threading.Thread(target=self.run,args=(offset,selected),daemon=True,name='landmark-log-history').start();return True
+    def run(self,offset,selected):
+        try:
+            db=Database()
+            if offset is not None:
+                rows=_v289_load_history(db,offset)
+                selected=rows[0]['id'] if rows else ''
+            else:rows=None
+            events=db.load_diagnostics(selected) if selected else []
+            with self.lock:
+                if rows is not None:self.rows=rows;self.offset=offset;self.loaded=True
+                self.selected=selected or '';self.events=events;self.revision+=1
+        except Exception as exc:
+            with self.lock:self.error=str(exc) if isinstance(exc,AppError) else type(exc).__name__;self.loaded=True
+        finally:
+            with self.lock:self.running=False
+
+
+@st.fragment(run_every='5s')
+def _v208_landmark_log_panel(state):
+    with st.expander('施設名検索のログ',expanded=True):
+        loader=state.get('_v289_history_loader')
+        if loader is None:
+            loader=_V289HistoryLoader();state['_v289_history_loader']=loader;loader.start(offset=0)
+        snap=loader.snapshot()
+        if st.button('保存した施設名検索ログを更新',key='landmark_history_refresh_v289',disabled=snap['running']):
+            loader.start(offset=0);st.rerun()
+        audit=_v288_landmark_audit(state,create=False)
+        options=(['current'] if audit is not None else [])+[r['id'] for r in snap['rows']]
+        lookup={r['id']:r for r in snap['rows']}
+        def label(value):
+            if value=='current':return '今回の検索'
+            row=lookup[value];summary=row.get('summary') or {};conditions=row.get('conditions') or {}
+            status={'completed':'完了','failed':'失敗','started':'開始記録のみ'}.get(summary.get('status'),row.get('status','保存済み'))
+            return str(row.get('started_at',''))+'｜'+str(conditions.get('query') or '旧版の施設名検索')+'｜'+status
+        if options:
+            select_key='landmark_history_choice_v289_'+str(snap['offset'])
+            if state.get(select_key) not in options:state[select_key]=options[0]
+            chosen=st.selectbox('確認する施設名検索',options,format_func=label,key=select_key)
+            if chosen=='current':events=audit.records()
+            elif chosen==snap['selected']:events=snap['events']
+            else:
+                events=[]
+                if not snap['running'] and not snap['error']:loader.start(selected=chosen)
+            if events:diagnostic_downloads(events,'landmark_v208')
+            elif not snap['running']:st.caption('保存した詳細ログを読み込みます。')
+        else:
+            st.caption('履歴を読み込み中です。' if snap['running'] else 'この保存領域には施設名検索の記録がありません。未受信と断定はできません。')
+            events=state.get('_v288_landmark_events') or []
+            if events:diagnostic_downloads(events,'landmark_v208')
+        if snap['error']:st.error('保存履歴の読み込み失敗：'+snap['error'])
+        if snap['offset'] and st.button('新しい履歴へ',key='landmark_history_newer_v289',disabled=snap['running']):
+            loader.start(offset=max(0,snap['offset']-20));st.rerun()
+        if len(snap['rows'])==20 and st.button('以前の履歴へ',key='landmark_history_older_v289',disabled=snap['running']):
+            loader.start(offset=snap['offset']+20);st.rerun()
+        if state.get('_v208_landmark_storage_error'):st.error('ログの保存失敗：'+state['_v208_landmark_storage_error'])
+        pending,lock=_v289_pending_logs()
+        with lock:unsaved=[pending[key] for key in state.get('_v289_unsaved_ids',[]) if key in pending]
+        if unsaved and st.button('未保存の検索ログを再保存',key='landmark_history_retry_v289'):
+            for failed,meta in unsaved:_v289_persist_current(state,failed,meta)
+            st.rerun()
+        st.caption('成功・失敗を問わず検索ごとに保存します。履歴は20件ずつ読み込み、過去の記録は削除しません。')
+
 
 def main():
     st.set_page_config(page_title='住まいコンパス｜新しい住まいを探す',page_icon='🏡',layout='wide',initial_sidebar_state='collapsed')
