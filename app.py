@@ -56,7 +56,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v294"
+BUILD = "REBUILD-01-v295"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -6747,6 +6747,7 @@ def search_all(db,conditions,screen,state=None):
                 started_at=utc_now(),finished_at=None,conditions=conditions,summary={})
     units={};saved=set();issues=[];warnings=[];logs=[];acquisition_pending={};q=None;provider_fallbacks=[]
     candidate=detail=rejected=skipped=incomplete=issue_events=0
+    task_outcomes={}
     def log(message):
         audit.add('progress',diagnosis_code(message) if 'エラー' in message or '失敗' in message else 'progress','INFO',{'message':message})
         logs.append(f"{datetime.now().strftime('%H:%M:%S')}  {message}")
@@ -6885,7 +6886,7 @@ def search_all(db,conditions,screen,state=None):
                 audit.add('search_conditions','provider_enabled','INFO',{'provider':'HOME’S','mansion':{'max_age':25,'layout_groups':[list(x) for x in HOMES_LAYOUT_GROUPS]},'house':{'max_age':40,'min_area_sqm':50},'filter_mode':'city -> 町域 -> mansion groups + kodate -> detail -> 地図を見る'})
                 continue
             available[provider]=['ALL'];generic_providers.append(provider)
-            audit.add('search_conditions','provider_enabled','INFO',{'provider':provider,'layouts':list(ALL_TARGET_LAYOUTS),'filter_mode':('separate mansion <=15y and house >=50sqm public searches + detail validation' if provider=='CHINTAI' else 'one public town-list crawl + explicit detail layout verification')})
+            audit.add('search_conditions','provider_enabled','INFO',{'provider':provider,'layouts':list(ALL_TARGET_LAYOUTS),'filter_mode':('separate mansion <=25y and house >=50sqm public searches + detail validation' if provider=='CHINTAI' else 'one public town-list crawl + explicit detail layout verification')})
         jobs=[];provider_targets=[]
         for provider in conditions['providers']:
             if provider not in available:continue
@@ -6907,7 +6908,19 @@ def search_all(db,conditions,screen,state=None):
                 if (requested_identity and requested_identity==actual_identity or
                     not requested_identity and requested_label and requested_label==actual_label):
                     matches.append((i,region,provider))
-            if len(matches)==1:
+            requested_batch=conditions.get('auto_task_identities') or []
+            if requested_batch:
+                selected=[]
+                for wanted in requested_batch:
+                    found=[(region,provider) for region,provider in jobs if automatic_task_identity(
+                        region.get('code'),region.get('suumo_town') or region.get('town'),provider)==wanted]
+                    if len(found)!=1:raise AppError('並列取得する町・取得元を照合できません。')
+                    selected.append(found[0])
+                if len(selected)>2 or len({p for _,p in selected})!=len(selected):raise AppError('並列取得元の指定が不正です。')
+                if len({automatic_task_identity(r.get('code'),r.get('suumo_town') or r.get('town'),'SUUMO') for r,_ in selected})!=1:
+                    raise AppError('並列取得する町が一致しません。')
+                jobs=selected
+            elif len(matches)==1:
                 index=matches[0][0]
                 conditions['auto_total_tasks']=len(jobs);conditions['auto_task_index']=index
                 jobs=[jobs[index]]
@@ -6920,10 +6933,15 @@ def search_all(db,conditions,screen,state=None):
                 jobs=[jobs[index]]
         db.job_new_keys=set()
         q=queue.Queue();active={};done=0;save_buffer={};save_failed_keys=set();last_flush=time.monotonic()
+        for task_index,(task_region,task_provider) in enumerate(jobs):
+            task_outcomes[task_index]={'identity':automatic_task_identity(task_region.get('code'),
+                task_region.get('suumo_town') or task_region.get('town'),task_provider),
+                'provider':task_provider,'finished':False,'incomplete':False}
         def work(index,region,provider):
             if web.cancel_event.is_set():return
             DIAG_CONTEXT.audit=audit;DIAG_CONTEXT.scope={'task':index,'region':region['label'],'town':region['town'],'municipality_code':region['code'],'provider':provider}
             def emit(kind,value):
+                if kind in ('issue','incomplete','provider_fallback'):task_outcomes[index]['incomplete']=True
                 if kind!='unit':web.check_cancel()
                 if kind in ('message','unit','skipped','detail','rejected','candidate','incomplete','issue'):
                     state.last_activity_at=time.monotonic()
@@ -6943,6 +6961,7 @@ def search_all(db,conditions,screen,state=None):
                         emit('provider_fallback',disabled);return
                 emit('message',provider+'｜'+region['label']+'｜検索を開始')
                 PROVIDER_COLLECTORS[provider](web,dict(region,search_layout=None),bounds,munis,emit)
+                task_outcomes[index]['finished']=True
             except SearchCancelled:return
             except Exception as exc:
                 if provider=='HOME’S' and is_homes_http403_error(exc):
@@ -7129,6 +7148,7 @@ def search_all(db,conditions,screen,state=None):
                 'property_id':row.get('property_id'),'decision':'failed','failed_stage':'database.final_save',
                 'category':'save_failure','reason':'Supabaseへの保存を最終再試行後も確認できない',
                 'observed':{'listing_key':key},'expected':'Supabase保存確認','evidence':[]})
+    search['summary']['source_tasks']=[dict(item,status=('completed' if item['finished'] and not item['incomplete'] else 'partial')) for item in task_outcomes.values()]
     audit.add('map','data_ready','INFO',{'confirmed_units':len(units),'colored_points':sum(has_point(r) for r in units.values()),'render_deferred_until_saved_data_load':False})
     screen['status'].info(f'検索終了｜処理 {final_processed}件｜保存 {len(saved)}件｜未保存 {final_errors}件｜スキップ {skipped}件'+
                           (f'｜中断時の未完了 {unfinished}件' if unfinished else ''))
@@ -7152,7 +7172,7 @@ def search_all(db,conditions,screen,state=None):
         stored_search['summary']['issues']=list((stored_search['summary'].get('issues') or [])[-8:])
         stored_search['conditions']={k:v for k,v in search.get('conditions',{}).items()
             if k in ('bounds','providers','mode','ward_code','town_codes','auto_task_index',
-                     'auto_task_label','auto_task_identity','region_source','providers_after_fallback')}
+                     'auto_task_label','auto_task_identity','auto_task_identities','region_source','providers_after_fallback')}
         db.save_search(stored_search)
     except AppError as exc:
         audit.add('database','save','ERROR',{'stage':'search.history','message':str(exc),'status':search.get('status')})
@@ -9392,6 +9412,29 @@ def automatic_task_plan(settings):
     return plan
 
 
+def _v295_parallel_tasks(plan,index,summary):
+    first=plan[index];indices=[index]
+    if first['provider'] not in ('SUUMO','CHINTAI'):return indices
+    attempted={int(i) for i in summary.get('cycle_attempted_indices',[]) if str(i).isdigit()}
+    completed={int(i) for i in summary.get('cycle_completed_indices',[]) if str(i).isdigit()}
+    for i,task in enumerate(plan):
+        if i==index or i in attempted or i in completed:continue
+        if (task['ward_code']==first['ward_code'] and address_key(task['town'])==address_key(first['town'])
+            and task['provider'] in ('SUUMO','CHINTAI') and task['provider']!=first['provider']):
+            indices.append(i);break
+    return indices
+
+
+def _v295_advance_batch(summary,indices,plan,source_tasks,can_complete):
+    by_identity={r['identity']:r.get('status') for r in source_tasks}
+    successes=0;outcome='next'
+    for i in indices:
+        success=can_complete and by_identity.get(plan[i]['identity'])=='completed'
+        outcome=advance_automatic_task(summary,i,len(plan),success)
+        successes+=int(success)
+    return outcome,successes
+
+
 def advance_automatic_task(summary,index,total,success):
     """Attempt each town once; keep incomplete towns pending for the next run."""
     if total<1:raise ValueError('empty plan')
@@ -9622,8 +9665,11 @@ class AutomaticCollection:
         if self.summary.get('current_status')=='running' and self.summary.get('task_labels'):
             labels=list(self.summary['task_labels'])
             index=int(self.summary.get('current_task_index',self.summary.get('next_task_index',0)) or 0)%len(labels)
-            advance_automatic_task(self.summary,index,len(labels),False)
-            self.summary['last_interrupted_town']=labels[index]
+            interrupted=self.summary.get('current_task_indices') or [index]
+            for interrupted_index in interrupted:
+                if isinstance(interrupted_index,int) and 0<=interrupted_index<len(labels):
+                    advance_automatic_task(self.summary,interrupted_index,len(labels),False)
+            self.summary['last_interrupted_town']=' / '.join(labels[i] for i in interrupted if isinstance(i,int) and 0<=i<len(labels))
             self.summary['last_interrupted_at']=utc_now()
             self.summary['current_status']='interrupted'
         self.lock=threading.RLock();self.io_lock=threading.Lock();self.stop_event=threading.Event()
@@ -9740,21 +9786,27 @@ class AutomaticCollection:
                     self.summary['task_labels']=[p['label'] for p in plan];self.summary['total_tasks']=total
                     self.summary['current_task_index']=index;self.summary['current_task_label']=plan[index]['label']
                     current_task=plan[index]
+                    batch_indices=_v295_parallel_tasks(plan,index,self.summary)
+                    batch_tasks=[plan[i] for i in batch_indices]
+                    self.summary['current_task_indices']=batch_indices
+                    batch_label=' / '.join(t['label'] for t in batch_tasks)
+                    self.summary['current_task_label']=batch_label
                     ward=current_task['ward_code']
                     # Pass only the active ward to SearchJob. Its local town
                     # index is NOT the global controller progress index.
                     active_regions=[r for r in (self.settings.get('auto_regions') or [])
                                     if str(r.get('code'))==ward]
                     if not active_regions:raise AppError('選択区の収集対象を確認できません：'+TOKYO_WARDS[ward])
-                    conditions={'bounds':[34,138,37,141],'ward_code':ward,'providers':[current_task['provider']],
-                                'mode':'automatic_collection','auto_task_index':index,'auto_task_label':current_task['label'],
+                    conditions={'bounds':[34,138,37,141],'ward_code':ward,'providers':[t['provider'] for t in batch_tasks],
+                                'mode':'automatic_collection','auto_task_index':index,'auto_task_label':batch_label,
+                                'auto_task_identities':[t['identity'] for t in batch_tasks],
                                 'auto_task_identity':current_task['identity'],
                                 'auto_controller_index':index,
                                 'auto_regions':active_regions,'auto_munis':self.settings.get('auto_munis') or {},
                                 # Each ward has already been filtered in ensure_plan.
                                 'town_codes':[]}
                     self.summary['last_started_at']=utc_now();self.summary['current_status']='running'
-                    self.message='検索中｜'+plan[index]['label']
+                    self.message='検索中｜'+batch_label
                     job=SearchJob(self.db,conditions)
                     # Keep the last search id even if the collector fails before
                     # search_all writes a finished search summary.
@@ -9837,9 +9889,12 @@ class AutomaticCollection:
                         self.error='検索処理が失敗しました。'+(str(last_issues[-1])[:320] if last_issues else '詳細ログを確認してください。')
                         self.message='保存先または検索処理が失敗したため停止しました。'
                     else:
-                        outcome=advance_automatic_task(self.summary,actual_index,total,success)
-                        if success:
-                            self.summary['completed_runs']=int(self.summary.get('completed_runs',0))+1
+                        sources=stats.get('source_tasks') or []
+                        # Missing result details (including an exception) never imply completion.
+                        outcome,successful_sources=_v295_advance_batch(self.summary,batch_indices,plan,sources,
+                            not timeout_reason and not int(stats.get('unsaved',0)) and not int(stats.get('acquisition_ids_pending',0)))
+                        if successful_sources:
+                            self.summary['completed_runs']=int(self.summary.get('completed_runs',0))+successful_sources
                             # Keep the whole multi-ward plan. Saving only this
                             # SearchJob's active ward would erase subsequent wards.
                         if outcome=='paused_incomplete':
@@ -10416,7 +10471,7 @@ def automatic_collection_panel():
             total=len(labels);current_index=int(summary.get('current_task_index',summary.get('next_task_index',0)) or 0)%total
             completed={int(x) for x in summary.get('cycle_completed_indices',[]) if isinstance(x,(int,float)) or str(x).isdigit()}
             completed={i for i in completed if 0<=i<total}
-            current_label=labels[current_index] if busy else '停止中'
+            current_label=summary.get('current_task_label',labels[current_index]) if busy else '停止中'
             selected_wards=automatic_ward_codes(snap.get('settings') or {})
             finished_wards=0
             for ward in selected_wards:
@@ -10431,7 +10486,7 @@ def automatic_collection_panel():
             lines=[]
             unconfirmed={int(x) for x in summary.get('incomplete_task_indices',[]) if str(x).isdigit()}
             for i,label in enumerate(labels):
-                status='検索中' if busy and i==current_index else '完了' if i in completed else '未確認' if i in unconfirmed else '待機'
+                status='検索中' if busy and i in (summary.get('current_task_indices') or [current_index]) else '完了' if i in completed else '未確認' if i in unconfirmed else '待機'
                 lines.append(f'{status}｜{i+1}/{total}｜{label}')
             with st.expander('検索対象の町一覧',expanded=False):st.code('\n'.join(lines),language=None)
         elif busy:
