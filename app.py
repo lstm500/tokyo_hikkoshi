@@ -56,7 +56,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v295"
+BUILD = "REBUILD-01-v297"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -7624,27 +7624,10 @@ def display_pipeline(units,bounds,load=None,include_records=False):
 
 
 def display_diagnostic_downloads(report,units=None,bounds=None,load=None):
-    stages=report['stages'];mapping=report['map']
-    st.caption(f"地図の〇 {mapping['colored_unique_positions']}個｜読み込んだ募集 {stages['loaded']}件｜現在の範囲 {stages['in_bounds']}件｜座標あり {mapping['markers_total']}件｜位置未確認 {mapping['unconfirmed_positions']}件")
-    st.caption(f"地図の〇＝家賃色を付けて地図上で区別できる座標位置。完全に同じ座標へ重なる募集は1個として数えます。家賃帯対象 {mapping['colored_points']}件｜家賃未確認 {mapping['gray_points']}件｜重なり {mapping['overlapping_points']}件。")
-    with st.expander('表示が少ない原因・全募集の診断ログ'):
-        st.dataframe([{'理由':DISPLAY_REASONS[k],'募集件数':v} for k,v in report['reason_counts'].items()],hide_index=True)
-        token=(id(units),len(units or []),tuple(bounds or ()))
-        if st.button('表示診断ログを準備',key='prepare_display_diagnostics'):
-            complete=display_pipeline(units or [],bounds,load,include_records=True)[3]
-            lines=['住まいコンパス 1募集1点の表示診断',json.dumps({k:v for k,v in complete.items() if k!='records'},ensure_ascii=False,indent=2),'募集ごとの判定：']
-            lines.extend(json.dumps(r,ensure_ascii=False) for r in complete['records'])
-            output=io.StringIO();writer=csv.DictWriter(output,fieldnames=list(complete['records'][0]) if complete['records'] else ['key','reason']);writer.writeheader();writer.writerows(complete['records'])
-            st.session_state['_mobile_diag_export']={'token':token,'txt':'\n'.join(lines).encode('utf-8-sig'),
-                'json':json.dumps(complete,ensure_ascii=False,indent=2).encode('utf-8'),
-                'csv':output.getvalue().encode('utf-8-sig')}
-        export=st.session_state.get('_mobile_diag_export')
-        if export and export.get('token')==token:
-            st.download_button('表示原因ログをTXTでダウンロード',export['txt'],'sumai_display_log.txt','text/plain',key='display_txt',on_click='ignore')
-            st.download_button('表示原因ログをJSONでダウンロード',export['json'],'sumai_display_log.json','application/json',key='display_json',on_click='ignore')
-            st.download_button('全募集の表示判定をCSVでダウンロード',export['csv'],'sumai_display_decisions.csv','text/csv',key='display_csv',on_click='ignore')
-        for advice in report['improvements']:st.write('・'+advice)
-
+    def produce():
+        complete=display_pipeline(units or [],bounds,load,include_records=True)[3]
+        return json.dumps(complete,ensure_ascii=False).encode('utf-8')
+    _v296_download('表示診断ログを出力',produce,'sumai_display_log.json','display_json_v297')
 
 
 def rent_color(price):
@@ -8928,15 +8911,7 @@ def background_status():
     try:
         cache=st.session_state.get('diagnostic_export_cache')
         cache_key=(job.audit.search_id,int(job.audit.count))
-        if st.button('詳細ログを更新してTXT・JSONを準備',key='prepare_current_log'):
-            cache={'key':cache_key,'events':job.audit.records(),'prepared_at':utc_now()}
-            st.session_state.diagnostic_export_cache=cache
-        if isinstance(cache,dict) and cache.get('events'):
-            diagnostic_downloads(cache['events'],'current')
-        else:
-            c1,c2=st.columns(2)
-            with c1:st.download_button('詳細ログ TXT',b'','sumai_work_log.txt','text/plain',key='current_txt_pending',disabled=True)
-            with c2:st.download_button('詳細ログ JSON',b'','sumai_work_log.json','application/json',key='current_json_pending',disabled=True)
+        _v296_log_card(_v296_log_context(st.session_state),'物件の取得','取得工程・通信・保存結果。','property',key_suffix='_current')
     except Exception as exc:
         st.error('詳細ログを出力できませんでした：'+type(exc).__name__)
     if job.audit.failure_storage_error:
@@ -10192,13 +10167,11 @@ def load_saved_search_audit_small_pages(db,search_id):
     out=[];last_id=''
     while True:
         for size in (8,2,1):
+            clauses=['id.gte.'+search_id+'.log.','id.lt.'+search_id+'.log/']
+            if last_id:clauses.append('id.gt.'+last_id)
             params={'namespace':'eq.'+db.namespace,'status':'eq.diagnostic_log',
-                    'id':('gt.'+last_id if last_id else 'like.'+search_id+'.log.*'),
-                    'select':'id,summary','order':'id.asc','limit':size}
+                'and':'('+','.join(clauses)+')','select':'id,summary','order':'id.asc','limit':size}
             try:
-                # After the first page, the keyset filter still needs the search-id
-                # namespace to avoid streaming other searches' unrelated records.
-                if last_id:params['and']=f'(id.like.{search_id}.log.*,id.gt.{last_id})';params.pop('id')
                 rows=db.call('GET',SEARCH_TABLE,params)
                 if not isinstance(rows,list):raise AppError('詳細ログの応答形式が不正です。')
                 break
@@ -10265,58 +10238,7 @@ def get_saved_automatic_log_loader():
 
 
 def automatic_log_download_panel(controller,busy,summary):
-    """Show the TXT/JSON section even without a running or cached controller."""
-    log_job=None
-    if controller:
-        with controller.lock:log_job=controller.current or controller.last_job
-    events=[];source=''
-    if log_job is not None:
-        try:
-            cache=st.session_state.get('automatic_log_cache')
-            search_id=log_job.audit.search_id;now=time.monotonic()
-            # Do not parse and JSON-serialize every historical event on each
-            # Streamlit fragment poll. Prepare the full TXT/JSON only on demand.
-            if st.button('詳細ログを更新してTXT・JSONを準備',key='prepare_automatic_log'):
-                cache={'search_id':search_id,'count':int(log_job.audit.count),'at':now,
-                       'events':log_job.audit.records()}
-                st.session_state.automatic_log_cache=cache
-            if isinstance(cache,dict) and cache.get('search_id')==search_id:
-                events=cache.get('events') or [];source='サーバーの作業ログ'
-        except Exception as exc:
-            st.warning('現在の作業ログを開けません：'+type(exc).__name__)
-    if not events:
-        cache=st.session_state.get('automatic_log_cache')
-        if isinstance(cache,dict) and cache.get('events'):
-            events=cache['events'];source='前回表示した作業ログ'
-    loader=None
-    try:
-        loader=get_saved_automatic_log_loader()
-        saved=loader.snapshot()
-    except Exception as exc:
-        st.warning('保存済みログの復元機能に接続できません：'+type(exc).__name__)
-        saved={'running':False,'loaded':False,'events':[],'error':''}
-    if not events and saved['loaded']:
-        events=saved['events'];source='Supabaseから復元した詳細ログ'
-    if events:
-        st.caption('出力元：'+source+'｜'+str(len(events))+'イベント')
-        diagnostic_downloads(events,'automatic')
-    else:
-        # Keep both controls in the UI after a stopped job / process restart.
-        c1,c2=st.columns(2)
-        with c1:st.download_button('詳細ログ TXT',b'','sumai_work_log.txt','text/plain',
-                                  key='automatic_txt_empty',disabled=True,use_container_width=True)
-        with c2:st.download_button('詳細ログ JSON',b'','sumai_work_log.json','application/json',
-                                  key='automatic_json_empty',disabled=True,use_container_width=True)
-        st.caption('現在のログがメモリ上にありません。保存済みログがある場合は下から復元してください。')
-    if loader is not None:
-        if st.button('前回の詳細ログをSupabaseから復元',key='restore_automatic_txt_json',
-                     disabled=saved['running']):
-            loader.start(summary)
-            st.rerun()
-        if saved['running']:st.caption('保存済みログをバックグラウンドで読込中です。')
-        if saved['error']:st.error('保存済みログの復元に失敗：'+saved['error'])
-        if saved['loaded'] and events is not saved['events']:
-            st.caption('保存済みログは復元済みです。停止後の再起動でも再取得できます。')
+    _v296_log_card(_v296_log_context(st.session_state),'物件の取得','取得工程・通信・保存結果。','property',key_suffix='_automatic')
 
 
 def automatic_collection_ward_filter_ui(ward_codes, filters, busy=False):
@@ -13087,7 +13009,7 @@ def _v208_run_landmark_lookup(state,data):
             state['_v208_landmark_storage_error']=audit.clean(str(exc))
             state['_v208_landmark_saved']=False
     if reply.get('error'):
-        reply['error']+=' 詳細は「設定」→「ログ出力」で「ログ表示を更新」を押すとダウンロードできます。'
+        reply['error']+=' 詳細は「設定」→「ログ出力」の「施設名検索を出力」を押してください。'
     state['_v288_landmark_events']=audit.records()
     return reply
 
@@ -13786,8 +13708,8 @@ def _v260_clean_diagnostics(value):
 def _v260_browser_log_download(diagnostic):
     # Read bounded browser storage only when requested; no server polling.
     payload=json.dumps(diagnostic,ensure_ascii=False).replace('<',chr(92)+'u003c')
-    st.components.v1.html('''<style>body{margin:0;font:14px system-ui}button{background:#fff;border:1px solid #9eb4bd;border-radius:8px;padding:12px;color:#173a5e;cursor:pointer}span{font-size:12px}</style><button id="export">端末の地図操作ログ JSON</button><span id="result"></span><script>
-const fallback=PAYLOAD;document.getElementById('export').onclick=function(){try{const stored=JSON.parse(localStorage.getItem('sumai-map-ui-v260')||'null');const data={...fallback,ui_diagnostics:stored||fallback.ui_diagnostics||{},exported_at:new Date().toISOString(),client_log_available:!!stored};const blob=new Blob([JSON.stringify(data,null,2)],{type:'application/json'});const url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download='sumai_map_ui_log.json';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);document.getElementById('result').textContent=stored?'':' 端末ログなし：受信済みログを出力';}catch(e){document.getElementById('result').textContent=' 端末ログを取得できません。上のJSONを保存してください。'}};
+    st.components.v1.html('''<style>body{margin:0;font:14px system-ui}button{background:#fff;border:1px solid #9eb4bd;border-radius:8px;padding:12px;color:#173a5e;cursor:pointer;width:100%;min-height:44px}span{font-size:12px}</style><button id="export">↓ 地図・画面の不具合を出力</button><span id="result"></span><script>
+const fallback=PAYLOAD;document.getElementById('export').onclick=function(){try{const stored=JSON.parse(localStorage.getItem('sumai-map-ui-v260')||'null');const performanceLog=JSON.parse(parent.localStorage.getItem('sumai-app-performance-v297')||'{}');const data={...fallback,app_performance:performanceLog,ui_diagnostics:stored||fallback.ui_diagnostics||{},exported_at:new Date().toISOString(),client_log_available:!!stored};const blob=new Blob([JSON.stringify(data,null,2)],{type:'application/json'});const url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download='sumai_map_ui_log.json';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);document.getElementById('result').textContent=stored?'':' 端末ログなし：受信済みログを出力';}catch(e){document.getElementById('result').textContent=' 端末ログを取得できません。上のJSONを保存してください。'}};
 </script>'''.replace('PAYLOAD',payload,1),height=74)
 
 
@@ -18231,31 +18153,7 @@ def v170_commute_autosave_sync():
 
 
 def _v209_automatic_log_tools():
-    controller=get_automatic_collection();snap=controller.snapshot() if controller else None
-    busy=bool(snap and snap['running']);summary=(snap.get('summary') or {}) if snap else {}
-    st.markdown('##### ログ・エラーCSV')
-    automatic_log_download_panel(controller,busy,summary if snap else st.session_state.get('automatic_saved_summary',{}))
-
-    try:
-        # Full historical errors are queried only when explicitly requested.
-        # This avoids competing 25k+ JSON rows with the primary collection job.
-        error_job=get_automatic_failure_export(max_age=900,refresh=False);failure=error_job.snapshot()
-        if st.button('エラー履歴を取得する（時間がかかります）',key='automatic_refresh_error_csv',disabled=busy or error_job.running):
-            error_job.refresh(max_age=0)
-            st.rerun()
-        if failure['loaded']:
-            st.download_button(f"エラー履歴CSV（{failure['row_count']}行）",
-                               failure['csv'],'sumai_all_acquisition_errors.csv','text/csv',
-                               key='automatic_all_errors_csv',on_click='ignore',use_container_width=True)
-            status='過去ログの統合が未完了' if failure.get('phase')=='partial' else '過去ログも裏で統合中' if failure['running'] and failure.get('phase')=='historical_backfill' else '裏で最新化中' if failure['running'] else '最新'
-            st.caption(f"エラーCSV：{status}｜最終同期 {acquisition_time_jst(failure.get('updated_at'))}｜同じ物件で複数エラーがあれば複数行です。")
-        else:
-            st.download_button('全取得エラーCSV',b'','sumai_all_acquisition_errors.csv','text/csv',
-                               key='automatic_all_errors_csv_wait',disabled=True,use_container_width=True)
-            st.caption('大量の履歴照会は自動実行しません。収集停止後に「エラーCSVを手動更新（過去全件）」を押してください。')
-        if failure['error']:st.error('エラーCSVの自動更新に失敗しました：'+failure['error'])
-    except Exception as exc:
-        st.error('エラーCSVを出力できませんでした：'+(str(exc) if isinstance(exc,AppError) else type(exc).__name__))
+    automatic_log_download_panel(None,False,{})
 
 
 def _v209_saved_log_tools(state):
@@ -18373,37 +18271,6 @@ def _v209_initial_settings(state):
                 st.link_button('町丁目データの出典・ライセンス','https://github.com/geolonia/japanese-addresses-v2')
 
 
-def _v209_log_tools(state):
-    st.subheader('ログ出力')
-    if st.button('ログ表示を更新',key='settings_refresh_logs_v209'):
-        state['_v288_log_refresh']=int(state.get('_v288_log_refresh',0))+1
-        state.pop('landmark_v208_log_export',None)
-    with st.expander('背景地図の読み込みログ'):
-        rows=state.get('_v245_map_diagnostics',[])
-        if rows:st.dataframe(rows,hide_index=True,use_container_width=True)
-        else:st.caption('地図を表示すると、背景地図の取得結果が記録されます。')
-        diagnostic={'background_tiles':rows,'rent_overlay':state.get('_v245_rent_diagnostics',{}),'ui_diagnostics':state.get('_v260_map_ui_diagnostics',{}),'supermarket_loader':_v264_supermarket_diagnostics(state)}
-        st.json(diagnostic['rent_overlay'],expanded=False)
-        st.download_button('背景地図の詳細ログ JSON',json.dumps(diagnostic,ensure_ascii=False,indent=2).encode('utf-8'),
-            'sumai_basemap_log.json','application/json',key='basemap_log_v245',disabled=not rows)
-        _v260_browser_log_download(diagnostic)
-        st.caption('白画面・地図消失の調査には「端末の地図操作ログ JSON」を出力してください。直近120件を記録します。')
-    _v247_equipment_log_tools(state)
-    _v208_landmark_log_panel(state)
-    if state.get('_v217_suumo_audit'):
-        with st.expander('SUUMO町名検索のログ'):
-            diagnostic_downloads(state['_v217_suumo_audit'].records(),'suumo_town_v217')
-    with st.expander('手動検索の作業ログ'):
-        if active_job() is None:st.caption('手動検索の作業ログはまだありません。')
-        else:background_status()
-    with st.expander('自動収集のログ・エラーCSV'):
-        _v209_automatic_log_tools()
-    with st.expander('保存済みのログ・検索履歴'):
-        _v209_saved_log_tools(state)
-    render_memory_diagnostic_v124()
-    if state.get('v147_live_test_job'):
-        with st.expander('実URL検証の結果・CSV'):
-            v147_replay_status()
 
 
 # v282: collect public reference aggregates through an explicit background job.
@@ -18756,16 +18623,7 @@ def _v282_reference_panel():
         st.subheader('保存した参考データ')
         if st.button('保存した参考家賃を読み込む',key='reference_load_v282',disabled=snap['running']):
             store.start('load');st.rerun()
-        if st.button('保存した参考家賃のログを読み込む',key='reference_logs_load_v282'):
-            try:
-                records=store.db.call('GET',SEARCH_TABLE,{'namespace':'eq.'+store.db.namespace,'status':'eq.reference_aoyama_log',
-                    'select':'id,started_at,summary','order':'started_at.desc','limit':20})
-                if not isinstance(records,list):raise AppError('参考家賃ログの応答形式が不正です。')
-                st.session_state['_v282_saved_logs']=records
-            except AppError as exc:st.error(str(exc))
-        logs={'current':snap['logs'],'saved':st.session_state.get('_v282_saved_logs',[])}
-        st.download_button('参考家賃の取得ログ JSON',json.dumps(logs,ensure_ascii=False,indent=2).encode(),
-            'sumai_reference_rent_log.json','application/json',key='reference_logs_v282',on_click='ignore',disabled=not any(logs.values()))
+        _v296_log_card(_v296_log_context(st.session_state),'成約家賃の取得','参考成約家賃の取得結果とエラー。','reference',key_suffix='_data')
 
 
 _V282_REFERENCE_JS=r"""
@@ -19265,9 +19123,343 @@ def _v216_web_document(web,query):
     return result
 
 
+
+# v296: one action generates and downloads a diagnostic file. No eager DB reads.
+class _V296Cleaner:
+    def __init__(self,secrets):self.secrets=secrets
+    def clean(self,value):return AuditLog.clean(self,value)
+
+
+def _v296_log_context(state):
+    controller=state.get('automatic_collection_controller')
+    automatic=None
+    if controller:
+        with controller.lock:automatic=controller.current or controller.last_job
+    try:manual=active_job()
+    except Exception:manual=None
+    try:db=Database();db_error=''
+    except Exception as exc:db=None;db_error=str(exc)
+    reference=None
+    if db is not None:
+        items,registry_lock=_v282_registry()
+        with registry_lock:reference=items.get(manual_registry_key(db))
+    return {'telemetry':_v297_recorder(),'controller':controller,'reference':reference,'db':db,'db_error':db_error,'automatic':automatic,'manual':manual,
+        'automatic_summary':dict(state.get('automatic_saved_summary') or (controller.summary if controller else {})),
+        'landmark':_v288_landmark_audit(state,create=False),
+        'landmark_events':state.get('_v288_landmark_events') or [],
+        'landmark_storage_error':state.get('_v208_landmark_storage_error',''),
+        'equipment':state.get('_v246_equipment_job'),
+        'reference_logs':state.get('_v282_saved_logs',[]),
+        'town_audit':state.get('_v217_suumo_audit'),
+        'secrets':_v209_log_secrets(),'lock':threading.Lock()}
+
+
+def _v296_saved_events(db,summary):
+    if db is None:raise AppError('保存先の接続設定を確認できません。')
+    if not summary:
+        rows=db.call('GET',SEARCH_TABLE,{'namespace':'eq.'+db.namespace,'id':'eq.'+AUTO_COLLECTION_ID,
+            'select':'summary','limit':1})
+        summary=(rows[0].get('summary') or {}) if rows else {}
+    # A new search may have started without a persisted diagnostic chunk yet.
+    ids=[summary.get('last_search_id'),((summary.get('last_summary') or {}).get('diagnostics') or {}).get('search_id')]
+    for identity in dict.fromkeys(v for v in ids if isinstance(v,str) and re.fullmatch(r'[0-9a-f]{64}',v)):
+        events=load_saved_search_audit_small_pages(db,identity)
+        if events:return {'search_id':identity,'events':events,'origin':'saved'}
+    return {'events':[],'origin':'saved','note':'保存済みの物件取得ログはありません。','progress':summary}
+
+
+def _v296_export_payload(ctx,kind,identity=None):
+    """Called on the download thread. Never reads session_state or calls st.*."""
+    db=ctx['db']
+    if kind in ('property','saved_property'):
+        if identity:
+            return {'search_id':identity,'origin':'saved','events':load_saved_search_audit_small_pages(db,identity)}
+        current=ctx['automatic'];summary=ctx['automatic_summary']
+        controller=ctx.get('controller')
+        if controller is not None:
+            with controller.lock:
+                current=controller.current or controller.last_job
+                summary=dict(controller.summary)
+        if kind=='property':
+            logs=[];seen=set()
+            for job in (current,ctx['manual']):
+                if job is not None and job.audit.search_id not in seen:
+                    seen.add(job.audit.search_id)
+                    logs.append({'search_id':job.audit.search_id,'origin':'current','events':job.audit.records()})
+            if logs:return {'searches':logs}
+        return _v296_saved_events(db,summary)
+    if kind=='landmark':
+        audit=ctx['landmark']
+        if audit is not None:return {'events':audit.records(),'storage_error':ctx['landmark_storage_error'],'origin':'current'}
+        if ctx['landmark_events']:return {'events':ctx['landmark_events'],'origin':'current'}
+        if db is None:raise AppError(ctx['db_error'])
+        rows=_v289_load_history(db)
+        if not rows:return {'events':[],'note':'施設名検索の記録はありません。'}
+        row=rows[0];return {'search':row,'events':load_saved_search_audit_small_pages(db,row['id']),'origin':'saved'}
+    if kind=='equipment':
+        job=ctx['equipment']
+        if job is not None:
+            with job.lock:
+                payload={'run_id':job.run_id,'started_at':job.started_at,'wards':list(job.wards),
+                    'status':job.status,'progress':{k:dict(v) for k,v in job.progress.items()},
+                    'dropped_events':job.dropped_logs,'storage_error':job.log_error,'events':list(job.logs)}
+            if payload['run_id']:return payload
+        if db is None:raise AppError(ctx['db_error'])
+        rows=_v247_load_logs(db)
+        if not rows:return {'events':[],'note':'スーパー取得の記録はありません。'}
+        payload,warning=_v251_read_log(db,rows[0]['id'])
+        return {'run':payload,'integrity_warning':warning,'origin':'saved'}
+    if kind=='reference':
+        current=ctx.get('reference')
+        if current is not None:
+            snap=current.snapshot()
+            if snap.get('logs'):return {'origin':'current',**snap}
+        if db is None:
+            if ctx['reference_logs']:return {'records':ctx['reference_logs']}
+            raise AppError(ctx['db_error'])
+        rows=db.call('GET',SEARCH_TABLE,{'namespace':'eq.'+db.namespace,'status':'eq.reference_aoyama_log',
+            'select':'id,started_at,summary','order':'started_at.desc','limit':1})
+        return {'records':rows,'note':'' if rows else '成約家賃取得の記録はありません。'}
+    if kind=='memory':return memory_diagnostic_v124()
+    if kind=='town':return {'events':ctx['town_audit'].records() if ctx['town_audit'] else [],'note':'' if ctx['town_audit'] else '町名検索の記録はありません。'}
+    raise ValueError('Unknown log type')
+
+
+def _v296_log_bytes(ctx,kind,identity=None):
+    with ctx['lock']:
+        try:payload=_v296_export_payload(ctx,kind,identity);status='ok'
+        except Exception as exc:
+            # A failed retrieval produces a diagnostic file, not a blank download.
+            payload={'error':str(exc),'exception_type':type(exc).__name__,'events':[]};status='export_failed'
+        if ctx.get('telemetry') is not None:payload={'log':payload,'server_performance':ctx['telemetry'].snapshot()}
+        result={'schema':2,'build':BUILD,'log_type':kind,'exported_at':utc_now(),'export_status':status,'data':payload}
+        return json.dumps(_V296Cleaner(ctx['secrets']).clean(result),ensure_ascii=False,separators=(',',':')).encode('utf-8')
+
+
+@st.cache_resource(show_spinner=False)
+def _v296_legacy_component():
+    folder=os.path.join(tempfile.gettempdir(),'sumai-log-download-v296');os.makedirs(folder,exist_ok=True)
+    source=r'''<!doctype html><html><meta charset="utf-8"><style>body{margin:0;font:14px system-ui}button{box-sizing:border-box;width:100%;min-height:44px;background:#fff;color:#173a5e;border:1px solid #b9c6ca;border-radius:8px;padding:10px;cursor:pointer}button:disabled{opacity:.7}</style><button id="download"></button><script>
+let args={},pending='',used='';const button=document.getElementById('download');
+function host(type,extra){parent.postMessage(Object.assign({isStreamlitMessage:true,type},extra||{}),'*')}
+button.onclick=()=>{pending=Date.now()+'_'+Math.random().toString(36).slice(2);button.disabled=true;button.textContent='出力中…';host('streamlit:setComponentValue',{dataType:'json',value:{ticket:pending}})};
+addEventListener('message',e=>{if(!e.data||e.data.type!=='streamlit:render')return;args=e.data.args||{};button.textContent=pending?'出力中…':args.label;button.disabled=!!pending;
+if(args.ticket&&args.ticket===pending&&args.ticket!==used){used=args.ticket;const bytes=Uint8Array.from(atob(args.data),c=>c.charCodeAt(0));const url=URL.createObjectURL(new Blob([bytes],{type:args.mime}));const a=document.createElement('a');a.href=url;a.download=args.filename;document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),60000);pending='';button.disabled=false;button.textContent=args.label;}
+host('streamlit:setFrameHeight',{height:50})});host('streamlit:componentReady',{apiVersion:1});
+</script></html>'''
+    path=os.path.join(folder,'index.html')
+    with open(path,'w',encoding='utf-8') as f:f.write(source)
+    return st.components.v1.declare_component('sumai_log_download_v296',path=folder)
+
+
+
+def _v296_download(label,producer,filename,key,mime='application/json'):
+    version=tuple(int(n) for n in re.findall(r'\d+',st.__version__)[:2])
+    if version>=(1,52):
+        # Native deferred generation: no serialization or network on page render.
+        st.download_button(label,producer,filename,mime,key=key,on_click='ignore',use_container_width=True)
+    else:
+        cache_key='_v296_download_'+key;cached=st.session_state.get(cache_key) or {}
+        request=_v296_legacy_component()(label=label,filename=filename,mime=mime,
+            ticket=cached.get('ticket',''),data=cached.get('data',''),key=key,default=None)
+        ticket=request.get('ticket') if isinstance(request,dict) else ''
+        if ticket and re.fullmatch(r'[0-9]+_[a-z0-9]+',ticket) and ticket!=cached.get('ticket'):
+            data=producer();data=data if isinstance(data,bytes) else data.encode()
+            st.session_state[cache_key]={'ticket':ticket,'data':base64.b64encode(data).decode()}
+            _v288_rerun_map()
+
+
+def _v296_log_card(ctx,title,description,kind,key_suffix=""):
+    with st.container(border=True):
+        st.markdown('**'+title+'**');st.caption(description)
+        _v296_download('↓ '+title+'を出力',lambda:_v296_log_bytes(ctx,kind),
+            'sumai_'+kind+'_log.json','log_export_v296_'+kind+key_suffix)
+
+
+def _v296_errors_csv(ctx):
+    # Stream small DB pages into CSV; do not retain every historical event object.
+    with ctx['lock']:
+        output=io.StringIO();writer=None;seen=set();cleaner=_V296Cleaner(ctx['secrets'])
+        try:
+            db=ctx['db']
+            if db is None:raise AppError(ctx['db_error'])
+            for status in ('diagnostic_error','diagnostic_log'):
+                last=''
+                while True:
+                    params={'namespace':'eq.'+db.namespace,'status':'eq.'+status,'select':'id,summary','order':'id.asc'}
+                    if status=='diagnostic_error':params['and']='(id.gte.failure.,id.lt.failure/)'
+                    if last:params['id']='gt.'+last
+                    rows,limit=_diagnostic_fetch_page(db,params,requested=25)
+                    for row in rows:
+                        summary=row.get('summary') or {}
+                        events=[summary.get('event')] if status=='diagnostic_error' else summary.get('events',[])
+                        for event in events:
+                            if not isinstance(event,dict) or not diagnostic_failure_event(event):continue
+                            key=_diagnostic_event_key(event)
+                            if key in seen:continue
+                            seen.add(key)
+                            for record in acquisition_failure_rows([event]):
+                                if writer is None:writer=csv.DictWriter(output,fieldnames=list(record),extrasaction='ignore');writer.writeheader()
+                                writer.writerow(cleaner.clean(record))
+                    if not rows or len(rows)<limit:break
+                    cursor=str(rows[-1].get('id') or '')
+                    if not cursor or cursor<=last:raise AppError('ログの取得位置が進みません。')
+                    last=cursor
+            if writer is None:output.write('記録\n取得エラーの記録はありません。\n')
+        except Exception as exc:
+            # Include failure explicitly; never present a partial file as complete.
+            output.write('\n');csv.writer(output).writerow(['出力エラー',cleaner.clean(str(exc))])
+        return output.getvalue().encode('utf-8-sig')
+
+
+def _v296_equipment_csv(ctx):
+    with ctx['lock']:
+        try:
+            payload=_v296_export_payload(ctx,'equipment');run=payload.get('run') or payload
+            events=run.get('events') if isinstance(run.get('events'),list) else []
+            _,excluded=_v247_analyze_logs(events)
+            return csv_bytes_from_rows(_V296Cleaner(ctx['secrets']).clean(excluded))
+        except Exception as exc:return csv_bytes_from_rows([{'出力エラー':_V296Cleaner(ctx['secrets']).clean(str(exc))}])
+
+
+def _v209_log_tools(state):
+    st.subheader('ログ出力')
+    st.caption('バージョン：'+BUILD)
+    st.caption('調べたい項目を1回押すと、最新の記録をJSONでダウンロードします。保存済みログも自動で読み込みます。')
+    ctx=_v296_log_context(state)
+    with st.container(border=True):
+        st.markdown('**地図・画面の不具合**')
+        st.caption('白画面、地図の消失、ピンやスーパーの表示、端末の地図操作。')
+        diagnostic={'background_tiles':state.get('_v245_map_diagnostics',[]),
+            'rent_overlay':state.get('_v245_rent_diagnostics',{}),'ui_diagnostics':state.get('_v260_map_ui_diagnostics',{}),
+            'supermarket_loader':_v264_supermarket_diagnostics(state)}
+        _v260_browser_log_download(diagnostic)
+    _v296_log_card(ctx,'物件の取得','SUUMO・CHINTAIの取得工程、通信、住所判定、保存結果。','property')
+    _v296_log_card(ctx,'スーパーの取得','店舗が出ない、取得漏れ、重複や住所不一致の調査。','equipment')
+    _v296_log_card(ctx,'施設名検索','入力した名前、検索候補、見つからなかった理由。','landmark')
+    _v296_log_card(ctx,'成約家賃の取得','参考成約家賃の取得結果とエラー。','reference')
+    _v296_log_card(ctx,'メモリ・動作環境','サーバーのメモリ使用量と実行環境を、その場で計測。','memory')
+    with st.expander('その他のログ・過去の物件取得',expanded=False):
+        _v296_log_card(ctx,'町名検索','地図から物件検索へ移動するときの町名照合。','town')
+        _v296_log_card(ctx,'前回保存した物件取得','再起動前の取得ログを保存先から読み込み。','saved_property')
+        with st.container(border=True):
+            st.markdown('**表形式のログ（CSV）**')
+            st.caption('物件の全期間エラーと、スーパーで除外した候補。過去全件の出力には時間がかかる場合があります。')
+            _v296_download('↓ 物件エラー履歴を出力',lambda:_v296_errors_csv(ctx),'sumai_all_acquisition_errors.csv','log_errors_csv_v296','text/csv')
+            _v296_download('↓ スーパーの除外候補を出力',lambda:_v296_equipment_csv(ctx),'sumai_equipment_exclusions.csv','log_equipment_csv_v296','text/csv')
+        # History selection is optional; the default exports above need no setup.
+        if st.toggle('過去の検索を選ぶ',key='log_history_show_v296'):
+            try:
+                if ctx['db'] is None:raise AppError(ctx['db_error'])
+                history=state.get('_v296_history')
+                if history is None:history=ctx['db'].history();state['_v296_history']=history
+                if history:
+                    chosen=st.selectbox('対象の検索',history,key='log_history_choice_v296',format_func=lambda r:acquisition_time_jst(r.get('started_at'))+'｜'+str((r.get('conditions') or {}).get('auto_task_label') or r.get('status','')))
+                    identity=chosen['id']
+                    _v296_download('↓ 選んだ取得ログを出力',lambda:_v296_log_bytes(ctx,'saved_property',identity),
+                        'sumai_saved_property_log.json','log_history_export_v296')
+                else:st.caption('保存された検索履歴はありません。')
+            except Exception as exc:st.error('保存履歴を読み込めません：'+str(exc))
+
+
+# v297: bounded per-session phase timings; no DB writes or polling for telemetry.
+_V297_LOCAL=threading.local()
+class _V297Telemetry:
+    def __init__(self):self.lock=threading.RLock();self.rows=deque(maxlen=5000);self.dropped=0
+    def add(self,event,**fields):
+        with self.lock:
+            if len(self.rows)==self.rows.maxlen:self.dropped+=1
+            self.rows.append({'at':time.time(),'event':event,**fields})
+    def snapshot(self):
+        with self.lock:return {'events':list(self.rows),'dropped':self.dropped,'capacity':self.rows.maxlen}
+
+def _v297_recorder():
+    state=st.session_state
+    if '_v297_telemetry' not in state:state['_v297_telemetry']=_V297Telemetry()
+    return state['_v297_telemetry']
+
+def _v297_begin(recorder=None):
+    recorder=recorder or _v297_recorder()
+    run={'id':hashlib.sha256(os.urandom(16)).hexdigest()[:16],'started_at':time.time(),'start':time.monotonic(),'phases':[],'recorder':recorder}
+    _V297_LOCAL.run=run;recorder.add('server_begin',run_id=run['id']);return run
+
+def _v297_timed(name,fn):
+    import functools
+    @functools.wraps(fn)
+    def wrapped(*args,**kwargs):
+        run=getattr(_V297_LOCAL,'run',None);start=time.monotonic();error=''
+        try:return fn(*args,**kwargs)
+        except BaseException as exc:error=type(exc).__name__;raise
+        finally:
+            if run is not None:
+                row={'stage':name,'offset_ms':round((start-run['start'])*1000,2),'duration_ms':round((time.monotonic()-start)*1000,2),'error_type':error}
+                if name=='database.request' and len(args)>=3:
+                    params=(args[3] if len(args)>3 else kwargs.get('params')) or {}
+                    row['request']={'method':args[1],'table':args[2],'filter_columns':list(params),'limit':params.get('limit'),'status_filter':params.get('status')}
+                run['phases'].append(row);run['recorder'].add('server_phase',run_id=run['id'],**row)
+    return wrapped
+
+def _v297_finish(run):
+    payload={'run_id':run['id'],'started_at':run['started_at'],'finished_at':time.time(),
+        'duration_ms':round((time.monotonic()-run['start'])*1000,2),'phases':run['phases'],'build':BUILD}
+    run['recorder'].add('server_complete',**payload);_V297_LOCAL.run=None
+    code=_V297_BROWSER.removeprefix('<script>').removesuffix('</script>').replace('SERVER_PAYLOAD',json.dumps(payload))
+    # Install in the parent realm: iframe listeners/timers die when Streamlit reruns.
+    bridge='<script>const n=parent.document.createElement("script");n.textContent='+json.dumps(code).replace('<','\\u003c')+';parent.document.head.appendChild(n);n.remove();</script>'
+    st.components.v1.html(bridge,height=0)
+
+_V297_BROWSER=r'''<script>(function(){const w=parent,doc=w.document,key='sumai-app-performance-v297';
+if(!w.__sumai297){let events=[],dropped=0,active=null,timer=null,saveTimer=null;try{const old=JSON.parse(w.localStorage.getItem(key)||'{}');events=old.events||[];dropped=old.dropped||0}catch(e){}
+const record=(event,data={})=>{events.push({event,at:Date.now(),...data});if(events.length>2000){events.shift();dropped++}if(!saveTimer)saveTimer=w.setTimeout(flush,5000)};
+function flush(){w.clearTimeout(saveTimer);saveTimer=null;try{w.localStorage.setItem(key,JSON.stringify({build:'v297',events,dropped,capacity:2000}))}catch(e){}}
+const busy=()=>[...doc.querySelectorAll('[data-stale="true"]')].some(e=>e.getClientRects().length>0);
+const settle=()=>{if(!active||!active.server)return;w.clearTimeout(timer);timer=w.setTimeout(()=>{if(!active||busy())return;const id=active.id;w.requestAnimationFrame(()=>w.requestAnimationFrame(()=>{if(!active||active.id!==id)return;record('dom_stable_after_two_frames',{interaction_id:id,label:active.label,total_ms:Math.round(w.performance.now()-active.start),server_ms:active.server.duration_ms,server_run_id:active.server.run_id});active=null;flush()}))},150)};
+doc.addEventListener('click',e=>{const el=e.target.closest('button,[role="tab"],a[role="button"]');if(!el)return;if(active)record('interaction_superseded',{interaction_id:active.id,elapsed_ms:Math.round(w.performance.now()-active.start)});active={id:Date.now().toString(36)+'_'+Math.random().toString(36).slice(2,8),label:(el.innerText||el.getAttribute('aria-label')||'control').slice(0,80),start:w.performance.now(),at:Date.now(),server:null};record('interaction_start',{interaction_id:active.id,label:active.label})},true);
+new w.MutationObserver(()=>{if(!active)return;const value=busy();if(active.busy!==value){active.busy=value;record(value?'ui_stale_begin':'ui_stale_end',{interaction_id:active.id,elapsed_ms:Math.round(w.performance.now()-active.start)})}settle()}).observe(doc.body,{subtree:true,childList:true,attributes:true,attributeFilter:['data-stale','aria-busy']});
+try{new w.PerformanceObserver(list=>{for(const e of list.getEntries())if(e.duration>=100)record('main_thread_long_task',{duration_ms:Math.round(e.duration),interaction_id:active&&active.id})}).observe({type:'longtask',buffered:false})}catch(e){}
+w.addEventListener('error',e=>record('browser_error',{message:String(e.message||'resource error').slice(0,200)}));w.addEventListener('pagehide',()=>{record('pagehide',{pending_interaction:active&&active.id});flush()});
+w.addEventListener('offline',()=>record('network_offline'));w.addEventListener('online',()=>record('network_online'));
+try{new w.PerformanceObserver(list=>{for(const e of list.getEntries()){const download=/deferred|media|download/.test(e.name);if(e.duration<100&&!download)continue;let path='';try{const u=new URL(e.name);path=u.origin+u.pathname}catch(x){}record('resource_timing',{path,duration_ms:Math.round(e.duration),initiator:e.initiatorType,interaction_id:active&&active.id});if(download&&active){record('download_response_ready',{interaction_id:active.id,label:active.label,total_ms:Math.round(w.performance.now()-active.start)});active=null;flush()}}}).observe({type:'resource',buffered:false})}catch(e){}
+w.__sumai297={server:p=>{record('server_phases',p);if(active&&p.started_at*1000>=active.at-1000){active.server=p;settle()}},record,flush};record('telemetry_started');flush();}
+w.__sumai297.server(SERVER_PAYLOAD);})();</script>'''
+
+def _v297_tabs(labels):
+    import inspect
+    if 'on_change' in inspect.signature(st.tabs).parameters:return st.tabs(labels,key='main_tabs_v297',on_change='rerun')
+    selected=st.radio('ページ',labels,horizontal=True,key='main_tabs_v297',label_visibility='collapsed')
+    result=[]
+    for label in labels:
+        item=st.container();item.__dict__['_v297_open']=label==selected;result.append(item)
+    return result
+
+def _v297_tab_open(tab):
+    if '_v297_open' in tab.__dict__:return tab.__dict__['_v297_open']
+    return tab.open is not False
+
+# Wrap explicit stages only. No stack profiling, file scans or frame loops.
+for _v297_name in ('v170_commute_autosave_sync','restore_manual_search','restore_automatic_collection',
+    'interactive_town_choropleth','town_location_search_panel_v184','background_progress','town_choropleth_status',
+    'automatic_collection_panel','_v282_reference_panel','equipment_panel','_v209_log_tools','_v209_initial_settings',
+    'town_component_v121','_v282_map_args','_v243_chintai_map_urls'):
+    if _v297_name in globals():globals()[_v297_name]=_v297_timed(_v297_name,globals()[_v297_name])
+Database.call=_v297_timed('database.request',Database.call)
+
+
+_v297_export_original=_v296_log_bytes
+def _v296_log_bytes(ctx,kind,identity=None):
+    recorder=ctx.get('telemetry')
+    if recorder is None:return _v297_export_original(ctx,kind,identity)
+    previous=getattr(_V297_LOCAL,'run',None);run=_v297_begin(recorder)
+    try:return _v297_export_original(ctx,kind,identity)
+    finally:
+        recorder.add('export_complete',run_id=run['id'],log_type=kind,duration_ms=round((time.monotonic()-run['start'])*1000,2),phases=run['phases'])
+        _V297_LOCAL.run=previous
+
+
 def main():
     st.set_page_config(page_title='住まいコンパス｜新しい住まいを探す',page_icon='🏡',layout='wide',initial_sidebar_state='collapsed')
-    st.markdown(CSS,unsafe_allow_html=True)
+    _v297_run=_v297_begin()
+    st.markdown(CSS+'\n<style>[data-stale="true"]{opacity:1!important}</style>',unsafe_allow_html=True)
     st.markdown(f'<div class="hero"><span class="badge">SUMAI COMPASS · {BUILD}</span><h1>次の住まいを、地図から。</h1><p>掲載物件を確認し、家賃と暮らしやすさを比べます。<br>間取りと家賃帯を、取得できた情報で比較します。</p></div>',unsafe_allow_html=True)
     state=st.session_state
     state.setdefault('new_units',[]);state.setdefault('new_search',None);state.setdefault('new_saved_keys',[])
@@ -19288,198 +19480,205 @@ def main():
     except Exception:state.current_storage_key=None
     # Choropleth display does not auto-restore thousands of old per-listing points.
     # The Saved Data tab can still load them explicitly for detailed export.
-    tabs=st.tabs(['住まいを探す','データ取得','周辺設備','通勤','設定'])
-    with tabs[0]:
-        st.subheader('地図を動かして、探す地域を表示してください')
-        selected_group=state.get('layout_display_group','group1')
-        bounds=state.get('new_bounds')
-        center=bounds_center(bounds) if bounds else state.get('new_view_center',DEFAULT_CENTER)
-        radius=bounds_radius(bounds) if bounds else 1500
-        state['_v263_supermarket_slot']=st.empty()
-        state['_v263_supermarket_sent']=None
-        interactive_town_choropleth(selected_group)
-        town_location_search_panel_v184()
-        # Only the map is a fragment; the search is an ordinary form.
-        background_progress()
-        # Initial component defaults are not real viewport bounds. Only the browser callback makes the search ready.
-        bounds=state.get('new_bounds')
-        if bounds:
-            center=bounds_center(bounds);radius=bounds_radius(bounds)
-            south,west,north,east=bounds
-            st.caption(f'検索する表示範囲：緯度 {south:.5f}〜{north:.5f}／経度 {west:.5f}〜{east:.5f}')
-        else: st.info('地図の表示範囲を受信しています。表示後に地図を少し動かしてください。対象は東京と周辺地域です。')
-        saved_provider_defaults=preferences.get('new_providers',['SUUMO'])
-        provider_defaults=[PROVIDER_DISPLAY.get(canonical_provider(x),x) for x in saved_provider_defaults]
-        provider_defaults=[x for x in dict.fromkeys(provider_defaults) if x in PROVIDER_OPTIONS] or ['SUUMO']
-        if 'new_providers' in state:
-            current_provider_state=[PROVIDER_DISPLAY.get(canonical_provider(x),x) for x in list(state.get('new_providers',[]))]
-            current_provider_state=[x for x in dict.fromkeys(current_provider_state) if x in PROVIDER_OPTIONS]
-            if not current_provider_state:current_provider_state=['SUUMO']
-            if list(state.get('new_providers',[]))!=current_provider_state:state.new_providers=current_provider_state
-        providers=st.multiselect('物件の取得元',list(PROVIDER_OPTIONS),default=provider_defaults,key='new_providers')
-        st.caption('SUUMO・CHINTAIを選択できます。掲載住所から町丁目を確認し、同じ家賃地図へ集計します。')
-        scope=st.radio('検索方法',['地図の表示範囲','区・町名を選択'],horizontal=True,key='manual_search_scope')
-        searching=automatic_busy() or bool(active_job() and not active_job().snapshot()['finished'])
-        if scope=='区・町名を選択':
-            ward_code=st.selectbox('検索する区',list(TOKYO_WARDS),index=list(TOKYO_WARDS).index(state.get('manual_selected_ward','13116')),format_func=lambda code:TOKYO_WARDS[code],key='manual_ward',disabled=searching)
-            state.manual_selected_ward=ward_code
-            ward_town_selector(ward_code,'manual',disabled=searching)
-        st.button('表示中の地名から全件検索・保存' if scope=='地図の表示範囲' else '選択した区・町名を検索・保存',type='primary',use_container_width=True,
-                  on_click=remember_search,key='new_start',disabled=searching or (scope=='地図の表示範囲' and (not bounds or not providers)))
-        result=state.new_search
-        if result:
-            summary=result['summary'];saved=summary.get('saved',0);confirmed=summary.get('confirmed',0)
-            if result.get('conditions',{}).get('mode')=='published_map_position_repair':st.info(f"位置の再確認：{summary.get('position_attempted',0)}件｜位置改善 {summary.get('position_updated',0)}件｜未確認 {summary.get('position_pending',0)}件｜全募集を保持")
-            processed=int(summary.get('processed',0));errors=int(summary.get('errors',0));skipped=int(summary.get('already_acquired',0))
-            metrics=f'処理 {processed}件｜保存 {saved}件｜未保存 {errors}件｜スキップ {skipped}件'
-            if result['status']=='completed': st.success('検索完了｜'+metrics)
-            elif result['status']=='cancelled': st.info('検索中断｜'+metrics)
-            elif result['status']=='partial': st.error('検索終了｜'+metrics)
-            else: st.error('検索失敗｜'+metrics)
-            for issue in summary.get('issues',[])[:8]: st.write('・'+issue)
-            if result.get('conditions',{}).get('regions'):
-                with st.expander('今回検索した地名・丁目'):
-                    for label in result['conditions']['regions']: st.write(label)
-        st.caption('町丁目別の集計対象は保存済みの募集データです。件数と平均家賃は区・町丁目単位で集計します。')
-        # Detailed 23-ward coverage and aggregation status are low-priority UI.
-        town_choropleth_status()
-    with tabs[1]:
-        with st.container(key='saved_data_tabs_v285'):
-            st.markdown(_V285_SAVED_TABS_CSS,unsafe_allow_html=True)
-            listing_tab,contract_tab=st.tabs(['掲載データを取得','成約データを取得'])
-            with listing_tab:
-                if state.get('saved_map_restore_message'):st.caption(state.saved_map_restore_message)
-                automatic_collection_panel()
-                st.subheader('保存した物件')
-                st.caption('物件と家賃の集計は共通のSupabaseに保存し、全利用者で同じデータを参照します。通勤設定は共有しません。')
-                st.caption('地図は自動集計した町丁目の平均家賃を表示します。ここは個々の物件の確認・CSV出力用です。')
-                if st.button('保存物件の一覧を読み込む',key='new_load',use_container_width=True,
-                             disabled=bool(active_job() and not active_job().snapshot()['finished'])):
-                    try:start_saved_load(bounds,state.get('address_point_cache'))
-                    except AppError as exc:st.error(str(exc))
-                saved_load_progress()
-                if state.get('new_notice'):st.caption(state.new_notice)
-                count=len(state.get('new_units') or [])
-                if count:
-                    st.caption(f'一覧に読み込んだ物件：{count:,}件')
-                    if st.button('一覧をCSVにする',key='mobile_prepare_units_csv'):
-                        state['_mobile_units_export']={'key':(id(state.new_units),len(state.new_units)),
-                            'bytes':csv_bytes(state.new_units)}
-                    ready=state.get('_mobile_units_export')
-                    if ready and ready.get('key')==(id(state.new_units),len(state.new_units)):
-                        st.download_button('CSVをダウンロード',ready['bytes'],'sumai_rebuild_units.csv',
-                                           'text/csv',use_container_width=True,on_click='ignore')
-                if st.toggle('その他の操作を表示（CSV取込・再読込）',
-                             key='show_saved_advanced_v122',value=False):
-                    st.caption('通常は操作不要です。保存データの修復・CSV取込に使用します。ログは「設定」→「ログ出力」で確認できます。')
-                    if st.button('保存物件を全件読み直す',key='new_load_full',use_container_width=False,
-                                 disabled=bool(active_saved_load() and not active_saved_load().snapshot()['finished'])):
-                        try:start_saved_load(bounds,state.get('address_point_cache'),force_full=True)
+    tabs=_v297_tabs(['住まいを探す','データ取得','周辺設備','通勤','設定'])
+    if _v297_tab_open(tabs[0]):
+        with tabs[0]:
+            st.subheader('地図を動かして、探す地域を表示してください')
+            selected_group=state.get('layout_display_group','group1')
+            bounds=state.get('new_bounds')
+            center=bounds_center(bounds) if bounds else state.get('new_view_center',DEFAULT_CENTER)
+            radius=bounds_radius(bounds) if bounds else 1500
+            state['_v263_supermarket_slot']=st.empty()
+            state['_v263_supermarket_sent']=None
+            interactive_town_choropleth(selected_group)
+            town_location_search_panel_v184()
+            # Only the map is a fragment; the search is an ordinary form.
+            background_progress()
+            # Initial component defaults are not real viewport bounds. Only the browser callback makes the search ready.
+            bounds=state.get('new_bounds')
+            if bounds:
+                center=bounds_center(bounds);radius=bounds_radius(bounds)
+                south,west,north,east=bounds
+                st.caption(f'検索する表示範囲：緯度 {south:.5f}〜{north:.5f}／経度 {west:.5f}〜{east:.5f}')
+            else: st.info('地図の表示範囲を受信しています。表示後に地図を少し動かしてください。対象は東京と周辺地域です。')
+            saved_provider_defaults=preferences.get('new_providers',['SUUMO'])
+            provider_defaults=[PROVIDER_DISPLAY.get(canonical_provider(x),x) for x in saved_provider_defaults]
+            provider_defaults=[x for x in dict.fromkeys(provider_defaults) if x in PROVIDER_OPTIONS] or ['SUUMO']
+            if 'new_providers' in state:
+                current_provider_state=[PROVIDER_DISPLAY.get(canonical_provider(x),x) for x in list(state.get('new_providers',[]))]
+                current_provider_state=[x for x in dict.fromkeys(current_provider_state) if x in PROVIDER_OPTIONS]
+                if not current_provider_state:current_provider_state=['SUUMO']
+                if list(state.get('new_providers',[]))!=current_provider_state:state.new_providers=current_provider_state
+            providers=st.multiselect('物件の取得元',list(PROVIDER_OPTIONS),default=provider_defaults,key='new_providers')
+            st.caption('SUUMO・CHINTAIを選択できます。掲載住所から町丁目を確認し、同じ家賃地図へ集計します。')
+            scope=st.radio('検索方法',['地図の表示範囲','区・町名を選択'],horizontal=True,key='manual_search_scope')
+            searching=automatic_busy() or bool(active_job() and not active_job().snapshot()['finished'])
+            if scope=='区・町名を選択':
+                ward_code=st.selectbox('検索する区',list(TOKYO_WARDS),index=list(TOKYO_WARDS).index(state.get('manual_selected_ward','13116')),format_func=lambda code:TOKYO_WARDS[code],key='manual_ward',disabled=searching)
+                state.manual_selected_ward=ward_code
+                ward_town_selector(ward_code,'manual',disabled=searching)
+            st.button('表示中の地名から全件検索・保存' if scope=='地図の表示範囲' else '選択した区・町名を検索・保存',type='primary',use_container_width=True,
+                      on_click=remember_search,key='new_start',disabled=searching or (scope=='地図の表示範囲' and (not bounds or not providers)))
+            result=state.new_search
+            if result:
+                summary=result['summary'];saved=summary.get('saved',0);confirmed=summary.get('confirmed',0)
+                if result.get('conditions',{}).get('mode')=='published_map_position_repair':st.info(f"位置の再確認：{summary.get('position_attempted',0)}件｜位置改善 {summary.get('position_updated',0)}件｜未確認 {summary.get('position_pending',0)}件｜全募集を保持")
+                processed=int(summary.get('processed',0));errors=int(summary.get('errors',0));skipped=int(summary.get('already_acquired',0))
+                metrics=f'処理 {processed}件｜保存 {saved}件｜未保存 {errors}件｜スキップ {skipped}件'
+                if result['status']=='completed': st.success('検索完了｜'+metrics)
+                elif result['status']=='cancelled': st.info('検索中断｜'+metrics)
+                elif result['status']=='partial': st.error('検索終了｜'+metrics)
+                else: st.error('検索失敗｜'+metrics)
+                for issue in summary.get('issues',[])[:8]: st.write('・'+issue)
+                if result.get('conditions',{}).get('regions'):
+                    with st.expander('今回検索した地名・丁目'):
+                        for label in result['conditions']['regions']: st.write(label)
+            st.caption('町丁目別の集計対象は保存済みの募集データです。件数と平均家賃は区・町丁目単位で集計します。')
+            # Detailed 23-ward coverage and aggregation status are low-priority UI.
+            town_choropleth_status()
+    if _v297_tab_open(tabs[1]):
+        with tabs[1]:
+            with st.container(key='saved_data_tabs_v285'):
+                st.markdown(_V285_SAVED_TABS_CSS,unsafe_allow_html=True)
+                listing_tab,contract_tab=st.tabs(['掲載データを取得','成約データを取得'])
+                with listing_tab:
+                    if state.get('saved_map_restore_message'):st.caption(state.saved_map_restore_message)
+                    automatic_collection_panel()
+                    st.subheader('保存した物件')
+                    st.caption('物件と家賃の集計は共通のSupabaseに保存し、全利用者で同じデータを参照します。通勤設定は共有しません。')
+                    st.caption('地図は自動集計した町丁目の平均家賃を表示します。ここは個々の物件の確認・CSV出力用です。')
+                    if st.button('保存物件の一覧を読み込む',key='new_load',use_container_width=True,
+                                 disabled=bool(active_job() and not active_job().snapshot()['finished'])):
+                        try:start_saved_load(bounds,state.get('address_point_cache'))
                         except AppError as exc:st.error(str(exc))
-                    st.caption('地図の集計は「住まいを探す」タブの「保存物件を再集計」で開始します。')
-                    upload=st.file_uploader('このアプリのCSVを追加する',type=['csv'])
-                    if st.button('CSVの物件をSupabaseへ保存',disabled=upload is None or bool(active_job() and not active_job().snapshot()['finished']),key='new_import'):
-                        try:
-                            rows=read_csv(upload.getvalue());saved=Database().save_units(rows)
-                            state.new_map_loaded=False;state.new_units=[];state.new_saved_keys=[]
-                            state.new_notice=f'CSVから{len(saved)}件を保存しました。地図反映には「保存物件を再集計」を押してください。';st.rerun()
-                        except AppError as exc: st.error(str(exc))
-                    if st.button('画面上の未保存物件を再保存',key='new_retry_save',disabled=not state.new_units or bool(active_job() and not active_job().snapshot()['finished'])):
-                        try:
-                            saved=Database().save_units(state.new_units);state.new_saved_keys=list(set(state.new_saved_keys)|saved)
-                            state.new_notice=f'{len(saved)}件の保存を確認しました。';st.rerun()
-                        except AppError as exc: st.error(str(exc))
-            with contract_tab:
-                _v282_reference_panel()
-    with tabs[2]:
-        _v246_equipment_panel()
-        _v246_equipment_results()
-    with tabs[3]:
-        st.subheader('通勤の目安')
-        if not commute_storage_ready:
-            st.caption('このブラウザー専用の通勤設定を読み込み・切り替え中です。')
-        elif not state.get('_v170_commute_available',True):
-            st.warning('ブラウザーが保存を制限しているため、通勤設定の永続保存・利用者切り替えは利用できません。')
-        else:
-            st.caption('通勤設定はこのブラウザーに自動保存し、クラウドにもバックアップします。更新後も自動復元します。物件データは全員共通です。')
-        if state.get('_v174_commute_backup_error'):
-            st.warning('通勤設定をクラウドに保存・確認できていません。通信状態またはSupabaseの接続設定を確認してください。')
-        if state.pop('_v170_commute_error',None):
-            st.warning('利用者プロファイルの操作に失敗しました。')
-        profiles=state.get('_v170_commute_profiles',[{'id':'primary','name':'このブラウザー'}])
-        profile_ids=[p['id'] for p in profiles]
-        current_profile=state.get('_v170_commute_active','primary')
-        if state.get('v170_commute_person_selector') not in profile_ids:
-            state['v170_commute_person_selector']=current_profile
-        st.selectbox('通勤設定の利用者（このブラウザー内）',profile_ids,
-                     format_func=lambda ident:next((p['name'] for p in profiles if p['id']==ident),ident),
-                     key='v170_commute_person_selector',on_change=v170_commute_profile_changed,
-                     disabled=(not commute_storage_ready or not state.get('_v170_commute_available',True)))
-        with st.expander('同じ端末を複数人で使う場合：利用者を追加'):
-            st.text_input('新しい利用者名',key='v170_person_new_name',max_chars=24,
-                          placeholder='例：本人・家族',disabled=not commute_storage_ready)
-            if st.button('利用者を追加（通勤先は未設定から開始）',key='v170_create_person',
-                         disabled=(not commute_storage_ready or not state.get('_v170_commute_available',True)
-                                   or len(profile_ids)>=12)):
-                name=str(state.get('v170_person_new_name','')).strip()
-                if name:
-                    state['_v170_commute_nonce']=state.get('_v170_commute_nonce',0)+1
-                    state['_v170_commute_pending']={'action':'create','name':name,
-                                                    'request_id':str(state['_v170_commute_nonce'])}
-                    st.rerun()
-                else:st.warning('利用者名を入力してください。')
-        st.caption('通勤先1・2・3は選択中の利用者ごとに自動保存します。保存・復元操作は不要です。')
-        available_lines=commute_lines_v160()
-        _v228_station_lookup_ui(state,available_lines,commute_storage_ready)
-        st.caption('勤務先は駅名だけで設定できます。利用路線・乗換駅は出発駅ごとに自動で選びます。')
-        station_options=[_COMMUTE_V160_NO_STATION,*sorted({name for names in available_lines.values() for name in names})]
-        for slot,station_key in enumerate(('commute_station_v160','commute_station_2_v164','commute_station_3_v228'),1):
-            selected=state.get(station_key,_COMMUTE_V160_NO_STATION)
-            selected=selected if selected in station_options else _COMMUTE_V160_NO_STATION
-            widget_key=_v242_destination_widget_key(state,slot,selected)
-            st.selectbox('通勤先'+str(slot)+'の最寄り駅'+('（任意）' if slot>1 else ''),station_options,
-                         key=widget_key,index=station_options.index(selected),on_change=_v230_station_changed,
-                         args=(slot,widget_key,state.get('_v170_commute_active','primary'),selected),
-                         help='駅名を入力して絞り込めます。路線の指定は不要です。',disabled=not commute_storage_ready)
-        chosen=commute_selected_destinations_v164()
-        if chosen:
-            st.caption('設定中：'+'　'.join(str(i+1)+'. '+name+'駅' for i,name in enumerate(chosen)))
-        st.caption('地図には「①35分（参考136%）-2回」の形式で表示します。混雑率は国土交通省2025年度の路線代表最混雑区間から計算した参考値です。')
-        st.caption('設定後、「住まいを探す」タブの地図に反映します。乗換回数最少を優先し、同数の場合に所要時間最短の経路を選びます（アプリ内路線データによる概算）。'
-                   '現行時刻表・待ち時間・改札内移動・職場までの徒歩時間は含みません。')
-        options=physical_units([r for r in state.new_units if has_point(r) and r.get('coordinate_precision')!='town'])
-        if options:
-            i=st.selectbox('出発する物件',range(len(options)),format_func=lambda i:options[i]['title'])
-            destination=st.selectbox('勤務先の最寄り駅',list(STATIONS),key='new_destination')
-            walk=st.number_input('勤務先までの徒歩（分）',min_value=0,max_value=60,value=8)
-            r=options[i];nearest=min(STATIONS,key=lambda s:meters((r['latitude'],r['longitude']),STATIONS[s]))
-            route=commute(nearest,destination)
-            home=math.ceil(meters((r['latitude'],r['longitude']),STATIONS[nearest])*1.25/80)
-            st.metric('ドアから勤務先までの概算',f"約{math.ceil(home+route['minutes']+walk+(3 if route['path'] else 0))}分")
-            st.write(f"登録駅で最も近い{nearest}駅まで徒歩約{home}分｜乗り換え{route['transfers']}回")
-            for a,b,line in route['path']: st.caption(f'{a} → {b}（{line}）')
-            st.link_button('実際の経路・時刻をGoogleマップで確認','https://www.google.com/maps/dir/?'+urlencode({'api':1,'origin':f"{r['latitude']},{r['longitude']}",'destination':f'{STATIONS[destination][0]},{STATIONS[destination][1]}','travelmode':'transit'}))
-            used=list(dict.fromkeys(line for _,_,line in route['path']))
-            if used:
-                st.dataframe([{'利用路線':line,'混雑率':str(CROWD[line][0])+'%','公表区間':CROWD[line][1],'調査時間帯':CROWD[line][2]} for line in used],hide_index=True)
-                st.caption('国土交通省2025年度の代表区間・最混雑1時間の公表値。選択した経路・方向・時刻の混雑予測ではありません。')
-                st.link_button('混雑率の原資料',CROWD_SOURCE)
-            st.caption('乗換回数最少を優先（同数なら最短時間）。登録41駅・11路線による概算。時刻表・直通運転・道路の徒歩経路は使用していません。徒歩は直線距離×1.25、列車は距離から推定、乗り換えは5分です。')
-        else: st.info('物件を検索するか、保存物件を読み込むと通勤を比較できます。')
-    with tabs[4]:
-        st.subheader('設定')
-        state.setdefault('_v209_settings_page','logs')
-        logs_button,initial_button=st.columns(2)
-        with logs_button:
-            if st.button('ログ出力',key='settings_logs_v209',use_container_width=True,
-                         type='primary' if state['_v209_settings_page']=='logs' else 'secondary'):
-                state['_v209_settings_page']='logs'
-        with initial_button:
-            if st.button('初期設定',key='settings_initial_v209',use_container_width=True,
-                         type='primary' if state['_v209_settings_page']=='initial' else 'secondary'):
-                state['_v209_settings_page']='initial'
-        if state['_v209_settings_page']=='initial':_v209_initial_settings(state)
-        else:_v209_log_tools(state)
+                    saved_load_progress()
+                    if state.get('new_notice'):st.caption(state.new_notice)
+                    count=len(state.get('new_units') or [])
+                    if count:
+                        st.caption(f'一覧に読み込んだ物件：{count:,}件')
+                        if st.button('一覧をCSVにする',key='mobile_prepare_units_csv'):
+                            state['_mobile_units_export']={'key':(id(state.new_units),len(state.new_units)),
+                                'bytes':csv_bytes(state.new_units)}
+                        ready=state.get('_mobile_units_export')
+                        if ready and ready.get('key')==(id(state.new_units),len(state.new_units)):
+                            st.download_button('CSVをダウンロード',ready['bytes'],'sumai_rebuild_units.csv',
+                                               'text/csv',use_container_width=True,on_click='ignore')
+                    if st.toggle('その他の操作を表示（CSV取込・再読込）',
+                                 key='show_saved_advanced_v122',value=False):
+                        st.caption('通常は操作不要です。保存データの修復・CSV取込に使用します。ログは「設定」→「ログ出力」で確認できます。')
+                        if st.button('保存物件を全件読み直す',key='new_load_full',use_container_width=False,
+                                     disabled=bool(active_saved_load() and not active_saved_load().snapshot()['finished'])):
+                            try:start_saved_load(bounds,state.get('address_point_cache'),force_full=True)
+                            except AppError as exc:st.error(str(exc))
+                        st.caption('地図の集計は「住まいを探す」タブの「保存物件を再集計」で開始します。')
+                        upload=st.file_uploader('このアプリのCSVを追加する',type=['csv'])
+                        if st.button('CSVの物件をSupabaseへ保存',disabled=upload is None or bool(active_job() and not active_job().snapshot()['finished']),key='new_import'):
+                            try:
+                                rows=read_csv(upload.getvalue());saved=Database().save_units(rows)
+                                state.new_map_loaded=False;state.new_units=[];state.new_saved_keys=[]
+                                state.new_notice=f'CSVから{len(saved)}件を保存しました。地図反映には「保存物件を再集計」を押してください。';st.rerun()
+                            except AppError as exc: st.error(str(exc))
+                        if st.button('画面上の未保存物件を再保存',key='new_retry_save',disabled=not state.new_units or bool(active_job() and not active_job().snapshot()['finished'])):
+                            try:
+                                saved=Database().save_units(state.new_units);state.new_saved_keys=list(set(state.new_saved_keys)|saved)
+                                state.new_notice=f'{len(saved)}件の保存を確認しました。';st.rerun()
+                            except AppError as exc: st.error(str(exc))
+                with contract_tab:
+                    _v282_reference_panel()
+    if _v297_tab_open(tabs[2]):
+        with tabs[2]:
+            _v246_equipment_panel()
+            _v246_equipment_results()
+    if _v297_tab_open(tabs[3]):
+        with tabs[3]:
+            st.subheader('通勤の目安')
+            if not commute_storage_ready:
+                st.caption('このブラウザー専用の通勤設定を読み込み・切り替え中です。')
+            elif not state.get('_v170_commute_available',True):
+                st.warning('ブラウザーが保存を制限しているため、通勤設定の永続保存・利用者切り替えは利用できません。')
+            else:
+                st.caption('通勤設定はこのブラウザーに自動保存し、クラウドにもバックアップします。更新後も自動復元します。物件データは全員共通です。')
+            if state.get('_v174_commute_backup_error'):
+                st.warning('通勤設定をクラウドに保存・確認できていません。通信状態またはSupabaseの接続設定を確認してください。')
+            if state.pop('_v170_commute_error',None):
+                st.warning('利用者プロファイルの操作に失敗しました。')
+            profiles=state.get('_v170_commute_profiles',[{'id':'primary','name':'このブラウザー'}])
+            profile_ids=[p['id'] for p in profiles]
+            current_profile=state.get('_v170_commute_active','primary')
+            if state.get('v170_commute_person_selector') not in profile_ids:
+                state['v170_commute_person_selector']=current_profile
+            st.selectbox('通勤設定の利用者（このブラウザー内）',profile_ids,
+                         format_func=lambda ident:next((p['name'] for p in profiles if p['id']==ident),ident),
+                         key='v170_commute_person_selector',on_change=v170_commute_profile_changed,
+                         disabled=(not commute_storage_ready or not state.get('_v170_commute_available',True)))
+            with st.expander('同じ端末を複数人で使う場合：利用者を追加'):
+                st.text_input('新しい利用者名',key='v170_person_new_name',max_chars=24,
+                              placeholder='例：本人・家族',disabled=not commute_storage_ready)
+                if st.button('利用者を追加（通勤先は未設定から開始）',key='v170_create_person',
+                             disabled=(not commute_storage_ready or not state.get('_v170_commute_available',True)
+                                       or len(profile_ids)>=12)):
+                    name=str(state.get('v170_person_new_name','')).strip()
+                    if name:
+                        state['_v170_commute_nonce']=state.get('_v170_commute_nonce',0)+1
+                        state['_v170_commute_pending']={'action':'create','name':name,
+                                                        'request_id':str(state['_v170_commute_nonce'])}
+                        st.rerun()
+                    else:st.warning('利用者名を入力してください。')
+            st.caption('通勤先1・2・3は選択中の利用者ごとに自動保存します。保存・復元操作は不要です。')
+            available_lines=commute_lines_v160()
+            _v228_station_lookup_ui(state,available_lines,commute_storage_ready)
+            st.caption('勤務先は駅名だけで設定できます。利用路線・乗換駅は出発駅ごとに自動で選びます。')
+            station_options=[_COMMUTE_V160_NO_STATION,*sorted({name for names in available_lines.values() for name in names})]
+            for slot,station_key in enumerate(('commute_station_v160','commute_station_2_v164','commute_station_3_v228'),1):
+                selected=state.get(station_key,_COMMUTE_V160_NO_STATION)
+                selected=selected if selected in station_options else _COMMUTE_V160_NO_STATION
+                widget_key=_v242_destination_widget_key(state,slot,selected)
+                st.selectbox('通勤先'+str(slot)+'の最寄り駅'+('（任意）' if slot>1 else ''),station_options,
+                             key=widget_key,index=station_options.index(selected),on_change=_v230_station_changed,
+                             args=(slot,widget_key,state.get('_v170_commute_active','primary'),selected),
+                             help='駅名を入力して絞り込めます。路線の指定は不要です。',disabled=not commute_storage_ready)
+            chosen=commute_selected_destinations_v164()
+            if chosen:
+                st.caption('設定中：'+'　'.join(str(i+1)+'. '+name+'駅' for i,name in enumerate(chosen)))
+            st.caption('地図には「①35分（参考136%）-2回」の形式で表示します。混雑率は国土交通省2025年度の路線代表最混雑区間から計算した参考値です。')
+            st.caption('設定後、「住まいを探す」タブの地図に反映します。乗換回数最少を優先し、同数の場合に所要時間最短の経路を選びます（アプリ内路線データによる概算）。'
+                       '現行時刻表・待ち時間・改札内移動・職場までの徒歩時間は含みません。')
+            options=physical_units([r for r in state.new_units if has_point(r) and r.get('coordinate_precision')!='town'])
+            if options:
+                i=st.selectbox('出発する物件',range(len(options)),format_func=lambda i:options[i]['title'])
+                destination=st.selectbox('勤務先の最寄り駅',list(STATIONS),key='new_destination')
+                walk=st.number_input('勤務先までの徒歩（分）',min_value=0,max_value=60,value=8)
+                r=options[i];nearest=min(STATIONS,key=lambda s:meters((r['latitude'],r['longitude']),STATIONS[s]))
+                route=commute(nearest,destination)
+                home=math.ceil(meters((r['latitude'],r['longitude']),STATIONS[nearest])*1.25/80)
+                st.metric('ドアから勤務先までの概算',f"約{math.ceil(home+route['minutes']+walk+(3 if route['path'] else 0))}分")
+                st.write(f"登録駅で最も近い{nearest}駅まで徒歩約{home}分｜乗り換え{route['transfers']}回")
+                for a,b,line in route['path']: st.caption(f'{a} → {b}（{line}）')
+                st.link_button('実際の経路・時刻をGoogleマップで確認','https://www.google.com/maps/dir/?'+urlencode({'api':1,'origin':f"{r['latitude']},{r['longitude']}",'destination':f'{STATIONS[destination][0]},{STATIONS[destination][1]}','travelmode':'transit'}))
+                used=list(dict.fromkeys(line for _,_,line in route['path']))
+                if used:
+                    st.dataframe([{'利用路線':line,'混雑率':str(CROWD[line][0])+'%','公表区間':CROWD[line][1],'調査時間帯':CROWD[line][2]} for line in used],hide_index=True)
+                    st.caption('国土交通省2025年度の代表区間・最混雑1時間の公表値。選択した経路・方向・時刻の混雑予測ではありません。')
+                    st.link_button('混雑率の原資料',CROWD_SOURCE)
+                st.caption('乗換回数最少を優先（同数なら最短時間）。登録41駅・11路線による概算。時刻表・直通運転・道路の徒歩経路は使用していません。徒歩は直線距離×1.25、列車は距離から推定、乗り換えは5分です。')
+            else: st.info('物件を検索するか、保存物件を読み込むと通勤を比較できます。')
+    if _v297_tab_open(tabs[4]):
+        with tabs[4]:
+            st.subheader('設定')
+            state.setdefault('_v209_settings_page','logs')
+            logs_button,initial_button=st.columns(2)
+            with logs_button:
+                if st.button('ログ出力',key='settings_logs_v209',use_container_width=True,
+                             type='primary' if state['_v209_settings_page']=='logs' else 'secondary'):
+                    state['_v209_settings_page']='logs'
+            with initial_button:
+                if st.button('初期設定',key='settings_initial_v209',use_container_width=True,
+                             type='primary' if state['_v209_settings_page']=='initial' else 'secondary'):
+                    state['_v209_settings_page']='initial'
+            if state['_v209_settings_page']=='initial':_v209_initial_settings(state)
+            else:_v209_log_tools(state)
+
+    _v297_finish(_v297_run)
 
 
 if __name__=='__main__':
