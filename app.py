@@ -56,7 +56,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v297"
+BUILD = "REBUILD-01-v298"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -69,7 +69,7 @@ _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inven
 #    then use its GIS reverse result only to identify map-relevant town/chome.
 # 4) A map center, neighborhood centroid or nearest unverified street number
 #    must NEVER be presented as a building's actual position or street address.
-# 5) Keep old rental_listing and acquisition records unchanged. Version-150
+# 5) Replace older town/source snapshots only after a complete verified crawl. Version-150
 #    observations use isolated IDs; old/new records share read-time map keys
 #    and deduplicate by SUUMO property ID in the town rent aggregator.
 # 6) Continue searching age<=25-year target-layout mansions and age<=40-year,
@@ -1281,7 +1281,7 @@ class Database:
             self.headers['Authorization']='Bearer '+self.key
         self.session=requests.Session();self.address_points=saved_position_memory();self._saved_address_coords={}
     def call(self,method,table,params=None,data=None,prefer=None):
-        if table not in (UNIT_TABLE,SEARCH_TABLE,PLACE_TABLE): raise AppError('保存先が不正です。')
+        if table not in (UNIT_TABLE,SEARCH_TABLE,PLACE_TABLE,'rpc/sumai_write_listings_v298','rpc/sumai_finish_snapshot_v298'): raise AppError('保存先が不正です。')
         headers=dict(self.headers)
         if prefer: headers['Prefer']=prefer
         response=None
@@ -1415,28 +1415,21 @@ class Database:
                             'source':compact['source'],'address_origin':('chintai_published_town_chome' if compact['source']=='CHINTAI' else 'suumo_source_or_map_town_chome' if key in v150_keys else 'legacy_provider_mapping'),
                             'map_granularity':'town_chome' if key in v150_keys else 'street_number'},
                 summary={'listing':compact}) for key,compact in batch]
-            result=self.call('POST',SEARCH_TABLE,{'on_conflict':'namespace,id','select':'id'},payload,'resolution=ignore-duplicates,return=representation')
-            if not isinstance(result,list):raise AppError('Supabaseから新規保存の確認が得られません。')
-            inserted={str(r.get('id','')).removeprefix('listing.') for r in result if isinstance(r,dict) and r.get('id')}
-            self.job_new_keys.update(key for key,_ in batch if storage_keys[key] in inserted)
-            updates=[r for r in payload if r['id'].removeprefix('listing.') not in inserted]
             ledger=self.acquisition_payload([{**compact,'address_quality_version':4} if key in v150_keys else compact
                                               for key,compact in batch])
             for entry in ledger:
                 entry_pid=entry['conditions'].get('property_id')
                 matching=next((key for key,compact in batch if compact.get('property_id')==entry_pid),None)
                 if matching is not None:entry['summary']['listing_key']=storage_keys[matching]
-            # PostgREST bulk writes require identical top-level keys. Listing
-            # rows have `source`, whereas acquisition records have their provider
-            # inside conditions. Keep the two record types in separate requests.
-            for record_type,records in (('listing_update',updates),('acquisition_ledger',ledger)):
-                if not records:continue
-                response=self.call('POST',SEARCH_TABLE,{'on_conflict':'namespace,id','select':'id'},records,'resolution=merge-duplicates,return=representation')
-                returned={r.get('id') for r in response if isinstance(r,dict)} if isinstance(response,list) else set()
-                if not {r['id'] for r in records}<=returned:
-                    error=AppError('募集情報の更新・取得済みIDの保存を確認できません。')
-                    error.diagnostic={'operation':record_type,'rows':len(records)}
-                    raise error
+            if getattr(self,'_v298_run_id',None):
+                for record in payload:record['conditions']['snapshot_run']=self._v298_run_id
+            result=self.call('POST','rpc/sumai_write_listings_v298',data={
+                'p_namespace':self.namespace,'p_rows':payload,'p_ledger':ledger})
+            if not isinstance(result,list) or {r.get('id') for r in result}!= {r['id'] for r in payload}:
+                raise AppError('物件・取得済みIDの一括保存を確認できません。')
+            inserted={r['id'].removeprefix('listing.') for r in result if r.get('inserted')}
+            self.job_new_keys.update(key for key,_ in batch if storage_keys[key] in inserted)
+            updates=[r for r in payload if r['id'].removeprefix('listing.') not in inserted]
             for row in ledger:
                 pid=row['conditions']['property_id']
                 self.covered_acquisitions[pid]=(row['finished_at'],row['summary']['listing_key'])
@@ -1477,6 +1470,11 @@ class Database:
                     for x in list(expected_by_id.values())[:6]],
                 'address_precision':'map_town_chome_or_better','result':'confirmed_after_database_get'},stage='database')
             saved.update(key for key,_ in batch)
+            scopes=getattr(self,'_v298_confirmed_scopes',None)
+            if scopes is not None:
+                for key,compact in batch:
+                    scope=_v298_listing_scope(compact)
+                    if scope:scopes.setdefault(scope,set()).add('listing.'+storage_keys[key])
             # Only fully read-back-verified units may advance the shared skip cache.
             shared=_v147_shared_acquisition_ledger()
             with shared['lock']:
@@ -1507,6 +1505,10 @@ class Database:
     def save_acquisition_ids(self,rows):
         payload=self.acquisition_payload(rows)
         covered=getattr(self,'covered_acquisitions',{})
+        for record in payload:
+            confirmed=covered.get(record['conditions']['property_id'])
+            if confirmed and confirmed[0]==record['finished_at']:
+                record['summary']['listing_key']=confirmed[1]
         payload=[r for r in payload if covered.get(r['conditions']['property_id'])!=(r['finished_at'],r['summary']['listing_key'])]
         if not payload:return
         result=self.call('POST',SEARCH_TABLE,{'on_conflict':'namespace,id','select':'id'},payload,'resolution=merge-duplicates,return=representation')
@@ -6746,6 +6748,9 @@ def search_all(db,conditions,screen,state=None):
     search=dict(id=audit.search_id,status='started',
                 started_at=utc_now(),finished_at=None,conditions=conditions,summary={})
     units={};saved=set();issues=[];warnings=[];logs=[];acquisition_pending={};q=None;provider_fallbacks=[]
+    conditions['replace_town_snapshot']=True
+    conditions['_v298_started_at']=search['started_at']
+    db._v298_run_id=audit.search_id;db._v298_confirmed_scopes={}
     candidate=detail=rejected=skipped=incomplete=issue_events=0
     task_outcomes={}
     def log(message):
@@ -6798,7 +6803,9 @@ def search_all(db,conditions,screen,state=None):
         screen['status'].info(f'検索実行中｜{stage} {done}/{total}｜{count}地域｜取得失敗 {errors}件｜経過 {int(time.monotonic()-started)}秒')
     try:
         web.check_cancel()
-        if any(p in ('SUUMO','CHINTAI') for p in conditions['providers']):
+        # Snapshot refreshes must visit the whole current set; a recent-ID skip
+        # would otherwise turn a skipped listing into an apparent disappearance.
+        if not conditions.get('replace_town_snapshot') and any(p in ('SUUMO','CHINTAI') for p in conditions['providers']):
             unavailable_until=float(getattr(db,'acquisition_ledger_disabled_until',0) or 0)
             if time.monotonic()<unavailable_until:
                 web.acquired_ids={}
@@ -6936,7 +6943,7 @@ def search_all(db,conditions,screen,state=None):
         for task_index,(task_region,task_provider) in enumerate(jobs):
             task_outcomes[task_index]={'identity':automatic_task_identity(task_region.get('code'),
                 task_region.get('suumo_town') or task_region.get('town'),task_provider),
-                'provider':task_provider,'finished':False,'incomplete':False}
+                'provider':task_provider,'scope':_v298_task_scope(task_region,task_provider),'finished':False,'incomplete':False}
         def work(index,region,provider):
             if web.cancel_event.is_set():return
             DIAG_CONTEXT.audit=audit;DIAG_CONTEXT.scope={'task':index,'region':region['label'],'town':region['town'],'municipality_code':region['code'],'provider':provider}
@@ -7012,7 +7019,7 @@ def search_all(db,conditions,screen,state=None):
                 # resolution, so waiting for 100 rows/3 seconds made the UI look as though
                 # completed properties were not being saved.  This changes only Supabase
                 # batching, not source-site request frequency.
-                batch=list(save_buffer.values()) if save_buffer and (len(save_buffer)>=25 or time.monotonic()-last_flush>=1 or web.cancel_event.is_set() or (len(ready)==len(pending) and next_job==len(jobs))) else []
+                batch=list(save_buffer.values()) if save_buffer and (len(save_buffer)>=60 or time.monotonic()-last_flush>=3 or web.cancel_event.is_set() or (len(ready)==len(pending) and next_job==len(jobs))) else []
                 if batch:
                     save_buffer.clear();last_flush=time.monotonic()
                     state.new_units=list(units.values())
@@ -7149,6 +7156,9 @@ def search_all(db,conditions,screen,state=None):
                 'category':'save_failure','reason':'Supabaseへの保存を最終再試行後も確認できない',
                 'observed':{'listing_key':key},'expected':'Supabase保存確認','evidence':[]})
     search['summary']['source_tasks']=[dict(item,status=('completed' if item['finished'] and not item['incomplete'] else 'partial')) for item in task_outcomes.values()]
+    if not web.cancel_event.is_set():
+        search['summary']['snapshot_replacements']=_v298_finish_sources(db,conditions,search['summary']['source_tasks'],audit,search['summary'],web.cancel_event.is_set)
+        if search['summary'].get('incomplete_tasks') and search['status']=='completed':search['status']='partial'
     audit.add('map','data_ready','INFO',{'confirmed_units':len(units),'colored_points':sum(has_point(r) for r in units.values()),'render_deferred_until_saved_data_load':False})
     screen['status'].info(f'検索終了｜処理 {final_processed}件｜保存 {len(saved)}件｜未保存 {final_errors}件｜スキップ {skipped}件'+
                           (f'｜中断時の未完了 {unfinished}件' if unfinished else ''))
@@ -7172,7 +7182,7 @@ def search_all(db,conditions,screen,state=None):
         stored_search['summary']['issues']=list((stored_search['summary'].get('issues') or [])[-8:])
         stored_search['conditions']={k:v for k,v in search.get('conditions',{}).items()
             if k in ('bounds','providers','mode','ward_code','town_codes','auto_task_index',
-                     'auto_task_label','auto_task_identity','auto_task_identities','region_source','providers_after_fallback')}
+                     'auto_task_label','auto_task_identity','auto_task_identities','replace_town_snapshot','_v298_started_at','region_source','providers_after_fallback')}
         db.save_search(stored_search)
     except AppError as exc:
         audit.add('database','save','ERROR',{'stage':'search.history','message':str(exc),'status':search.get('status')})
@@ -19455,6 +19465,51 @@ def _v296_log_bytes(ctx,kind,identity=None):
         recorder.add('export_complete',run_id=run['id'],log_type=kind,duration_ms=round((time.monotonic()-run['start'])*1000,2),phases=run['phases'])
         _V297_LOCAL.run=previous
 
+
+# v298: a completed town/source crawl replaces its previous listing snapshot.
+def _v298_listing_scope(row):
+    key=town_chome_key(row.get('address'))
+    if not key:return None
+    ward,town=key.split('|',1)
+    return ward+'|'+address_key(town_base_name(town))+'|'+listing_source(row)
+
+def _v298_task_scope(region,provider):
+    ward=TOKYO_WARDS.get(str(region.get('code')))
+    town=region.get('suumo_town') or region.get('town')
+    if not ward or not town or provider not in ('SUUMO','CHINTAI'):return None
+    return ward+'|'+address_key(town_base_name(town))+'|'+provider
+
+def _v298_finish_sources(db,conditions,sources,audit,summary,cancelled):
+    if cancelled() or summary.get('unsaved') or summary.get('acquisition_ids_pending'):return []
+    results=[]
+    for source in sources:
+        scope=source.get('scope')
+        if source.get('status')!='completed' or not scope:continue
+        keep=sorted(getattr(db,'_v298_confirmed_scopes',{}).get(scope,set()))
+        deleted=ledger_deleted=0
+        try:
+            for _ in range(20):
+                if cancelled():raise SearchCancelled()
+                result=db.call('POST','rpc/sumai_finish_snapshot_v298',data={
+                    'p_namespace':db.namespace,'p_scope':scope,'p_run':audit.search_id,
+                    'p_started':conditions['_v298_started_at'],'p_keep':keep})
+                if not isinstance(result,dict) or 'deleted' not in result:raise AppError('旧物件の削除結果を確認できません。')
+                deleted+=int(result['deleted']);ledger_deleted+=int(result.get('ledger_deleted',0))
+                if not result.get('cleanup_pending'):break
+            else:raise AppError('旧物件の整理が残っています。次回に再確認します。')
+            item={'scope':scope,'deleted':deleted,'ledger_deleted':ledger_deleted,'retained':len(keep)}
+            results.append(item);audit.add('database','town_snapshot_replaced','INFO',item)
+            if deleted:notify_town_summary_saved(db)
+        except Exception as exc:
+            source['status']='partial'
+            summary['incomplete_tasks']=int(summary.get('incomplete_tasks',0))+1
+            message=str(exc) if isinstance(exc,AppError) else type(exc).__name__
+            summary.setdefault('issues',[]).append('旧物件の整理未完了｜'+scope+'｜'+message)
+            audit.add('database','town_snapshot_cleanup_failed','ERROR',{'scope':scope,'reason':message,'new_listings_retained':True})
+    return results
+
+
+SQL += "\nCREATE OR REPLACE FUNCTION public.sumai_listing_scope_v298(p jsonb)\nRETURNS text LANGUAGE plpgsql IMMUTABLE STRICT SECURITY INVOKER SET search_path='' AS $$\nDECLARE a text; w text; t text; s text;\nBEGIN\n s:=p->>'source';\n IF s IS NULL OR s='' THEN RETURN NULL; END IF;\n a:=regexp_replace(translate(coalesce(p->>'address',''),'０１２３４５６７８９','0123456789'),'[[:space:]\u3000]','','g');\n a:=regexp_replace(a,'^東京都/?','');w:=substring(a from '^([^区]+区)');\n IF w IS NULL THEN RETURN NULL; END IF;\n t:=substring(a from length(w)+1);\n t:=regexp_replace(t,'[0-9一二三四五六七八九十]+丁目.*$','');\n t:=regexp_replace(t,'[0-9].*$','');\n IF t='' THEN RETURN NULL; END IF;\n RETURN w||'|'||t||'|'||s;\nEND $$;\nCREATE INDEX IF NOT EXISTS housing_listing_scope_v298 ON public.housing_searches_v1(namespace,public.sumai_listing_scope_v298(summary->'listing'),id) WHERE status='rental_listing';\nCREATE INDEX IF NOT EXISTS housing_acquisition_listing_v298 ON public.housing_searches_v1(namespace,((summary->>'listing_key'))) WHERE status='rental_acquisition';\nCREATE INDEX IF NOT EXISTS housing_acquisition_cursor_v298 ON public.housing_searches_v1(namespace,id) INCLUDE (finished_at) WHERE status='rental_acquisition';\n\nCREATE OR REPLACE FUNCTION public.sumai_write_listings_v298(p_namespace text,p_rows jsonb,p_ledger jsonb)\nRETURNS jsonb LANGUAGE plpgsql SECURITY INVOKER SET search_path='' AS $$\nDECLARE saved jsonb;\nBEGIN\n IF jsonb_typeof(p_rows)<>'array' OR jsonb_array_length(p_rows)>60 OR jsonb_typeof(p_ledger)<>'array' OR jsonb_array_length(p_ledger)>60 THEN RAISE EXCEPTION 'invalid batch size'; END IF;\n IF EXISTS(SELECT 1 FROM jsonb_array_elements(p_rows) r WHERE r->>'namespace' IS DISTINCT FROM p_namespace OR r->>'status' IS DISTINCT FROM 'rental_listing' OR r->>'id' NOT LIKE 'listing.%') THEN RAISE EXCEPTION 'invalid listing scope'; END IF;\n IF EXISTS(SELECT 1 FROM jsonb_array_elements(p_ledger) r WHERE r->>'namespace' IS DISTINCT FROM p_namespace OR r->>'status' IS DISTINCT FROM 'rental_acquisition') THEN RAISE EXCEPTION 'invalid ledger scope'; END IF;\n WITH upserted AS (\n  INSERT INTO public.housing_searches_v1(namespace,id,status,started_at,finished_at,source,conditions,summary)\n  SELECT r.namespace,r.id,r.status,r.started_at,r.finished_at,r.source,r.conditions,r.summary\n  FROM jsonb_to_recordset(p_rows) AS r(namespace text,id text,status text,started_at timestamptz,finished_at timestamptz,source text,conditions jsonb,summary jsonb)\n  ON CONFLICT(namespace,id) DO UPDATE SET status=excluded.status,started_at=excluded.started_at,finished_at=excluded.finished_at,source=excluded.source,conditions=excluded.conditions,summary=excluded.summary\n  RETURNING id,(xmax=0) AS inserted\n ) SELECT coalesce(jsonb_agg(to_jsonb(upserted)),'[]'::jsonb) INTO saved FROM upserted;\n INSERT INTO public.housing_searches_v1(namespace,id,status,started_at,finished_at,source,conditions,summary)\n SELECT r.namespace,r.id,r.status,r.started_at,r.finished_at,r.source,r.conditions,r.summary\n FROM jsonb_to_recordset(p_ledger) AS r(namespace text,id text,status text,started_at timestamptz,finished_at timestamptz,source text,conditions jsonb,summary jsonb)\n ON CONFLICT(namespace,id) DO UPDATE SET status=excluded.status,started_at=excluded.started_at,finished_at=excluded.finished_at,source=excluded.source,conditions=excluded.conditions,summary=excluded.summary;\n RETURN saved;\nEND $$;\n\nCREATE OR REPLACE FUNCTION public.sumai_finish_snapshot_v298(p_namespace text,p_scope text,p_run text,p_started timestamptz,p_keep text[])\nRETURNS jsonb LANGUAGE plpgsql SECURITY INVOKER SET search_path='' AS $$\nDECLARE current_start timestamptz; matched bigint; removed bigint; ledger_removed bigint; manifest text;\nBEGIN\n IF p_scope !~ '^[^|]+区[|][^|]+[|](SUUMO|CHINTAI)$' OR p_run !~ '^[0-9a-f]{64}$' OR p_started IS NULL OR p_keep IS NULL THEN RAISE EXCEPTION 'invalid snapshot'; END IF;\n PERFORM pg_advisory_xact_lock(hashtextextended(p_namespace||'|'||p_scope,298));\n manifest:='snapshot.v298.'||md5(p_scope);\n SELECT started_at INTO current_start FROM public.housing_searches_v1 WHERE namespace=p_namespace AND id=manifest FOR UPDATE;\n IF current_start>p_started THEN RETURN jsonb_build_object('deleted',0,'newer_snapshot',true); END IF;\n SELECT count(DISTINCT id) INTO matched FROM public.housing_searches_v1\n WHERE namespace=p_namespace AND status='rental_listing' AND id=ANY(p_keep) AND public.sumai_listing_scope_v298(summary->'listing')=p_scope;\n IF matched<>(SELECT count(DISTINCT x) FROM unnest(p_keep) x) THEN RAISE EXCEPTION 'new snapshot readback incomplete'; END IF;\n WITH old AS (\n  SELECT namespace,id FROM public.housing_searches_v1\n  WHERE namespace=p_namespace AND status='rental_listing' AND public.sumai_listing_scope_v298(summary->'listing')=p_scope\n   AND NOT(id=ANY(p_keep))\n   AND CASE WHEN pg_input_is_valid(summary->'listing'->>'fetched_at','timestamp with time zone') THEN (summary->'listing'->>'fetched_at')::timestamptz < p_started ELSE false END\n  ORDER BY id LIMIT 2000 FOR UPDATE\n ), deleted AS (\n  DELETE FROM public.housing_searches_v1 t USING old o WHERE t.namespace=o.namespace AND t.id=o.id RETURNING t.id\n ), deleted_ids AS (\n  DELETE FROM public.housing_searches_v1 a USING deleted d\n  WHERE a.namespace=p_namespace AND a.status='rental_acquisition' AND a.summary->>'listing_key'=substring(d.id from 9)\n  RETURNING a.id\n ) SELECT (SELECT count(*) FROM deleted),(SELECT count(*) FROM deleted_ids) INTO removed,ledger_removed;\n INSERT INTO public.housing_searches_v1(namespace,id,status,started_at,finished_at,conditions,summary)\n VALUES(p_namespace,manifest,'rental_snapshot',p_started,now(),jsonb_build_object('scope',p_scope,'run',p_run),jsonb_build_object('retained',matched,'last_deleted',removed,'cleanup_pending',removed=2000))\n ON CONFLICT(namespace,id) DO UPDATE SET status=excluded.status,started_at=excluded.started_at,finished_at=excluded.finished_at,conditions=excluded.conditions,summary=excluded.summary;\n RETURN jsonb_build_object('deleted',removed,'ledger_deleted',ledger_removed,'retained',matched,'cleanup_pending',removed=2000);\nEND $$;\nREVOKE ALL ON FUNCTION public.sumai_write_listings_v298(text,jsonb,jsonb) FROM PUBLIC,anon,authenticated;\nREVOKE ALL ON FUNCTION public.sumai_finish_snapshot_v298(text,text,text,timestamptz,text[]) FROM PUBLIC,anon,authenticated;\nGRANT EXECUTE ON FUNCTION public.sumai_write_listings_v298(text,jsonb,jsonb) TO service_role;\nGRANT EXECUTE ON FUNCTION public.sumai_finish_snapshot_v298(text,text,text,timestamptz,text[]) TO service_role;\nNOTIFY pgrst,'reload schema';\n"
 
 def main():
     st.set_page_config(page_title='住まいコンパス｜新しい住まいを探す',page_icon='🏡',layout='wide',initial_sidebar_state='collapsed')
