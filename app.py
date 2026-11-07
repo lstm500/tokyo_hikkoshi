@@ -56,7 +56,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v301"
+BUILD = "REBUILD-01-v302"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -19696,8 +19696,27 @@ def _v301_official_location(web,raw,base,query):
     return None
 
 
+# v302: keep ordinary browser Back inside the app and select the existing home tab.
+_V302_BACK_GUARD = '(function(){\'use strict\';\nconst w=window,doc=w.document,flag=\'__sumaiBack302\';\nif(w[flag]){w[flag].arm();return;}\nconst url=w.location.href;\nfunction record(kind,detail){if(w.__sumai297)w.__sumai297.record(kind,detail||{});}\nfunction stamp(kind){const current=w.history.state;return Object.assign({},current&&typeof current===\'object\'?current:{},{__sumai302:kind});}\nfunction arm(){\n try{\n  if(w.history.state&&w.history.state.__sumai302===\'guard\')return;\n  w.history.replaceState(stamp(\'base\'),\'\',url);\n  w.history.pushState(stamp(\'guard\'),\'\',url);\n }catch(e){record(\'back_guard_error\',{name:e.name});}\n}\nfunction home(){\n // Select the existing home tab; do not reload the page or clear saved data.\n const tabs=doc.querySelector(\'[role="tablist"]\'),tab=tabs&&tabs.querySelector(\'[role="tab"]\');\n if(tab){if(tab.getAttribute(\'aria-selected\')!==\'true\')tab.click();}\n else{\n  const group=doc.querySelector(\'.st-key-main_tabs_v297 [role="radiogroup"]\');\n  const radio=group&&group.querySelector(\'input[type="radio"]\');\n  if(radio&&!radio.checked)radio.click();\n }\n doc.querySelectorAll(\'iframe\').forEach(frame=>{try{frame.contentWindow.postMessage({type:\'sumai:back-home-v302\'},w.location.origin)}catch(e){}});\n const scroll=doc.querySelector(\'[data-testid="stAppViewContainer"]\');if(scroll)scroll.scrollTop=0;\n w.scrollTo({top:0,left:0,behavior:\'instant\'});\n record(\'back_to_home\',{strategy:\'stay_in_app\'});\n}\nw[flag]={arm:arm,home:home};\n// Use cancellation where supported. Older browsers use the bounded same-URL\n// history pair below. No window.close, external URL or native minimize call.\nif(w.navigation)w.navigation.addEventListener(\'navigate\',function(event){\n if(event.navigationType===\'traverse\'&&event.cancelable){event.preventDefault();home();}\n});\nw.addEventListener(\'popstate\',function(){home();arm();});\nw.addEventListener(\'pageshow\',arm);\narm();\n})();\n'
+
+def _v302_install_back_guard():
+    # Parent-realm listener survives Streamlit component replacement/reruns.
+    bridge='<script>try{const w=parent;const n=w.document.createElement("script");n.textContent='+json.dumps(_V302_BACK_GUARD).replace('<','\\u003c')+';w.document.head.appendChild(n);n.remove();}catch(e){}</script>'
+    st.components.v1.html(bridge,height=0)
+
+_V302_MAP_BACK = r"""
+window.addEventListener('message',function(event){
+ if(event.source!==window.parent||!event.data||event.data.type!=='sumai:back-home-v302')return;
+ if(state.map)state.map.closePopup();
+ if(state._v211Draft)v211CancelDraft();
+});
+"""
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace("hostMessage('streamlit:componentReady'",_V302_MAP_BACK+"\nhostMessage('streamlit:componentReady'",1)
+
+
 def main():
     st.set_page_config(page_title='住まいコンパス｜新しい住まいを探す',page_icon='🏡',layout='wide',initial_sidebar_state='collapsed')
+    _v302_install_back_guard()
     _v297_run=_v297_begin()
     st.markdown(CSS+'\n<style>[data-stale="true"]{opacity:1!important}</style>',unsafe_allow_html=True)
     st.markdown(f'<div class="hero"><span class="badge">SUMAI COMPASS · {BUILD}</span><h1>次の住まいを、地図から。</h1><p>掲載物件を確認し、家賃と暮らしやすさを比べます。<br>間取りと家賃帯を、取得できた情報で比較します。</p></div>',unsafe_allow_html=True)
