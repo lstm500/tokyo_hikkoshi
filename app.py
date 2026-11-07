@@ -56,7 +56,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v300"
+BUILD = "REBUILD-01-v301"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -19109,6 +19109,9 @@ def _v291_public_web_document(web,query):
                 page,url=_v291_fetch(web,row['url']);name,addresses,text,title=_v291_page_identity(page)
                 alias=_v291_web_alias(query,name,text)
                 if not alias and len(addresses)==1:alias=_v293_context_match(query,name,addresses,row['snippet'])
+                if not (name and addresses and alias):
+                    official=_v301_official_location(web,page,url,query)
+                    if official:return official
                 if name and addresses and alias:page_elements=_v292_geocode_web(web,query,name,addresses,url,alias)
                 else:trace(web,'landmark_web_identity_rejected',{'query':query,'url':url,'name':name,
                     'missing':[k for k,v in [('name',name),('address',addresses),('alias',alias)] if not v]},stage='landmark.web')
@@ -19634,6 +19637,63 @@ def _v212_name_document(web,query,pattern):
     except Exception as exc:
         trace(web,'landmark_branch_supplement_failed',{'query':query,'reason':str(exc)},'WARNING','landmark.name_search')
     return {'elements':[]},{'provider':'地域指定を確認した施設名検索'}
+
+
+# v301: read the page's own site identity and a unique labelled postal address.
+_v301_previous_page_identity=_v291_page_identity
+
+def _v291_page_identity(raw):
+    name,addresses,text,title=_v301_previous_page_identity(raw)
+    soup=BeautifulSoup(raw,'html.parser')
+    if not name:
+        meta=soup.find('meta',attrs={'property':'og:site_name'})
+        site=normal(meta.get('content')) if meta else ''
+        # The title must corroborate the site name. Do not label a generic
+        # access/contact heading as a facility or borrow the user's query.
+        key=_v231_name_key(site)
+        if 3<=len(key)<=100 and key in _v231_name_key(title):name=site
+    if not addresses:
+        main=soup.find('main') or soup.find(attrs={'role':'main'})
+        if main is not None:
+            postal={}
+            for node in main.find_all(['p','dd','td','address']):
+                value=normal(node.get_text(' ',strip=True))
+                if len(value)>600 or not re.search(r'〒\s*[0-9０-９]{3}[-ー－−]?[0-9０-９]{4}|住所|所在地',value):continue
+                value=re.sub(r'\s+','',unicodedata.normalize('NFKC',value))
+                found=_extract_detailed_addresses(value)
+                found+=re.findall(r'東京都[^\s,、。|<>]{1,12}区[^\s,、。|<>]{1,20}?\d+-\d+(?:-\d+)?',value)
+                for address in found:postal[_v291_address_token(address)]=address
+            # Multiple locations on a directory page must stay unresolved.
+            if len(postal)==1:addresses=list(postal.values())
+    return name,addresses,text,title
+
+
+def _v301_official_location(web,raw,base,query):
+    soup=BeautifulSoup(raw,'html.parser')
+    title=soup.title.get_text(' ',strip=True) if soup.title else ''
+    # Follow only an explicitly labelled official-site link on a relevant page.
+    # The destination still has to identify the facility and its own address.
+    if not _v300_name_score(query,title)[0]:return None
+    visited=getattr(web,'_v301_official_visited',None)
+    if visited is None:visited=set();web._v301_official_visited=visited
+    if visited:return None  # At most one supplementary destination per lookup.
+    for link in soup.select('a[href]'):
+        parent=link.parent;label=normal(parent.get_text(' ',strip=True)) if parent else ''
+        if len(label)>700 or not re.search(r'公式(?:サイト|ウェブサイト|ホームページ)|official\s*(?:site|website)',label,re.I):continue
+        target=urljoin(base,link.get('href',''));u=urlparse(target)
+        if u.scheme!='https' or u.hostname==urlparse(base).hostname:continue
+        visited.add(target)
+        try:
+            page,url=_v291_fetch(web,target);name,addresses,text,title=_v291_page_identity(page)
+            if len(addresses)!=1:continue
+            alias=_v293_context_match(query,name,addresses,text)
+            if not alias:continue
+            elements=_v292_geocode_web(web,query,name,addresses,url,alias)
+            if elements:return {'elements':elements},{'provider':'明示された公式サイト＋所在地＋国土地理院'}
+        except Exception as exc:
+            trace(web,'landmark_official_link_failed',{'url':target,'reason':str(exc)},'WARNING','landmark.web')
+        break
+    return None
 
 
 def main():
