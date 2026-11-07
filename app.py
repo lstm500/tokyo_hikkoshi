@@ -56,7 +56,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v298"
+BUILD = "REBUILD-01-v300"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -13409,7 +13409,7 @@ def _v207_search_landmarks(data,audit=None):
                 lat,lng=float(point['lat']),float(point['lon'])
                 if not name or not (math.isfinite(lat) and math.isfinite(lng) and 35.45<=lat<=35.95 and 139.4<=lng<=140.05):continue
                 aliases=[name]+[normal(tags.get(k)) for k in ('name:ja','name','alt_name','short_name') if tags.get(k)]
-                score,match_kind=max((_v288_name_match(query,n) for n in aliases),key=lambda pair:pair[0])
+                score,match_kind=max((_v300_name_score(query,n) for n in aliases),key=lambda pair:pair[0])
                 if not score and tags.get('web_name_verified') is True and _v231_name_key(tags.get('web_query_alias'))==_v231_name_key(query):
                     score,match_kind=.9,'similar'
                 if not score and tags.get('web_location_match') is True and _v231_name_key(tags.get('web_query_alias'))==_v231_name_key(query):
@@ -13419,6 +13419,10 @@ def _v207_search_landmarks(data,audit=None):
                 address=normal(tags.get('addr:full'))
                 if not address:
                     address=''.join(normal(tags.get(k)) for k in ('addr:province','addr:city','addr:suburb','addr:quarter','addr:neighbourhood','addr:street','addr:block_number','addr:housenumber'))
+                location_ok,location_basis=_v300_location_match(query,name,address,lat,lng)
+                if not location_ok:
+                    trace(web,'landmark_candidate_rejected',{'query':query,'name':name,'address':address,'reason':location_basis},stage='landmark.result');continue
+                if _v300_query_context(query)[1]:score,match_kind=max(score,.95),'name_and_location'
                 key=(name,round(lat,5),round(lng,5))
                 if key in seen:continue
                 seen.add(key);reply['candidates'].append({'name':name,'title':name,'address':address[:180],
@@ -19067,6 +19071,7 @@ def _v292_snippet_identity(row,query):
 def _v292_geocode_web(web,query,name,addresses,url,alias,snippet=False):
     elements=[]
     for address in addresses[:2]:
+        if _v300_query_context(query)[1] and not _v300_location_match(query,name,address)[0]:continue
         doc,info=_v208_landmark_json(web,'https://msearch.gsi.go.jp/address-search/AddressSearch',{'q':address},'web_address_lookup')
         if not isinstance(doc,list):continue
         for point in doc:
@@ -19510,6 +19515,126 @@ def _v298_finish_sources(db,conditions,sources,audit,summary,cancelled):
 
 
 SQL += "\nCREATE OR REPLACE FUNCTION public.sumai_listing_scope_v298(p jsonb)\nRETURNS text LANGUAGE plpgsql IMMUTABLE STRICT SECURITY INVOKER SET search_path='' AS $$\nDECLARE a text; w text; t text; s text;\nBEGIN\n s:=p->>'source';\n IF s IS NULL OR s='' THEN RETURN NULL; END IF;\n a:=regexp_replace(translate(coalesce(p->>'address',''),'０１２３４５６７８９','0123456789'),'[[:space:]\u3000]','','g');\n a:=regexp_replace(a,'^東京都/?','');w:=substring(a from '^([^区]+区)');\n IF w IS NULL THEN RETURN NULL; END IF;\n t:=substring(a from length(w)+1);\n t:=regexp_replace(t,'[0-9一二三四五六七八九十]+丁目.*$','');\n t:=regexp_replace(t,'[0-9].*$','');\n IF t='' THEN RETURN NULL; END IF;\n RETURN w||'|'||t||'|'||s;\nEND $$;\nCREATE INDEX IF NOT EXISTS housing_listing_scope_v298 ON public.housing_searches_v1(namespace,public.sumai_listing_scope_v298(summary->'listing'),id) WHERE status='rental_listing';\nCREATE INDEX IF NOT EXISTS housing_acquisition_listing_v298 ON public.housing_searches_v1(namespace,((summary->>'listing_key'))) WHERE status='rental_acquisition';\nCREATE INDEX IF NOT EXISTS housing_acquisition_cursor_v298 ON public.housing_searches_v1(namespace,id) INCLUDE (finished_at) WHERE status='rental_acquisition';\n\nCREATE OR REPLACE FUNCTION public.sumai_write_listings_v298(p_namespace text,p_rows jsonb,p_ledger jsonb)\nRETURNS jsonb LANGUAGE plpgsql SECURITY INVOKER SET search_path='' AS $$\nDECLARE saved jsonb;\nBEGIN\n IF jsonb_typeof(p_rows)<>'array' OR jsonb_array_length(p_rows)>60 OR jsonb_typeof(p_ledger)<>'array' OR jsonb_array_length(p_ledger)>60 THEN RAISE EXCEPTION 'invalid batch size'; END IF;\n IF EXISTS(SELECT 1 FROM jsonb_array_elements(p_rows) r WHERE r->>'namespace' IS DISTINCT FROM p_namespace OR r->>'status' IS DISTINCT FROM 'rental_listing' OR r->>'id' NOT LIKE 'listing.%') THEN RAISE EXCEPTION 'invalid listing scope'; END IF;\n IF EXISTS(SELECT 1 FROM jsonb_array_elements(p_ledger) r WHERE r->>'namespace' IS DISTINCT FROM p_namespace OR r->>'status' IS DISTINCT FROM 'rental_acquisition') THEN RAISE EXCEPTION 'invalid ledger scope'; END IF;\n WITH upserted AS (\n  INSERT INTO public.housing_searches_v1(namespace,id,status,started_at,finished_at,source,conditions,summary)\n  SELECT r.namespace,r.id,r.status,r.started_at,r.finished_at,r.source,r.conditions,r.summary\n  FROM jsonb_to_recordset(p_rows) AS r(namespace text,id text,status text,started_at timestamptz,finished_at timestamptz,source text,conditions jsonb,summary jsonb)\n  ON CONFLICT(namespace,id) DO UPDATE SET status=excluded.status,started_at=excluded.started_at,finished_at=excluded.finished_at,source=excluded.source,conditions=excluded.conditions,summary=excluded.summary\n  RETURNING id,(xmax=0) AS inserted\n ) SELECT coalesce(jsonb_agg(to_jsonb(upserted)),'[]'::jsonb) INTO saved FROM upserted;\n INSERT INTO public.housing_searches_v1(namespace,id,status,started_at,finished_at,source,conditions,summary)\n SELECT r.namespace,r.id,r.status,r.started_at,r.finished_at,r.source,r.conditions,r.summary\n FROM jsonb_to_recordset(p_ledger) AS r(namespace text,id text,status text,started_at timestamptz,finished_at timestamptz,source text,conditions jsonb,summary jsonb)\n ON CONFLICT(namespace,id) DO UPDATE SET status=excluded.status,started_at=excluded.started_at,finished_at=excluded.finished_at,source=excluded.source,conditions=excluded.conditions,summary=excluded.summary;\n RETURN saved;\nEND $$;\n\nCREATE OR REPLACE FUNCTION public.sumai_finish_snapshot_v298(p_namespace text,p_scope text,p_run text,p_started timestamptz,p_keep text[])\nRETURNS jsonb LANGUAGE plpgsql SECURITY INVOKER SET search_path='' AS $$\nDECLARE current_start timestamptz; matched bigint; removed bigint; ledger_removed bigint; manifest text;\nBEGIN\n IF p_scope !~ '^[^|]+区[|][^|]+[|](SUUMO|CHINTAI)$' OR p_run !~ '^[0-9a-f]{64}$' OR p_started IS NULL OR p_keep IS NULL THEN RAISE EXCEPTION 'invalid snapshot'; END IF;\n PERFORM pg_advisory_xact_lock(hashtextextended(p_namespace||'|'||p_scope,298));\n manifest:='snapshot.v298.'||md5(p_scope);\n SELECT started_at INTO current_start FROM public.housing_searches_v1 WHERE namespace=p_namespace AND id=manifest FOR UPDATE;\n IF current_start>p_started THEN RETURN jsonb_build_object('deleted',0,'newer_snapshot',true); END IF;\n SELECT count(DISTINCT id) INTO matched FROM public.housing_searches_v1\n WHERE namespace=p_namespace AND status='rental_listing' AND id=ANY(p_keep) AND public.sumai_listing_scope_v298(summary->'listing')=p_scope;\n IF matched<>(SELECT count(DISTINCT x) FROM unnest(p_keep) x) THEN RAISE EXCEPTION 'new snapshot readback incomplete'; END IF;\n WITH old AS (\n  SELECT namespace,id FROM public.housing_searches_v1\n  WHERE namespace=p_namespace AND status='rental_listing' AND public.sumai_listing_scope_v298(summary->'listing')=p_scope\n   AND NOT(id=ANY(p_keep))\n   AND CASE WHEN pg_input_is_valid(summary->'listing'->>'fetched_at','timestamp with time zone') THEN (summary->'listing'->>'fetched_at')::timestamptz < p_started ELSE false END\n  ORDER BY id LIMIT 2000 FOR UPDATE\n ), deleted AS (\n  DELETE FROM public.housing_searches_v1 t USING old o WHERE t.namespace=o.namespace AND t.id=o.id RETURNING t.id\n ), deleted_ids AS (\n  DELETE FROM public.housing_searches_v1 a USING deleted d\n  WHERE a.namespace=p_namespace AND a.status='rental_acquisition' AND a.summary->>'listing_key'=substring(d.id from 9)\n  RETURNING a.id\n ) SELECT (SELECT count(*) FROM deleted),(SELECT count(*) FROM deleted_ids) INTO removed,ledger_removed;\n INSERT INTO public.housing_searches_v1(namespace,id,status,started_at,finished_at,conditions,summary)\n VALUES(p_namespace,manifest,'rental_snapshot',p_started,now(),jsonb_build_object('scope',p_scope,'run',p_run),jsonb_build_object('retained',matched,'last_deleted',removed,'cleanup_pending',removed=2000))\n ON CONFLICT(namespace,id) DO UPDATE SET status=excluded.status,started_at=excluded.started_at,finished_at=excluded.finished_at,conditions=excluded.conditions,summary=excluded.summary;\n RETURN jsonb_build_object('deleted',removed,'ledger_deleted',ledger_removed,'retained',matched,'cleanup_pending',removed=2000);\nEND $$;\nREVOKE ALL ON FUNCTION public.sumai_write_listings_v298(text,jsonb,jsonb) FROM PUBLIC,anon,authenticated;\nREVOKE ALL ON FUNCTION public.sumai_finish_snapshot_v298(text,text,text,timestamptz,text[]) FROM PUBLIC,anon,authenticated;\nGRANT EXECUTE ON FUNCTION public.sumai_write_listings_v298(text,jsonb,jsonb) TO service_role;\nGRANT EXECUTE ON FUNCTION public.sumai_finish_snapshot_v298(text,text,text,timestamptz,text[]) TO service_role;\nNOTIFY pgrst,'reload schema';\n"
+
+# v299: bounded, indexed cleanup; compatible with v298 clients.
+SQL += "\nCREATE OR REPLACE FUNCTION public.sumai_finish_snapshot_v298(p_namespace text,p_scope text,p_run text,p_started timestamptz,p_keep text[])\nRETURNS jsonb LANGUAGE plpgsql SECURITY INVOKER SET search_path='' AS $$\nDECLARE current_start timestamptz; matched bigint; removed bigint; ledger_removed bigint:=0; manifest text; old_ids text[]; old_id text; affected bigint;\nBEGIN\n IF p_scope !~ '^[^|]+区[|][^|]+[|](SUUMO|CHINTAI)$' OR p_run !~ '^[0-9a-f]{64}$' OR p_started IS NULL OR p_keep IS NULL THEN RAISE EXCEPTION 'invalid snapshot'; END IF;\n PERFORM pg_advisory_xact_lock(hashtextextended(p_namespace||'|'||p_scope,298));\n manifest:='snapshot.v298.'||md5(p_scope);\n SELECT started_at INTO current_start FROM public.housing_searches_v1 WHERE namespace=p_namespace AND id=manifest FOR UPDATE;\n IF current_start>p_started THEN RETURN jsonb_build_object('deleted',0,'newer_snapshot',true); END IF;\n SELECT count(DISTINCT id) INTO matched FROM public.housing_searches_v1\n WHERE namespace=p_namespace AND status='rental_listing' AND id=ANY(p_keep) AND public.sumai_listing_scope_v298(summary->'listing')=p_scope;\n IF matched<>(SELECT count(DISTINCT x) FROM unnest(p_keep) x) THEN RAISE EXCEPTION 'new snapshot readback incomplete'; END IF;\n -- Bound the transaction and use exact indexed lookups for acquisition rows.\n SELECT coalesce(array_agg(id),ARRAY[]::text[]) INTO old_ids FROM (\n  SELECT id FROM public.housing_searches_v1\n  WHERE namespace=p_namespace AND status='rental_listing' AND public.sumai_listing_scope_v298(summary->'listing')=p_scope\n   AND NOT(id=ANY(p_keep))\n   AND CASE WHEN pg_input_is_valid(summary->'listing'->>'fetched_at','timestamp with time zone') THEN (summary->'listing'->>'fetched_at')::timestamptz < p_started ELSE false END\n  ORDER BY id LIMIT 100 FOR UPDATE\n ) candidates;\n FOREACH old_id IN ARRAY old_ids LOOP\n  DELETE FROM public.housing_searches_v1\n  WHERE namespace=p_namespace AND status='rental_acquisition' AND summary->>'listing_key'=substring(old_id from 9);\n  GET DIAGNOSTICS affected=ROW_COUNT;\n  ledger_removed:=ledger_removed+affected;\n END LOOP;\n DELETE FROM public.housing_searches_v1 WHERE namespace=p_namespace AND status='rental_listing' AND id=ANY(old_ids);\n GET DIAGNOSTICS removed=ROW_COUNT;\n INSERT INTO public.housing_searches_v1(namespace,id,status,started_at,finished_at,conditions,summary)\n VALUES(p_namespace,manifest,'rental_snapshot',p_started,now(),jsonb_build_object('scope',p_scope,'run',p_run),jsonb_build_object('retained',matched,'last_deleted',removed,'cleanup_pending',removed=100))\n ON CONFLICT(namespace,id) DO UPDATE SET status=excluded.status,started_at=excluded.started_at,finished_at=excluded.finished_at,conditions=excluded.conditions,summary=excluded.summary;\n RETURN jsonb_build_object('deleted',removed,'ledger_deleted',ledger_removed,'retained',matched,'cleanup_pending',removed=100);\nEND $$;\n\nNOTIFY pgrst,'reload schema';\n"
+
+# v300: separate branch location from brand; never substitute another area's branch.
+def _v300_query_context(query):
+    q=normal(unicodedata.normalize('NFKC',str(query or '')))
+    # Longest known station/ward suffix first; an English brand may contain spaces.
+    places=sorted(set(STATIONS)|set(TOKYO_WARDS.values()),key=len,reverse=True)
+    for place in places:
+        match=re.search(re.escape(place)+r'(?:駅)?(?:東口|西口|南口|北口)?(?:本店|支店|店)?$',q)
+        if match:
+            brand=q[:match.start()].strip(' ・_-　')
+            if len(_v231_name_key(brand))>=2:return brand,place
+    return q,''
+
+
+def _v300_brand_key(value):
+    # A brand spelling alias, without storing branch addresses or coordinates.
+    return re.sub(r'boxing[\s_-]*club','ボクシングクラブ',unicodedata.normalize('NFKC',str(value)),flags=re.I)
+
+
+def _v300_name_score(query,name):
+    brand,place=_v300_query_context(query)
+    if not place:return _v288_name_match(query,name)
+    return _v288_name_match(_v300_brand_key(brand),_v300_brand_key(name))
+
+
+def _v300_location_match(query,name,address,lat=None,lng=None):
+    brand,place=_v300_query_context(query)
+    if not place:return True,'not_specified'
+    if not _v300_name_score(query,name)[0]:return False,'brand_mismatch'
+    named_place=_v300_query_context(name)[1]
+    if place in STATIONS and named_place in STATIONS and named_place!=place:
+        return False,'different_branch'
+    evidence=_v231_name_key(name+' '+address)
+    # Body text/navigation can list every branch and is not location evidence.
+    textual=_v231_name_key(place) in evidence
+    distance=None
+    if place in STATIONS and lat is not None and lng is not None:
+        a,b=STATIONS[place];x=math.radians(float(lat)-a);y=math.radians(float(lng)-b)
+        h=math.sin(x/2)**2+math.cos(math.radians(a))*math.cos(math.radians(float(lat)))*math.sin(y/2)**2
+        distance=6371000*2*math.asin(math.sqrt(min(1.,h)))
+    if textual and (distance is None or distance<=5000):return True,'name_or_address'
+    if distance is not None and distance<=2000:return True,'station_proximity'
+    return False,'location_mismatch'
+
+
+_v300_previous_context_match=_v293_context_match
+
+def _v293_context_match(query,name,addresses,context):
+    brand,place=_v300_query_context(query)
+    if not place:return _v300_previous_context_match(query,name,addresses,context)
+    # Evaluate each address independently; a footer/other branch cannot lend its address.
+    if any(_v300_location_match(query,name,a)[0] for a in addresses):return 'name_and_location_context'
+    return ''
+
+
+_v300_previous_web_alias=_v291_web_alias
+
+def _v291_web_alias(query,name,text):
+    if _v300_query_context(query)[1]:return ''  # Require address context before geocoding.
+    return _v300_previous_web_alias(query,name,text)
+
+
+_v300_previous_page_identity=_v291_page_identity
+
+def _v291_page_identity(raw):
+    name,addresses,text,title=_v300_previous_page_identity(raw)
+    soup=BeautifulSoup(raw,'html.parser')
+    heading=soup.find('h1')
+    branch=normal(heading.get_text(' ',strip=True)) if heading else ''
+    if len(branch)<=100 and _v300_query_context(branch)[1] and _v300_name_score(branch,name)[0]:name=branch
+    if addresses:return name,addresses,text,title
+    # Read labelled address sections, stopping at the next section, never the footer.
+    for heading in soup.find_all(['h1','h2','h3','h4','h5']):
+        label=_v231_name_key(heading.get_text(' ',strip=True))
+        if label not in ('住所','所在地','アドレス','address','addressアドレス','所在地住所'):continue
+        parts=[]
+        for sibling in heading.next_siblings:
+            if getattr(sibling,'name',None) in ('h1','h2','h3','h4','h5','footer','nav','section'):break
+            value=sibling.get_text(' ',strip=True) if hasattr(sibling,'get_text') else str(sibling)
+            parts.append(value)
+            if sum(map(len,parts))>1500:break
+        value=unicodedata.normalize('NFKC',' '.join(parts));value=re.sub(r'\s+','',value)
+        found=_extract_detailed_addresses(value)
+        found+=re.findall(r'東京都[^\s,、。|<>]{1,12}区[^\s,、。|<>]{1,20}?\d+-\d+(?:-\d+)?',value)
+        addresses.extend(found)
+    return name,list(dict.fromkeys(addresses)),text,title
+
+
+_v300_previous_name_document=_v212_name_document
+
+def _v212_name_document(web,query,pattern):
+    brand,place=_v300_query_context(query)
+    if not place:return _v300_previous_name_document(web,query,pattern)
+    lookup=brand+' '+place
+    trace(web,'landmark_branch_query',{'query':query,'brand':brand,'location':place,'lookup':lookup},stage='landmark.name_search')
+    def filtered(result):
+        if not result:return None
+        doc,info=result;accepted=[]
+        for element in doc.get('elements',[]):
+            tags=element.get('tags') or {};point=element.get('center') or element
+            name=normal(tags.get('name:ja') or tags.get('name'));address=normal(tags.get('addr:full'))
+            ok,basis=_v300_location_match(query,name,address,point.get('lat'),point.get('lon'))
+            trace(web,'landmark_branch_decision',{'query':query,'name':name,'address':address,'accepted':ok,'basis':basis},stage='landmark.result')
+            if ok:accepted.append(element)
+        return ({'elements':accepted},info) if accepted else None
+    result=filtered(_v300_previous_name_document(web,lookup,pattern))
+    if result:return result
+    # An unrelated branch is not a successful lookup. Continue complementary providers.
+    result=filtered(_v216_web_document(web,lookup))
+    if result:return result
+    try:
+        result=filtered(_v212_photon_document(web,brand))
+        if result:return result
+    except Exception as exc:
+        trace(web,'landmark_branch_supplement_failed',{'query':query,'reason':str(exc)},'WARNING','landmark.name_search')
+    return {'elements':[]},{'provider':'地域指定を確認した施設名検索'}
+
 
 def main():
     st.set_page_config(page_title='住まいコンパス｜新しい住まいを探す',page_icon='🏡',layout='wide',initial_sidebar_state='collapsed')
