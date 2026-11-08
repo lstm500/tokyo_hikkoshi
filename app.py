@@ -56,7 +56,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v302"
+BUILD = "REBUILD-01-v303"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -1061,6 +1061,7 @@ def compact_saved_listing(row):
             if parsed_stamp.tzinfo is None:return None
             stamp=parsed_stamp.astimezone(timezone.utc).isoformat(timespec='seconds')
         result={'source':listing_source(row),'rent':int(round(float(rent))),'layout':layout,'address':address[:220],'dwelling_type':dwelling_type,'fetched_at':stamp or None}
+        if _v303_is_rc(row.get('structure')):result['structure']='RC'
         property_id=row.get('property_id')
         if isinstance(property_id,str) and re.fullmatch(r'(?:SUUMO:(?:bc|jnc):\d+|CHINTAI:bk:[A-Za-z0-9_-]+)',property_id):result['property_id']=property_id
         return result
@@ -1411,7 +1412,7 @@ class Database:
                     if not compact.get('fetched_at') and stamps.get(key):compact['fetched_at']=stamps[key]
             payload=[dict(namespace=self.namespace,id='listing.'+storage_keys[key],source=compact['source'],status='rental_listing',started_at=utc_now(),finished_at=None,
                 conditions={'record_type':'rental_listing','schema':8 if key in v150_keys else 7,
-                            'fields':['source','property_id','rent','layout','address','dwelling_type','fetched_at'],
+                            'fields':['source','property_id','rent','layout','address','dwelling_type','fetched_at','structure'],
                             'source':compact['source'],'address_origin':('chintai_published_town_chome' if compact['source']=='CHINTAI' else 'suumo_source_or_map_town_chome' if key in v150_keys else 'legacy_provider_mapping'),
                             'map_granularity':'town_chome' if key in v150_keys else 'street_number'},
                 summary={'listing':compact}) for key,compact in batch]
@@ -1455,6 +1456,7 @@ class Database:
                     got.get('layout')!=expected.get('layout') or
                     got.get('rent')!=expected.get('rent') or
                     got.get('property_id')!=expected.get('property_id') or
+                    (expected.get('structure')=='RC' and got.get('structure')!='RC') or
                     canonical_provider(got.get('source'))!=expected['source'] or
                     item.get('source')!=expected['source'] or
                     not town_chome_key(got.get('address'))):
@@ -3858,6 +3860,7 @@ def suumo_prepare_region(web,region):
 def suumo_group_params(prepared,layouts,page=1):
     params=dict(prepared['base_params'])
     params['ts']=SUUMO_BUILDING_TYPE_CODES['マンション']  # 建物の種類：マンション（アパートは除外）
+    params['kz']='1'  # Provider iron-reinforced family; exact RC checked in detail.
     params['cn']='25'                # 築年数：25年以内
     # Prefer the site's currently observed public form values when available.
     # Never omit the 1R/1K/1DK codes added to the same verified layout set.
@@ -5826,6 +5829,13 @@ def suumo_collect(web,region,bounds,munis,emit):
                     begin_listing(web,'SUUMO',url)
                     if not web.permitted(url):raise AppError('SUUMO詳細ページの自動取得が許可されていません。')
                     detail_reply=web.fetch(url);detail=BeautifulSoup(detail_reply.text,'html.parser');fields=suumo_detail_fields(detail)
+                    raw_structure=fields.get('raw_structure','')
+                    if not _v303_is_rc(raw_structure):
+                        reject_listing(web,'SUUMO',url,'detail.structure','condition' if _v303_structure_known(raw_structure) else 'missing_data','RC（鉄筋コンクリート）と確認できません',raw_structure,'RC')
+                        emit('rejected',1)
+                        if not _v303_structure_known(raw_structure):emit('incomplete',1)
+                        return
+                    trace(web,'structure_verified',{'provider':'SUUMO','url':url,'raw':raw_structure,'required':'RC'},stage='search_conditions')
                     original_name=fields.get('building_name','')
                     fields['building_name']=_v140_choose_suumo_name(original_name,card_hint)
                     if original_name!=fields['building_name']:
@@ -5854,7 +5864,7 @@ def suumo_collect(web,region,bounds,munis,emit):
                             '掲載所在地または物件マーカーから町丁目・正式町名を特定');emit('rejected',1);return
 
                     # Rent, layout, inferred address and acquisition time survive Database.save_units().
-                    row=partial_listing('SUUMO',url,'SUUMO掲載募集',address,layout,rent,None,None,region,bounds,location,None,age,ym,'')
+                    row=partial_listing('SUUMO',url,'SUUMO掲載募集',address,layout,rent,None,None,region,bounds,location,raw_structure,age,ym,'')
                     if not row:reject_listing(web,'SUUMO',url,'listing.validation','invalid_data','保存必須項目の検証を通らない',{'rent':rent,'layout':layout,'address':address,'location':location},'有効な家賃・間取り・地図で使える町丁目・物件URL');emit('rejected',1);return
                     row['property_id']=suumo_property_id(url)
                     row['address_source']=location['location_method'];row['address_quality_version']=4
@@ -5894,7 +5904,7 @@ def suumo_collect(web,region,bounds,munis,emit):
 
 def suumo_house_collect(web,region,bounds,munis,emit):
     """SUUMO third building-type category: house/other, <=40y, >=50 sqm."""
-    prepared=suumo_prepare_region(web,region);filter_params=dict(prepared['base_params']);filter_params.update(SUUMO_HOUSE_PARAMS)
+    prepared=suumo_prepare_region(web,region);filter_params=dict(prepared['base_params']);filter_params.update(SUUMO_HOUSE_PARAMS);filter_params['kz']='1'
     current_url=prepared['url'];current_params=filter_params;seen_pages=set();seen_urls=set();seen_ids=set();list_type_by_url={};list_name_by_url={};list_age_by_url={};page_number=1;found=0
     collection_towns=[town_base_name(region.get('town',''))];scope=dict(getattr(DIAG_CONTEXT,'scope',{}))
     emit('message','SUUMO条件4｜一戸建て・その他（アパート除外）｜築40年以内｜50㎡以上')
@@ -5962,6 +5972,12 @@ def suumo_house_collect(web,region,bounds,munis,emit):
                     begin_listing(web,'SUUMO',url)
                     if not web.permitted(url):raise AppError('SUUMO一戸建て詳細ページの自動取得が許可されていません。')
                     detail_reply=web.fetch(url);detail=BeautifulSoup(detail_reply.text,'html.parser');fields=suumo_detail_fields(detail)
+                    raw_structure=fields.get('raw_structure','')
+                    if not _v303_is_rc(raw_structure):
+                        reject_listing(web,'SUUMO',url,'detail.structure','condition' if _v303_structure_known(raw_structure) else 'missing_data','RC（鉄筋コンクリート）と確認できません',raw_structure,'RC')
+                        emit('rejected',1)
+                        if not _v303_structure_known(raw_structure):emit('incomplete',1)
+                        return
                     fields['building_name']=_v140_choose_suumo_name(fields.get('building_name',''),list_name_by_url.get(url,''))
                     if age_info(fields['raw_age'])[0] is None and age_info(list_age_by_url.get(url,''))[0] is not None:
                         fields['raw_age']=list_age_by_url[url]
@@ -5993,7 +6009,7 @@ def suumo_house_collect(web,region,bounds,munis,emit):
                         reject_listing(web,'SUUMO',url,'address.town_chome','location_failure',
                             '一戸建ての掲載所在地・物件マーカーから町丁目・正式町名を特定できない',location,
                             '地図上の町丁目');emit('rejected',1);return
-                    row=partial_listing('SUUMO',url,'SUUMO一戸建て掲載募集',address,layout,rent,None,area,region,bounds,location,'一戸建て',age,ym,'',dwelling_type='house')
+                    row=partial_listing('SUUMO',url,'SUUMO一戸建て掲載募集',address,layout,rent,None,area,region,bounds,location,raw_structure,age,ym,'',dwelling_type='house')
                     if not row:
                         reject_listing(web,'SUUMO',url,'listing.validation','invalid_data','一戸建ての保存必須項目の検証を通らない',{'rent':rent,'layout':layout,'area':area,'address':address},'家賃・間取り・50㎡以上・地図で使える町丁目');emit('rejected',1);return
                     row['property_id']=suumo_property_id(url);row['address_source']=location['location_method'];row['address_quality_version']=4;emit('unit',row)
@@ -6564,6 +6580,10 @@ def _v232_chintai_detail(web,url,region,bounds,munis,layouts=None):
     def field(*names):return next((fields[name] for name in names if fields.get(name)), '')
     def reject(stage,reason,observed):
         return reject_listing(web,'CHINTAI',url,stage,'condition_or_missing_data',reason,observed,'町丁目・家賃・対象間取り・建物種別・築年数の確認')
+    raw_structure=field('構造','建物構造','種別/構造')
+    if not _v303_structure_known(raw_structure):raise AppError('CHINTAIの構造欄を読めません。RC限定の取得を未完了として前回データを保持します。')
+    if not _v303_is_rc(raw_structure):return reject('detail.structure','RC（鉄筋コンクリート）ではありません',raw_structure)
+    trace(web,'structure_verified',{'provider':'CHINTAI','url':url,'raw':raw_structure,'required':'RC'},stage='search_conditions')
     raw_address=field('住所','所在地')
     # Requested town is a collection entry, never the saved property's address.
     # Keep the selected municipality boundary, but use the listing's actual town.
@@ -6602,7 +6622,7 @@ def _v232_chintai_detail(web,url,region,bounds,munis,layouts=None):
     heading=soup.select_one('h1')
     title=heading.get_text(' ',strip=True) if heading else 'CHINTAI掲載物件'
     row=partial_listing('CHINTAI',url,title,address,layout,rent,None,None,region,bounds,location,
-                        field('構造'),age,ym,field('物件階層'),dwelling_type='house' if house else 'mansion')
+                        raw_structure,age,ym,field('物件階層'),dwelling_type='house' if house else 'mansion')
     if row:
         row.update(property_id=pid,source='CHINTAI',address_quality_version=4)
         trace(web,'chintai_detail_accepted',{'property_id':pid,'source':'CHINTAI','address':address,
@@ -6671,8 +6691,8 @@ def chintai_collect(web,region,bounds,munis,emit):
     # Verified against CHINTAI's public search controls: b=2 mansion, b=3
     # house/terrace, h=7 <=25 years, sf=50 >=50 m2. No <=40-year option
     # exists, so houses retain their existing detail-level <=40-year check.
-    searches=(('mansion','マンション・築25年以内',{'b':'2','h':'7','sf':'0'}),
-              ('house','一戸建て・50㎡以上',{'b':'3','h':'99','sf':'50'}))
+    searches=(('mansion','マンション・築25年以内',{'b':'2','h':'7','sf':'0','kz':'1'}),
+              ('house','一戸建て・50㎡以上',{'b':'3','h':'99','sf':'50','kz':'1'}))
     seen_ids=set()
     for kind,label,params in searches:
         web.check_cancel()
@@ -6748,6 +6768,7 @@ def search_all(db,conditions,screen,state=None):
     search=dict(id=audit.search_id,status='started',
                 started_at=utc_now(),finished_at=None,conditions=conditions,summary={})
     units={};saved=set();issues=[];warnings=[];logs=[];acquisition_pending={};q=None;provider_fallbacks=[]
+    conditions['structure_filter']='RC';conditions['collection_policy']='rc_v303'
     conditions['replace_town_snapshot']=True
     conditions['_v298_started_at']=search['started_at']
     db._v298_run_id=audit.search_id;db._v298_confirmed_scopes={}
@@ -7182,7 +7203,7 @@ def search_all(db,conditions,screen,state=None):
         stored_search['summary']['issues']=list((stored_search['summary'].get('issues') or [])[-8:])
         stored_search['conditions']={k:v for k,v in search.get('conditions',{}).items()
             if k in ('bounds','providers','mode','ward_code','town_codes','auto_task_index',
-                     'auto_task_label','auto_task_identity','auto_task_identities','replace_town_snapshot','_v298_started_at','region_source','providers_after_fallback')}
+                     'auto_task_label','auto_task_identity','auto_task_identities','structure_filter','collection_policy','replace_town_snapshot','_v298_started_at','region_source','providers_after_fallback')}
         db.save_search(stored_search)
     except AppError as exc:
         audit.add('database','save','ERROR',{'stage':'search.history','message':str(exc),'status':search.get('status')})
@@ -7302,7 +7323,7 @@ class AuditLog:
         self._persisted_fault_samples=0
         self._persisted_db_fault_samples=0
         self._persisted_start=False
-        self.add('search','start','INFO',{'build':BUILD,'bounds':conditions.get('bounds'),'providers':conditions.get('providers'),'filters':{'structure':None,'max_age':None,'layouts':list(LAYOUTS),'suumo':{'mansion':{'max_age':25,'layout_groups':[list(x) for x in SUUMO_LAYOUT_GROUPS]},'house':{'max_age':40,'min_area_sqm':50}}},'property_limit':None})
+        self.add('search','start','INFO',{'build':BUILD,'bounds':conditions.get('bounds'),'providers':conditions.get('providers'),'filters':{'structure':'RC','max_age':None,'layouts':list(LAYOUTS),'suumo':{'mansion':{'max_age':25,'layout_groups':[list(x) for x in SUUMO_LAYOUT_GROUPS]},'house':{'max_age':40,'min_area_sqm':50}}},'property_limit':None})
     def clean(self,value):
         if isinstance(value,dict):return {str(k):('[REDACTED]' if re.search(r'^(?:key|apikey|api_key|token|access_token|authorization|cookie|password|secret|SUPABASE_.*KEY)$',str(k),re.I) else self.clean(v)) for k,v in value.items()}
         if isinstance(value,(list,tuple)):return [self.clean(x) for x in value]
@@ -10079,15 +10100,15 @@ def start_automatic_collection(ward_codes,interval_minutes=0,town_codes=None,*,r
             prior_wards=[];prior_filters={}
         same_scope=(prior_wards==wards and prior_filters==filters)
         summary=dict(previous_summary) if same_scope and not restart_all else {}
-        if same_scope and not restart_all and summary.get('layout_collection_revision')!='studio_1r_1k_1dk_v174':
-            # Layout coverage expanded: formerly completed towns did not search
-            # 1R/1K/1DK. Revisit each town once without deleting saved listings.
+        if same_scope and not restart_all and summary.get('layout_collection_revision')!='studio_1r_1k_1dk_rc_v303':
+            # RC policy changed: previously completed towns have not been verified
+            # under the RC-only rule. Revisit once, retaining data until success.
             for progress_key in ('cycle_completed_indices','cycle_attempted_indices',
                                  'incomplete_task_indices'):
                 summary[progress_key]=[]
             summary['next_task_index']=0
             summary.pop('cycle_reset_pending',None)
-        summary['layout_collection_revision']='studio_1r_1k_1dk_v174'
+        summary['layout_collection_revision']='studio_1r_1k_1dk_rc_v303'
         if same_scope and not restart_all:
             # Preserve attempted/failed markers so a restart does not hammer the
             # same incomplete town when other towns were never attempted.
@@ -10349,7 +10370,7 @@ def automatic_collection_panel():
     st.caption('取得順：'+(' → '.join(TOKYO_WARDS[code] for code in collection_wards) if collection_wards else '区を選択してください'))
     st.markdown('**2. 取得条件**')
     st.multiselect('取得元',list(PROVIDER_OPTIONS),default=_v232_enabled_providers(saved.get('providers') or AUTOMATIC_REGION_PROVIDERS),key='automatic_providers_v232',disabled=busy)
-    st.caption('選択した取得元で町ごとに最後のページまで検索します。マンションは築25年以内、ワンルーム/1K/1DK・1LDK/2K/2DK・2LDK/3K/3DK、一戸建て・その他は築40年以内・50㎡以上を対象とします。')
+    st.caption('選択した取得元で町ごとに最後のページまで検索します。RC（鉄筋コンクリート）限定。マンションは築25年以内、ワンルーム/1K/1DK・1LDK/2K/2DK・2LDK/3K/3DK、一戸建て・その他は築40年以内・50㎡以上を対象とします。')
     manual=active_job();manual_busy=bool(manual and not manual.snapshot()['finished'])
     cannot_start=busy or manual_busy or not collection_wards
     st.markdown('**3. 取得操作**')
@@ -18273,7 +18294,7 @@ def _v209_initial_settings(state):
             st.caption('旧アプリの物件や検索状態を使用しません。旧テーブルのデータは削除しません。')
             st.caption(f'実行中の版：{BUILD}')
             with st.expander('取得・集計の範囲'):
-                st.write('SUUMO・CHINTAIで検索します。マンションは築25年以内、ワンルーム/1K/1DK・1LDK/2K/2DK・2LDK/3K/3DK。一戸建て・その他は築40年以内・50㎡以上。地図の色分けに必要な町丁目はSUUMO掲載所在地を優先し、不足時のみ物件固有地図から照合します。')
+                st.write('SUUMO・CHINTAIで検索します。RC（鉄筋コンクリート）限定。マンションは築25年以内、ワンルーム/1K/1DK・1LDK/2K/2DK・2LDK/3K/3DK。一戸建て・その他は築40年以内・50㎡以上。地図の色分けに必要な町丁目はSUUMO掲載所在地を優先し、不足時のみ物件固有地図から照合します。')
                 st.caption('住所照合：SUUMOの所在地を市区・町丁目に正規化。町丁目を特定できない場合だけ物件固有のマーカーから国土地理院の逆ジオコーディングを利用します。番地を作りません。')
                 st.write('データベースへ保存する募集項目は家賃・間取り・種別・町丁目（既存の詳細住所は保持）・取得日時です。UTCで保存し画面はJST表示します。管理費・面積・築年数・画像・緯度経度は募集データに保存しません。')
                 st.write('募集情報は既存SupabaseのJSON領域を利用し、追加SQLは不要です。過去のschema 3〜7は書き換えず、集計時に町丁目へ正規化。新規schema 8のデータと同じ区域で表示します。')
@@ -19713,6 +19734,33 @@ window.addEventListener('message',function(event){
 """
 TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace("hostMessage('streamlit:componentReady'",_V302_MAP_BACK+"\nhostMessage('streamlit:componentReady'",1)
 
+
+# v303: exact RC collection policy, checked against labelled detail fields.
+def _v303_is_rc(value):
+    v=re.sub(r'\s+','',normal(value)).upper()
+    if not v or re.search(r'鉄骨|SRC|木造|一部|混合|不明|未確認',v):return False
+    return bool('鉄筋コンクリート' in v or '鉄筋コン' in v or re.search(r'(?<![A-Z])W?RC(?:造)?(?![A-Z])',v))
+
+def _v303_structure_known(value):
+    v=re.sub(r'\s+','',normal(value)).upper()
+    return _v303_is_rc(v) or bool(re.search(r'鉄骨|木造|ブロック|ALC|SRC|(?<![A-Z])(?:S|W|PC)造?(?![A-Z])',v))
+
+_v303_previous_suumo_fields=suumo_detail_fields
+
+def suumo_detail_fields(soup):
+    fields=_v303_previous_suumo_fields(soup)
+    fields['raw_structure']=normal(generic_labeled(soup,('構造','建物構造','種別/構造')))
+    return fields
+
+
+
+_V303_SEARCH_JS='var V303_OPTIONS={"suumo": {"cn": [["0", "新築"], ["1", "1年以内"], ["3", "3年以内"], ["5", "5年以内"], ["7", "7年以内"], ["10", "10年以内"], ["15", "15年以内"], ["20", "20年以内"], ["25", "25年以内"], ["30", "30年以内"], ["9999999", "指定しない"]], "et": [["1", "1分以内"], ["5", "5分以内"], ["7", "7分以内"], ["10", "10分以内"], ["15", "15分以内"], ["20", "20分以内"], ["9999999", "指定しない"]], "ct": [["9999999", "上限なし"], ["3.0", "3万円"], ["3.5", "3.5万円"], ["4.0", "4万円"], ["4.5", "4.5万円"], ["5.0", "5万円"], ["5.5", "5.5万円"], ["6.0", "6万円"], ["6.5", "6.5万円"], ["7.0", "7万円"], ["7.5", "7.5万円"], ["8.0", "8万円"], ["8.5", "8.5万円"], ["9.0", "9万円"], ["9.5", "9.5万円"], ["10.0", "10万円"], ["10.5", "10.5万円"], ["11.0", "11万円"], ["11.5", "11.5万円"], ["12.0", "12万円"], ["12.5", "12.5万円"], ["13.0", "13万円"], ["13.5", "13.5万円"], ["14.0", "14万円"], ["14.5", "14.5万円"], ["15.0", "15万円"], ["15.5", "15.5万円"], ["16.0", "16万円"], ["16.5", "16.5万円"], ["17.0", "17万円"], ["17.5", "17.5万円"], ["18.0", "18万円"], ["18.5", "18.5万円"], ["19.0", "19万円"], ["19.5", "19.5万円"], ["20.0", "20万円"], ["21.0", "21万円"], ["22.0", "22万円"], ["23.0", "23万円"], ["24.0", "24万円"], ["25.0", "25万円"], ["26.0", "26万円"], ["27.0", "27万円"], ["28.0", "28万円"], ["29.0", "29万円"], ["30.0", "30万円"], ["35.0", "35万円"], ["40.0", "40万円"], ["50.0", "50万円"], ["100.0", "100万円"]], "cb": [["0.0", "下限なし"], ["3.0", "3万円"], ["3.5", "3.5万円"], ["4.0", "4万円"], ["4.5", "4.5万円"], ["5.0", "5万円"], ["5.5", "5.5万円"], ["6.0", "6万円"], ["6.5", "6.5万円"], ["7.0", "7万円"], ["7.5", "7.5万円"], ["8.0", "8万円"], ["8.5", "8.5万円"], ["9.0", "9万円"], ["9.5", "9.5万円"], ["10.0", "10万円"], ["10.5", "10.5万円"], ["11.0", "11万円"], ["11.5", "11.5万円"], ["12.0", "12万円"], ["12.5", "12.5万円"], ["13.0", "13万円"], ["13.5", "13.5万円"], ["14.0", "14万円"], ["14.5", "14.5万円"], ["15.0", "15万円"], ["15.5", "15.5万円"], ["16.0", "16万円"], ["16.5", "16.5万円"], ["17.0", "17万円"], ["17.5", "17.5万円"], ["18.0", "18万円"], ["18.5", "18.5万円"], ["19.0", "19万円"], ["19.5", "19.5万円"], ["20.0", "20万円"], ["21.0", "21万円"], ["22.0", "22万円"], ["23.0", "23万円"], ["24.0", "24万円"], ["25.0", "25万円"], ["26.0", "26万円"], ["27.0", "27万円"], ["28.0", "28万円"], ["29.0", "29万円"], ["30.0", "30万円"], ["35.0", "35万円"], ["40.0", "40万円"], ["50.0", "50万円"], ["100.0", "100万円"]], "mb": [["0", "下限なし"], ["20", "20m2"], ["25", "25m2"], ["30", "30m2"], ["35", "35m2"], ["40", "40m2"], ["45", "45m2"], ["50", "50m2"], ["55", "55m2"], ["60", "60m2"], ["65", "65m2"], ["70", "70m2"], ["80", "80m2"], ["90", "90m2"], ["100", "100m2"]], "mt": [["20", "20m2"], ["25", "25m2"], ["30", "30m2"], ["35", "35m2"], ["40", "40m2"], ["45", "45m2"], ["50", "50m2"], ["55", "55m2"], ["60", "60m2"], ["65", "65m2"], ["70", "70m2"], ["80", "80m2"], ["90", "90m2"], ["100", "100m2"], ["9999999", "上限なし"]]}, "chintai": {"ct": [["0", "上限なし"], ["30", "3万円"], ["35", "3.5万円"], ["40", "4万円"], ["45", "4.5万円"], ["50", "5万円"], ["55", "5.5万円"], ["60", "6万円"], ["65", "6.5万円"], ["70", "7万円"], ["75", "7.5万円"], ["80", "8万円"], ["85", "8.5万円"], ["90", "9万円"], ["95", "9.5万円"], ["100", "10万円"], ["110", "11万円"], ["120", "12万円"], ["130", "13万円"], ["140", "14万円"], ["150", "15万円"], ["160", "16万円"], ["170", "17万円"], ["180", "18万円"], ["190", "19万円"], ["200", "20万円"], ["250", "25万円"], ["300", "30万円"], ["400", "40万円"], ["500", "50万円"], ["1000", "100万円"]], "h": [["99", "指定なし"], ["0", "新築"], ["1", "1年以内"], ["2", "3年以内"], ["3", "5年以内"], ["3.5", "7年以内"], ["4", "10年以内"], ["5", "15年以内"], ["6", "20年以内"], ["7", "25年以内"], ["8", "30年以内"]], "j": [["", "指定なし"], ["1", "1分以内"], ["2", "3分以内"], ["3", "5分以内"], ["4", "7分以内"], ["5", "10分以内"], ["6", "15分以内"], ["7", "20分以内"]], "cf": [["0", "下限なし"], ["30", "3万円"], ["35", "3.5万円"], ["40", "4万円"], ["45", "4.5万円"], ["50", "5万円"], ["55", "5.5万円"], ["60", "6万円"], ["65", "6.5万円"], ["70", "7万円"], ["75", "7.5万円"], ["80", "8万円"], ["85", "8.5万円"], ["90", "9万円"], ["95", "9.5万円"], ["100", "10万円"], ["110", "11万円"], ["120", "12万円"], ["130", "13万円"], ["140", "14万円"], ["150", "15万円"], ["160", "16万円"], ["170", "17万円"], ["180", "18万円"], ["190", "19万円"], ["200", "20万円"], ["250", "25万円"], ["300", "30万円"], ["400", "40万円"], ["500", "50万円"], ["1000", "100万円"]], "sf": [["0", "下限なし"], ["10", "10㎡"], ["15", "15㎡"], ["20", "20㎡"], ["25", "25㎡"], ["30", "30㎡"], ["35", "35㎡"], ["40", "40㎡"], ["45", "45㎡"], ["50", "50㎡"], ["55", "55㎡"], ["60", "60㎡"], ["70", "70㎡"], ["80", "80㎡"], ["90", "90㎡"], ["100", "100㎡"], ["110", "110㎡"], ["120", "120㎡"], ["130", "130㎡"], ["140", "140㎡"], ["150", "150㎡"], ["160", "160㎡"], ["170", "170㎡"], ["180", "180㎡"], ["190", "190㎡"], ["200", "200㎡"]], "st": [["10", "10㎡"], ["15", "15㎡"], ["20", "20㎡"], ["25", "25㎡"], ["30", "30㎡"], ["35", "35㎡"], ["40", "40㎡"], ["45", "45㎡"], ["50", "50㎡"], ["55", "55㎡"], ["60", "60㎡"], ["70", "70㎡"], ["80", "80㎡"], ["90", "90㎡"], ["100", "100㎡"], ["110", "110㎡"], ["120", "120㎡"], ["130", "130㎡"], ["140", "140㎡"], ["150", "150㎡"], ["160", "160㎡"], ["170", "170㎡"], ["180", "180㎡"], ["190", "190㎡"], ["200", "200㎡"], ["0", "上限なし"]]}};\nfunction v303BaseUrl(entry){\n var provider=v240Provider(),key=v240PopupKey(entry.place),reply=state._v217Reply;\n var url=provider===\'SUUMO\'?v217Url(entry.place,entry.props.suumo_url):\'\';\n if(!url&&reply&&reply.key===key)url=provider===\'CHINTAI\'?v240ChintaiUrl(entry.place,reply.url):v217Url(entry.place,reply.url);\n return url;\n}\nfunction v303Open(entry){\n var base=v303BaseUrl(entry);\n if(!base){state._v303Waiting=entry;v217RequestPopup(entry);if(entry._v303Button)entry._v303Button.textContent=\'条件を準備中…\';return;}\n state._v303Waiting=null;state._v303Entry=entry;state._v303Base=base;\n var provider=v240Provider(),group=state._v240Group||\'group1\',house=group===\'house\';\n var doc=document,opts=V303_OPTIONS[provider===\'SUUMO\'?\'suumo\':\'chintai\'];\n var mappings=provider===\'SUUMO\'?{age:\'cn\',walk:\'et\',rentMin:\'cb\',rentMax:\'ct\',areaMin:\'mb\',areaMax:\'mt\'}:{age:\'h\',walk:\'j\',rentMin:\'cf\',rentMax:\'ct\',areaMin:\'sf\',areaMax:\'st\'};\n var defaults={age:house?(provider===\'SUUMO\'?\'9999999\':\'99\'):(provider===\'SUUMO\'?\'25\':\'7\'),walk:provider===\'SUUMO\'?\'15\':\'6\',rentMin:provider===\'SUUMO\'?\'0.0\':\'0\',rentMax:provider===\'SUUMO\'?\'9999999\':\'0\',areaMin:house?\'50\':\'0\',areaMax:provider===\'SUUMO\'?\'9999999\':\'0\'};\n Object.keys(mappings).forEach(function(k){var el=doc.getElementById(\'v303-\'+k);el.replaceChildren();(opts[mappings[k]]||[]).forEach(function(row){var o=doc.createElement(\'option\');o.value=row[0];o.textContent=row[1].replace(/m2/g,\'㎡\');el.appendChild(o)});el.value=defaults[k];});\n doc.getElementById(\'v303-building\').value=house?\'3\':\'1\';doc.getElementById(\'v303-structure\').value=\'1\';\n doc.getElementById(\'v303-place\').textContent=entry.place.ward+\' \'+entry.place.name+\'（丁目を含む町全体）\';\n var layouts=doc.getElementById(\'v303-layouts\');layouts.replaceChildren();\n [\'1R\',\'1K\',\'1DK\',\'1LDK\',\'2K\',\'2DK\',\'2LDK\',\'3K\',\'3DK\',\'3LDK\'].forEach(function(label,i){var row=doc.createElement(\'label\'),input=doc.createElement(\'input\');input.type=\'checkbox\';input.value=label;input.checked=house||({group0:[0,1,2],group1:[3,4,5],group2:[6,7,8]}[group]||[]).includes(i);row.appendChild(input);row.appendChild(doc.createTextNode(label));layouts.appendChild(row);});\n doc.getElementById(\'v303-note\').textContent=\'地図の平均家賃は変更しません。鉄筋系はRC・SRCを含みます。\'+(house?\'築40年以内は掲載先の詳細で確認してください。\':\'\');\n doc.getElementById(\'v303-search\').textContent=\'この条件で\'+provider+\'検索 ↗\';\n doc.getElementById(\'v303-search-dialog\').showModal();v303Update();\n}\nfunction v303Update(){\n var link=document.getElementById(\'v303-search\'),base=state._v303Base;if(!base)return;\n var u=new URL(base),s=u.searchParams,suumo=v240Provider()===\'SUUMO\',error=\'\';\n var keys=suumo?{age:\'cn\',walk:\'et\',rentMin:\'cb\',rentMax:\'ct\',areaMin:\'mb\',areaMax:\'mt\'}:{age:\'h\',walk:\'j\',rentMin:\'cf\',rentMax:\'ct\',areaMin:\'sf\',areaMax:\'st\'};\n var value={};Object.keys(keys).forEach(function(k){value[k]=document.getElementById(\'v303-\'+k).value;s.set(keys[k],value[k]);});\n var rentMax=Number(value.rentMax),areaMax=Number(value.areaMax);\n if(rentMax!==0&&rentMax!==9999999&&Number(value.rentMin)>rentMax)error=\'家賃の下限は上限以下にしてください。\';\n if(areaMax!==0&&areaMax!==9999999&&Number(value.areaMin)>areaMax)error=\'面積の下限は上限以下にしてください。\';\n var structure=document.getElementById(\'v303-structure\').value;s.delete(\'kz\');if(structure)s.set(\'kz\',structure);\n var building=document.getElementById(\'v303-building\').value;s.delete(suumo?\'ts\':\'b\');if(building)s.set(suumo?\'ts\':\'b\',suumo?building:(building===\'1\'?\'2\':\'3\'));\n var selected=Array.from(document.querySelectorAll(\'#v303-layouts input:checked\')).map(e=>e.value);\n if(!selected.length)error=\'間取りを1つ以上選んでください。\';\n s.delete(suumo?\'md\':\'m\');\n var codes=suumo?{\'1R\':\'01\',\'1K\':\'02\',\'1DK\':\'03\',\'1LDK\':\'04\',\'2K\':\'05\',\'2DK\':\'06\',\'2LDK\':\'07\',\'3K\':\'08\',\'3DK\':\'09\',\'3LDK\':\'10\'}:{\'1R\':\'0\',\'1K\':\'1\',\'1DK\':\'2\',\'1LDK\':\'3\',\'2K\':\'4\',\'2DK\':\'5\',\'2LDK\':\'6\',\'3K\':\'7\',\'3DK\':\'8\',\'3LDK\':\'9\'};\n selected.forEach(label=>s.append(suumo?\'md\':\'m\',codes[label]));s.delete(\'page\');\n document.getElementById(\'v303-error\').textContent=error;link.setAttribute(\'aria-disabled\',String(!!error));if(error)link.removeAttribute(\'href\');else link.href=u.href;\n}\nfunction v303Init(){\n if(document.getElementById(\'v303-search-dialog\').dataset.ready)return;\n var dialog=document.getElementById(\'v303-search-dialog\');dialog.dataset.ready=\'1\';\n dialog.addEventListener(\'change\',v303Update);document.getElementById(\'v303-close\').onclick=function(){dialog.close()};\n document.getElementById(\'v303-reset\').onclick=function(){dialog.close();v303Open(state._v303Entry)};\n document.getElementById(\'v303-search\').onclick=function(e){if(this.getAttribute(\'aria-disabled\')===\'true\'){e.preventDefault();return;}dialog.close();};\n window.addEventListener(\'message\',function(e){if(e.source===parent&&e.data&&e.data.type===\'sumai:back-home-v302\')dialog.close();});\n}\nvar v303PreviousAttach=v217AttachSuumo;\nv217AttachSuumo=function(layer,actions,el,props){\n v303PreviousAttach(layer,actions,el,props);\n var entry=layer._v280PopupEntry||state._v217Active;\n // The entry created by v217AttachSuumo is captured at creation (see injection).\n entry=layer._v303SearchEntry||entry;if(!entry)return;\n var button=document.createElement(\'button\');button.type=\'button\';button.className=\'v303-config\';button.textContent=\'条件を変えて検索\';entry._v303Button=button;\n button.onclick=function(e){e.preventDefault();e.stopPropagation();v303Init();v303Open(entry)};actions.appendChild(button);\n};\nvar v303PreviousUpdate=v240UpdatePopup;\nv240UpdatePopup=v217UpdatePopup=function(entry){v303PreviousUpdate(entry);if(entry&&entry._v303Button)entry._v303Button.textContent=\'条件を変えて検索\';if(entry&&state._v303Waiting===entry&&v303BaseUrl(entry))v303Open(entry);};\n'
+_V303_SEARCH_DOM='<dialog id="v303-search-dialog"><div class="v303-heading"><h2>条件を変えて検索</h2><button type="button" id="v303-close">閉じる</button></div><p id="v303-place"></p><div class="v303-fields"><label>家賃下限（万円）<select id="v303-rentMin"></select></label><label>家賃上限（万円）<select id="v303-rentMax"></select></label><label>築年数<select id="v303-age"></select></label><label>駅までの徒歩<select id="v303-walk"></select></label><label>面積下限（㎡）<select id="v303-areaMin"></select></label><label>面積上限（㎡）<select id="v303-areaMax"></select></label><label>建物種別<select id="v303-building"><option value="1">マンション</option><option value="3">一戸建て・その他</option><option value="">指定なし</option></select></label><label>構造<select id="v303-structure"><option value="1">鉄筋系</option><option value="">指定なし</option><option value="2">鉄骨系</option><option value="3">木造</option><option value="4">ブロック・その他</option></select></label></div><fieldset><legend>間取り</legend><div id="v303-layouts"></div></fieldset><p id="v303-note"></p><p id="v303-error" role="alert"></p><div class="v303-actions"><button id="v303-reset" type="button">初期条件に戻す</button><a id="v303-search" role="button" target="_blank" rel="noopener noreferrer">この条件で検索 ↗</a></div></dialog>'
+_V303_SEARCH_CSS='#v303-search-dialog{color-scheme:light;box-sizing:border-box;width:calc(100% - 24px);max-width:520px;max-height:calc(100vh - 24px);padding:16px;border:1px solid #9eb4bd;border-radius:12px;background:#fff;color:#173a5e;overflow:auto;font:14px system-ui}#v303-search-dialog::backdrop{background:rgba(0,0,0,.3)}.v303-heading{display:flex;align-items:center;justify-content:space-between;gap:10px}.v303-heading h2{margin:0;font-size:18px}.v303-fields{display:grid;grid-template-columns:1fr 1fr;gap:12px}#v303-search-dialog label{display:flex;flex-direction:column;gap:5px;min-width:0;font-weight:600}#v303-search-dialog select{box-sizing:border-box;width:100%;min-height:44px;background:#fff;color:#173a5e;border:1px solid #9eb4bd;border-radius:7px;padding:6px;font:16px system-ui}#v303-search-dialog option{background:#fff;color:#173a5e}#v303-layouts{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}#v303-layouts label{flex-direction:row;align-items:center;gap:6px;min-height:36px}#v303-layouts input{width:20px;height:20px;accent-color:#174a6a}#v303-search-dialog fieldset{border:1px solid #cbd5d8;border-radius:8px;margin:14px 0 0;padding:10px}#v303-note{font-size:12px;line-height:1.5}#v303-error{color:#9f2929}.v303-actions{display:flex;flex-wrap:wrap;gap:8px;position:sticky;bottom:-16px;background:#fff;padding:12px 0}.v303-actions a{background:#174a6a!important;color:#fff!important;text-decoration:none!important;flex:1;text-align:center}.v303-actions a[aria-disabled="true"]{background:#dbe2e4!important;color:#52636b!important;cursor:not-allowed}#v303-search-dialog button,.v303-actions a,.v303-config{box-sizing:border-box;border:1px solid #9eb4bd;border-radius:7px;padding:10px 12px;font:14px system-ui;min-height:44px}#v303-search-dialog button,.v303-config{background:#fff;color:#173a5e}.v303-config{width:100%;flex-basis:100%;order:5;margin-top:8px;cursor:pointer}'
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('</style></head>',_V303_SEARCH_CSS+'</style></head>',1)
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('</body>',_V303_SEARCH_DOM+'</body>',1)
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('var entry={link:link,help:help,props:props,place:v217Place(props),layer:layer};','var entry={link:link,help:help,props:props,place:v217Place(props),layer:layer};layer._v303SearchEntry=entry;',1)
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('function render(args){',_V303_SEARCH_JS+'\nfunction render(args){',1)
 
 def main():
     st.set_page_config(page_title='住まいコンパス｜新しい住まいを探す',page_icon='🏡',layout='wide',initial_sidebar_state='collapsed')
