@@ -56,7 +56,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v303"
+BUILD = "REBUILD-01-v304"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -19762,9 +19762,20 @@ TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('</body>',_V303_SEARCH
 TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('var entry={link:link,help:help,props:props,place:v217Place(props),layer:layer};','var entry={link:link,help:help,props:props,place:v217Place(props),layer:layer};layer._v303SearchEntry=entry;',1)
 TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('function render(args){',_V303_SEARCH_JS+'\nfunction render(args){',1)
 
+# v304: separate Android Chrome handoff from ordinary new-tab navigation.
+_V304_EXTERNAL_BROWSER_JS = "(function(){'use strict';\nvar w=window,doc=w.document;\nif(w.__sumaiExternal304)return;\nvar android=/Android/i.test(w.navigator.userAgent);\nfunction propertyUrl(value){\n try{var u=new URL(value,w.location.href);\n  if(u.protocol!=='https:'||u.username||u.password||u.port||!['suumo.jp','www.suumo.jp','chintai.net','www.chintai.net'].includes(u.hostname))return '';\n  return u.href;\n }catch(e){return '';}\n}\nfunction chromeIntent(value){\n var safe=propertyUrl(value);if(!safe)return '';\n var u=new URL(safe);\n // Explicit browser package prevents handing the URL back to the current\n // standalone app/WebView or to a SUUMO/CHINTAI native app.\n // Deliberately no HTTPS fallback into the in-app browser.\n return 'intent://'+u.host+u.pathname+u.search+'#Intent;scheme=https;package=com.android.chrome;action=android.intent.action.VIEW;category=android.intent.category.BROWSABLE;end';\n}\nfunction click(event){\n if(event.defaultPrevented||event.button>0||event.ctrlKey||event.metaKey||event.shiftKey||event.altKey)return;\n var node=event.target,link=node&&node.closest?node.closest('a[href]'):null;\n if(!link||link.getAttribute('aria-disabled')==='true')return;\n var safe=propertyUrl(link.href);if(!safe)return;\n link.target='_blank';link.rel='noopener noreferrer';\n if(!android)return;\n // Change the anchor synchronously in the user's click. Opening via a later\n // postMessage/timer would lose the activation required by Android intents.\n var intent=chromeIntent(safe);link.href=intent;\n if(w.__sumai297)w.__sumai297.record('external_property_launch_requested',{provider:new URL(safe).hostname,method:'android_chrome_intent'});\n w.setTimeout(function(){if(link.getAttribute('href')===intent)link.href=safe;},0);\n}\ndoc.addEventListener('click',click,true);\nw.__sumaiExternal304={propertyUrl:propertyUrl,chromeIntent:chromeIntent,android:android};\n})();\n"
+
+def _v304_install_external_browser():
+    bridge='<script>try{const n=parent.document.createElement("script");n.textContent='+json.dumps(_V304_EXTERNAL_BROWSER_JS).replace('<','\\u003c')+';parent.document.head.appendChild(n);n.remove();}catch(e){}</script>'
+    st.components.v1.html(bridge,height=0)
+
+# Install in both realms: map clicks must retain their own user activation.
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('</body>','<script>'+_V304_EXTERNAL_BROWSER_JS+'</script></body>',1)
+
 def main():
     st.set_page_config(page_title='住まいコンパス｜新しい住まいを探す',page_icon='🏡',layout='wide',initial_sidebar_state='collapsed')
     _v302_install_back_guard()
+    _v304_install_external_browser()
     _v297_run=_v297_begin()
     st.markdown(CSS+'\n<style>[data-stale="true"]{opacity:1!important}</style>',unsafe_allow_html=True)
     st.markdown(f'<div class="hero"><span class="badge">SUMAI COMPASS · {BUILD}</span><h1>次の住まいを、地図から。</h1><p>掲載物件を確認し、家賃と暮らしやすさを比べます。<br>間取りと家賃帯を、取得できた情報で比較します。</p></div>',unsafe_allow_html=True)
