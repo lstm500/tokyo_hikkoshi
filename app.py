@@ -56,7 +56,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v306"
+BUILD = "REBUILD-01-v307"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -19762,19 +19762,9 @@ TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('</body>',_V303_SEARCH
 TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('var entry={link:link,help:help,props:props,place:v217Place(props),layer:layer};','var entry={link:link,help:help,props:props,place:v217Place(props),layer:layer};layer._v303SearchEntry=entry;',1)
 TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('function render(args){',_V303_SEARCH_JS+'\nfunction render(args){',1)
 
-# v306: automatic Chrome handoff through the Android companion.
-_V306_PROPERTY_HANDOFF_JS="(function install(){'use strict';\nvar w=window,d=w.document;if(w.__sumaiExternal306)return;\nvar android=/Android/i.test(navigator.userAgent);\nif(w!==w.parent){try{\n if(!w.parent.__sumaiExternal306){\n  var bridge=w.parent.document.createElement('script');\n  bridge.textContent='('+install.toString()+')();';\n  w.parent.document.head.appendChild(bridge);bridge.remove();\n }\n}catch(e){}}\nfunction safe(v){try{\n var u=new URL(v,w.location.href);\n return u.protocol==='https:'&&!u.username&&!u.password&&!u.port&&\n ['suumo.jp','www.suumo.jp','chintai.net','www.chintai.net'].includes(u.hostname)?u.href:'';\n}catch(e){return '';}}\nfunction intent(v){\n return 'intent://open?url='+encodeURIComponent(v)+\n '#Intent;scheme=sumaichrome;package=jp.sumai.chromeopener;action=android.intent.action.VIEW;category=android.intent.category.BROWSABLE;end';\n}\nfunction prepare(a){\n if(!a||!a.matches||!a.matches('a[href]'))return;\n var v=safe(a.href);if(!v)return;\n if(android){a.dataset.sumaiHttps306=v;a.href=intent(v);a.target='_top';}\n else a.target='_blank';\n a.rel='noopener noreferrer';\n}\nfunction scan(n){if(n.nodeType!==1)return;prepare(n);n.querySelectorAll('a[href]').forEach(prepare);}\nscan(d.documentElement);\nnew MutationObserver(function(records){records.forEach(function(r){\n if(r.type==='attributes')prepare(r.target);else r.addedNodes.forEach(scan);\n});}).observe(d.documentElement,{subtree:true,childList:true,attributes:true,attributeFilter:['href']});\nvar old=d.getElementById('sumai-handoff305');\nif(old){if(old.open)old.close();old.remove();}\nw.addEventListener('click',function(e){\n var a=e.target&&e.target.closest?e.target.closest('a[href]'):null;\n if(!a||a.getAttribute('aria-disabled')==='true'||e.button>0)return;\n var v=safe(a.href),stored=safe(a.dataset.sumaiHttps306);\n if(!v&&stored&&a.getAttribute('href')===intent(stored))v=stored;\n if(!v)return;\n if(w.__sumai297)w.__sumai297.record('external_property_launch_requested',{\n  provider:new URL(v).hostname,method:android?'android_chrome_opener':'https_new_tab'});\n if(android){\n  e.preventDefault();e.stopImmediatePropagation();\n  var q=d.getElementById('v303-search-dialog');if(q&&q.open)q.close();\n  var host=w;try{if(w.parent.__sumaiExternal306)host=w.parent;}catch(error){}\n  host.__sumaiExternal306.launch(v);\n }\n},true);\nw.__sumaiExternal306={safe:safe,intent:intent,launch:function(value){\n var v=safe(value);if(v)w.location.href=intent(v);\n}};\n})();\n"
-
-def _v306_install_property_handoff():
-    bridge='<script>try{const n=parent.document.createElement("script");n.textContent='+json.dumps(_V306_PROPERTY_HANDOFF_JS).replace('<','\\u003c')+';parent.document.head.appendChild(n);n.remove();}catch(e){}</script>'
-    st.components.v1.html(bridge,height=0)
-
-TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('</body>','<script>'+_V306_PROPERTY_HANDOFF_JS+'</script></body>',1)
-
 def main():
     st.set_page_config(page_title='住まいコンパス｜新しい住まいを探す',page_icon='🏡',layout='wide',initial_sidebar_state='collapsed')
     _v302_install_back_guard()
-    _v306_install_property_handoff()
     _v297_run=_v297_begin()
     st.markdown(CSS+'\n<style>[data-stale="true"]{opacity:1!important}</style>',unsafe_allow_html=True)
     st.markdown(f'<div class="hero"><span class="badge">SUMAI COMPASS · {BUILD}</span><h1>次の住まいを、地図から。</h1><p>掲載物件を確認し、家賃と暮らしやすさを比べます。<br>間取りと家賃帯を、取得できた情報で比較します。</p></div>',unsafe_allow_html=True)
