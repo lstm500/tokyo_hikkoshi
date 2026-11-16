@@ -56,7 +56,7 @@ import streamlit as st
 # streamlit_folium is deferred for the same legacy path.
 from bs4 import BeautifulSoup
 
-BUILD = "REBUILD-01-v309"
+BUILD = "REBUILD-01-v311"
 _V127_INSPECTION_ONLY = True  # Do not reclaim cache until the actual file inventory is reviewed.
 
 # ============================================================================
@@ -17325,6 +17325,7 @@ def interactive_town_choropleth(group):
                 suumo_town_codes=suumo_oz_codes,
                 suumo_search_reply=state.get('_v189_suumo_reply'),
                 polygon_suumo_reply=state.get('_v217_suumo_reply'),
+                listing_search_reply=_v311_snapshot(state),
                 custom_pin_reply=state.get('_v205_pin_reply'),
                 search_error=state.get('_v184_search_error'),
                 commute_destination=(destinations[0] if destinations else ''),
@@ -17375,6 +17376,8 @@ def interactive_town_choropleth(group):
                 state['_v205_last_pin_ticket']=ticket
                 state['_v205_pin_reply']=_v208_run_landmark_lookup(state,landmark_data)
                 _v288_rerun_map()
+        if _v311_handle(state,data):
+            _v288_rerun_map()
         if data.get('event')=='polygon_suumo_v217':
             ticket=str(data.get('ticket') or '')[:100]
             if ticket and ticket!=state.get('_v217_last_suumo_ticket'):
@@ -19767,6 +19770,159 @@ _V308_RENT_JS = "// One personal ceiling for every property search from the map;
 _V308_RENT_CSS = '.v309-search-filters{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);align-items:end;gap:12px;box-sizing:border-box;flex-basis:100%;width:100%;order:-1;margin:0 0 8px}\n.v308-rent-field{display:flex;flex-direction:column;align-items:stretch;gap:6px;min-width:0;margin:0;color:#173a5e;font:600 13px system-ui}\n.v308-rent-input{box-sizing:border-box;min-width:0;width:100%;max-width:100%;min-height:44px;padding:9px 12px;border:1px solid #9eb4bd;border-radius:7px;background:#fff;color:#173a5e;font:16px system-ui;text-align:right;color-scheme:light}\n.v309-new-field{display:flex;align-items:center;justify-content:center;gap:8px;box-sizing:border-box;min-width:0;min-height:44px;padding:9px 8px;border:1px solid #9eb4bd;border-radius:7px;background:#fff;color:#173a5e;font:600 14px system-ui;cursor:pointer;white-space:nowrap}\n.v309-new-input{width:20px;height:20px;margin:0;accent-color:#174a6a;cursor:pointer}\n.v309-new-field:has(:checked){background:#eaf2f6;border-color:#174a6a}\n.v308-rent-input:focus,.v309-new-input:focus-visible{outline:2px solid #174a6a;outline-offset:1px}.v308-rent-input::placeholder{color:#7c8d93;opacity:1}.v308-rent-input:invalid{border-color:#9f2929}\n'
 TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('</style></head>',_V308_RENT_CSS+'</style></head>',1)
 TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('function render(args){',_V308_RENT_JS+'\nfunction render(args){',1)
+
+# v311: live SUUMO results scoped to the selected published chome, no DB writes.
+def _v311_scope(address,ward,name):
+    actual=address_key(address).removeprefix('東京都')
+    wanted=address_key(name)
+    match=re.fullmatch(r'(.+?)(\d+)丁目',wanted)
+    if not match or not actual.startswith(ward):return False
+    base,num=match.groups()
+    return bool(re.fullmatch(re.escape(base+num)+r'(?:丁目(?:[\d番地号\-ー−－].*)?|(?:[\-ー−－番].*)?)',actual[len(ward):]))
+
+
+def _v311_search_url(value,ward):
+    u=urlparse(str(value or ''))
+    city=_V167_WARD_TO_CODE.get(ward)
+    q=parse_qs(u.query,keep_blank_values=True)
+    if (u.scheme!='https' or u.netloc!='suumo.jp' or u.path!='/jj/chintai/ichiran/FR301FC001/' or
+        not city or q.get('sc')!=[city] or len(q.get('oz',[]))!=1 or
+        not re.fullmatch(re.escape(city)+r'\d{3}',q['oz'][0])):
+        raise ValueError('検索地域を確認できません。地図から検索し直してください。')
+    q.pop('page',None);q['pc']=['50']
+    return u._replace(query=urlencode(q,doseq=True),fragment='').geturl()
+
+
+def _v311_rows(soup,ward,name,query):
+    def text(node):return normal(node.get_text(' ',strip=True)) if node else ''
+    def value(raw):
+        m=re.search(r'\d+(?:\.\d+)?',normal(raw).replace(',',''))
+        return float(m[0]) if m else None
+    def limit(key,fallback):
+        try:return float(query.get(key,[str(fallback)])[0])
+        except (ValueError,TypeError):raise ValueError('検索条件を読み取れません。')
+    layouts={v:k for k,v in SUUMO_LAYOUT_CODES.items()}
+    allowed={layouts.get(code) for code in query.get('md',[]) }
+    out=[];excluded=0
+    for building in suumo_result_buildings(soup):
+        address=text(building.select_one('.cassetteitem_detail-col1'))
+        if not _v311_scope(address,ward,name):excluded+=1;continue
+        title=text(building.select_one('.cassetteitem_content-title'))
+        age,_=age_info(text(building.select_one('.cassetteitem_detail-col3')))
+        walks=[]
+        for access in building.select('.cassetteitem_detail-col2 .cassetteitem_detail-text'):
+            t=text(access)
+            # Bus minutes are never interpreted as station walk minutes.
+            m=re.search(r'駅\s*(?:歩|徒歩)\s*(\d+)分',t)
+            if m and 'バス' not in t:walks.append((int(m[1]),t.split('駅')[0].split('/')[-1]+'駅'))
+        walk,station=min(walks) if walks else (None,'')
+        for room in building.select('tr.js-cassette_link'):
+            rent_raw=text(room.select_one('.cassetteitem_price--rent'))
+            rent=value(rent_raw)
+            if rent is not None and '万円' not in rent_raw and '円' in rent_raw:rent/=10000
+            area=value(text(room.select_one('.cassetteitem_menseki')))
+            layout=parsed_layout(text(room.select_one('.cassetteitem_madori')),rough=False)
+            if rent is None or area is None or layout is None:continue
+            if not limit('cb',0)<=rent<=limit('ct',9999999):continue
+            if not limit('mb',0)<=area<=limit('mt',9999999):continue
+            if allowed and layout not in allowed:continue
+            if limit('cn',9999999)<9999999 and (age is None or age>limit('cn',9999999)):continue
+            if limit('et',9999999)<9999999 and (walk is None or walk>limit('et',9999999)):continue
+            link=room.select_one('a.js-cassette_link_href[href]')
+            if link is None:continue
+            url=urljoin('https://suumo.jp',link['href']);u=urlparse(url)
+            if u.scheme!='https' or u.netloc!='suumo.jp' or not re.match(r'^/chintai/(?:bc_|jnc_)\d+/',u.path):continue
+            identity=suumo_property_id(url) or url
+            out.append({'id':identity,'title':title,'address':address,'rent':rent,'layout':layout,
+                'age':age,'area':area,'walk':walk,'station':station,'url':url})
+    return out,excluded
+
+
+def _v311_snapshot(state):
+    job=state.get('_v311_job')
+    if not job:return None
+    with job['lock']:
+        return {k:job[k] for k in ('ticket','label','running','pages','excluded','error','revision','elapsed')}|{'rows':list(job['rows'])}
+
+
+def _v311_run(job,url,ward,name,config):
+    started=time.monotonic();web=PublicWeb();web.configure(config);web.cancel_event=job['cancel'];web.audit=job['audit']
+    query=parse_qs(urlparse(url).query,keep_blank_values=True);seen_pages=set();seen_rows=set();next_url=url
+    try:
+        while next_url:
+            web.check_cancel();tick=time.monotonic()
+            response=web.fetch(next_url);soup=BeautifulSoup(response.text,'html.parser')
+            if not suumo_result_buildings(soup) and not suumo_explicit_zero_results(soup):
+                raise AppError('検索結果を読み取れませんでした。取得済みの結果を表示しています。')
+            signature=hashlib.sha256(str(suumo_result_buildings(soup)).encode()).hexdigest()
+            if signature in seen_pages:raise AppError('同じ検索ページが返されたため停止しました。取得は未完了です。')
+            seen_pages.add(signature)
+            rows,excluded=_v311_rows(soup,ward,name,query)
+            web.check_cancel()
+            with job['lock']:
+                for row in rows:
+                    if row['id'] not in seen_rows:job['rows'].append(row);seen_rows.add(row['id'])
+                job['pages']+=1;job['excluded']+=excluded;job['revision']+=1
+                job['elapsed']=round(time.monotonic()-started,1)
+            trace(web,'chome_page',{'ward':ward,'name':name,'page':job['pages'],'matched':len(rows),
+                'excluded_buildings':excluded,'duration_ms':round((time.monotonic()-tick)*1000)},stage='listing_search')
+            target=generic_next_page(soup,response.url,'SUUMO')
+            if target:
+                u=urlparse(target);nq=parse_qs(u.query,keep_blank_values=True)
+                if u.netloc!='suumo.jp' or u.path!='/jj/chintai/ichiran/FR301FC001/':
+                    raise AppError('次ページの検索範囲を確認できません。取得は未完了です。')
+                for key,values in query.items():
+                    if key!='page':nq[key]=values
+                next_url=u._replace(query=urlencode(nq,doseq=True),fragment='').geturl()
+                if job['pages']>=200 or len(seen_rows)>=10000:
+                    raise AppError('一度の検索量を超えました。条件を絞って再検索してください。取得は未完了です。')
+            else:next_url=None
+    except SearchCancelled:
+        with job['lock']:job['error']='取得を中止しました。'
+    except Exception as exc:
+        with job['lock']:job['error']=str(exc)[:350]
+        trace(web,'chome_search_failed',{'reason':str(exc),'pages':job['pages']},'ERROR','listing_search')
+    finally:
+        with job['lock']:
+            job['running']=False;job['elapsed']=round(time.monotonic()-started,1);job['revision']+=1
+        trace(web,'chome_search_finished',{'matched':len(job['rows']),'pages':job['pages'],
+            'duration_ms':round((time.monotonic()-started)*1000),'error':job['error']},stage='listing_search')
+
+
+def _v311_handle(state,data):
+    event=data.get('event')
+    if event not in ('chome_search_v311','chome_poll_v311','chome_cancel_v311'):return False
+    job=state.get('_v311_job');ticket=str(data.get('ticket') or '')[:100]
+    if event=='chome_cancel_v311':
+        if job and ticket==job['ticket']:job['cancel'].set()
+        return False
+    if event=='chome_poll_v311':
+        poll=str(data.get('poll_id') or '')[:100]
+        if not poll or state.get('_v311_poll_id')==poll:return False
+        state['_v311_poll_id']=poll
+        return bool(job and ticket==job['ticket'])
+    if not ticket or job and ticket==job['ticket']:return False
+    if job:job['cancel'].set()
+    ward=str(data.get('ward') or '')[:30];name=str(data.get('name') or '')[:90]
+    job={'ticket':ticket,'label':ward+' '+name,'running':False,'pages':0,'excluded':0,'rows':[],
+        'error':'','revision':0,'elapsed':0,'lock':threading.RLock(),'cancel':threading.Event(),
+        'audit':state.get('_v217_suumo_audit') or AuditLog({'mode':'chome_listing_search','ward':ward,'town':name},_v209_log_secrets())}
+    state['_v311_job']=job
+    state['_v217_suumo_audit']=job['audit']
+    try:
+        if not re.fullmatch(r'.+?[0-9０-９一二三四五六七八九十]+丁目',name):raise ValueError('丁目を選択してください。')
+        url=_v311_search_url(data.get('url'),ward)
+        job['running']=True
+        threading.Thread(target=_v311_run,args=(job,url,ward,name,rental_network_settings()),daemon=True,name='chome-search').start()
+    except Exception as exc:job['running']=False;job['error']=str(exc)[:350]
+    return True
+
+_V311_SEARCH_JS = "var v311Ticket='',v311Timer=null,v311Revision=-1,v311Rows=[],v311Page=0;\nfunction v311Send(event,extra){hostMessage('streamlit:setComponentValue',{dataType:'json',value:Object.assign({event:event,ticket:v311Ticket,poll_id:Date.now()+'_'+Math.random(),home_view_epoch:state._v202HomeEpoch},extra||{})});}\nfunction v311Init(){\n var dialog=document.getElementById('v311-list');if(dialog.dataset.ready)return;dialog.dataset.ready='1';\n document.getElementById('v311-prev').onclick=function(){v311Page=Math.max(0,v311Page-1);v311Draw();};\n document.getElementById('v311-next').onclick=function(){v311Page++;v311Draw();};\n document.getElementById('v311-close').onclick=function(){dialog.close();};\n dialog.addEventListener('close',function(){clearTimeout(v311Timer);if(v311Ticket)v311Send('chome_cancel_v311');v311Ticket='';});\n window.addEventListener('message',function(e){if(e.source===parent&&e.data&&e.data.type==='sumai:back-home-v302')dialog.close();});\n}\nfunction v311Poll(){clearTimeout(v311Timer);v311Timer=setTimeout(function(){if(v311Ticket&&document.getElementById('v311-list').open)v311Send('chome_poll_v311');},1000);}\nfunction v311Start(place,url){\n v311Init();clearTimeout(v311Timer);v311Revision=-1;v311Rows=[];v311Page=0;v311Draw();\n v311Ticket='chome_'+Date.now()+'_'+Math.random().toString(36).slice(2,8);\n document.getElementById('v311-title').textContent=place.ward+' '+place.name;\n document.getElementById('v311-status').textContent='SUUMOから取得中…';document.getElementById('v311-error').textContent='';document.getElementById('v311-rows').replaceChildren();\n var advanced=document.getElementById('v303-search-dialog');if(advanced.open)advanced.close();\n var dialog=document.getElementById('v311-list');if(!dialog.open)dialog.showModal();\n v311Send('chome_search_v311',{ward:place.ward,name:place.name,url:url});v311Poll();\n}\nfunction v311Receive(reply){\n if(!reply||reply.ticket!==v311Ticket)return;\n if(reply.revision!==v311Revision){\n  v311Revision=reply.revision;\n  v311Rows=reply.rows||[];v311Draw();\n }\n document.getElementById('v311-status').textContent=(reply.running?'取得中':'取得完了')+'｜'+(reply.rows||[]).length+'件｜'+reply.pages+'ページ確認';\n if(!reply.running&&!(reply.rows||[]).length&&!reply.error)document.getElementById('v311-status').textContent='条件に一致する物件はありません。';\n if(reply.error)document.getElementById('v311-status').textContent='取得を停止｜'+(reply.rows||[]).length+'件（取得済み分）';\n document.getElementById('v311-error').textContent=reply.error||'';\n if(reply.running)v311Poll();else clearTimeout(v311Timer);\n}\n// Capture before existing external-link handlers: selected chome stays in this map.\nwindow.addEventListener('click',function(e){\n var a=e.target.closest&&e.target.closest('a[href]');if(!a)return;\n var entry=a.id==='v303-search'?state._v303Entry:state._v217Active;\n if(a.id==='town-suumo')entry={place:state._v189Place};\n if(!entry||!entry.place||!/[0-9０-９一二三四五六七八九十]+丁目$/.test(entry.place.name))return;\n if(!(a.id==='v303-search'||a.id==='town-suumo'||a===entry.link))return;\n var u;try{u=new URL(a.href);}catch(err){return;}\n if(v308PropertyProvider(u)!=='suumo')return;\n var input=document.querySelector('.leaflet-popup-content .v308-rent-input');\n e.preventDefault();e.stopImmediatePropagation();\n if(input&&!input.validity.valid){input.reportValidity();return;}\n v311Start(entry.place,v308RentUrl(a.href));\n},true);\nvar v311PreviousOpen=v303Open;\nv303Open=function(entry){v311PreviousOpen(entry);if(v240Provider()==='SUUMO'&&/[0-9０-９一二三四五六七八九十]+丁目$/.test(entry.place.name)){document.getElementById('v303-place').textContent=entry.place.ward+' '+entry.place.name;document.getElementById('v303-search').textContent='この条件で一覧を表示';}};\n\nfunction v311Draw(){\n v311Page=Math.min(v311Page,Math.max(0,Math.ceil(v311Rows.length/50)-1));\n  var body=document.getElementById('v311-rows');body.replaceChildren();\n  v311Rows.slice(v311Page*50,(v311Page+1)*50).forEach(function(row){\n   var info=document.createElement('tr'),name=document.createElement('td');name.colSpan=5;name.className='v311-name';\n   var a=document.createElement('a');a.textContent=row.title||'SUUMOで詳細を見る';\n   try{var u=new URL(row.url);if(u.protocol==='https:'&&u.hostname==='suumo.jp'&&/^\\/chintai\\/(bc_|jnc_)\\d+\\//.test(u.pathname)){a.href=u.href;a.target='_blank';a.rel='noopener noreferrer';}}catch(e){}\n   name.appendChild(a);var address=document.createElement('small');address.textContent=row.address+(row.station?'｜'+row.station:'');name.appendChild(address);info.appendChild(name);body.appendChild(info);\n   var tr=document.createElement('tr');tr.className='v311-values';\n   [row.rent+'万円',row.layout,row.age===null?'不明':row.age===0?'新築':'築'+row.age+'年',row.area+'㎡',row.walk===null?'不明':row.walk+'分'].forEach(function(value){var td=document.createElement('td');td.textContent=value;tr.appendChild(td);});body.appendChild(tr);\n  });\n var pages=Math.max(1,Math.ceil(v311Rows.length/50));\n document.getElementById('v311-pagination').hidden=pages===1;\n document.getElementById('v311-page').textContent=(v311Page+1)+' / '+pages;\n document.getElementById('v311-prev').disabled=v311Page===0;\n document.getElementById('v311-next').disabled=v311Page+1>=pages;\n}\nvar v311PreviousPopupUpdate=v240UpdatePopup;\nv240UpdatePopup=v217UpdatePopup=function(entry){v311PreviousPopupUpdate(entry);if(entry&&v240Provider()==='SUUMO'&&/[0-9０-９一二三四五六七八九十]+丁目$/.test(entry.place.name)&&entry.link.hasAttribute('href'))entry.link.textContent='SUUMOで検索';};\n"
+_V311_SEARCH_CSS = '#v311-list{box-sizing:border-box;width:calc(100% - 20px);max-width:720px;max-height:min(640px,calc(100dvh - 24px));margin:12px auto;inset:0 0 auto;padding:14px;border:1px solid #9eb4bd;border-radius:12px;background:#fff;color:#173a5e;font:14px system-ui;overflow:auto;color-scheme:light}#v311-list::backdrop{background:rgba(0,0,0,.28)}.v311-heading{display:flex;justify-content:space-between;align-items:center;gap:10px;position:sticky;top:-14px;background:#fff;z-index:2;padding:8px 0}.v311-heading h2{font-size:17px;margin:0}#v311-close{min-height:44px;padding:8px 12px;border:1px solid #9eb4bd;border-radius:7px;background:#fff;color:#173a5e;font:14px system-ui;flex-shrink:0}#v311-status{font-size:13px;color:#52636b}#v311-error{font-size:13px;color:#9f2929}#v311-list table{width:100%;border-collapse:collapse;table-layout:fixed;font-size:13px}#v311-list th{padding:8px 1px;background:#eaf2f6;font-size:12px;white-space:nowrap}#v311-list td{padding:9px 1px;text-align:center;overflow-wrap:anywhere}.v311-name{text-align:left!important;padding-top:14px!important}.v311-name a{color:#174a6a;font-weight:700;text-decoration:underline;display:inline-flex;align-items:center;min-height:36px}.v311-name small{display:block;color:#52636b;font-size:11px}.v311-values td{border-bottom:1px solid #cbd5d8;padding-bottom:13px!important}#v311-list p:empty{display:none}\n\n#v311-pagination:not([hidden]){display:flex;justify-content:center;align-items:center;gap:16px;margin-top:12px}#v311-pagination button{min-height:44px;padding:8px 14px;border:1px solid #9eb4bd;border-radius:7px;background:#fff;color:#173a5e}\n'
+_V311_SEARCH_DOM = '<dialog id="v311-list" aria-labelledby="v311-title"><div class="v311-heading"><h2 id="v311-title">物件一覧</h2><button type="button" id="v311-close">閉じる</button></div><p id="v311-status" role="status"></p><p id="v311-error" role="alert"></p><table><thead><tr><th>家賃</th><th>間取り</th><th>築年数</th><th>面積</th><th>駅徒歩</th></tr></thead><tbody id="v311-rows"></tbody></table><nav id="v311-pagination" hidden><button id="v311-prev" type="button">前へ</button><span id="v311-page"></span><button id="v311-next" type="button">次へ</button></nav></dialog>'
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('</style></head>',_V311_SEARCH_CSS+'</style></head>',1)
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('</body>',_V311_SEARCH_DOM+'</body>',1)
+TOWN_COMPONENT_HTML_V121=TOWN_COMPONENT_HTML_V121.replace('function render(args){',_V311_SEARCH_JS+'\nfunction render(args){\n v311Receive(args.listing_search_reply);',1)
 
 def main():
     st.set_page_config(page_title='住まいコンパス｜新しい住まいを探す',page_icon='🏡',layout='wide',initial_sidebar_state='collapsed')
